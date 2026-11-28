@@ -90,6 +90,7 @@ fn has_native_current(
 fn measured_targets(
     instances: &[DeviceInstance],
     models: &crate::devices::models::ModelResolver<'_>,
+    resistors: &crate::devices::pwl_resistor::BoundResistors,
 ) -> SpiceResult<BTreeSet<usize>> {
     let mut referenced = BTreeMap::new();
     for expression in instances.iter().flat_map(expressions) {
@@ -107,6 +108,7 @@ fn measured_targets(
     let mut targets = BTreeSet::new();
     for (index, instance) in instances.iter().enumerate() {
         if let Some(location) = referenced.get(&instance.name.to_ascii_lowercase())
+            && !resistors.contains_key(&instance.name)
             && !has_native_current(instance, models)?
         {
             // A series probe reads the first physical terminal. A terminal-less
@@ -142,9 +144,10 @@ pub(in crate::devices) fn expand<'a, 'n>(
     models: &crate::devices::models::ModelResolver<'_>,
     existing_names: impl Iterator<Item = &'n str>,
     capacity: usize,
+    resistors: &crate::devices::pwl_resistor::BoundResistors,
 ) -> SpiceResult<ExpandedInstances<'a>> {
     let count = derivative_count(instances);
-    let measured = measured_targets(instances, models)?;
+    let measured = measured_targets(instances, models, resistors)?;
     if count == 0 && measured.is_empty() {
         return Ok(ExpandedInstances {
             instances: Cow::Borrowed(instances),

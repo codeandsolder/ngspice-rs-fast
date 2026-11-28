@@ -59,9 +59,10 @@ records the design of the earlier milestones.
 
 ## Installation
 
-`ngspice-rs` is published on [crates.io](https://crates.io/crates/ngspice-rs) and
-needs Rust **1.89** or newer (edition 2024). No C toolchain or ngspice binary is
-required.
+`ngspice-rs` is published on [crates.io](https://crates.io/crates/ngspice-rs).
+This fork uses the pinned Rust nightly in `rust-toolchain.toml` (edition 2024),
+allowing portable SIMD without stable-compiler constraints. No C toolchain or
+ngspice binary is required.
 
 The `spice-rs` command-line tool can be installed as a prebuilt binary with
 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), or compiled
@@ -69,7 +70,7 @@ from source with `cargo install`:
 
 ```sh
 cargo binstall ngspice-rs    # prebuilt binary, no compilation
-cargo install ngspice-rs     # build from crates.io source
+cargo +nightly-2026-11-20 install ngspice-rs # build from crates.io source
 spice-rs simulate --output out.raw deck.cir
 ```
 

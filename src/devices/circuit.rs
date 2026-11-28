@@ -767,6 +767,40 @@ impl<'a> PreparedRun<'a> {
         )
     }
 
+    pub(crate) fn physical_taylor_storage_bindings(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Vec<(usize, String)>> {
+        let point = self.point(context)?;
+        let mut bindings = Vec::new();
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            device.physical_charge_histories(&mut |history| {
+                let range = self
+                    .circuit
+                    .state_rows(index)
+                    .ok_or_else(|| SpiceError::circuit("missing physical Taylor history range"))?;
+                if history.slot.saturating_add(1) >= range.len() {
+                    return Err(SpiceError::circuit(
+                        "physical Taylor history pair outside device",
+                    ));
+                }
+                bindings.push((range.start + history.slot, device.name().to_owned()));
+                Ok(())
+            })?;
+        }
+        bindings.sort_unstable_by_key(|binding| binding.0);
+        if bindings
+            .windows(2)
+            .any(|pair| pair[0].0.saturating_add(1) >= pair[1].0)
+        {
+            return Err(SpiceError::circuit(
+                "overlapping physical Taylor history pairs",
+            ));
+        }
+        Ok(bindings)
+    }
+
     pub(crate) fn dae_nonlinear_taylor(
         &self,
         model: &ModelContext,
@@ -778,8 +812,13 @@ impl<'a> PreparedRun<'a> {
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
             if device.is_nonlinear() {
-                device.assemble_nonlinear_taylor(
-                    &mut crate::devices::physical_dae::TaylorContext {
+                device
+                    .assemble_nonlinear_taylor(&mut crate::devices::physical_dae::TaylorContext {
+                        device: index,
+                        state_rows: self
+                            .circuit
+                            .state_rows(index)
+                            .ok_or_else(|| SpiceError::circuit("missing Taylor state range"))?,
                         model,
                         unknowns: &self.circuit.bindings.unknowns,
                         branch: self.circuit.bindings.branch_rows[index].clone().next(),
@@ -787,11 +826,73 @@ impl<'a> PreparedRun<'a> {
                         state,
                         time,
                         output,
-                    },
-                )?;
+                    })
+                    .map_err(|error| match error {
+                        SpiceError::Circuit { message } => SpiceError::circuit(format!(
+                            "{}: physical Taylor evaluation at t = {:e}: {message}",
+                            device.name(),
+                            time.value()
+                        )),
+                        other => other,
+                    })?;
             }
         }
         Ok(())
+    }
+
+    /// Populate a physical trial from its solved one-sided state. Devices
+    /// whose history is already fully specified must not be evaluated again
+    /// at the scalar boundary (which may select an isolated, undefined branch).
+    pub(crate) fn physical_candidate_state(
+        &self,
+        request: &LoadRequest<'_>,
+        canonical: &[(usize, Real)],
+    ) -> SpiceResult<TrialState> {
+        let mut trial = request.history.trial();
+        let mut covered = vec![false; trial.values().len()];
+        for &(slot, value) in canonical {
+            let flag = covered
+                .get_mut(slot)
+                .ok_or_else(|| SpiceError::circuit("invalid physical history slot"))?;
+            *flag = true;
+            request
+                .history
+                .set_candidate_slot(&mut trial, slot, value)?;
+        }
+        let point = self.point(request.model_context)?;
+        let mutual = point.mutual(self.circuit)?;
+        let n = request.solution.len();
+        let mut matrix = SparseMatrix::new(n, n);
+        let mut rhs = Vector::zeros(n);
+        for index in self.circuit.load_order() {
+            let mut rows = self
+                .circuit
+                .state_rows(index)
+                .ok_or_else(|| SpiceError::circuit("missing physical state range"))?;
+            if rows.all(|slot| covered[slot]) {
+                continue;
+            }
+            matrix.clear();
+            rhs.clear();
+            self.circuit.stamp_isolated(
+                index,
+                point.device(self.circuit, index),
+                request,
+                &mut matrix,
+                StampRhs::dense(&mut rhs),
+                request.history.device_of(&mut trial, index)?,
+                &mutual,
+                None,
+            )?;
+        }
+        // Partial device loads may have overwritten canonical coordinates.
+        for &(slot, value) in canonical {
+            request
+                .history
+                .set_candidate_slot(&mut trial, slot, value)?;
+        }
+        trial.snapshot()?;
+        Ok(trial)
     }
 
     /// Assemble only selected physical charge equations for a constrained
@@ -4627,6 +4728,16 @@ impl Circuit {
         models: &crate::devices::models::ModelResolver<'_>,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<()> {
+        self.add_prepared_instances(instances, models, context, &BTreeMap::new())
+    }
+
+    fn add_prepared_instances(
+        &mut self,
+        instances: &[crate::netlist::ast::DeviceInstance],
+        models: &crate::devices::models::ModelResolver<'_>,
+        context: &ModelContext,
+        resistors: &crate::devices::pwl_resistor::BoundResistors,
+    ) -> SpiceResult<()> {
         let existing = self.elaboration_size()?;
         let limits = self.elaboration_limits;
         let instances = crate::devices::behavioural::dynamic::expand(
@@ -4635,13 +4746,15 @@ impl Circuit {
             models,
             self.devices.iter().map(|device| device.name()),
             limits.devices.saturating_sub(existing.devices),
+            resistors,
         )?;
         let aliases = instances.probe_aliases;
         let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
-        let plan =
+        let mut plan =
             PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
+        plan.resistors = (!resistors.is_empty()).then_some(resistors);
         let seen: BTreeSet<String> = self
             .devices
             .iter()
@@ -4752,9 +4865,15 @@ impl Circuit {
                     )?;
                 }
                 None => {
-                    let device = crate::devices::factory::instantiate_with_models(
-                        instance, nodes, models, context,
-                    )?;
+                    let device = if let Some(resistor) =
+                        plan.resistors.and_then(|laws| laws.get(&instance.name))
+                    {
+                        resistor.bind(instance, nodes)?
+                    } else {
+                        crate::devices::factory::instantiate_with_models(
+                            instance, nodes, models, context,
+                        )?
+                    };
                     Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
                 }
                 Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Native(native))) => {
@@ -5031,7 +5150,7 @@ impl Circuit {
             mutual_limits,
             elaboration_limits,
             scope,
-            &[],
+            crate::devices::subckt::PreparedDeclarations::default(),
         )
     }
 
@@ -5046,7 +5165,7 @@ impl Circuit {
         mutual_limits: MutualLimits,
         elaboration_limits: ElaborationLimits,
         scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
-        waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+        declarations: crate::devices::subckt::PreparedDeclarations<'_>,
     ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         // The nonlinear E/G/F/H forms become B sources and generated XSPICE
@@ -5075,7 +5194,7 @@ impl Circuit {
                 max_devices: elaboration_limits.devices,
                 ..Default::default()
             },
-            waveforms,
+            declarations,
         )?;
         let models = crate::devices::models::ModelResolver::new(&expanded.models)?
             .with_bin_options(crate::devices::binning::BinOptions {
@@ -5101,7 +5220,12 @@ impl Circuit {
                 .is_some_and(|analyses| {
                     analyses.contains(&(crate::primitives::AnalysisKind::Noise, false))
                 });
-        circuit.add_instances(&expanded.devices, &models, &setup)?;
+        circuit.add_prepared_instances(
+            &expanded.devices,
+            &models,
+            &setup,
+            &expanded.prepared_resistors,
+        )?;
         let binned_deck = BinnedDeck::capture(
             &expanded.devices,
             &expanded.models,
@@ -5109,6 +5233,7 @@ impl Circuit {
             setup.noise_analysis,
             &expanded.prepared_initialization,
             &expanded.prepared_waveforms,
+            &expanded.prepared_resistors,
         )
         .map(Arc::new);
         circuit.apply_prepared_waveforms(expanded.prepared_waveforms)?;

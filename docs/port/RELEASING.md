@@ -4,12 +4,15 @@
 [`.github/workflows/publish.yml`](../../.github/workflows/publish.yml). The
 `xtask` workspace member has `publish = false` and is never uploaded.
 
+All builds and checks use the pinned nightly compiler in `rust-toolchain.toml`.
+
 ## What the workflow does
 
 1. **Shared strict gate** (`strict-rust` job): runs the immutable
    rust-skills2 workflow against the repository's dated, quarantined nightly.
 2. **Release gate** (`verify` job, no credentials):
    - checks that the pushed tag equals `v` + `version` in `Cargo.toml`;
+   - the central strict nightly lint, source policy and format gate;
    - checks new registry dependency versions against the default branch with
      the shared 72-hour release quarantine;
    - verifies all five archive layouts and negative tag/target checks;

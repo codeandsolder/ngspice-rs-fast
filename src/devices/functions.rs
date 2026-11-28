@@ -489,12 +489,8 @@ pub(super) const fn phase_radians(degrees: Real) -> Real {
 }
 
 /// SIN before its delay and in DC share the same reference formula.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "C SIN offset addition follows a separately rounded amplitude product"
-)]
 fn held_sine(offset: Real, amplitude: Real, radians: Real) -> Real {
-    offset + amplitude * radians.sin()
+    amplitude.mul_add(radians.sin(), offset)
 }
 
 /// SFFM and AM both use the C left-associated carrier/modulator angle.
@@ -503,24 +499,18 @@ fn held_sine(offset: Real, amplitude: Real, radians: Real) -> Real {
     reason = "preserve C time-frequency product and phase addition rounding"
 )]
 const fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
-    2. * PI * frequency * time + radians
+    (2. * PI * frequency).mul_add(time, radians)
 }
 
 impl Sine {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C SIN time-frequency product, phase addition and damping have a fixed rounding order"
-    )]
     fn value_at(self, t: Real) -> Real {
         let time = t - self.delay;
         let phase = phase_radians(self.phase);
         if time <= 0. {
             held_sine(self.offset, self.amplitude, phase)
         } else {
-            self.offset
-                + self.amplitude
-                    * (self.frequency * time * 2. * PI + phase).sin()
-                    * (-time * self.damping).exp()
+            let angle = (self.frequency * time * 2.).mul_add(PI, phase);
+            (self.amplitude * angle.sin()).mul_add((-time * self.damping).exp(), self.offset)
         }
     }
 }
@@ -561,10 +551,6 @@ impl Exponential {
 }
 
 impl Sffm {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C SFFM separately rounds the modulation index product and the offset sum"
-    )]
     fn value_at(self, t: Real, limit: Limit) -> Real {
         let time = t - self.delay;
         if time < 0. || (time == 0. && limit == Limit::Left) {
@@ -572,16 +558,12 @@ impl Sffm {
         }
         let carrier_angle = modulation_angle(self.carrier, time, phase_radians(self.carrier_phase));
         let signal_angle = modulation_angle(self.signal, time, phase_radians(self.signal_phase));
-        let angle = carrier_angle + self.index * signal_angle.sin();
-        self.offset + self.amplitude * angle.sin()
+        let angle = self.index.mul_add(signal_angle.sin(), carrier_angle);
+        self.amplitude.mul_add(angle.sin(), self.offset)
     }
 }
 
 impl Am {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C AM rounds the modulation product and carrier amplitude before the final offset sum"
-    )]
     fn value_at(self, t: Real, limit: Limit) -> Real {
         let time = t - self.delay;
         if time < 0. || (time == 0. && limit == Limit::Left) {
@@ -597,9 +579,9 @@ impl Am {
             time,
             phase_radians(self.modulation_phase),
         );
-        self.offset
-            + (self.carrier_amplitude + self.modulation_amplitude * signal_angle.sin())
-                * carrier_angle.sin()
+        self.modulation_amplitude
+            .mul_add(signal_angle.sin(), self.carrier_amplitude)
+            .mul_add(carrier_angle.sin(), self.offset)
     }
 }
 
@@ -816,11 +798,11 @@ impl SourceFunction {
 /// knot. With `r = t_k` the segment `[t_k, t_last]` repeats forever with period
 /// `t_last - t_k`; where `v_k != v_last` each repetition boundary is a jump.
 ///
-/// Values follow `vsrcload.c` verbatim, including at a repetition boundary,
-/// which C evaluates once: depending on which side of `t_last` the landing
-/// time (`CKTtime += CKTdelta` toward the breakpoint `VSRCaccept` requested)
-/// folds, it loads `v_last` or `v_k`. The transient driver reproduces those
-/// landing times bit for bit, so the requested [`Limit`] is ignored.
+/// Repetition boundary selection follows `vsrcload.c`: the folded time
+/// determines whether the last or restart value is loaded. This is a
+/// discontinuity, not a small rounding error; the requested [`Limit`]
+/// is ignored. Interior interpolation uses fused arithmetic and exact
+/// knots return their stored values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PwlSource {
     knots: Arc<[(Real, Real)]>,
@@ -944,26 +926,33 @@ impl PwlSource {
     }
 
     /// Linear interpolation at an in-range local time (C's segment search).
-    #[expect(
-        clippy::float_cmp,
-        reason = "exact knot comparisons preserve stored ordinate bits including signed zero"
-    )]
     fn interpolate(&self, time: Real) -> Real {
         // Strictly increasing finite knots are guaranteed by the constructor.
-        // Search right endpoints, returning stored ordinates at exact knots.
-        // Interior samples retain C's operation order when the endpoint
-        // difference is representable.
+        // Search right endpoints, choosing the preceding segment at an exact
+        // knot. Return the stored endpoint exactly rather than reconstruct it.
         let left = self.knots[1..].partition_point(|(t, _)| *t < time);
         let (t0, v0) = self.knots[left];
         self.knots.get(left + 1).map_or(v0, |&(t1, v1)| {
-            if time == t0 {
+            if time <= t0 {
                 return v0;
             }
-            if time == t1 {
+            if time >= t1 {
                 return v1;
             }
-            let fraction = (time - t0) / (t1 - t0);
-            affine_value(v0, v1, fraction)
+            // Start from the nearer endpoint so cancellation at the far
+            // end does not lose a small stored value. If the value span
+            // overflows, use a convex combination instead.
+            let span = v1 - v0;
+            let width = t1 - t0;
+            if !span.is_finite() {
+                let fraction = (time - t0) / width;
+                return fraction.mul_add(v1, (1. - fraction) * v0);
+            }
+            if time <= t0.midpoint(t1) {
+                ((time - t0) / width).mul_add(span, v0)
+            } else {
+                ((t1 - time) / width).mul_add(-span, v1)
+            }
         })
     }
 
@@ -1578,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn pwl_binary_lookup_preserves_linear_search_bits() {
+    fn pwl_binary_lookup_agrees_with_linear_segment_selection() {
         let knots: Vec<_> = (0..257)
             .map(|i| {
                 let t = Real::from(i);
@@ -1594,18 +1583,26 @@ mod tests {
                     .find_map(|w| {
                         let ((a, x), (b, y)) = (w[0], w[1]);
                         (b >= t).then(|| {
-                            if t == a {
-                                x
-                            } else if t == b {
-                                y
-                            } else {
-                                let fraction = (t - a) / (b - a);
-                                x + fraction * (y - x)
+                            if t <= a {
+                                return (x, x.abs());
                             }
+                            if t >= b {
+                                return (y, y.abs());
+                            }
+                            let fraction = (t - a) / (b - a);
+                            ((1. - fraction) * x + fraction * y, x.abs().max(y.abs()))
                         })
                     })
-                    .unwrap_or(knots.last().unwrap().1);
-                assert_eq!(p.interpolate(t).to_bits(), expected.to_bits(), "t={t}");
+                    .unwrap_or_else(|| {
+                        let value = knots.last().unwrap().1;
+                        (value, value.abs())
+                    });
+                let (expected, scale) = expected;
+                let actual = p.interpolate(t);
+                assert!(
+                    (actual - expected).abs() <= 4. * Real::EPSILON * scale,
+                    "t={t}: {actual} != {expected}"
+                );
             }
         }
         let single = PwlSource::new(vec![(0., -0.)], 0., None).unwrap();
@@ -1701,40 +1698,47 @@ mod tests {
             2_f64.next_up(),
             7.,
         ] {
-            // Interior interpolation follows the original C expression;
-            // an exact knot returns its stored value without rounding it.
-            let expected = if time <= knots[0].0 {
-                knots[0].1
+            // Independent linear lookup, with the stored values at knots.
+            let (expected, scale) = if time <= knots[0].0 {
+                (knots[0].1, knots[0].1.abs())
             } else {
                 knots
                     .windows(2)
                     .find_map(|w| {
                         let ((t0, v0), (t1, v1)) = (w[0], w[1]);
                         (t1 >= time).then(|| {
-                            if time == t0 {
-                                v0
-                            } else if time == t1 {
-                                v1
-                            } else {
-                                let fraction = (time - t0) / (t1 - t0);
-                                let increment = fraction * (v1 - v0);
-                                v0 + increment
+                            if time >= t1 {
+                                return (v1, v1.abs());
                             }
+                            let fraction = (time - t0) / (t1 - t0);
+                            ((1. - fraction) * v0 + fraction * v1, v0.abs().max(v1.abs()))
                         })
                     })
-                    .unwrap_or(knots[2].1)
+                    .unwrap_or((knots[2].1, knots[2].1.abs()))
             };
-            assert_eq!(
-                plain.value_at(time, L).unwrap().to_bits(),
-                expected.to_bits(),
-                "{time}"
-            );
-            assert_eq!(
-                shifted.value_at(time, R).unwrap().to_bits(),
-                expected.to_bits(),
-                "{time}"
-            );
+            for actual in [
+                plain.value_at(time, L).unwrap(),
+                shifted.value_at(time, R).unwrap(),
+            ] {
+                assert!(
+                    (actual - expected).abs() <= 4. * Real::EPSILON * scale,
+                    "{time}: {actual} != {expected}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn pwl_interpolation_preserves_endpoints_and_finite_convex_values() {
+        let p = PwlSource::plain(vec![(0., 1e25), (1., -1.)]).unwrap();
+        assert_eq!(p.interpolate(1.).to_bits(), (-1.0_f64).to_bits());
+        let t = 1.0_f64.next_down();
+        let expected = (1. - t).mul_add(1e25, -t);
+        assert!((p.interpolate(t) - expected).abs() <= expected.abs() * 2. * Real::EPSILON);
+        let p = PwlSource::plain(vec![(0., -Real::MAX), (1., Real::MAX)]).unwrap();
+        assert_eq!(p.interpolate(0.5), 0.);
+        assert!(p.interpolate(0.25).is_finite());
+        assert!(p.interpolate(0.75).is_finite());
     }
 
     #[test]

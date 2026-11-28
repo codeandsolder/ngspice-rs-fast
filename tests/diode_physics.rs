@@ -10,6 +10,10 @@ const K_OVER_Q: f64 = 1.38064852e-23 / 1.6021766208e-19;
 const GMIN: f64 = 1e-12;
 
 fn simulate(body: &str) -> Plot {
+    simulate_observed(body, &[])
+}
+
+fn simulate_observed(body: &str, observations: &[String]) -> Plot {
     let n = Parser::new()
         .parse_deck(&parse_deck_text(
             Path::new("diode_physics.cir"),
@@ -18,6 +22,7 @@ fn simulate(body: &str) -> Plot {
         .unwrap();
     let config = RunConfig::from_netlist(&n).unwrap();
     let mut circuit = config.circuit(&n).unwrap();
+    circuit.set_observations(observations).unwrap();
     let request = config.plan_for(&n.analyses[0]).unwrap();
     request.run(&mut circuit, &config.context()).unwrap()
 }
@@ -385,6 +390,125 @@ fn soft_recovery_observations_are_external_terminal_quantities() {
             let voltage = real(&plot, "v(a)", point);
             assert!((current + input).abs() <= 1e-12 + 1e-6 * input.abs());
             assert!((power - voltage * current).abs() <= 1e-12 + 1e-6 * power.abs());
+        }
+    }
+}
+
+#[test]
+fn physical_derivative_chain_with_native_diode_preserves_kcl() {
+    for method in ["gear", "trap"] {
+        let p = simulate(&format!(
+            "v1 in 0 PWL(0 2 1m 3)\nb1 first 0 v=1m*ddt(v(in))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\nd1 in 0 dm\n.model dm d(is=1e-18 n=10)\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 50u 0 1u uic"
+        ));
+        let vt = 10. * K_OVER_Q * 300.15;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let v = 1000_f64.mul_add(t, 2.);
+            let current = 1e-18 * (v / vt).exp_m1() + GMIN * v;
+            assert!((real(&p, "v(in)", i) - v).abs() < 1e-11);
+            assert!((real(&p, "v(first)", i) - 1.).abs() < 1e-10);
+            assert!(real(&p, "v(out)", i).abs() < 1e-10);
+            assert!((real(&p, "i(v1)", i) + current).abs() < 1e-17);
+        }
+    }
+}
+
+#[test]
+fn physical_derivative_chain_with_charged_diode_preserves_kcl() {
+    for method in ["gear", "trap"] {
+        let p = simulate(&format!(
+            "v1 in 0 PWL(0 -0.4 1m 0.6)\nb1 first 0 v=1m*ddt(v(in))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\nd1 in 0 dm\n.model dm d(is=1e-12 n=10 cjo=20p vj=0.8 m=0.4 tt=5n)\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 50u 0 1u uic"
+        ));
+        let vt = 10. * K_OVER_Q * 300.15;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let v = 1000_f64.mul_add(t, -0.4);
+            let current = 1e-12 * (v / vt).exp_m1() + GMIN * v;
+            let conductance = 1e-12 / vt * (v / vt).exp() + GMIN;
+            let cap = 20e-12 * (1. - v / 0.8).powf(-0.4) + 5e-9 * conductance;
+            assert!((real(&p, "v(first)", i) - 1.).abs() < 1e-10);
+            assert!(real(&p, "v(out)", i).abs() < 1e-10);
+            assert!((real(&p, "i(v1)", i) + current + 1000. * cap).abs() < 1e-15);
+        }
+    }
+}
+
+#[test]
+fn device_local_diode_charges_on_shared_node_have_independent_history() {
+    // The two depletion charges share a KCL row but have separate companion
+    // histories. At M=0 their sum is a linear capacitor; the reverse leakage
+    // is negligible, and the gmin term is included in the closed form.
+    for method in ["gear", "trap"] {
+        let p = simulate(&format!(
+            "v1 in 0 PWL(0 0 1m 1)\nr1 in a 1k\nd1 0 a dm1\nd2 0 a dm2\n.model dm1 d(is=1e-18 n=10 cjo=0.3u m=0)\n.model dm2 d(is=1e-18 n=10 cjo=0.7u m=0)\nb1 first 0 v=1m*ddt(v(a))\nb2 out 0 v=1m*ddt(v(first))\nr2 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 100u 0 1u uic"
+        ));
+        let dc_gain = 1. / (1. + 2. * GMIN * 1000.);
+        let tau = 1e-3 * dc_gain;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let e = (-t / tau).exp();
+            let v = 1000. * dc_gain * (t + tau * (e - 1.));
+            let first = dc_gain * (1. - e);
+            let second = 1e-3 * dc_gain / tau * e;
+            assert!((real(&p, "v(a)", i) - v).abs() < 1e-6);
+            assert!((real(&p, "v(first)", i) - first).abs() < 1e-6);
+            assert!((real(&p, "v(out)", i) - second).abs() < 1e-6);
+        }
+    }
+}
+
+#[test]
+fn diode_recovery_state_participates_in_physical_derivative_array() {
+    for method in ["gear", "trap"] {
+        let p = simulate_observed(
+            &format!(
+                "v1 in 0 PWL(0 0 1u 0.05)\nd1 in 0 dm\n.model dm d(is=1e-8 tt=1u vp=0.5 qpscale=1e6)\nb1 first 0 v=1u*ddt(v(in))\nb2 out 0 v=1u*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 10n 0.5u 0 10n uic"
+            ),
+            &["@d1[i]".into(), "@d1[p]".into()],
+        );
+        let slope = 50_000.;
+        let a = slope / (K_OVER_Q * 300.15);
+        let tau = 0.5e-6;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let exponential = (a * t).exp();
+            let decay = (-t / tau).exp();
+            let current = 1e-8 * (a * t).exp_m1() + GMIN * slope * t;
+            let qdot = 1e-6 * 1e-8 * a / (1. + a * tau) * (exponential - decay)
+                + 1e-6 * GMIN * slope * (1. - decay);
+            assert!((real(&p, "v(first)", i) - 0.05).abs() < 1e-10);
+            assert!(real(&p, "v(out)", i).abs() < 1e-10);
+            assert!((real(&p, "i(v1)", i) + current + 0.5 * qdot).abs() < 2e-12);
+            assert!((real(&p, "@d1[i]", i) + real(&p, "i(v1)", i)).abs() < 1e-13);
+            assert!(
+                (real(&p, "@d1[p]", i) - real(&p, "@d1[i]", i) * real(&p, "v(in)", i)).abs()
+                    < 1e-15
+            );
+        }
+    }
+}
+
+#[test]
+fn derivative_array_diode_observation_respects_ground_and_series_nodes() {
+    for resistance in [0., 10.] {
+        for reverse in [false, true] {
+            for method in ["gear", "trap"] {
+                let (terminals, sign) = if reverse { ("0 in", -1.) } else { ("in 0", 1.) };
+                let p = simulate_observed(
+                    &format!(
+                        "v1 in 0 PWL(0 0 1m 1)\nd1 {terminals} dm\n.model dm d(is=1e-12 n=10 cjo=20p rs={resistance})\nb1 first 0 v=1m*ddt(v(in))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 20u 0 1u uic"
+                    ),
+                    &["@d1[i]".into(), "@d1[p]".into()],
+                );
+                for i in 0..p.point_count() {
+                    let expected = -sign * real(&p, "i(v1)", i);
+                    assert!((real(&p, "@d1[i]", i) - expected).abs() < 2e-13);
+                    assert!(
+                        (real(&p, "@d1[p]", i) - expected * sign * real(&p, "v(in)", i)).abs()
+                            < 1e-15
+                    );
+                }
+            }
         }
     }
 }

@@ -589,7 +589,7 @@ mod tests {
         tree.check_tree(1, &mut enough).unwrap();
         let mut short = TreeBudget::new(3);
         let error = tree.check_tree(1, &mut short).unwrap_err();
-        assert_eq!(error.to_string().contains("expression node limit"), true);
+        assert!(error.to_string().contains("expression node limit"));
         assert!(error.to_string().contains("behavioural-budget.cir:4:1"));
     }
 

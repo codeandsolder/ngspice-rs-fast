@@ -57,6 +57,7 @@
 
 mod disto;
 mod physics;
+mod taylor;
 
 static INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(INSTANCE);
 
@@ -1246,6 +1247,31 @@ impl Device for Bjt {
             _ => None,
         })
     }
+    fn observation_operating(
+        &self,
+        key: &str,
+        context: &ModelContext,
+        voltage: &dyn Fn(NodeId) -> Real,
+        transient: bool,
+    ) -> SpiceResult<Option<Real>> {
+        // bjtask.c: the intrinsic collector/base currents are not external
+        // collector/base terminal residuals when series and substrate
+        // junctions are present. Replay the same bias/temperature physics
+        // as the ordinary BJT load, then apply BJTm exactly once.
+        // Transient asks require the history-dependent charge companions.
+        if !matches!(key, "ic" | "ib") || transient {
+            return Ok(None);
+        }
+        let p = c_point(&self.thermal(context)?, self.bias(voltage), context.gmin)?;
+        let current = if key == "ic" {
+            p.transport.cc
+        } else if self.subs < 0. {
+            p.transport.cb - p.substrate.current
+        } else {
+            p.transport.cb
+        };
+        Ok(Some(self.instance.multiplier * current))
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -1457,12 +1483,24 @@ impl Device for Bjt {
             for branch in [be, bc] {
                 branch.zero_derivative(&mut context.states)?;
             }
-            // C never writes `cqsub`/`cqbx` outside transient and
-            // `MODEINITSMSIG`, yet reads them into `ceqsub`/`ceqbx`: a DC load
-            // after a small-signal analysis of the same deck sees the
-            // capacitances that analysis stored there.
-            cqsub = sub.retain_derivative(&mut context.states)?;
-            cqbx = bx.retain_derivative(&mut context.states)?;
+            if matches!(
+                context.mode,
+                crate::devices::AnalysisMode::Instantaneous { .. }
+            ) {
+                // A physical residual has no discretized history currents.
+                // The exact local charge rates are restored from the solved
+                // trial by the physical candidate and observation paths.
+                sub.zero_derivative(&mut context.states)?;
+                bx.zero_derivative(&mut context.states)?;
+                cqsub = 0.;
+                cqbx = 0.;
+            } else {
+                // C never writes `cqsub`/`cqbx` outside transient and
+                // `MODEINITSMSIG`, yet reads them into `ceqsub`/`ceqbx`: a DC
+                // load after a small-signal analysis sees those capacitances.
+                cqsub = sub.retain_derivative(&mut context.states)?;
+                cqbx = bx.retain_derivative(&mut context.states)?;
+            }
         }
         for branch in [be, bc, bx, sub] {
             branch.store(&mut context.states)?;
@@ -1536,6 +1574,31 @@ impl Device for Bjt {
             ],
         )
     }
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        use crate::devices::traits::PhysicalChargeHistory;
+        let n = self.nodes;
+        let scale = self.pol * self.instance.multiplier;
+        for (slot, nodes, scale) in [
+            (slot::QBE, [n.bp, n.ep], scale),
+            (slot::QBC, [n.bp, n.cp], scale),
+            (slot::QSUB, [n.s, n.sc], scale * self.subs),
+            (slot::QBX, [n.b, n.cp], scale),
+        ] {
+            visit(PhysicalChargeHistory { slot, nodes, scale })?;
+        }
+        Ok(())
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         context: &mut crate::devices::traits::ChargeContext<'_>,

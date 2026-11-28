@@ -2,7 +2,7 @@
 
 Prepared artifacts can carry typed waveform declarations alongside the emitted
 electrical deck. Parse the artifact (including its companion files) and call
-`RunConfig::prepared_circuit` with the declaration slice. The circuit uses the
+`RunConfig::prepared_circuit` with the complete `PreparedDeclarations` value. The circuit uses the
 shared producer contract, not a second parser for source-dialect syntax.
 
 The declaration is identified by artifact filename, subcircuit definition and
