@@ -46,8 +46,9 @@
 //! A [`FunctionScope`] holds the `.func` definitions of one lexical scope
 //! (deck or `.subckt` body) and is attached to a [`ParamScope`]; calls
 //! ([`ExprKind::UserCall`], or a built-in name a `.func` redefines) are
-//! evaluated by value, with the body's free names resolved at the call site,
-//! as C's textual expansion (`inpcom.c` `inp_expand_macro_in_str()`) implies.
+//! evaluated through lazily memoized actual arguments in the caller's
+//! environment. The body's free names resolve at the call site, as C's
+//! textual expansion (`inpcom.c` `inp_expand_macro_in_str()`) implies.
 //! Recursion is rejected with the cycle (iterative petgraph SCC) instead of C's
 //! unbounded expansion. [`ParamScope::for_netlist`] is the entry point for
 //! evaluating anything against a deck's top-level parameters and functions.

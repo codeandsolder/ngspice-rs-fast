@@ -1080,7 +1080,9 @@ fn actual_ltspice_prepared_waveforms_drive_transient_with_exact_cutoffs() {
         let fall = -(-(time - 1e-6).max(0.) / 3e-6).exp_m1();
         let b = 2_f64.mul_add(rise - fall, 1.);
         let phase = (time - 1e-6).max(0.) % 10e-6;
-        let c = if time >= cutoff {
+        // The accepted endpoint of a step landing on a discontinuity
+        // is the incoming value; the restarted step uses the right limit.
+        let c = if time > cutoff {
             0.
         } else {
             (phase / 1e-7)
@@ -1106,7 +1108,9 @@ fn vendor_prepared_waveform_values_match_at_independent_samples() {
     let dir = tempfile::tempdir().unwrap();
     let bundle = prepare_deck(
         dir.path(),
-        include_str!("fixtures/ltspice_waveforms/waveforms-gear.cir"),
+        &include_str!("fixtures/ltspice_waveforms/waveforms-gear.cir")
+            .replace(" plotwinsize=0", "")
+            .replace(" numdgt=15", ""),
         InputFormat::LtspiceDeck,
     );
     let netlist = Parser::new()

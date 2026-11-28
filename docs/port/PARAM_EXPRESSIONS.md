@@ -250,7 +250,7 @@ reports a positioned parse error. Fixture: `conformance/cases/param_func.cir`.
 | visibility | all definitions of a scope are visible throughout it (hoisted), also to `.param` cards and nested definitions, never outside the defining `.subckt` | same: one `FunctionScope` per lexical scope; expansion uses the definition's scope, not the caller's |
 | shadowing | a body-local definition hides an outer one; within one scope the **last** definition wins | same |
 | built-ins | a `.func` replaces a built-in of the same name (`max`, or excluded names such as `limit`) | same; a different-arity redefinition of an allowlisted built-in is `NotYetPorted` |
-| arguments | bound by value; a formal shadows a `.param` of the same name inside the body | same |
+| arguments | textual substitution; a formal shadows a `.param` of the same name inside the body | actuals evaluate lazily in the caller environment, with a single scalar realization per formal |
 | free names | resolved where the call is written (e.g. a body `.param k` inside a subcircuit); an enclosing `.func` call's formals capture them first (textual expansion) | same, through the chain of active calls |
 | unused body naming an undefined parameter | accepted | accepted; a used one is an `undefined parameter` error with the call chain |
 | undefined function | `Undefined parameter` error | `undefined function` error at the call |
@@ -305,8 +305,9 @@ deviation a/s; `gauss(n,r,s)` uses n*r/s. Nonpositive variation or sigma
 returns the nominal value. `aunif(n,a)` adds a uniform draw in [-a,a],
 `unif(n,r)` uses n*r, and `limit(n,a)` selects n-a or n+a with equal
 probability. User functions shadow these names. Statistical calls inside
-a scalar function evaluate by value, as for all numparam functions;
-behavioural macro expansion realizes each resulting call occurrence.
+a scalar function use the static invocation path; a reused formal realizes
+its argument only once. Behavioural expansion preserves the identity of the
+original argument and the static call path, including runtime passive laws.
 Both static parameter and behavioural elaboration use the shared
 counter-based random kernel, not C's process-global RNG.
 

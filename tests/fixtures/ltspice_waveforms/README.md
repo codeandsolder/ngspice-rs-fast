@@ -16,3 +16,6 @@ the left landing value at the exact release time. The solver explicitly
 represents both external limits, with prepared transient startup using
 the physical right limit. The witness test compares the recorded left
 value at the two exact landing samples and the actual law everywhere else.
+
+The solver test removes only the vendor raw-output formatting options
+`plotwinsize` and `numdgt`; these do not alter circuit forcing.
