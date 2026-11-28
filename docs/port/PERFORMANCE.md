@@ -156,3 +156,54 @@ belong in the issue/worklog.
 - [2026-11-22 scalar reference](performance-baselines/2026-11-22.md):
   generic/native release timing, nine allocation profiles and numerical records.
 - [2026-11-22 sparse factor telemetry](performance-baselines/2026-11-22-factor-telemetry.md): actual storage and work counters, release workload timings and numerical signatures.
+
+## Active transient lifecycle bindings (#295)
+
+Finalized topology binds only devices that implement convergence, acceptance,
+truncation or delay capabilities. Prepared replacements can add or remove a
+convergence hook. Delay histories use dense slots; validation scratch is reused,
+and only validated updates are committed. Acceptance and breakpoint order and
+rollback remain unchanged.
+
+Reproduce the whole-path release workload with:
+
+```sh
+cargo +nightly test --release --locked --test companion_transient \
+  benchmark_transient_lifecycle_workloads -- --exact --ignored --nocapture
+```
+
+Compare the identical benchmark at base `f53dfcc7b0189b35d36d8b5eb1bdbef44866162a`
+and the lifecycle implementation, with the same compiler and managed build
+cache. On a Ryzen 7 4700U, ten interleaved release runs per version pinned to the
+same core gave the following median elapsed times. The benchmark hashes each
+time/output-voltage sample and records actual accepted/rejected steps.
+
+| Workload | Devices | Accepted / rejected | Digest (both versions) | Base ms | Bound ms |
+| --- | ---: | ---: | --- | ---: | ---: |
+| Inert passives | 1027 | 606 / 14 | `08f7b5faeba5286d` | 75.470 | 77.226 |
+| Sparse active subset | 1033 | 615 / 19 | `334a517e68b78f17` | 85.627 | 85.988 |
+| Dense delay lines (24) | 51 | 606 / 14 | `08f7b5faeba5286d` | 17.617 | 15.543 |
+| Nonlinear | 69 | 615 / 19 | `334a517e68b78f17` | 7.638 | 7.444 |
+
+Across the complete four-case test process, `perf stat` recorded median retired
+user instructions of 2,368,739,811 versus 2,019,590,883 (14.7% fewer),
+792,254,693 versus 788,744,834 cycles, and 198.755 versus 198.055 ms task-clock.
+Aggregate elapsed throughput is essentially unchanged on this machine; the
+clear wall-time improvement is concentrated in the dense-delay case. DHAT
+recorded 205,957 versus 201,083 cumulative allocation blocks and 34,136,021
+versus 26,513,384 cumulative bytes (22.3% fewer). The old per-step delay map
+accounted for 3,044 blocks and 642,720 bytes; no such allocation remains.
+Peak live allocation is essentially unchanged (3.17 MB).
+
+The sparse-lifecycle unit test instruments the actual convergence, acceptance,
+truncation and delay paths. For 262 devices and 122 accepted / 2 rejected
+steps, convergence visits are 126, delay update visits 123, delay limit and
+truncation visits 127 each, and inactive acceptance visits zero. The test also
+checks topology rebinding and stale-history rejection. Additional tests cover
+prepared replacement convergence capability changes and transactional rollback
+with sparse delay ordinals.
+
+Independent reference tests revealed an existing soft-recovery diode failure
+(#310), reproduced bit-for-bit on the unmodified base and the candidate. The
+reference test and tolerance are unmodified; seven other companion reference
+comparisons and all other selected integration tests pass.
