@@ -1348,10 +1348,10 @@ impl SparseMatrix {
         }
     }
 
-    /// Whether an original coefficient times its actual solution coordinate
-    /// reaches the supplied magnitude. Keep the original contribution peaks
-    /// (rather than folded entries) so cancellation within a cell is visible.
+    /// Cheap, conservative bound on the scale of the original products.
     pub(crate) fn has_large_original_product(&self, solution: &Vector, threshold: Real) -> bool {
+        // Original contribution peaks, not folded cells, retain cancellation
+        // evidence; match each peak with the coordinate it actually multiplies.
         debug_assert!(self.column_peaks.is_empty() || self.column_peaks.len() == solution.len());
         self.column_peaks
             .iter()
