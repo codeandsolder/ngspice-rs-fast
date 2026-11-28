@@ -96,6 +96,7 @@ pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
                 | "pn_terminal_bias_ac"
                 | "pn_terminal_bias_tran"
                 | "pn_exact_ic"
+                | "pn_parallel_ic"
                 | "pn_gseries_dc"
                 | "pn_gseries_ac"
                 | "pn_gseries_tran"

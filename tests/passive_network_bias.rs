@@ -173,3 +173,84 @@ fn hierarchy_preserves_fractional_multiplicity_and_zero_target() -> SpiceResult<
     close(at(&plots[0], "v(b)", 0), Complex::real(7. / 6.), 1e-9);
     Ok(())
 }
+
+#[test]
+fn parallel_capacitance_has_independent_exact_startup_voltage() -> SpiceResult<()> {
+    let plots = simulate(
+        "v1 s 0 2\n\
+         r1 s a 10\nc1 a 0 2u ic=.75 pn_rseries=5 pn_cparallel=1u pn_parallel_ic=.75 pn_terminal_bias_tran=.2 pn_exact_ic=1\n\
+         r2 s b 10\nc2 b 0 2u m=3 ic=.75 pn_rseries=5 pn_cparallel=1u pn_parallel_ic=.75 pn_terminal_bias_tran=.2 pn_exact_ic=1\n\
+         r3 s c 10\nl1 c 0 3m ic=.1 pn_rseries=5 pn_rparallel=20 pn_cparallel=1u pn_terminal_bias_tran=.05 pn_exact_ic=1\n\
+         .tran 1n 10n 0 1n\n.tran 1n 10n 0 1n uic",
+    )?;
+    for node in ["v(a)", "v(b)"] {
+        close(at(&plots[0], node, 0), Complex::real(7. / 6.), 1e-9);
+        for (plot, index) in [(&plots[0], 1), (&plots[1], 0)] {
+            let time = at(plot, "time", index).re;
+            let copies = if node == "v(a)" { 1. } else { 3. };
+            let slope = 0.125_f64 / (copies * 1e-6);
+            close(
+                at(plot, node, index),
+                Complex::real(slope.mul_add(time, 0.75)),
+                1e-7,
+            );
+        }
+    }
+    close(at(&plots[0], "v(c)", 0), Complex::real(2. / 3.), 1e-9);
+    close(at(&plots[0], "v(c)", 1), Complex::real(2. / 3.), 1e-7);
+    let time = at(&plots[1], "time", 0).re;
+    close(at(&plots[1], "v(c)", 0), Complex::real(1e5 * time), 1e-7);
+    Ok(())
+}
+
+#[test]
+fn derivative_startup_keeps_the_reported_bias_distinct_from_exact_storage() -> SpiceResult<()> {
+    let plots = simulate(
+        "v1 s 0 2\n\
+         r1 s a 10\nc1 a 0 2u ic=.75 pn_terminal_bias_tran=1000 pn_exact_ic=1 pn_report_dc=1\n\
+         v2 x 0 PWL(0 0 1u 1)\nb1 y 0 v=1u*ddt(v(x))\nr2 y 0 1k\n\
+         .tran 1n 10n 0 1n",
+    )?;
+    let plot = &plots[0];
+    close(at(plot, "v(a)", 0), Complex::real(0.7501249875012499), 1e-9);
+    close(
+        at(plot, "i(c1)", 0),
+        Complex::real((2. - 0.7501249875012499) / 10.),
+        1e-9,
+    );
+    for index in 1..plot.point_count() {
+        let t = at(plot, "time", index).re;
+        let v = 1.25_f64.mul_add(-(-t / 20e-6).exp_m1(), 0.75);
+        close(at(plot, "v(a)", index), Complex::real(v), 1e-7);
+        close(at(plot, "v(y)", index), Complex::real(1.), 1e-8);
+    }
+    Ok(())
+}
+
+#[test]
+fn coupled_inductors_use_exact_initial_currents_for_both_fluxes() -> SpiceResult<()> {
+    let plots = simulate(
+        "v1 s 0 2\nr1 s a 10\nr2 s b 10\n\
+         l1 a 0 3m ic=.1 pn_terminal_bias_tran=0 pn_exact_ic=1\n\
+         l2 b 0 3m ic=.05 pn_terminal_bias_tran=0 pn_exact_ic=1\n\
+         k1 l1 l2 .5\n.tran 1n 100n 0 1n",
+    )?;
+    let plot = &plots[0];
+    for index in 0..plot.point_count() {
+        let t = at(plot, "time", index).re;
+        // Exact solution of L di/dt = 2 - 10i using common and differential modes.
+        let common = 0.125_f64 * (-t / 450e-6).exp();
+        let differential = 0.025 * (-t / 150e-6).exp();
+        close(
+            at(plot, "v(a)", index),
+            Complex::real(10. * (common - differential)),
+            2e-7,
+        );
+        close(
+            at(plot, "v(b)", index),
+            Complex::real(10. * (common + differential)),
+            2e-7,
+        );
+    }
+    Ok(())
+}

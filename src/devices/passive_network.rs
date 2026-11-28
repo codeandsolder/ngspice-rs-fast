@@ -157,6 +157,7 @@ pub struct PreparedPassiveNetwork {
     nodes: usize,
     temperature: Option<Real>,
     initialization: Option<PassiveInitialization>,
+    parallel_initialization: Option<PassiveInitialization>,
     reporting: Option<CurrentReporting>,
     control: Option<CurrentReference>,
     primary_probe: bool,
@@ -269,10 +270,29 @@ impl PreparedPassiveNetwork {
             nodes,
             temperature: input.temperature,
             initialization,
+            parallel_initialization: None,
             reporting: None,
             control: None,
             primary_probe: false,
         }))
+    }
+
+    /// Prescribe independent initial voltage of the external parallel capacitance.
+    /// A zero capacitance removes that storage, including its initial voltage.
+    ///
+    /// # Errors
+    /// The voltage is nonfinite.
+    pub fn with_parallel_initial_voltage(mut self, voltage: Real) -> SpiceResult<Self> {
+        let policy = PassiveInitialization::new(StorageKind::Capacitor, Some(voltage), [])?
+            .with_exact_history()?;
+        if self
+            .edges
+            .iter()
+            .any(|edge| edge.role == Role::ParallelCapacitance)
+        {
+            self.parallel_initialization = Some(policy);
+        }
+        Ok(self)
     }
 
     fn terminal_bias(&self) -> Option<&PassiveInitialization> {
@@ -481,6 +501,10 @@ impl PreparedPassiveNetwork {
                 && let Some(policy) = &self.initialization
             {
                 device.bind_passive_initialization(policy.primary_policy())?;
+            } else if edge.role == Role::ParallelCapacitance
+                && let Some(policy) = &self.parallel_initialization
+            {
+                device.bind_passive_initialization(policy.clone())?;
             }
             devices.push(device);
         }
@@ -816,6 +840,9 @@ impl NetworkPlan {
         else {
             return Ok(Self::Storage(None));
         };
+        if let Some(voltage) = get("pn_parallel_ic") {
+            network = network.with_parallel_initial_voltage(voltage)?;
+        }
         let conductance = network
             .edges
             .iter()
@@ -867,14 +894,19 @@ impl NetworkPlan {
     ) -> SpiceResult<Option<PassiveInitialization>> {
         use super::passive_bias::PassiveBias;
         use crate::primitives::AnalysisKind;
-        let initial = initial.map(|value| match kind {
-            StorageKind::Capacitor => value,
-            StorageKind::Inductor => value * multiplicity,
-        });
         let mut constraints = Vec::new();
         let terminal = ["op", "dc", "ac", "tran"]
             .into_iter()
             .any(|phase| coefficients.contains_key(format!("pn_terminal_bias_{phase}").as_str()));
+        // Terminal bias uses aggregate physical coordinates. Ordinary
+        // storage IC and local bias continue to use per-copy winding current.
+        let initial = initial.map(|value| {
+            if kind == StorageKind::Inductor && !terminal {
+                value * multiplicity
+            } else {
+                value
+            }
+        });
         let exact = match coefficients.get("pn_exact_ic").copied().unwrap_or(0.) {
             0. => false,
             1. => true,
