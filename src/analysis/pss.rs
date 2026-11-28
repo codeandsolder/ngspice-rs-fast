@@ -418,7 +418,7 @@ pub(super) fn run(
             ".pss single shooting requires 2..={MAX_UNKNOWN_COUNT} MNA unknowns"
         )));
     }
-    let width = n + circuit.reported_currents().len() + circuit.observations().len() + 1;
+    let width = n + circuit.projected_output_count() + circuit.observations().len() + 1;
     if plan.harmonics != 0 && harmonic_work_exceeds_limit(width, plan) {
         return Err(failure("periodic harmonic work limit"));
     }
