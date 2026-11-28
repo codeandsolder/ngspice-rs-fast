@@ -1865,6 +1865,8 @@ pub struct TransientEventContext<'a> {
     pub time: Real,
     /// The candidate solution.
     pub solution: &'a Vector,
+    /// First branch-current row of this device, when allocated.
+    pub branch: Option<usize>,
     /// The circuit's ground-eliminated node numbering.
     pub unknowns: &'a MnaUnknowns,
 }
@@ -1888,6 +1890,14 @@ pub trait DeviceTransientEvents {
     /// # Errors
     /// Invalid state or unrepresentable event time.
     fn next_boundary(&self, accepted: &[Real]) -> SpiceResult<Option<Real>>;
+
+    /// Time of an abrupt physical law change between accepted and refined
+    /// candidate state, if any. Unlike a smooth ramp endpoint, this requires
+    /// restarting the integration stencil.
+    ///
+    /// # Errors
+    /// Invalid device-local history or candidate state.
+    fn discontinuity(&self, accepted: &[Real], candidate: &[Real]) -> SpiceResult<Option<Real>>;
 
     /// Refine receiver state from the converged solution and optionally
     /// request a retry at an interior crossing. Only candidate slots may

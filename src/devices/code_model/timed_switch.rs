@@ -11,18 +11,28 @@ fn invalid(message: &str) -> SpiceError {
 pub(super) struct Material {
     conductance: [Real; 2],
     log_conductance: [Real; 2],
-    duration: [Real; 2],
+    transition: Transition,
     delay: [Real; 2],
     threshold: [Real; 2],
     tolerance: Real,
     initial: bool,
 }
 
+/// Physical transition law, distinct from propagation delay. Instantaneous
+/// inertial changes commit at the deadline, including an exactly coincident
+/// reversal; shorter requests cancel. Smooth transitions retain their own
+/// established finite-ramp reversal policy.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Transition {
+    Smooth([Real; 2]),
+    InstantInertial,
+}
+
 /// Cold parameters, in off/on or falling/rising order.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Parameters {
     pub(super) resistance: [Real; 2],
-    pub(super) duration: [Real; 2],
+    pub(super) transition: Transition,
     pub(super) delay: [Real; 2],
     pub(super) center: Real,
     pub(super) hysteresis: Real,
@@ -34,7 +44,7 @@ impl Default for Parameters {
     fn default() -> Self {
         Self {
             resistance: [1e12, 1.],
-            duration: [1e-9; 2],
+            transition: Transition::Smooth([1e-9; 2]),
             delay: [0.; 2],
             center: 0.5,
             hysteresis: 1.,
@@ -51,8 +61,8 @@ impl Material {
         if p.resistance
             .into_iter()
             .chain(conductance)
-            .chain(p.duration)
             .any(|value| !value.is_finite() || value <= 0.)
+            || matches!(p.transition, Transition::Smooth(duration) if duration.into_iter().any(|value| !value.is_finite() || value <= 0.))
             || p.delay
                 .into_iter()
                 .any(|value| !value.is_finite() || value < 0.)
@@ -69,12 +79,16 @@ impl Material {
         Ok(Self {
             conductance,
             log_conductance: p.resistance.map(|resistance| -resistance.ln()),
-            duration: p.duration,
+            transition: p.transition,
             delay: p.delay,
             threshold,
             tolerance: p.tolerance,
             initial: p.initial,
         })
+    }
+
+    pub(super) const fn instantaneous(self) -> bool {
+        matches!(self.transition, Transition::InstantInertial)
     }
 
     fn receive(self, control: Real, previous: bool) -> bool {
@@ -89,7 +103,7 @@ impl Material {
 
     pub(super) fn equilibrium(self, control: Real) -> SpiceResult<State> {
         if !control.is_finite() {
-            return Err(invalid("nonfinite control voltage"));
+            return Err(invalid("nonfinite control value"));
         }
         let bit = self.receive(control, self.initial);
         Ok(State {
@@ -149,14 +163,26 @@ impl Material {
     )]
     pub(super) fn retry_at(self, old: State, candidate: State) -> Option<Real> {
         let time = candidate.time;
-        if candidate.requested == old.requested || time <= old.time {
+        if time <= old.time {
             return None;
+        }
+        // If a threshold-equality point was already accepted, the crossing
+        // may be at old.time. Its newly discovered propagation deadline can
+        // nevertheless fall strictly inside this trial. Land on that exact
+        // boundary instead of integrating over an unannounced discontinuity.
+        let transition = (self.instantaneous()
+            && candidate.target != old.target
+            && candidate.anchor_time > old.time
+            && candidate.anchor_time < time)
+            .then_some(candidate.anchor_time);
+        if candidate.requested == old.requested {
+            return transition;
         }
         let crossing = self.crossing(old, time, candidate.control, candidate.requested);
         // Try the exact estimated crossing before falling back to bracket
         // refinement. Once the remaining bracket is within tolerance, the
         // physical ramp anchor still uses the interpolated crossing.
-        if crossing > old.time && crossing < time {
+        let retry = if crossing > old.time && crossing < time {
             Some(crossing)
         } else if crossing <= old.time
             && time - old.time > self.tolerance
@@ -166,7 +192,8 @@ impl Material {
             (mid > old.time && mid < time).then_some(mid)
         } else {
             None
-        }
+        };
+        retry.into_iter().chain(transition).reduce(Real::min)
     }
 
     pub(super) fn advance(self, old: State, time: Real, control: Real) -> SpiceResult<State> {
@@ -177,10 +204,13 @@ impl Material {
         let request = self.receive(control, old.requested);
         if request != old.requested {
             let edge = self.crossing(old, time, control, request);
-            if let Some(deadline) = next
-                .deadline
-                .filter(|&deadline| certainly_before(deadline, edge))
-            {
+            if let Some(deadline) = next.deadline.filter(|&deadline| {
+                if self.instantaneous() {
+                    deadline <= edge
+                } else {
+                    certainly_before(deadline, edge)
+                }
+            }) {
                 next.start_ramp(self, deadline, next.requested)?;
             }
             next.requested = request;
@@ -245,18 +275,26 @@ impl State {
     }
 
     fn ramp_end(self, material: Material) -> SpiceResult<Real> {
-        let distance = (self.target_phase() - self.anchor_phase).abs();
-        future(
-            self.anchor_time,
-            distance * material.duration[usize::from(self.target)],
-        )
+        match material.transition {
+            Transition::InstantInertial => Ok(self.anchor_time),
+            Transition::Smooth(duration) => {
+                let distance = (self.target_phase() - self.anchor_phase).abs();
+                future(
+                    self.anchor_time,
+                    distance * duration[usize::from(self.target)],
+                )
+            }
+        }
     }
 
     pub(super) fn phase(self, material: Material, time: Real) -> SpiceResult<Real> {
+        let Transition::Smooth(duration) = material.transition else {
+            return Ok(self.target_phase());
+        };
         if time >= self.ramp_end(material)? {
             return Ok(self.target_phase());
         }
-        let delta = (time - self.anchor_time).max(0.) / material.duration[usize::from(self.target)];
+        let delta = (time - self.anchor_time).max(0.) / duration[usize::from(self.target)];
         let phase = if self.target {
             self.anchor_phase + delta
         } else {
@@ -270,7 +308,8 @@ impl State {
         reason = "phase rail identity is exact and determines whether the ramp has started"
     )]
     fn moving_at(self, material: Material, time: Real) -> SpiceResult<bool> {
-        Ok(self.anchor_phase != self.target_phase()
+        Ok(!material.instantaneous()
+            && self.anchor_phase != self.target_phase()
             && !certainly_before(self.ramp_end(material)?, time))
     }
 
@@ -278,6 +317,9 @@ impl State {
         self.anchor_phase = self.phase(material, time)?;
         self.anchor_time = time;
         self.target = target;
+        if material.instantaneous() {
+            self.anchor_phase = self.target_phase();
+        }
         self.deadline = None;
         self.ramp_end(material)?;
         Ok(())
@@ -351,6 +393,30 @@ impl State {
     pub(super) fn at_conductance(self, material: Material) -> SpiceResult<Real> {
         Ok(material.conductance(self.phase(material, self.time)?))
     }
+
+    pub(super) fn discontinuity(self, material: Material, accepted: Self) -> Option<Real> {
+        (material.instantaneous() && self.target != accepted.target).then_some(self.anchor_time)
+    }
+
+    pub(super) fn step_conductance(
+        self,
+        material: Material,
+        accepted: Option<Self>,
+    ) -> SpiceResult<Real> {
+        // A step ending at a jump integrates the *left* branch law. The
+        // discrete candidate still commits the new state at the deadline,
+        // ready for the subsequent interval. Applying the new conductance
+        // across the preceding integration interval would inject fictitious
+        // charge into capacitive loads (or fictitious flux into inductors).
+        if let Some(old) = accepted
+            && self.discontinuity(material, old) == Some(self.time)
+            && self.time > old.time
+        {
+            old.at_conductance(material)
+        } else {
+            self.at_conductance(material)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -360,7 +426,7 @@ mod tests {
     fn model() -> SpiceResult<Material> {
         Material::compile(Parameters {
             resistance: [1e6, 1.],
-            duration: [4., 2.],
+            transition: Transition::Smooth([4., 2.]),
             delay: [3., 2.],
             center: 0.,
             hysteresis: 0.,
@@ -434,7 +500,7 @@ mod tests {
         );
         assert!(
             Material::compile(Parameters {
-                duration: [0., 1.],
+                transition: Transition::Smooth([0., 1.]),
                 ..Parameters::default()
             })
             .is_err()
@@ -547,7 +613,7 @@ mod tests {
             };
             let material = Material::compile(Parameters {
                 resistance: [1e6, 10.],
-                duration: [200e-9, 100e-9],
+                transition: Transition::Smooth([200e-9, 100e-9]),
                 delay: [300e-9, 500e-9],
                 center: 2.5,
                 hysteresis: 0.5,
@@ -563,6 +629,79 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn instantaneous_scheduler_matches_independent_inertial_events() -> SpiceResult<()> {
+        // Exact binary-fraction pulse times avoid ambiguous decimal rounding
+        // at the equality boundary. Reference is C ngspice's d_source and
+        // inertial d_buffer event trace, not the finite-slew code model.
+        let material = Material::compile(Parameters {
+            resistance: [1e6, 10.],
+            transition: Transition::InstantInertial,
+            delay: [2_f64.powi(-21), 2_f64.powi(-20)],
+            center: 0.,
+            hysteresis: 0.,
+            ..Parameters::default()
+        })?;
+        let mut state = material.equilibrium(-1.)?;
+        for row in include_str!("../../../tests/fixtures/native-timed-switch/instant-inertial.csv")
+            .lines()
+            .skip(1)
+        {
+            let fields: Vec<_> = row.split(',').collect();
+            let time = fields[0].parse::<Real>().unwrap();
+            let control = if fields[1] == "1" { 1. } else { -1. };
+            let expected = fields[2] == "1";
+            // Approach the edge with the old receiver value, then present
+            // the new event at the same timestamp as the digital oracle.
+            let left = material.advance(state, time, state.control)?;
+            let candidate = material.advance(left, time, control)?;
+            assert_eq!(candidate.target, expected, "{row}");
+            assert_eq!(
+                candidate.at_conductance(material)?,
+                material.conductance(Real::from(u8::from(expected)))
+            );
+            assert_eq!(
+                State::from_values(&candidate.values())?.values(),
+                candidate.values()
+            );
+            state = candidate;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn instantaneous_threshold_equality_signed_rails_and_deadline_retry() -> SpiceResult<()> {
+        let material = Material::compile(Parameters {
+            transition: Transition::InstantInertial,
+            resistance: [100., 1e-3],
+            delay: [0., 2.],
+            center: -3.,
+            hysteresis: 1.,
+            ..Parameters::default()
+        })?;
+        let initial = material.equilibrium(-5.)?;
+        let equality = material.advance(initial, 3., -2.)?;
+        assert_eq!(equality.discrete(), (false, false, false));
+        let candidate = material.advance(equality, 7., -1.)?;
+        assert_eq!(material.retry_at(equality, candidate), Some(5.));
+        let landed = material.advance(equality, 5., -1.5)?;
+        assert_eq!(landed.at_conductance(material)?, 1e3);
+        assert_eq!(landed.step_conductance(material, Some(equality))?, 0.01);
+        assert_eq!(landed.discontinuity(material, equality), Some(5.));
+        let next = material.advance(landed, 5.5, -1.5)?;
+        assert_eq!(next.step_conductance(material, Some(landed))?, 1e3);
+        let lower_equality = material.advance(landed, 6., -4.)?;
+        assert_eq!(lower_equality.at_conductance(material)?, 1e3);
+        let off = material.advance(lower_equality, 7., -5.)?;
+        assert_eq!(off.at_conductance(material)?, 0.01);
+        // A rejected recrossing has no effect on a fresh trial of the same
+        // accepted state. No artificial ramp endpoint is queued.
+        let retry = material.advance(lower_equality, 7., -3.)?;
+        assert_eq!(retry.at_conductance(material)?, 1e3);
+        assert_eq!(retry.next_boundary(material)?, None);
         Ok(())
     }
 

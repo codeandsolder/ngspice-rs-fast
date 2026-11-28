@@ -1,0 +1,12 @@
+Independent inertial scheduler pulse qualification
+Asource [input] src
+Abuffer input output buf
+.model src d_source(input_file="instant-inertial.txt" input_load=0)
+.model buf d_buffer(rise_delay=0.00000095367431640625 fall_delay=0.000000476837158203125 inertial_delay=true input_load=0)
+.control
+set numdgt=17
+tran 10n 20u 0 10n
+eprint input output
+quit
+.endc
+.end

@@ -193,7 +193,7 @@ impl Driver<'_> {
             solution: x,
             state,
         };
-        let accepted = self.commit_candidate(attempt, next, candidate, None)?;
+        let accepted = self.commit_candidate(attempt, next, candidate, None, false)?;
         self.accepted_guards = guards;
         self.derivative_predictor = Some(DerivativePredictor {
             time,

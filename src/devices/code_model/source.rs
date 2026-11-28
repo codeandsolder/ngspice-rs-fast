@@ -135,7 +135,7 @@ impl SourceModel {
             PortSpec::new(Voltage, ANALOG, false, false),
         ];
         const SWITCH_PORTS: &[PortSpec] = &[
-            PortSpec::new(VoltageDifferential, ANALOG, false, false),
+            PortSpec::new(VoltageDifferential, TRANSFER, false, false),
             PortSpec::new(ConductanceDifferential, BRANCH, false, false),
         ];
         const PSWITCH_PORTS: &[PortSpec] = &[
@@ -213,6 +213,7 @@ impl SourceModel {
                     Some(Real)
                 }
                 "ic" => Some(Integer),
+                "instantaneous" => Some(Boolean),
                 _ => None,
             },
         }
@@ -600,12 +601,17 @@ pub(in crate::devices) fn instantiate(
             let [control, branch] = instance.code_ports.as_slice() else {
                 return Err(SpiceError::circuit("timed switch port count mismatch"));
             };
+            let sense_current = matches!(control.terminals[0].kind, Current | CurrentDifferential);
             let [cp, cn] = analog_pair(&control.terminals[0], nodes)?;
+            if sense_current && cp == cn {
+                return Err(SpiceError::circuit("shorted timed switch current sensor"));
+            }
             let [p, n] = analog_pair(&branch.terminals[0], nodes)?;
             Ok(Box::new(super::timed_switch_device::TimedSwitch {
                 name: instance.name.clone(),
                 model_name: model.card().name.clone(),
                 terminals: [cp, cn, p, n],
+                sense_current,
                 material: *material,
             }))
         }

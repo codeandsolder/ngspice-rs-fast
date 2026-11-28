@@ -30,3 +30,17 @@ The pulse and oscillator decks use the same physical cases and numerical
 tolerances as the producer's independent SIMetrix vendor qualification.
 Only compact numerical witnesses are committed, not the C runtime or
 the full raw trace.
+
+## Abrupt inertial reference
+
+`instant-inertial.cir` is an independently authored ngspice-47 XSPICE
+`d_source` / `d_buffer` circuit using `inertial_delay=true`, with rise and
+fall delays exactly representable in binary (2^-20 and 2^-21 seconds).
+Run `ngspice -b instant-inertial.cir` in this directory; `eprint` gives
+the digital event sequence. `instant-inertial.csv` records the resulting
+time, input, and output levels, including the suppressed short pulse, the
+exactly equal-width pulse, and the longer pulses. The equal-width pulse
+commits at the coincident deadline and reverses after the fall delay.
+The native tests independently reconstruct analog threshold crossings at
+these timestamps. No custom code model or external dialect simulator is
+required for this reference.
