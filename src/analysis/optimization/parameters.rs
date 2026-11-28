@@ -21,6 +21,7 @@ use crate::netlist::eval::{
     ParameterScopeId, ParameterScopeSpec,
 };
 use crate::netlist::expr::ParameterExpression;
+use crate::primitives::value::round_numparam_literal;
 use crate::primitives::{Complex, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// What candidate preparation did to the finalized circuit.
@@ -541,8 +542,7 @@ impl CircuitCandidate<'_> {
                 Ok(value) if value.is_finite() => value,
                 _ => return Ok(None),
             };
-            let literal = elaborate::format_literal(raw);
-            let Some(value) = crate::primitives::parse_spice_number(&literal) else {
+            let Some(value) = round_numparam_literal(raw) else {
                 return Ok(None);
             };
             Ok(Some(Complex::real(value - base)))
@@ -708,8 +708,7 @@ impl CircuitCandidate<'_> {
                     self.site_values[index]
                 } else {
                     // Preserve numparam decimal read-back for device setters.
-                    let text = elaborate::format_literal(raw);
-                    let value = crate::primitives::parse_spice_number(&text).ok_or_else(|| {
+                    let value = round_numparam_literal(raw).ok_or_else(|| {
                         SpiceError::circuit("candidate scalar cannot be read back")
                     })?;
                     roundings += 1;
