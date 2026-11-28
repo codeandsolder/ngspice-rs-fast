@@ -374,3 +374,93 @@ fn physical_current_observers_share_the_native_storage_branch() -> SpiceResult<(
     close(ac.value("i(vc)", 0).unwrap().im, -expected, 1e-10);
     Ok(())
 }
+
+#[test]
+fn physical_taylor_matches_signed_charge_and_flux_at_all_orders() -> SpiceResult<()> {
+    use ngspice_rs::devices::{Limit, ModelContext, TransientTiming};
+    use ngspice_rs::maths::Vector;
+    let deck = parse_deck_text(
+        Path::new("taylor.cir"),
+        "polynomial Taylor\nc1 p n cm 2u\nl1 a b lm 3m\n.model cm pspice_cap(vc1=-0.2 vc2=0.3)\n.model lm pspice_ind(il1=0.7 il2=-0.25)\n.end\n",
+    );
+    let netlist = Parser::new().parse_deck(&deck)?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    circuit.finalize()?;
+    let run = circuit.prepare_run();
+    let mut dae =
+        run.prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
+    let node_rows = ["p", "n", "a", "b"].map(|name| {
+        circuit
+            .unknowns()
+            .node_row(circuit.nodes().get(name).unwrap())
+            .unwrap()
+    });
+    let branch_rows = ["c1", "l1"].map(|name| {
+        let index = circuit
+            .devices()
+            .iter()
+            .position(|device| device.name() == name)
+            .unwrap();
+        circuit.branch_rows(index).unwrap().start
+    });
+    let n = circuit.unknown_count();
+    let mut state = vec![Vector::zeros(n); 10];
+    for (row, coefficients) in node_rows.into_iter().chain(branch_rows).zip([
+        [-1.0, 0.6, 0.2, -0.07],
+        [0.2, -0.1, -0.3, 0.08],
+        [0.1, 0.2, 0.3, 0.05],
+        [-0.5, 0.1, -0.04, 0.02],
+        [0.001, 0.002, 0.003, -0.001],
+        [-0.8, 0.9, -0.2, 0.11],
+    ]) {
+        for (vector, value) in state.iter_mut().zip(coefficients) {
+            vector.set(row, value)?;
+        }
+    }
+    for limit in [Limit::Left, Limit::Right] {
+        let jet = dae.evaluate_taylor(&state, 0., 1e-6, limit)?;
+        for t in [-0.75_f64, 0., 0.25, 0.9] {
+            let series = |values: &[Vector], row| {
+                values.iter().rev().fold(0., |sum: f64, vector| {
+                    sum.mul_add(t, vector.get(row).unwrap())
+                })
+            };
+            let mut sample = Vector::zeros(n);
+            for row in 0..n {
+                sample.set(row, series(&state, row))?;
+            }
+            let actual = dae.evaluate(&sample, 0., limit)?;
+            for row in 0..n {
+                close(
+                    series(&jet.residual, row),
+                    actual.residual.get(row).unwrap(),
+                    1e-13,
+                );
+                close(
+                    series(&jet.charge, row),
+                    actual.charge.get(row).unwrap(),
+                    1e-16,
+                );
+                for column in 0..n {
+                    let matrix_series = |matrices: &[ngspice_rs::maths::SparseMatrix]| {
+                        matrices.iter().rev().fold(0., |sum: f64, matrix| {
+                            sum.mul_add(t, matrix.get(row, column))
+                        })
+                    };
+                    close(
+                        matrix_series(&jet.conductance),
+                        actual.conductance.get(row, column),
+                        1e-13,
+                    );
+                    close(
+                        matrix_series(&jet.capacitance),
+                        actual.capacitance.get(row, column),
+                        1e-16,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
