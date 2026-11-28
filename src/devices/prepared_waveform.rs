@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use model_normalize_ngspice::waveform::{Forcing, Knot, Repeat, ResolvedWaveform};
 
-use crate::devices::functions::{affine_value, scaled_interval_difference};
+use crate::devices::functions::{
+    Exponential, affine_value, phase_radians, scaled_interval_difference,
+};
 use crate::devices::pulse::MAX_CYCLE;
 use crate::devices::{Limit, WaveformEvent, WaveformEventKind};
 use crate::maths::taylor::Jet;
@@ -28,6 +30,7 @@ pub struct PreparedForcing {
 enum Law {
     Pwl(SidedPwl),
     Sine(SignedSine),
+    Exp(Exponential),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +53,9 @@ struct SignedSine {
     frequency: Real,
     delay: Real,
     damping: Real,
+    phase: Real,
     hold: bool,
+    stop: Option<(Real, Real)>, // (absolute event time, capped elapsed time)
 }
 
 impl PreparedForcing {
@@ -58,35 +63,54 @@ impl PreparedForcing {
     /// invariants at the engine boundary before any source is stamped.
     /// # Errors
     /// Invalid ordinates, geometry, period, or sine coefficients.
+    #[expect(
+        clippy::float_cmp,
+        reason = "reject a cutoff that rounds to the exact delay"
+    )]
     pub fn new(resolved: ResolvedWaveform) -> SpiceResult<Self> {
         if !resolved.dc.is_finite() || !resolved.startup.is_finite() {
             return Err(invalid("nonfinite DC bias or transient startup"));
         }
         let law = match resolved.forcing {
             Forcing::PiecewiseLinear { knots, repeat } => Law::Pwl(SidedPwl::new(knots, repeat)?),
+            Forcing::Exponential(exp) => Law::Exp(Exponential::from_prepared(exp)?),
             Forcing::Sine {
                 offset,
                 amplitude,
                 frequency,
                 delay,
                 damping,
+                phase,
                 hold_before_delay,
+                stop_after,
             } => {
-                if ![offset, amplitude, frequency, delay, damping]
+                if ![offset, amplitude, frequency, delay, damping, phase]
                     .iter()
                     .all(|v| v.is_finite())
-                    || amplitude < 0.
-                    || frequency <= 0.
                 {
                     return Err(invalid("invalid sine coefficients"));
                 }
+                let stop = stop_after
+                    .map(|elapsed| {
+                        let time = delay + elapsed;
+                        if !elapsed.is_finite()
+                            || !time.is_finite()
+                            || (elapsed != 0. && time == delay)
+                        {
+                            return Err(invalid("unrepresentable sine cutoff"));
+                        }
+                        Ok((time, elapsed))
+                    })
+                    .transpose()?;
                 Law::Sine(SignedSine {
                     offset,
                     amplitude,
                     frequency,
                     delay,
                     damping,
+                    phase: phase_radians(phase),
                     hold: hold_before_delay,
+                    stop,
                 })
             }
         };
@@ -124,7 +148,8 @@ impl PreparedForcing {
         }
         let value = match &self.law {
             Law::Pwl(pwl) => pwl.value_at(time, limit)?,
-            Law::Sine(sine) => sine.value_at(time),
+            Law::Sine(sine) => sine.value_at(time, limit),
+            Law::Exp(exp) => exp.independent_value_at(time),
         };
         if !value.is_finite() {
             return Err(invalid("nonfinite forcing"));
@@ -149,6 +174,9 @@ impl PreparedForcing {
             Law::Sine(sine) => sine
                 .jet(time, scale, order, limit)
                 .with_value(self.value_at(time, limit)?),
+            Law::Exp(exp) => exp
+                .independent_jet(time, scale, order, limit)
+                .with_value(self.value_at(time, limit)?),
         })
     }
 
@@ -162,35 +190,80 @@ impl PreparedForcing {
         }
         let events = match &self.law {
             Law::Pwl(pwl) => Events::Pwl(pwl.events(start, end)?),
-            Law::Sine(sine) => Events::Single(
-                (sine.hold && (start..=end).contains(&sine.delay)).then_some(sine.delay),
-            ),
+            Law::Sine(sine) => Events::fixed(sine.events(), start, end),
+            Law::Exp(exp) => Events::fixed(exp.delays().map(Some), start, end),
         };
         Ok(PreparedEvents(events))
     }
 }
 
 impl SignedSine {
-    fn value_at(self, time: Real) -> Real {
-        if self.amplitude == 0. || (self.hold && time <= self.delay) {
+    // Select the segment by absolute event time, not by a rounded elapsed
+    // subtraction. A negative cap with a startup hold takes effect when the
+    // hold releases, potentially jumping directly to the capped endpoint.
+    #[expect(
+        clippy::float_cmp,
+        reason = "exact external limits select the event segment"
+    )]
+    fn elapsed_at(self, time: Real, limit: Limit) -> (Real, bool) {
+        if self.hold && (time < self.delay || (time == self.delay && limit == Limit::Left)) {
+            return (0., false);
+        }
+        if let Some((stop, elapsed)) = self.stop {
+            if time > stop || (time == stop && limit == Limit::Right) {
+                return (elapsed, false);
+            }
+            if time == stop {
+                return (elapsed, true);
+            }
+        }
+        (time - self.delay, true)
+    }
+
+    fn events(self) -> [Option<Real>; 2] {
+        [
+            self.hold.then_some(self.delay),
+            self.stop
+                .and_then(|(time, _)| (!self.hold || time > self.delay).then_some(time)),
+        ]
+    }
+
+    fn angle(self, elapsed: Real) -> Real {
+        let cycles = if self.frequency == 0. {
+            0.
+        } else {
+            elapsed * self.frequency % 1.
+        };
+        cycles.mul_add(std::f64::consts::TAU, self.phase)
+    }
+
+    fn decay(self, elapsed: Real) -> Real {
+        if self.damping == 0. {
+            0.
+        } else {
+            -self.damping * elapsed
+        }
+    }
+
+    fn at_elapsed(self, elapsed: Real) -> Real {
+        if self.amplitude == 0. {
             return self.offset;
         }
-        let elapsed = time - self.delay;
-        let phase = (elapsed * self.frequency % 1.) * std::f64::consts::TAU;
-        (self.amplitude * (-self.damping * elapsed).exp()).mul_add(phase.sin(), self.offset)
+        (self.amplitude * self.decay(elapsed).exp()).mul_add(self.angle(elapsed).sin(), self.offset)
+    }
+
+    fn value_at(self, time: Real, limit: Limit) -> Real {
+        self.at_elapsed(self.elapsed_at(time, limit).0)
     }
 
     fn jet(self, time: Real, scale: Real, order: usize, limit: Limit) -> Jet {
-        if self.amplitude == 0.
-            || (self.hold && (time < self.delay || (limit == Limit::Left && time <= self.delay)))
-        {
-            return Jet::constant(order, self.offset);
+        let (elapsed, active) = self.elapsed_at(time, limit);
+        if self.amplitude == 0. || !active {
+            return Jet::constant(order, self.at_elapsed(elapsed));
         }
-        let elapsed = time - self.delay;
-        let phase = (elapsed * self.frequency % 1.) * std::f64::consts::TAU;
         let angular_scale = self.frequency * scale * std::f64::consts::TAU;
-        let (sin, _) = Jet::affine(order, phase, angular_scale).sin_cos();
-        let envelope = Jet::affine(order, -self.damping * elapsed, -self.damping * scale)
+        let (sin, _) = Jet::affine(order, self.angle(elapsed), angular_scale).sin_cos();
+        let envelope = Jet::affine(order, self.decay(elapsed), -self.damping * scale)
             .exp()
             .scale(self.amplitude);
         envelope.multiply(&sin).offset(self.offset)
@@ -218,6 +291,10 @@ impl SidedPwl {
                 || knots[0].time.abs().to_bits() != 0
                 || knots[knots.len() - 1].time >= r.period
                 || r.hold.is_some_and(|v| !v.is_finite())
+                || r.limit.is_some_and(|limit| {
+                    let time = limit.time;
+                    !time.is_finite() || !limit.value.is_finite() || time <= r.origin
+                })
             {
                 return Err(invalid("invalid repeating knot geometry"));
             }
@@ -298,7 +375,11 @@ impl SidedPwl {
     fn cycle_or_hold(&self, time: Real, limit: Limit) -> SpiceResult<CycleOrHold> {
         Ok(match self.repeat {
             Some(r) => {
-                if let Some(hold) = r.hold
+                if let Some(stop) = r.limit
+                    && (time > stop.time || (time == stop.time && limit == Limit::Right))
+                {
+                    CycleOrHold::Hold(stop.value)
+                } else if let Some(hold) = r.hold
                     && (time < r.origin || (time == r.origin && limit == Limit::Left))
                 {
                     CycleOrHold::Hold(hold)
@@ -426,7 +507,11 @@ impl SidedPwl {
     }
 
     fn events(&self, start: Real, end: Real) -> SpiceResult<PwlEvents> {
+        let cutoff = self.repeat.and_then(|r| r.limit).map(|stop| stop.time);
+        let terminal = cutoff.filter(|time| (start..=end).contains(time));
+        let end = cutoff.map_or(end, |time| end.min(time));
         let (cycle, done) = match self.repeat {
+            Some(_) if cutoff.is_some_and(|time| start >= time) => (0., true),
             Some(r) if r.hold.is_some() && end < r.origin => (0., true),
             Some(r) => {
                 let first = if r.hold.is_some() && start < r.origin {
@@ -435,9 +520,8 @@ impl SidedPwl {
                     self.cycle_at(start, r)?
                 };
                 let last = self.cycle_at(end, r)?;
-                // Each endpoint cycle has been checked exactly if necessary.
-                // For an arbitrarily long window require a uniform proof:
-                // iterating all intervening cycles would destroy laziness.
+                // Validate only cycles that can actually produce events;
+                // a finite repetition permits arbitrarily distant queries.
                 if first < last && !self.spacing_proven(first, last, r) {
                     return Err(invalid(
                         "unrepresentable periodic knot spacing over event window",
@@ -455,6 +539,7 @@ impl SidedPwl {
             cycle,
             index,
             end,
+            terminal,
             done,
         })
     }
@@ -467,7 +552,26 @@ pub struct PreparedEvents(Events);
 #[derive(Debug, Clone)]
 enum Events {
     Pwl(PwlEvents),
-    Single(Option<Real>),
+    Fixed(std::array::IntoIter<Option<Real>, 2>),
+}
+
+impl Events {
+    fn fixed(mut times: [Option<Real>; 2], start: Real, end: Real) -> Self {
+        times.sort_by(|a, b| match (a, b) {
+            (Some(a), Some(b)) => a.total_cmp(b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        if times[0] == times[1] {
+            times[1] = None;
+        }
+        Self::Fixed(
+            times
+                .map(|time| time.filter(|t| (start..=end).contains(t)))
+                .into_iter(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -476,26 +580,27 @@ struct PwlEvents {
     cycle: Real,
     index: usize,
     end: Real,
+    terminal: Option<Real>,
     done: bool,
 }
 
 impl PwlEvents {
     fn next_time(&mut self) -> Option<Real> {
         if self.done {
-            return None;
+            return self.terminal.take();
         }
         if self.index == self.pwl.knots.len() {
             if self.pwl.repeat.is_none() {
                 self.done = true;
-                return None;
+                return self.terminal.take();
             }
             self.cycle += 1.;
             self.index = 0;
         }
         let time = self.pwl.time_at(self.cycle, self.index);
-        if time > self.end {
+        if time > self.end || self.terminal.is_some_and(|terminal| time >= terminal) {
             self.done = true;
-            return None;
+            return self.terminal.take();
         }
         self.index += 1;
         Some(time)
@@ -507,7 +612,7 @@ impl Iterator for PreparedEvents {
     fn next(&mut self) -> Option<Self::Item> {
         let time = match &mut self.0 {
             Events::Pwl(pwl) => pwl.next_time()?,
-            Events::Single(time) => time.take()?,
+            Events::Fixed(times) => times.find_map(|time| time)?,
         };
         Some(WaveformEvent {
             time,
