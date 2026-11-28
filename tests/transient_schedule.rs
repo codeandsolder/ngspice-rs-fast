@@ -1,10 +1,8 @@
 use std::path::Path;
 
 use ngspice_rs::analysis::{
-    AnalysisContext, AnalysisInput, RunConfig, TimingSegment, TransientSchedule,
-    companion_transient,
+    AnalysisInput, RunConfig, TimingSegment, TransientSchedule, companion_transient,
 };
-use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::{Parser, source::parse_deck_text};
 use ngspice_rs::primitives::AnalysisKind;
 
@@ -41,13 +39,12 @@ fn continuous_rc_and_rl_state_across_independent_timing_boundaries() {
         );
         let netlist = Parser::new().parse_deck(&deck).unwrap();
         let config = RunConfig::from_netlist(&netlist).unwrap();
-        let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
         let mut request = AnalysisInput::new(AnalysisKind::Transient);
         request.uic = true;
         request.transient_schedule = Some(schedule(0.15e-3));
         let plan = config.plan(request).unwrap();
-        let (plot, stats) =
-            companion_transient(&mut circuit, &plan, &AnalysisContext::default()).unwrap();
+        let (plot, stats) = companion_transient(&mut circuit, &plan, &config.context()).unwrap();
         let expected = [
             0.15e-3, 0.25e-3, 0.35e-3, 0.45e-3, 0.55e-3, 0.65e-3, 0.7e-3, 0.95e-3, 1.2e-3, 1.45e-3,
             1.5e-3,
