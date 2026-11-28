@@ -848,6 +848,36 @@ mod projected_tests {
     }
 
     #[test]
+    #[ignore = "manual high-index derivative-array throughput measurement"]
+    fn benchmark_high_index_rank_reduction() {
+        use std::{hint::black_box, time::Instant};
+        for (depth, repetitions) in [(8, 200), (32, 30), (60, 10)] {
+            let width = depth + 1;
+            let (matrix, rhs) = derivative_chain(depth, depth + 2, 1e-6);
+            let start = Instant::now();
+            for _ in 0..repetitions {
+                let result = complete(
+                    black_box(&matrix),
+                    black_box(&rhs),
+                    &[],
+                    &[],
+                    &[],
+                    2 * width,
+                )
+                .unwrap();
+                assert_eq!(result.prefix_rank, 2 * width);
+                assert!((result.values.as_slice()[0] - 1.).abs() < 1e-12);
+                black_box(result);
+            }
+            println!(
+                "rank high-index depth={depth} columns={} repetitions={repetitions} elapsed={:?}",
+                matrix.cols(),
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
     fn derivative_depth_resolves_prefix_without_gauging_highest_jets() {
         for depth in 1..=32 {
             let width = depth + 1;
@@ -1118,6 +1148,64 @@ mod storage_tests {
             }
         }
         println!("rank arithmetic digest={digest:016x}");
+    }
+
+    #[test]
+    #[ignore = "manual near-dependent rank and uncertainty throughput measurement"]
+    fn benchmark_near_dependent_rank_reduction() {
+        let columns = 256;
+        let rows = columns * 3 / 2;
+        let mut matrix = SparseMatrix::new(rows, columns);
+        let mut rhs = vec![0.; rows];
+        let mut bounds = vec![0.; rows];
+        for pair in 0..columns / 2 {
+            for (row, delta, exponent) in [
+                (2 * pair, 0., -200),
+                (2 * pair + 1, 2.0_f64.powi(-30), 0),
+                (columns + pair, 2.0_f64.powi(-29), 200),
+            ] {
+                let scale = 2.0_f64.powi(exponent);
+                matrix.add(row, 2 * pair, scale).unwrap();
+                matrix.add(row, 2 * pair + 1, (1. + delta) * scale).unwrap();
+                rhs[row] = (2. + delta) * scale;
+                bounds[row] = 2.0_f64.powi(-45) * scale;
+            }
+        }
+        matrix.fold_duplicates();
+        let start = Instant::now();
+        let mut digest = 0xcbf2_9ce4_8422_2325;
+        for _ in 0..200 {
+            let reduction = reduce(
+                black_box(&matrix),
+                black_box(&rhs),
+                &[],
+                &[],
+                &[],
+                columns,
+                Some(&bounds),
+            )
+            .unwrap();
+            let solution = reduction
+                .basis
+                .solution(&reduction.column_exponents)
+                .unwrap();
+            for &value in solution.as_slice() {
+                assert_eq!(value, 1.);
+                mix(&mut digest, value.to_bits());
+            }
+            let uncertainty = reduction
+                .basis
+                .prefix_uncertainty(&reduction.column_exponents)
+                .unwrap();
+            for &value in uncertainty.as_slice() {
+                assert!(value.is_finite() && value > 0.);
+                mix(&mut digest, value.to_bits());
+            }
+        }
+        println!(
+            "rank near-dependent columns={columns} repetitions=200 elapsed={:?} digest={digest:016x}",
+            start.elapsed()
+        );
     }
 
     #[test]
