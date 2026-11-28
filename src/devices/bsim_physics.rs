@@ -539,6 +539,7 @@ impl<S: Constitutive> SaturationRoot<S> {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn derivative(&self, da: &S, db: &S, dc: &S) -> SpiceResult<S> {
         let y = &self.value;
         y.clone()
@@ -547,6 +548,156 @@ impl<S: Constitutive> SaturationRoot<S> {
             .mul_add(da, &y.clone().scale(-1.).mul_add(db, dc))
             .divide(&self.discriminant)
     }
+}
+
+/// Saturation voltage and implicit local partials. Inputs are the thermal
+/// overdrive, bulk factor, saturation field times length, resistance-width
+/// product and saturation shape. The rationalized root includes the
+/// zero-resistance/unit-shape linear limit without a separate model branch.
+pub(super) fn saturation_voltage<S: Constitutive>(
+    drive: &S,
+    bulk: &S,
+    field: &S,
+    resistance: &S,
+    shape: &S,
+) -> SpiceResult<LocalPart<S, 5>> {
+    let one = drive.constant(1.);
+    let shape_delta = shape.clone().scale(-1.).offset(1.).divide(shape)?;
+    let bulk_resistance = bulk.clone().multiply(resistance);
+    let inverse_shape = one.divide(shape)?;
+    let shape_term = inverse_shape.clone().scale(2.).offset(-1.);
+    let mixed = bulk_resistance.clone().scale(3.).add(&shape_term);
+    let quadratic = bulk
+        .clone()
+        .scale(2.)
+        .multiply(&bulk_resistance.clone().add(&shape_delta));
+    let linear = drive.clone().mul_add(&mixed, &bulk.clone().multiply(field));
+    let drive_resistance = drive.clone().multiply(resistance);
+    let constant = drive
+        .clone()
+        .multiply(&drive_resistance.clone().scale(2.).add(field));
+    let root = SaturationRoot::new(&quadratic, linear, constant)?;
+    let y = &root.value;
+    let gap = bulk.clone().scale(-1.).mul_add(y, drive);
+    let double_gap = gap.clone().add(drive);
+    let drive_partial = y
+        .clone()
+        .scale(-1.)
+        .mul_add(&mixed, &drive_resistance.clone().scale(4.).add(field));
+    let bulk_partial = y.clone().multiply(&y.clone().mul_add(
+        &bulk_resistance.scale(2.).add(&shape_delta),
+        &drive_resistance.scale(-3.).add(&field.clone().scale(-1.)),
+    ));
+    let resistance_partial = gap.clone().multiply(&double_gap);
+    let shape_partial = y
+        .clone()
+        .multiply(&double_gap)
+        .multiply(&inverse_shape.clone().multiply(&inverse_shape));
+    Ok(LocalPart {
+        partials: [
+            drive_partial.divide(&root.discriminant)?,
+            bulk_partial.divide(&root.discriminant)?,
+            gap.divide(&root.discriminant)?,
+            resistance_partial.divide(&root.discriminant)?,
+            shape_partial.divide(&root.discriminant)?,
+        ],
+        value: root.value,
+    })
+}
+
+/// Saturation Early voltage with local partials in overdrive, bulk factor,
+/// saturation voltage, field times length, resistance-width product and
+/// saturation shape.
+pub(super) fn saturation_early_voltage<S: Constitutive>(
+    overdrive: &S,
+    bulk: &S,
+    saturation: &S,
+    field: &S,
+    resistance: &S,
+    shape: &S,
+    thermal: Real,
+) -> SpiceResult<LocalPart<S, 6>> {
+    let drive = overdrive.clone().offset(2. * thermal);
+    let half_saturation = saturation.clone().scale(0.5).divide(&drive)?;
+    let edge = bulk
+        .clone()
+        .scale(-1.)
+        .mul_add(&half_saturation, &overdrive.constant(1.));
+    let inverse_shape = shape.constant(1.).divide(shape)?;
+    let denominator = bulk
+        .clone()
+        .mul_add(resistance, &inverse_shape.clone().scale(2.).offset(-1.));
+    let product = resistance.clone().multiply(overdrive);
+    let numerator = product
+        .clone()
+        .scale(2.)
+        .mul_add(&edge, &field.clone().add(saturation));
+    let value = numerator.divide(&denominator)?;
+    let drive_partial = bulk
+        .clone()
+        .multiply(&half_saturation)
+        .multiply(&overdrive.clone().divide(&drive)?)
+        .add(&edge)
+        .multiply(&resistance.clone().scale(2.));
+    let bulk_partial = product.clone().scale(-2.).mul_add(
+        &half_saturation,
+        &value.clone().scale(-1.).multiply(resistance),
+    );
+    let saturation_partial = product.scale(-1.).multiply(bulk).divide(&drive)?.offset(1.);
+    let field_partial = overdrive.constant(1.);
+    let resistance_partial = overdrive
+        .clone()
+        .scale(2.)
+        .mul_add(&edge, &value.clone().scale(-1.).multiply(bulk));
+    let shape_partial = value
+        .clone()
+        .scale(2.)
+        .multiply(&inverse_shape.clone().multiply(&inverse_shape));
+    Ok(LocalPart {
+        value,
+        partials: [
+            drive_partial.divide(&denominator)?,
+            bulk_partial.divide(&denominator)?,
+            saturation_partial.divide(&denominator)?,
+            field_partial.divide(&denominator)?,
+            resistance_partial.divide(&denominator)?,
+            shape_partial.divide(&denominator)?,
+        ],
+    })
+}
+
+/// Drain-induced barrier-lowering Early voltage with exact partials in the
+/// thermal overdrive, bulk factor, saturation voltage and effective body
+/// bias. The caller retains the model generation's enable predicate.
+pub(super) fn dibl_early_voltage<S: Constitutive>(
+    drive: &S,
+    bulk: &S,
+    saturation: &S,
+    body: &S,
+    theta: Real,
+    body_coefficient: Real,
+) -> SpiceResult<LocalPart<S, 4>> {
+    let denominator = bulk.clone().mul_add(saturation, drive);
+    let ratio = drive.clone().divide(&denominator)?;
+    let base = ratio.clone().multiply(drive).scale(theta.recip());
+    let (body_factor, slope) = reciprocal_floor(body.clone().scale(body_coefficient), -0.9, 20.)?;
+    let scaled = body_factor.clone().scale(theta.recip());
+    let derivative_factor = ratio.clone().multiply(&scaled);
+    let drain_factor = derivative_factor.clone().scale(-1.).multiply(&ratio);
+    let drive_partial = ratio.scale(-1.).offset(2.).multiply(&derivative_factor);
+    let bulk_partial = drain_factor.clone().multiply(saturation);
+    let saturation_partial = drain_factor.multiply(bulk);
+    let body_partial = base.clone().multiply(&slope).scale(body_coefficient);
+    let value = base.multiply(&body_factor);
+    Ok(LocalPart {
+        value,
+        partials: [
+            drive_partial,
+            bulk_partial,
+            saturation_partial,
+            body_partial,
+        ],
+    })
 }
 
 /// Charge-thickness effective overdrive and its gate partial. The smooth
@@ -1122,6 +1273,91 @@ mod tests {
         for (&actual, &expected) in gradient.coefficients().iter().zip(cap.value.coefficients()) {
             close(actual, expected, 2e-26);
         }
+    }
+
+    #[test]
+    fn saturation_and_early_voltages_share_exact_local_partials() -> SpiceResult<()> {
+        type Local = Differential<6>;
+        for point in [
+            [0.8, 1.2, 0.5, 0.2, 0.8, -0.5],
+            [0.1, 0.8, 0.1, 0., 1., -1.1],
+            [1e-12, 1., 0.8, 1e-13, 0.999999999999, 0.1],
+        ] {
+            let thermal = 0.026;
+            let rates = [point[0] * 0.02, 0.003, 0.004, 0.001, -0.002, 0.003];
+            let local = |i: usize| Local::variable(i, Jet::affine(ORDER, point[i], rates[i]));
+            let overdrive = local(0)?;
+            let bulk = local(1)?;
+            let field = local(2)?;
+            let resistance = local(3)?;
+            let shape = local(4)?;
+            let body = local(5)?;
+            let drive = overdrive.clone().offset(2. * thermal);
+            let saturation = saturation_voltage(&drive, &bulk, &field, &resistance, &shape)?;
+            for (coordinate, partial) in saturation.partials.iter().enumerate() {
+                for (degree, &expected) in partial.value.coefficients().iter().enumerate() {
+                    let actual = saturation.value.gradient[coordinate]
+                        .as_ref()
+                        .map_or(0., |g| g.coefficients()[degree]);
+                    close(actual, expected, 3e-15);
+                }
+            }
+            // Independent coordinates for the local Early-voltage laws.
+            let independent_sat = Local::variable(2, saturation.value.value.clone())?;
+            let early = saturation_early_voltage(
+                &local(0)?,
+                &local(1)?,
+                &independent_sat,
+                &Local::variable(3, field.value.clone())?,
+                &Local::variable(4, resistance.value.clone())?,
+                &Local::variable(5, shape.value.clone())?,
+                thermal,
+            )?;
+            let dibl = dibl_early_voltage(
+                &drive,
+                &bulk,
+                &independent_sat,
+                &Local::variable(3, body.value.clone())?,
+                0.2,
+                1.,
+            )?;
+            for (value, partials) in [
+                (&early.value, early.partials.as_slice()),
+                (&dibl.value, dibl.partials.as_slice()),
+            ] {
+                for (coordinate, partial) in partials.iter().enumerate() {
+                    for (degree, &expected) in partial.value.coefficients().iter().enumerate() {
+                        let actual = value.gradient[coordinate]
+                            .as_ref()
+                            .map_or(0., |g| g.coefficients()[degree]);
+                        close(actual, expected, 3e-15);
+                    }
+                }
+            }
+            for time in [0., 0.001, 0.02] {
+                let [u, a, e, r, l, b]: [Real; 6] =
+                    std::array::from_fn(|i| rates[i].mul_add(time, point[i]));
+                let drive = u + 2. * thermal;
+                let quadratic = 2. * a * (a * r + (1. - l) / l);
+                let linear = drive.mul_add((3. * a).mul_add(r, 2. / l - 1.), a * e);
+                let constant = drive * (2. * drive).mul_add(r, e);
+                let y = value_at(&saturation.value.value, time);
+                // Check the polynomial rather than a second copy of the root.
+                let residual = (0.5 * quadratic * y).mul_add(y, (-linear).mul_add(y, constant));
+                close(residual, 0., 3e-14 * constant.abs());
+                let expected_early = (2. * r * u).mul_add((-0.5 * a).mul_add(y / drive, 1.), e + y)
+                    / a.mul_add(r, 2. / l - 1.);
+                let body_factor = if b < -0.9 {
+                    20.0_f64.mul_add(b, 17.) / (0.8 + b)
+                } else {
+                    1. / (1. + b)
+                };
+                let expected_dibl = drive * drive / a.mul_add(y, drive) / 0.2 * body_factor;
+                close(value_at(&early.value.value, time), expected_early, 1e-14);
+                close(value_at(&dibl.value.value, time), expected_dibl, 1e-14);
+            }
+        }
+        Ok(())
     }
 
     #[test]

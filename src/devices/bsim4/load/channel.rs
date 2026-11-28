@@ -39,12 +39,13 @@
 use super::bias::LoadBias;
 use super::{
     CHARGE, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, MM,
-    Model, SaturationRoot, SizeParam, exp, log, smooth_drain, smooth_positive, sqrt,
+    Model, SizeParam, exp, log, smooth_drain, smooth_positive, sqrt,
 };
 
 use crate::devices::bsim_physics::{
-    channel_conductance, effective_overdrive, impact_ionization, poly_depletion, rational_floor,
-    reciprocal_floor, saturation_shape, series_conductance, substrate_early_voltage,
+    channel_conductance, dibl_early_voltage, effective_overdrive, impact_ionization,
+    poly_depletion, rational_floor, reciprocal_floor, saturation_early_voltage, saturation_shape,
+    saturation_voltage, series_conductance, substrate_early_voltage,
 };
 use crate::primitives::SpiceResult;
 
@@ -844,55 +845,23 @@ pub(super) fn transport(
     dEsatL_dVb = T0 * dueff_dVb;
     (Lambda, dLambda_dVg) = saturation_shape(&Vgsteff, pParam.a1, pParam.a2)?;
     Vgst2Vtm = Vgsteff + 2.0 * Vtm;
-    if Rds > 0.0 {
-        tmp2 = dRds_dVg / Rds + dWeff_dVg / Weff;
-        tmp3 = dRds_dVb / Rds + dWeff_dVb / Weff;
-    } else {
-        tmp2 = dWeff_dVg / Weff;
-        tmp3 = dWeff_dVb / Weff;
-    }
-    if (Rds == 0.0) && (Lambda == 1.0) {
-        T0 = 1.0 / (Abulk * EsatL + Vgst2Vtm);
-        tmp1 = 0.0;
-        T1 = T0 * T0;
-        T2 = Vgst2Vtm * T0;
-        T3 = EsatL * Vgst2Vtm;
-        Vdsat = T3 * T0;
-        dT0_dVg = -(Abulk * dEsatL_dVg + EsatL * dAbulk_dVg + 1.0) * T1;
-        dT0_dVd = -(Abulk * dEsatL_dVd) * T1;
-        dT0_dVb = -(Abulk * dEsatL_dVb + dAbulk_dVb * EsatL) * T1;
-        dVdsat_dVg = T3 * dT0_dVg + T2 * dEsatL_dVg + EsatL * T0;
-        dVdsat_dVd = T3 * dT0_dVd + T2 * dEsatL_dVd;
-        dVdsat_dVb = T3 * dT0_dVb + T2 * dEsatL_dVb;
-    } else {
-        tmp1 = dLambda_dVg / (Lambda * Lambda);
-        T9 = Abulk * WVCoxRds;
-        T8 = Abulk * T9;
-        T7 = Vgst2Vtm * T9;
-        T6 = Vgst2Vtm * WVCoxRds;
-        let inverse_lambda_delta = (1.0 - Lambda) / Lambda;
-        T0 = 2.0 * Abulk * (T9 + inverse_lambda_delta);
-        dT0_dVg = 2.0 * (T8 * tmp2 - Abulk * tmp1 + (2.0 * T9 + inverse_lambda_delta) * dAbulk_dVg);
-        dT0_dVb =
-            2.0 * (T8 * (2.0 / Abulk * dAbulk_dVb + tmp3) + inverse_lambda_delta * dAbulk_dVb);
-        dT0_dVd = 0.0;
-        T1 = Vgst2Vtm * (2.0 / Lambda - 1.0) + Abulk * EsatL + 3.0 * T7;
-        dT1_dVg = (2.0 / Lambda - 1.0) - 2.0 * Vgst2Vtm * tmp1
-            + Abulk * dEsatL_dVg
-            + EsatL * dAbulk_dVg
-            + 3.0 * (T9 + T7 * tmp2 + T6 * dAbulk_dVg);
-        dT1_dVb = Abulk * dEsatL_dVb + EsatL * dAbulk_dVb + 3.0 * (T6 * dAbulk_dVb + T7 * tmp3);
-        dT1_dVd = Abulk * dEsatL_dVd;
-        T2 = Vgst2Vtm * (EsatL + 2.0 * T6);
-        dT2_dVg = EsatL + Vgst2Vtm * dEsatL_dVg + T6 * (4.0 + 2.0 * Vgst2Vtm * tmp2);
-        dT2_dVb = Vgst2Vtm * (dEsatL_dVb + 2.0 * T6 * tmp3);
-        dT2_dVd = Vgst2Vtm * dEsatL_dVd;
-        let root = SaturationRoot::new(&T0, T1, T2)?;
-        Vdsat = root.value;
-        dVdsat_dVg = root.derivative(&dT0_dVg, &dT1_dVg, &dT2_dVg)?;
-        dVdsat_dVd = root.derivative(&dT0_dVd, &dT1_dVd, &dT2_dVd)?;
-        dVdsat_dVb = root.derivative(&dT0_dVb, &dT1_dVb, &dT2_dVb)?;
-    }
+    let resistance_slopes = [
+        WVCox.mul_add(dRds_dVg, WVCoxRds * dWeff_dVg / Weff),
+        0.,
+        WVCox.mul_add(dRds_dVb, WVCoxRds * dWeff_dVb / Weff),
+    ];
+    let bulk_slopes = [dAbulk_dVg, 0., dAbulk_dVb];
+    let shape_slopes = [dLambda_dVg, 0., 0.];
+    let saturation = saturation_voltage(&Vgst2Vtm, &Abulk, &EsatL, &WVCoxRds, &Lambda)?;
+    let saturation_slopes = saturation.project(&[
+        [1., 0., 0.],
+        bulk_slopes,
+        [dEsatL_dVg, dEsatL_dVd, dEsatL_dVb],
+        resistance_slopes,
+        shape_slopes,
+    ]);
+    [dVdsat_dVg, dVdsat_dVd, dVdsat_dVb] = saturation_slopes;
+    Vdsat = saturation.value;
     here.vdsat = Vdsat;
     let smoothing = smooth_drain(Vdsat, Vds, pParam.delta)?;
     Vdseff = smoothing.effective;
@@ -944,24 +913,17 @@ pub(super) fn transport(
         Esat = EsatL / Leff;
         here.EsatL = EsatL;
     }
-    tmp4 = 1.0 - 0.5 * Abulk * Vdsat / Vgst2Vtm;
-    T9 = WVCoxRds * Vgsteff;
-    T8 = T9 / Vgst2Vtm;
-    T0 = EsatL + Vdsat + 2.0 * T9 * tmp4;
-    T7 = 2.0 * WVCoxRds * tmp4;
-    dT0_dVg = dEsatL_dVg + dVdsat_dVg + T7 * (1.0 + tmp2 * Vgsteff)
-        - T8 * (Abulk * dVdsat_dVg - Abulk * Vdsat / Vgst2Vtm + Vdsat * dAbulk_dVg);
-    dT0_dVb = dEsatL_dVb + dVdsat_dVb + T7 * tmp3 * Vgsteff
-        - T8 * (dAbulk_dVb * Vdsat + Abulk * dVdsat_dVb);
-    dT0_dVd = dEsatL_dVd + dVdsat_dVd - T8 * Abulk * dVdsat_dVd;
-    T9 = WVCoxRds * Abulk;
-    T1 = 2.0 / Lambda - 1.0 + T9;
-    dT1_dVg = -2.0 * tmp1 + WVCoxRds * (Abulk * tmp2 + dAbulk_dVg);
-    dT1_dVb = dAbulk_dVb * WVCoxRds + T9 * tmp3;
-    Vasat = T0 / T1;
-    dVasat_dVg = (dT0_dVg - Vasat * dT1_dVg) / T1;
-    dVasat_dVb = (dT0_dVb - Vasat * dT1_dVb) / T1;
-    dVasat_dVd = dT0_dVd / T1;
+    let early =
+        saturation_early_voltage(&Vgsteff, &Abulk, &Vdsat, &EsatL, &WVCoxRds, &Lambda, Vtm)?;
+    [dVasat_dVg, dVasat_dVd, dVasat_dVb] = early.project(&[
+        [1., 0., 0.],
+        bulk_slopes,
+        saturation_slopes,
+        [dEsatL_dVg, dEsatL_dVd, dEsatL_dVb],
+        resistance_slopes,
+        shape_slopes,
+    ]);
+    Vasat = early.value;
     tmp1 = here.vtfbphi2;
     tmp2 = 2.0e8 * here.toxp;
     dT0_dVg = 1.0 / tmp2;
@@ -1036,26 +998,17 @@ pub(super) fn transport(
         dCclm_dVd = dCclm_dVg;
     }
     if pParam.thetaRout > MIN_EXP {
-        T8 = Abulk * Vdsat;
-        T0 = Vgst2Vtm * T8;
-        dT0_dVg = Vgst2Vtm * Abulk * dVdsat_dVg + T8 + Vgst2Vtm * Vdsat * dAbulk_dVg;
-        dT0_dVb = Vgst2Vtm * (dAbulk_dVb * Vdsat + Abulk * dVdsat_dVb);
-        dT0_dVd = Vgst2Vtm * Abulk * dVdsat_dVd;
-        T1 = Vgst2Vtm + T8;
-        dT1_dVg = 1.0 + Abulk * dVdsat_dVg + Vdsat * dAbulk_dVg;
-        dT1_dVb = Abulk * dVdsat_dVb + dAbulk_dVb * Vdsat;
-        dT1_dVd = Abulk * dVdsat_dVd;
-        T9 = T1 * T1;
-        T2 = pParam.thetaRout;
-        VADIBL = (Vgst2Vtm - T0 / T1) / T2;
-        dVADIBL_dVg = (1.0 - dT0_dVg / T1 + T0 * dT1_dVg / T9) / T2;
-        dVADIBL_dVb = (-dT0_dVb / T1 + T0 * dT1_dVb / T9) / T2;
-        dVADIBL_dVd = (-dT0_dVd / T1 + T0 * dT1_dVd / T9) / T2;
-        (T3, T4) = reciprocal_floor(pParam.pdiblb * Vbseff, -0.9, 20.)?;
-        dVADIBL_dVg *= T3;
-        dVADIBL_dVb = dVADIBL_dVb * T3 + VADIBL * pParam.pdiblb * T4;
-        dVADIBL_dVd *= T3;
-        VADIBL *= T3;
+        let early = dibl_early_voltage(
+            &Vgst2Vtm,
+            &Abulk,
+            &Vdsat,
+            &Vbseff,
+            pParam.thetaRout,
+            pParam.pdiblb,
+        )?;
+        [dVADIBL_dVg, dVADIBL_dVd, dVADIBL_dVb] =
+            early.project(&[[1., 0., 0.], bulk_slopes, saturation_slopes, [0., 0., 1.]]);
+        VADIBL = early.value;
         dVADIBL_dVg = dVADIBL_dVg * PvagTerm + VADIBL * dPvagTerm_dVg;
         dVADIBL_dVb = dVADIBL_dVb * PvagTerm + VADIBL * dPvagTerm_dVb;
         dVADIBL_dVd = dVADIBL_dVd * PvagTerm + VADIBL * dPvagTerm_dVd;

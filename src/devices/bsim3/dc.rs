@@ -22,9 +22,9 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use crate::devices::bsim_physics::{
-    SaturationRoot, bsim3_junction, channel_conductance, impact_ionization, poly_depletion,
-    rational_floor, reciprocal_floor, saturation_shape, series_conductance, smooth_drain,
-    substrate_early_voltage,
+    bsim3_junction, channel_conductance, dibl_early_voltage, impact_ionization, poly_depletion,
+    rational_floor, reciprocal_floor, saturation_early_voltage, saturation_shape,
+    saturation_voltage, series_conductance, smooth_drain, substrate_early_voltage,
 };
 use crate::primitives::{Real, SpiceResult};
 
@@ -505,74 +505,24 @@ impl DcModel<'_> {
 
         let vgst2vtm = 2.0f64.mul_add(vtm, vgsteff);
         let abulk_over_vgst2vtm = abulk / vgst2vtm;
-        let (tmp2v, tmp3v) = if rds > 0.0 {
-            (
-                drds_dvg / rds + dweff_dvg / weff,
-                drds_dvb / rds + dweff_dvb / weff,
-            )
-        } else {
-            (dweff_dvg / weff, dweff_dvb / weff)
-        };
-
-        let (vdsat, dvdsat_dvg, dvdsat_dvd, dvdsat_dvb, tmp1v);
-        if rds == 0.0 && lambda == 1.0 {
-            let t0 = 1.0 / abulk.mul_add(esatl, vgst2vtm);
-            tmp1v = 0.0;
-            let t1v = t0 * t0;
-            let t2 = vgst2vtm * t0;
-            let t3 = esatl * vgst2vtm;
-            vdsat = t3 * t0;
-            let dt0_dvg = -(esatl.mul_add(dabulk_dvg, abulk * desatl_dvg) + 1.0) * t1v;
-            let dt0_dvd = -(abulk * desatl_dvd) * t1v;
-            let dt0_dvb = -dabulk_dvb.mul_add(esatl, abulk * desatl_dvb) * t1v;
-            dvdsat_dvg = esatl.mul_add(t0, t2.mul_add(desatl_dvg, t3 * dt0_dvg));
-            dvdsat_dvd = t2.mul_add(desatl_dvd, t3 * dt0_dvd);
-            dvdsat_dvb = t2.mul_add(desatl_dvb, t3 * dt0_dvb);
-        } else {
-            tmp1v = dlambda_dvg / (lambda * lambda);
-            let t9 = abulk * wvcoxrds;
-            let t8 = abulk * t9;
-            let t7 = vgst2vtm * t9;
-            let t6 = vgst2vtm * wvcoxrds;
-            let t0 = 2.0 * abulk * (t9 - 1.0 + 1.0 / lambda);
-            let dt0_dvg = 2.0
-                * (2.0f64.mul_add(t9, 1.0 / lambda) - 1.0)
-                    .mul_add(dabulk_dvg, abulk.mul_add(-tmp1v, t8 * tmp2v));
-            let dt0_dvb = 2.0
-                * f64::mul_add(
-                    1.0 / lambda - 1.0,
-                    dabulk_dvb,
-                    t8 * (2.0 / abulk).mul_add(dabulk_dvb, tmp3v),
-                );
-            let t1v = 3.0f64.mul_add(t7, abulk.mul_add(esatl, vgst2vtm * (2.0 / lambda - 1.0)));
-            let dt1_dvg = 3.0f64.mul_add(
-                t6.mul_add(dabulk_dvg, t7.mul_add(tmp2v, t9)),
-                esatl.mul_add(
-                    dabulk_dvg,
-                    abulk.mul_add(
-                        desatl_dvg,
-                        (2.0 * vgst2vtm).mul_add(-tmp1v, 2.0 / lambda - 1.0),
-                    ),
-                ),
-            );
-            let dt1_dvb = 3.0f64.mul_add(
-                t7.mul_add(tmp3v, t6 * dabulk_dvb),
-                esatl.mul_add(dabulk_dvb, abulk * desatl_dvb),
-            );
-            let dt1_dvd = abulk * desatl_dvd;
-            let t2v = vgst2vtm * 2.0f64.mul_add(t6, esatl);
-            let dt2_dvg = t6.mul_add(
-                (2.0 * vgst2vtm).mul_add(tmp2v, 4.0),
-                vgst2vtm.mul_add(desatl_dvg, esatl),
-            );
-            let dt2_dvb = vgst2vtm * (2.0 * t6).mul_add(tmp3v, desatl_dvb);
-            let dt2_dvd = vgst2vtm * desatl_dvd;
-            let root = SaturationRoot::new(&t0, t1v, t2v)?;
-            vdsat = root.value;
-            dvdsat_dvg = root.derivative(&dt0_dvg, &dt1_dvg, &dt2_dvg)?;
-            dvdsat_dvb = root.derivative(&dt0_dvb, &dt1_dvb, &dt2_dvb)?;
-            dvdsat_dvd = root.derivative(&0., &dt1_dvd, &dt2_dvd)?;
-        }
+        let resistance_slopes = [
+            wvcox.mul_add(drds_dvg, wvcoxrds * dweff_dvg / weff),
+            0.,
+            wvcox.mul_add(drds_dvb, wvcoxrds * dweff_dvb / weff),
+        ];
+        let bulk_slopes = [dabulk_dvg, 0., dabulk_dvb];
+        let field_slopes = [desatl_dvg, desatl_dvd, desatl_dvb];
+        let shape_slopes = [dlambda_dvg, 0., 0.];
+        let saturation = saturation_voltage(&vgst2vtm, &abulk, &esatl, &wvcoxrds, &lambda)?;
+        let saturation_slopes = saturation.project(&[
+            [1., 0., 0.],
+            bulk_slopes,
+            field_slopes,
+            resistance_slopes,
+            shape_slopes,
+        ]);
+        let [dvdsat_dvg, dvdsat_dvd, dvdsat_dvb] = saturation_slopes;
+        let vdsat = saturation.value;
 
         let smoothing = smooth_drain(vdsat, vds, p.binned.delta)?;
         let vdseff = if smoothing.effective > vds {
@@ -588,32 +538,17 @@ impl DcModel<'_> {
         let diff_vds = smoothing.drain_excess;
 
         // Early voltage: saturation, CLM and DIBL components.
-        let tmp4v = 1.0 - 0.5 * abulk * vdsat / vgst2vtm;
-        let t9v = wvcoxrds * vgsteff;
-        let t8v = t9v / vgst2vtm;
-        let t0v = (2.0 * t9v).mul_add(tmp4v, esatl + vdsat);
-        let t7v = 2.0 * wvcoxrds * tmp4v;
-        let dt0_dvg = t8v.mul_add(
-            -f64::mul_add(
-                vdsat,
-                dabulk_dvg,
-                abulk.mul_add(dvdsat_dvg, -(abulk * vdsat / vgst2vtm)),
-            ),
-            t7v.mul_add(f64::mul_add(tmp2v, vgsteff, 1.0), desatl_dvg + dvdsat_dvg),
-        );
-        let dt0_dvb = t8v.mul_add(
-            -abulk.mul_add(dvdsat_dvb, dabulk_dvb * vdsat),
-            (t7v * tmp3v).mul_add(vgsteff, desatl_dvb + dvdsat_dvb),
-        );
-        let dt0_dvd = (t8v * abulk).mul_add(-dvdsat_dvd, desatl_dvd + dvdsat_dvd);
-        let t9e = wvcoxrds * abulk;
-        let t1e = 2.0 / lambda - 1.0 + t9e;
-        let dt1_dvg = wvcoxrds.mul_add(abulk.mul_add(tmp2v, dabulk_dvg), -2.0 * tmp1v);
-        let dt1_dvb = t9e.mul_add(tmp3v, dabulk_dvb * wvcoxrds);
-        let vasat = t0v / t1e;
-        let dvasat_dvg = vasat.mul_add(-dt1_dvg, dt0_dvg) / t1e;
-        let dvasat_dvb = vasat.mul_add(-dt1_dvb, dt0_dvb) / t1e;
-        let dvasat_dvd = dt0_dvd / t1e;
+        let early =
+            saturation_early_voltage(&vgsteff, &abulk, &vdsat, &esatl, &wvcoxrds, &lambda, vtm)?;
+        let [dvasat_dvg, dvasat_dvd, dvasat_dvb] = early.project(&[
+            [1., 0., 0.],
+            bulk_slopes,
+            saturation_slopes,
+            field_slopes,
+            resistance_slopes,
+            shape_slopes,
+        ]);
+        let vasat = early.value;
 
         let (vaclm, dvaclm_dvg, dvaclm_dvd, dvaclm_dvb) = if p.binned.pclm > 0.0
             && diff_vds > 1.0e-10
@@ -640,28 +575,17 @@ impl DcModel<'_> {
         };
 
         let (vadibl, dvadibl_dvg, dvadibl_dvd, dvadibl_dvb) = if p.derived.thetarout > 0.0 {
-            let t8 = abulk * vdsat;
-            let t0 = vgst2vtm * t8;
-            let dt0_dvg =
-                (vgst2vtm * vdsat).mul_add(dabulk_dvg, (vgst2vtm * abulk).mul_add(dvdsat_dvg, t8));
-            let dt0_dvb = vgst2vtm * abulk.mul_add(dvdsat_dvb, dabulk_dvb * vdsat);
-            let dt0_dvd = vgst2vtm * abulk * dvdsat_dvd;
-            let t1 = vgst2vtm + t8;
-            let dt1_dvg = f64::mul_add(vdsat, dabulk_dvg, abulk.mul_add(dvdsat_dvg, 1.0));
-            let dt1_dvb = dabulk_dvb.mul_add(vdsat, abulk * dvdsat_dvb);
-            let dt1_dvd = abulk * dvdsat_dvd;
-            let t9 = t1 * t1;
-            let t2 = p.derived.thetarout;
-            let mut vadibl = (vgst2vtm - t0 / t1) / t2;
-            let mut dvadibl_dvg = (1.0 - dt0_dvg / t1 + t0 * dt1_dvg / t9) / t2;
-            let mut dvadibl_dvb = (-dt0_dvb / t1 + t0 * dt1_dvb / t9) / t2;
-            let mut dvadibl_dvd = (-dt0_dvd / t1 + t0 * dt1_dvd / t9) / t2;
-            let (factor, slope) = reciprocal_floor(p.binned.pdiblcb * vbseff, -0.9, 20.)?;
-            dvadibl_dvb = (vadibl * p.binned.pdiblcb).mul_add(slope, dvadibl_dvb * factor);
-            dvadibl_dvg *= factor;
-            dvadibl_dvd *= factor;
-            vadibl *= factor;
-            (vadibl, dvadibl_dvg, dvadibl_dvd, dvadibl_dvb)
+            let early = dibl_early_voltage(
+                &vgst2vtm,
+                &abulk,
+                &vdsat,
+                &vbseff,
+                p.derived.thetarout,
+                p.binned.pdiblcb,
+            )?;
+            let [dg, dd, db] =
+                early.project(&[[1., 0., 0.], bulk_slopes, saturation_slopes, [0., 0., 1.]]);
+            (early.value, dg, dd, db)
         } else {
             (MAX_EXP, 0.0, 0.0, 0.0)
         };
