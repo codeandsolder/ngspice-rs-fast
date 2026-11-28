@@ -482,7 +482,11 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
     ) -> SpiceResult<std::cell::Ref<'_, PreparedPoint>> {
-        if let Ok(point) = std::cell::Ref::filter_map(self.point.borrow(), |current| {
+        let current = self
+            .point
+            .try_borrow()
+            .map_err(|_| SpiceError::circuit("prepared candidate transaction already active"))?;
+        if let Ok(point) = std::cell::Ref::filter_map(current, |current| {
             current
                 .as_ref()
                 .filter(|point| point.context_valid && point.context.same_preparation(context))
@@ -506,10 +510,13 @@ impl<'a> PreparedRun<'a> {
         mut replacements: Vec<(usize, Box<dyn Device>)>,
         mutual: std::cell::OnceCell<PreparedMutualTerms>,
     ) -> SpiceResult<()> {
+        let mut current = self
+            .point
+            .try_borrow_mut()
+            .map_err(|_| SpiceError::circuit("prepared candidate is borrowed"))?;
         let prepared_batches = {
-            let previous = self.point.borrow();
-            self.prepare_instances(context, &mut replacements, previous.as_ref())?;
-            if let Some(previous) = previous.as_ref() {
+            self.prepare_instances(context, &mut replacements, current.as_ref())?;
+            if let Some(previous) = current.as_ref() {
                 let mut plan = previous.batches()?;
                 plan.rebind(
                     |index| effective_device(self.circuit, &replacements, index),
@@ -529,13 +536,13 @@ impl<'a> PreparedRun<'a> {
                 )?
             }
         };
-        self.point.replace(Some(PreparedPoint {
+        *current = Some(PreparedPoint {
             context: *context,
             context_valid: true,
             replacements,
             mutual,
             prepared_batches: std::cell::RefCell::new(prepared_batches),
-        }));
+        });
         Ok(())
     }
 

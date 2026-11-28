@@ -133,3 +133,68 @@ fn optimizer_commit_leases_validation_preparation_and_preserves_failed_candidate
     circuit.prepare_run().validate_dc_inputs(&context).unwrap();
     assert_eq!(count.load(Ordering::Relaxed), after_failure + 1);
 }
+
+#[test]
+fn preparation_key_includes_analysis_phase_and_all_elaboration_settings() {
+    use crate::primitives::AnalysisKind;
+    let original = ModelContext::default();
+    let cases = [
+        ModelContext {
+            analysis_kind: Some(AnalysisKind::Transient),
+            ..original
+        },
+        ModelContext {
+            bias_analysis: Some(AnalysisKind::OperatingPoint),
+            ..original
+        },
+        ModelContext {
+            configured_gmin: 1e-8,
+            ..original
+        },
+        ModelContext {
+            geometry_scale: 2.,
+            ..original
+        },
+        ModelContext {
+            shunts: crate::devices::models::TopologyShunts {
+                resistance: Some(1e6),
+                ..original.shunts
+            },
+            ..original
+        },
+        ModelContext {
+            shunts: crate::devices::models::TopologyShunts {
+                capacitance: 1e-12,
+                ..original.shunts
+            },
+            ..original
+        },
+    ];
+    assert!(original.same_preparation(&original));
+    for case in cases {
+        assert!(!original.same_preparation(&case));
+        assert!(!case.same_preparation(&original));
+    }
+}
+
+#[test]
+fn active_prepared_view_rejects_context_transaction_before_preparing() {
+    let (circuit, count) = counted_circuit();
+    let run = circuit.prepare_run();
+    let context = ModelContext::default();
+    let held = run.point(&context).unwrap();
+    let changed = context
+        .with_instance_override(
+            circuit
+                .bind_instance_target("m3", "g")
+                .unwrap()
+                .at(2e-3)
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(run.validate_context(&changed).is_err());
+    assert_eq!(count.load(Ordering::Relaxed), 129);
+    drop(held);
+    run.validate_context(&changed).unwrap();
+    assert_eq!(count.load(Ordering::Relaxed), 130);
+}
