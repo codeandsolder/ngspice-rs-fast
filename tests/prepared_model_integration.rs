@@ -1225,10 +1225,16 @@ fn actual_vdmos_artifact_binds_hidden_rows_solves_and_reprepares_candidates() {
         .count();
     assert!(hidden >= 3);
     assert_eq!(circuit.unknown_count(), 3 * (hidden + 4));
-    assert_eq!(
-        circuit.state_len(),
-        3 * 2 * model.descriptor().equations.len()
+    // The accepted VDMOS kernel now owns family-specific trial
+    // initialization, limiting and convergence. In addition to two charge
+    // history slots per equation it needs the evaluated coordinates and
+    // their validity marker, independently for each instance.
+    assert_ne!(
+        model.descriptor().trial,
+        model_kernel_api::trial::TrialCapabilities::ENGINE
     );
+    let equations = model.descriptor().equations.len();
+    assert_eq!(circuit.state_len(), 3 * (2 * equations + equations + 1));
     let context = ModelContext::default();
     let options = NewtonOptions {
         reltol: 1e-10,
