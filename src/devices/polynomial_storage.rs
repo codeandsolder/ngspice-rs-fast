@@ -4,8 +4,8 @@
 use model_normalize_ngspice::passive_storage::{PolynomialStorage, StoragePoint};
 
 use crate::devices::{
-    Device, InitialCoordinate, InitialCoordinateHistory, InitialVoltageStorage, ModelContext,
-    ModelFamily, ResolvedModel, StampContext,
+    ConvergenceContext, Device, InitialCoordinate, InitialCoordinateHistory, InitialVoltageStorage,
+    ModelContext, ModelFamily, ResolvedModel, StampContext,
     linear::LinearContext,
     noise::{DeviceNoise, NoiseContext, NoiseSource},
     nonlinear::charge::ChargeBranch,
@@ -140,13 +140,16 @@ impl Prepared {
     }
 
     fn taylor(self, x: Jet) -> SpiceResult<(Jet, Jet)> {
+        if self.base == 0. {
+            return Ok((Jet::constant(x.order(), 0.), Jet::constant(x.order(), 0.)));
+        }
         let center = x.value();
         let point = self.at(center)?;
         let delta = x.offset(-center);
         let square = delta.multiply(&delta);
         let cubic = square.multiply(&delta);
-        let curvature = self.base * (2. * self.quadratic).mul_add(center, self.linear);
         let second = self.base * self.quadratic;
+        let curvature = (2. * second).mul_add(center, self.base * self.linear);
         let value = Jet::constant(delta.order(), point.stored)
             .add(&delta.clone().scale(point.differential))
             .add(&square.clone().scale(curvature / 2.))
@@ -214,6 +217,7 @@ impl Recipe {
 #[derive(Debug, Clone)]
 struct PolynomialDevice {
     name: String,
+    model_name: String,
     terminals: [NodeId; 2],
     recipe: Recipe,
     prepared: Prepared,
@@ -236,6 +240,7 @@ impl PolynomialDevice {
     fn with_recipe(&self, recipe: Recipe, context: &ModelContext) -> SpiceResult<Self> {
         Ok(Self {
             name: self.name.clone(),
+            model_name: self.model_name.clone(),
             terminals: self.terminals,
             prepared: recipe.prepare(context)?,
             recipe,
@@ -310,6 +315,9 @@ impl Rows {
 impl Device for PolynomialDevice {
     fn name(&self) -> &str {
         &self.name
+    }
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model_name)
     }
     fn designator(&self) -> char {
         match self.recipe.kind {
@@ -474,6 +482,14 @@ impl Device for PolynomialDevice {
             }
             let companion = storage.integrate(&mut context.states, integration)?;
             rows.dynamic_stamp(context.matrix, companion.conductance)?;
+            let rate = match self.recipe.kind {
+                Kind::Capacitor => context.row_value(rows.branch)?,
+                Kind::Inductor => {
+                    context.node_voltage(self.terminals[0])
+                        - context.node_voltage(self.terminals[1])
+                }
+            };
+            context.states.set(1, rate)?;
             context.rhs.add_to(
                 rows.branch,
                 (-companion.conductance).mul_add(x, companion.derivative),
@@ -482,6 +498,41 @@ impl Device for PolynomialDevice {
             storage.zero_derivative(&mut context.states)?;
         }
         storage.store(&mut context.states)
+    }
+
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        let rows = self.rows(context.unknowns, context.branch)?;
+        let x = rows.coordinate(context.solution)?;
+        let point = self.prepared.at(x)?;
+        let actual = match self.recipe.kind {
+            Kind::Capacitor => context
+                .solution
+                .get(rows.branch)
+                .ok_or_else(|| SpiceError::circuit("missing polynomial branch current"))?,
+            Kind::Inductor => {
+                context.voltage(self.terminals[0]) - context.voltage(self.terminals[1])
+            }
+        };
+        let absolute = match self.recipe.kind {
+            Kind::Capacitor => context.abstol,
+            Kind::Inductor => context.vntol,
+        };
+        let (expected, rounding) = if let Some(integration) = context.integration {
+            let storage = ChargeBranch::new(0, point.stored, 1.);
+            let companion =
+                storage.companion(integration, |age, slot| context.accepted(age, slot))?;
+            let roundoff = (8. * Real::EPSILON * companion.conductance.abs()).mul_add(
+                point.stored.abs(),
+                8. * Real::EPSILON * companion.current.abs(),
+            );
+            (companion.derivative, roundoff)
+        } else {
+            (0., 0.)
+        };
+        Ok((actual - expected).abs()
+            > context
+                .reltol
+                .mul_add(actual.abs().max(expected.abs()), absolute + rounding))
     }
 
     fn assemble_small_signal(
@@ -558,6 +609,7 @@ pub(super) fn instantiate(
     let prepared = recipe.prepare(context)?;
     Ok(Box::new(PolynomialDevice {
         name: instance.name.clone(),
+        model_name: model.card().name.clone(),
         terminals: nodes.intern_array(&instance.nodes)?,
         recipe,
         prepared,

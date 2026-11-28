@@ -264,3 +264,32 @@ actual independent coordinate, even when the initial hint was inconsistent;
 convergence checks the physical law. Predicted sweep points use the previous
 solution rather than reapplying a startup constraint. Candidate elaboration
 retains the original source identities and immutable law data.
+
+## Producer-selected polynomial storage (#252)
+
+The explicit prepared model families `pspice_cap` and `pspice_ind` bind the
+source producer's differential-storage law. They do not change the ordinary
+native C/L models. Model setters are `c,vc1,vc2` or `l,il1,il2` respectively,
+plus `tc1,tc2,temp,dtemp,tnom`; each instance requires a signed nonzero finite
+scalar value. The model's dimensionless multiplier may make the effective
+value zero. The initial-coordinate setter is `ic` (V or A), and instance
+temperature and TC setters override the declaration. No artificial
+conductance or independent noise source is added.
+
+For an effective base B and differential coefficients a,b, the stored
+quantity is S(x)=B(x+a*x²/2+b*x³/3), and its Jacobian is
+D(x)=B(1+a*x+b*x²). The current or voltage branch equation differentiates
+S, rather than multiplying x by D. DC sees an open capacitor or short
+inductor; AC and pole-zero use the local differential at the bias point.
+Transient history contains S and its time derivative, and UIC seeds the
+nonlinear stored quantity at the selected coordinate. Candidate replacement
+rebinds the effective law without changing the branch or history layout.
+Physical Taylor assembly lifts the same law exactly through cubic order.
+
+Native positive `scale` multiplies the base and `m` represents parallel
+copies: capacitor charge multiplies by m; inductor flux is S(I/m), with
+total branch current I. These are native prepared-model extensions, not a
+claim that PSpice accepts these instance keywords. Nonlinear mutual
+inductance is rejected until a coupled energy law is available.
+Source-specific non-UIC initial bias semantics require a separate producer
+policy; the native instance IC alone does not impose a DC clamp.
