@@ -12,7 +12,7 @@ mod continuous;
 use continuous::{ContinuousHistory, ContinuousPlan};
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BinaryHeap, btree_map::Entry},
     sync::Arc,
 };
 
@@ -792,27 +792,31 @@ impl LossyPlan {
             time: arrival.hi,
             node: edge.target,
         };
-        if let Some(event) = kernel.pending.get_mut(&key) {
-            for (target, value) in event.values.iter_mut().zip(values) {
-                *target = edge.gain.mul_add(*value, *target);
+        // Reuse the ordered search for a new arrival as well as a coalesced
+        // one. A vacant entry is not inserted if roundoff pruning
+        // eliminates the entire contribution.
+        let pending_len = kernel.pending.len();
+        let entry = match kernel.pending.entry(key) {
+            Entry::Occupied(mut entry) => {
+                for (target, value) in entry.get_mut().values.iter_mut().zip(values) {
+                    *target = edge.gain.mul_add(*value, *target);
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
+            Entry::Vacant(entry) => entry,
+        };
         let mut incoming: Vec<_> = values.iter().map(|value| edge.gain * value).collect();
         self.prune_roundoff(&mut kernel.remaining_roundoff, key, &mut incoming);
         if incoming.iter().all(|value| *value == 0.) {
             return Ok(());
         }
-        if kernel.pending.len() >= self.limit / Kernel::arrival_bytes(values.len()) {
+        if pending_len >= self.limit / Kernel::arrival_bytes(values.len()) {
             return Err(invalid("CPL arrival workspace exceeded"));
         }
-        kernel.pending.insert(
-            key,
-            Increment {
-                time: arrival,
-                values: incoming,
-            },
-        );
+        entry.insert(Increment {
+            time: arrival,
+            values: incoming,
+        });
         Ok(())
     }
 
@@ -1196,6 +1200,117 @@ impl LossyPlan {
 mod tests {
     use super::*;
     use crate::devices::cpl::CoupledLineLimits;
+
+    fn arrival_test_plan() -> LossyPlan {
+        let material = CoupledLinePlan::from_packed(
+            2,
+            1.,
+            &[20., 5., 30.],
+            &[250e-9, 0., 400e-9],
+            &[0.; 3],
+            &[100e-12, 0., 160e-12],
+            CoupledLineLimits::default(),
+        )
+        .unwrap();
+        let basis = ModalBasis::prepare(&material).unwrap().unwrap();
+        let mut plan = LossyPlan::prepare(basis, &material, 1).unwrap();
+        // These are exact queue tests, independent of the pruning policy.
+        plan.path_bound = None;
+        plan
+    }
+
+    #[test]
+    fn arrival_coalescing_preserves_first_wide_time_and_fma_at_capacity() {
+        let mut plan = arrival_test_plan();
+        let mut kernel = Kernel::empty(4);
+        plan.limit = Kernel::arrival_bytes(4);
+        let time = Wide::from_real(1.);
+        let perturbed = time + Wide::from_real(Real::EPSILON / 4.);
+        let edge = Edge {
+            target: plan.terminal,
+            delay: 1.,
+            gain: 1.,
+        };
+        let first = time + Wide::from_real(edge.delay);
+        let later = perturbed + Wide::from_real(edge.delay);
+        assert_eq!(first.hi.to_bits(), later.hi.to_bits());
+        assert_ne!(first, later);
+        plan.send(&mut kernel, time, edge, &[-1., 1., 0., 0.])
+            .unwrap();
+        let gain = 1. + Real::EPSILON;
+        let value = 1. - Real::EPSILON;
+        plan.send(
+            &mut kernel,
+            perturbed,
+            Edge { gain, ..edge },
+            &[value, 0., 0., 0.],
+        )
+        .unwrap();
+        let (&key, event) = kernel.pending.first_key_value().unwrap();
+        assert_eq!(event.time, first);
+        assert_eq!(
+            event.values[0].to_bits(),
+            gain.mul_add(value, -1.).to_bits()
+        );
+        assert_ne!(event.values[0], 0.);
+        assert_eq!(event.values[1], 1.);
+        assert_eq!(key.node, edge.target);
+        assert_eq!(kernel.pending.len(), 1);
+        let other = Edge {
+            target: edge.target + 1,
+            ..edge
+        };
+        // A zero contribution is discarded before testing the capacity.
+        plan.send(&mut kernel, time, other, &[0.; 4]).unwrap();
+        assert!(
+            plan.send(&mut kernel, time, other, &[1., 0., 0., 0.])
+                .is_err()
+        );
+        assert_eq!(kernel.pending.len(), 1);
+        assert_eq!(kernel.pending.first_key_value().unwrap().1.time, first);
+    }
+
+    #[test]
+    fn cancelled_arrivals_do_not_leave_knots_and_ties_keep_node_order() {
+        let plan = arrival_test_plan();
+        let mut kernel = Kernel::empty(4);
+        let time = Wide::from_real(1.);
+        kernel.horizon = time.hi;
+        let edge = Edge {
+            target: plan.terminal + 2,
+            delay: 1.,
+            gain: 1.,
+        };
+        // Deliberately insert the largest key first, then cancel its
+        // incident vector exactly without dropping the pending event early.
+        let values = [1., -2., 3., -4.];
+        plan.send(&mut kernel, time, edge, &values).unwrap();
+        plan.send(&mut kernel, time, Edge { gain: -1., ..edge }, &values)
+            .unwrap();
+        let first = Edge {
+            target: plan.terminal,
+            ..edge
+        };
+        plan.send(&mut kernel, time, first, &[1., 0., 0., 0.])
+            .unwrap();
+        assert_eq!(kernel.pending.len(), 2);
+        assert_eq!(
+            kernel.pending.first_key_value().unwrap().0.node,
+            first.target
+        );
+        let initial = kernel.clone();
+        plan.extend_kernel(&mut kernel, 2., 0).unwrap();
+        assert!(kernel.pending.is_empty());
+        assert_eq!(kernel.records, 1);
+        assert_eq!(kernel.traces[0][0].impulse, 1.);
+        assert!(kernel.traces[1..].iter().all(Vec::is_empty));
+        // Rejected trial state is independent of the original queue.
+        assert_eq!(initial.pending.len(), 2);
+        assert_eq!(initial.records, 0);
+        let mut repeated = initial;
+        plan.extend_kernel(&mut repeated, 2., 0).unwrap();
+        assert_eq!(kernel, repeated);
+    }
 
     #[test]
     fn bounded_path_roundoff_preserves_first_arrivals_and_small_transfer_coefficients() {

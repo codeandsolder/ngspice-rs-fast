@@ -96,9 +96,10 @@ impl Events {
     }
 }
 
-// Ordinary source schedules have few simultaneous pending corners. Bound
-// the contiguous search/shift cost; retain the ordered index for large sets.
-const INLINE_BREAKS: usize = 8;
+// Bound the contiguous search/shift cost and keep common multi-source
+// schedules allocation-free. The 8/16/32/64-entry sweep favored 32 as a
+// compromise between recurrent moderate queues and the size of the table.
+const INLINE_BREAKS: usize = 32;
 
 /// C's breakpoint table `CKTbreaks`: at least two entries, normally ascending.
 ///
@@ -1162,8 +1163,9 @@ mod tests {
         }
         reference.compare(&table);
         for cycle in 0..4 {
-            for i in 1..=16 {
-                let time = Real::from(i + cycle * 20);
+            let count = u32::try_from(INLINE_BREAKS).unwrap() + 4;
+            for i in 1..=count {
+                let time = Real::from(i + cycle * count);
                 assert_eq!(table.set(-1., time).is_ok(), reference.set(-1., time));
                 reference.compare(&table);
             }
@@ -1192,7 +1194,7 @@ mod tests {
     #[test]
     #[ignore = "opt-in source-driven breakpoint occupancy measurement"]
     fn pulse_schedule_occupancy() {
-        for count in [1_u32, 4, 8, 16, 64] {
+        for count in [1_u32, 4, 8, 16, 32, 64] {
             let stop = 20.;
             let mut system = LinearSystem::new(0);
             for i in 0..count {
@@ -1216,7 +1218,8 @@ mod tests {
             let mut sources = SourceBreaks::new(&system);
             let mut table = BreakTable::new(stop, 1e-10).unwrap();
             let mut visits = 0;
-            let mut small = 0;
+            let mut occupancy = [0; 4];
+            let mut inline = 0;
             let mut peak = 0;
             let mut now = 0.;
             while now < stop {
@@ -1224,7 +1227,14 @@ mod tests {
                     .accept(SourceKind::Voltage, now, true, &timing, &mut table)
                     .unwrap();
                 visits += 1;
-                small += usize::from(table.len() <= INLINE_BREAKS);
+                let bucket = match table.len() {
+                    0..=8 => 0,
+                    9..=16 => 1,
+                    17..=32 => 2,
+                    _ => 3,
+                };
+                occupancy[bucket] += 1;
+                inline += usize::from(table.breaks.is_empty());
                 peak = peak.max(table.len());
                 while table.first() <= now {
                     table.clear();
@@ -1232,7 +1242,7 @@ mod tests {
                 now = table.first();
             }
             println!(
-                "sources={count},accepted={visits},inline_eligible={small},peak_pending={peak}"
+                "sources={count},accepted={visits},occupancy={occupancy:?},inline={inline},peak_pending={peak}"
             );
         }
     }
