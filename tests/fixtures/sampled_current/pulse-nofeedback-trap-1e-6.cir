@@ -1,0 +1,10 @@
+* occurrence-local sampled-current no-feedback witness
+V1 s 0 DC 2 PULSE(2 3 1u 100n 100n 2u 5u)
+R1 s p 3
+C1 p 0 2u Rser=5 Rpar=20 Cpar=1u
+B1 b 0 V=I(C1)
+R2 b 0 1
+.options method=trap reltol=1e-6 abstol=1e-12 vntol=1e-9 plotwinsize=0 numdgt=15
+.save V(s) V(p) V(b) I(C1) I(R1)
+.tran 0 5u 0 50n
+.end

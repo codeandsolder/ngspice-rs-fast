@@ -116,6 +116,55 @@ fn feedback_converges_to_present_physical_current_for_both_companion_methods() -
 }
 
 #[test]
+fn feedback_endpoint_matches_independent_ltspice_witness() -> SpiceResult<()> {
+    let evidence = include_str!("fixtures/sampled_current/ltspice-24.0.12.tsv");
+    for (method, witness) in [
+        ("method=trap", "trap-.5-1e-6"),
+        ("method=gear", "gear-.5-1e-6"),
+    ] {
+        let fields: Vec<_> = evidence
+            .lines()
+            .find(|line| line.split('\t').next() == Some(witness))
+            .unwrap()
+            .split('\t')
+            .collect();
+        let mut c = circuit(&format!(
+            "feedback witness\nv1 drive 0 dc 2 pulse(2 3 1u 100n 100n 2u 5u)\nbdrive s 0 v=v(drive)-.5*sampled_current(i(c1))\n{NETWORK}.end\n"
+        ))?;
+        let plan = AnalysisInput::with_arguments(
+            AnalysisKind::Transient,
+            [
+                "50n",
+                "5u",
+                "0",
+                "50n",
+                method,
+                "rtol=1e-6",
+                "vntol=1e-9",
+                "abstol=1e-12",
+            ],
+        )
+        .resolve()?;
+        let (plot, _) = companion_transient(&mut c, &plan, &AnalysisContext::default())?;
+        let last = plot.point_count() - 1;
+        for (name, field, absolute) in [
+            ("time", 4, 1e-14),
+            ("v(s)", 5, 5e-5),
+            ("v(p)", 6, 5e-5),
+            ("i(c1)", 7, 2e-5),
+        ] {
+            let expected: f64 = fields[field].parse().unwrap();
+            let actual = plot.value(name, last).unwrap();
+            assert!(
+                (actual - Complex::real(expected)).magnitude() <= absolute,
+                "{witness} {name}: {actual:?} != {expected:e}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn transient_load_samples_only_its_input_iterate_and_has_no_control_tangent() -> SpiceResult<()> {
     let mut c =
         circuit("transaction\nv1 a 0 1\nr1 a 0 1\nb1 b 0 v=sampled_current(i(v1))\n.end\n")?;
@@ -139,7 +188,7 @@ fn transient_load_samples_only_its_input_iterate_and_has_no_control_tangent() ->
         let mut x = vec![0.; n];
         x[control_row] = current;
         let mut trial = history.trial();
-        let mut a = SparseMatrix::new(n, n);
+        let mut a = c.new_matrix()?;
         let mut rhs = Vector::zeros(n);
         c.load(
             &LoadRequest {
@@ -202,6 +251,9 @@ fn malformed_sampling_is_not_silently_converted_to_a_static_expression() {
         "sampled_current(i(missing))",
     ] {
         let text = format!("invalid sample\nv1 a 0 1\nr1 a 0 1\nb1 b 0 v={expression}\n.end\n");
-        assert!(circuit(&text).is_err(), "accepted {expression}");
+        assert!(
+            circuit(&text).and_then(|mut c| c.finalize()).is_err(),
+            "accepted {expression}"
+        );
     }
 }
