@@ -348,6 +348,7 @@ impl Device for ModelPassive {
                 effective: self.parameters.effective_value(context)?,
                 coupling_base: self.parameters.coupling_value(context)?,
                 initial: self.initial_condition().unwrap_or(0.),
+                exact_startup: self.exact_startup_storage(),
             })
         })
     }

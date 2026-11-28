@@ -1,4 +1,5 @@
 //! Analysis-bound physical conductance, using the native nodal kernels.
+use crate::devices::passive_bias::PassiveInitialization;
 use crate::devices::{
     AnalysisMode, Device, LinearContext, ModelContext, ResistorNoise, StampContext,
     distortion::{DeviceDistortion, DistortionContext},
@@ -8,6 +9,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::primitives::{AnalysisKind, NodeId, Real, SpiceError, SpiceResult};
+use std::sync::Arc;
 
 /// Affine physical conductance in the configured junction minimum conductance.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -107,6 +109,34 @@ pub(super) struct DampingShunt {
     pub(super) terminals: [NodeId; 2],
     pub(super) damping: AnalysisDamping,
     pub(super) temperature: Option<Real>,
+    pub(super) excluded_bias: Option<Arc<PassiveInitialization>>,
+}
+
+impl DampingShunt {
+    pub(super) fn resistive(
+        name: String,
+        terminals: [NodeId; 2],
+        resistance: Real,
+        temperature: Option<Real>,
+        excluded_bias: Option<Arc<PassiveInitialization>>,
+    ) -> Self {
+        let law = ConductanceLaw {
+            constant: 1. / resistance,
+            gmin_scale: 0.,
+        };
+        Self {
+            name,
+            terminals,
+            temperature,
+            excluded_bias,
+            damping: AnalysisDamping {
+                steady: law,
+                small_signal: law,
+                transient: law,
+                noisy: true,
+            },
+        }
+    }
 }
 
 impl Device for DampingShunt {
@@ -132,10 +162,17 @@ impl Device for DampingShunt {
     }
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        let g = self
-            .damping
-            .stamp_law(context.mode, context.analysis_kind)
-            .evaluate(context.configured_gmin)?;
+        let g = if self
+            .excluded_bias
+            .as_ref()
+            .is_some_and(|policy| policy.active(context).is_some())
+        {
+            0.
+        } else {
+            self.damping
+                .stamp_law(context.mode, context.analysis_kind)
+                .evaluate(context.configured_gmin)?
+        };
         stamp_conductance(self.terminals, g, context)
     }
 
