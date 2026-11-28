@@ -736,7 +736,16 @@ pub struct SparseMatrix {
     dynamic_owner: u64,
     // Optional ledger retains contributions before binary64 assembly.
     original: Option<Vec<Triplet>>,
-    peak_stamp: super::StampPeak,
+    // Original coefficient peaks, indexed by the coordinate they multiply.
+    // Empty outside the Newton load; capacity is reused.
+    column_peaks: Vec<super::StampPeak>,
+}
+
+#[inline]
+fn observe_column(peaks: &mut [super::StampPeak], col: usize, value: Real) {
+    if let Some(peak) = peaks.get_mut(col) {
+        peak.observe(value);
+    }
 }
 
 impl PartialEq for SparseMatrix {
@@ -800,7 +809,7 @@ impl SparseMatrix {
             names: None,
             dynamic_owner: 0,
             original: None,
-            peak_stamp: super::StampPeak::DISABLED,
+            column_peaks: Vec::new(),
         }
     }
 
@@ -852,7 +861,7 @@ impl SparseMatrix {
             names: None,
             dynamic_owner: 0,
             original: None,
-            peak_stamp: super::StampPeak::DISABLED,
+            column_peaks: Vec::new(),
         })
     }
 
@@ -987,14 +996,15 @@ impl SparseMatrix {
         let mut mask = batch.mask;
         debug_assert_eq!(traced.len(), mask.count_ones() as usize);
         bound.view.take();
-        self.peak_stamp.observe_batch(values);
         if traced.len() == N {
-            for (&(_, _, id), &value) in traced.iter().zip(values) {
+            for (&(_, col, id), &value) in traced.iter().zip(values) {
+                observe_column(&mut self.column_peaks, col as usize, value);
                 bound.values[id as usize] += value;
             }
         } else {
-            for &(_, _, id) in traced {
+            for &(_, col, id) in traced {
                 let k = mask.trailing_zeros() as usize;
+                observe_column(&mut self.column_peaks, col as usize, values[k]);
                 bound.values[id as usize] += values[k];
                 mask &= mask - 1;
             }
@@ -1066,14 +1076,16 @@ impl SparseMatrix {
             .values
             .get_mut(element.index())
             .ok_or_else(|| pattern_error("element handle outside bound pattern"))?;
-        if let Some(original) = &mut self.original {
+        if self.original.is_some() || !self.column_peaks.is_empty() {
             let (row, col) = bound
                 .pattern
                 .position(element)
                 .ok_or_else(|| pattern_error("element handle outside bound pattern"))?;
-            Self::retain_stamp(original, row, col, value)?;
+            if let Some(original) = &mut self.original {
+                Self::retain_stamp(original, row, col, value)?;
+            }
+            observe_column(&mut self.column_peaks, col, value);
         }
-        self.peak_stamp.observe(value);
         *slot += value;
         bound.view.take();
         Ok(())
@@ -1141,7 +1153,7 @@ impl SparseMatrix {
             if let Some(original) = &mut self.original {
                 Self::retain_stamp(original, row, col, value)?;
             }
-            self.peak_stamp.observe(value);
+            observe_column(&mut self.column_peaks, col, value);
             bound.values[id.index()] = value;
             return Ok(());
         }
@@ -1215,7 +1227,7 @@ impl SparseMatrix {
             && let Some(bound) = &mut self.bound
             && let Some(id) = bound.replay(row, col)
         {
-            self.peak_stamp.observe(value);
+            observe_column(&mut self.column_peaks, col, value);
             bound.view.take();
             bound.values[id.index()] += value;
             return Ok(());
@@ -1239,7 +1251,7 @@ impl SparseMatrix {
         if let Some(original) = &mut self.original {
             Self::retain_stamp(original, row, col, value)?;
         }
-        self.peak_stamp.observe(value);
+        observe_column(&mut self.column_peaks, col, value);
         if let Some(bound) = &mut self.bound {
             bound.view.take();
             if let Some(id) = bound.element(row, col)? {
@@ -1297,7 +1309,7 @@ impl SparseMatrix {
     pub fn clear(&mut self) {
         self.dynamic_owner = 0;
         self.triplets.clear();
-        self.peak_stamp = super::StampPeak::DISABLED;
+        self.column_peaks.clear();
         if let Some(original) = &mut self.original {
             original.clear();
         }
@@ -1327,7 +1339,8 @@ impl SparseMatrix {
     }
 
     pub(crate) fn record_original(&mut self, enabled: bool) {
-        self.peak_stamp = super::StampPeak::EMPTY;
+        self.column_peaks.clear();
+        self.column_peaks.resize(self.cols, super::StampPeak::EMPTY);
         if enabled {
             self.original.get_or_insert_with(Vec::new).clear();
         } else {
@@ -1347,8 +1360,17 @@ impl SparseMatrix {
     }
 
     /// Cheap, conservative bound on the scale of the original products.
-    pub(crate) fn peak_stamp(&self) -> Real {
-        self.peak_stamp.value()
+    pub(crate) fn has_large_original_product(&self, solution: &Vector, threshold: Real) -> bool {
+        // Original contribution peaks, not folded cells, retain cancellation
+        // evidence; match each peak with the coordinate it actually multiplies.
+        debug_assert!(self.column_peaks.is_empty() || self.column_peaks.len() == solution.len());
+        self.column_peaks
+            .iter()
+            .zip(solution.as_slice())
+            .any(|(peak, value)| {
+                let coefficient = peak.value();
+                !coefficient.is_finite() || coefficient * value.abs() >= threshold
+            })
     }
 
     /// Compute b - A*x from individual original stamps. Sorting by equation
@@ -1580,6 +1602,42 @@ impl SparseMatrix {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn original_product_scale_uses_matching_coordinates_before_folding() {
+        use super::{Pattern, SparseMatrix};
+        use crate::maths::Vector;
+        use std::sync::Arc;
+        for bound in [false, true] {
+            let pattern = Arc::new(Pattern::new(2, [(0, 0), (1, 1)]).unwrap());
+            let mut matrix = if bound {
+                SparseMatrix::bound(Arc::clone(&pattern)).unwrap()
+            } else {
+                SparseMatrix::new(2, 2)
+            };
+            matrix.record_original(false);
+            let x = Vector::from_slice(&[1., 1e-9]);
+            matrix.add(0, 0, 1.).unwrap();
+            matrix.set(1, 1, 1e9).unwrap();
+            assert!(!matrix.has_large_original_product(&x, 1e3));
+            for stamp in [1e9, -1e9] {
+                if bound {
+                    matrix
+                        .add_element(pattern.find(0, 0).unwrap(), stamp)
+                        .unwrap();
+                } else {
+                    matrix.add(0, 0, stamp).unwrap();
+                }
+            }
+            matrix.fold_duplicates();
+            assert_eq!(matrix.get(0, 0), 1.);
+            assert!(matrix.has_large_original_product(&x, 1e3));
+            matrix.clear();
+            matrix.record_original(false);
+            matrix.add(1, 0, 1.).unwrap(); // overflow for bound matrix
+            assert!(!matrix.has_large_original_product(&x, 1e3));
+        }
+    }
 
     #[test]
     fn original_stamp_ledger_survives_assembly_and_physical_row_edits() {
@@ -2203,6 +2261,23 @@ mod tests {
         assert!(other.lend_fixed(fixed, 1).unwrap().is_none());
         other.begin_device(0).unwrap();
         assert!(!other.add_fixed(&[1.0, 2.0]));
+    }
+
+    #[test]
+    fn fixed_batch_product_scale_tracks_columns_and_excludes_ground() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (1, 1)]).unwrap());
+        let stamps = [(1, 1, 1e9), (0, 0, 1.)];
+        // The middle contribution has no actual matrix coordinate.
+        let values = [1e9, 1e16, 1.];
+        let (_, _, fixed) = fixed_load(&pattern, FixedStamps::default(), &stamps, 0b101, &values);
+        let (_, _, fixed) = fixed_load(&pattern, fixed, &stamps, 0b101, &values);
+        let mut matrix = SparseMatrix::bound(pattern).unwrap();
+        matrix.record_original(false);
+        assert!(matrix.lend_fixed(fixed, 1).unwrap().is_none());
+        matrix.begin_device(0).unwrap();
+        assert!(matrix.add_fixed(&values));
+        assert!(!matrix.has_large_original_product(&Vector::from_slice(&[1., 1e-9]), 1e3));
+        assert!(matrix.has_large_original_product(&Vector::from_slice(&[1., 1.]), 1e3));
     }
 
     #[test]

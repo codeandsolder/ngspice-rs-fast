@@ -365,11 +365,61 @@ pub(super) enum CircuitLoad<'a, 'p> {
         context: &'a ModelContext,
         history: &'a StateHistory,
         forcing: Option<Forcing>,
+        explicit_bias: bool,
     },
     Transient {
         attempt: &'a mut PreparedTransient<'p>,
         uic: bool,
     },
+}
+
+/// One immutable binding of a Newton load's physical context and history.
+/// Only a transient attempt lends its separate disposable workspace.
+struct BoundCircuitLoad<'a, 'p> {
+    prepared: &'a PreparedRun<'a>,
+    context: &'a ModelContext,
+    history: &'a StateHistory,
+    forcing: Option<Forcing>,
+    time: Real,
+    integration: Option<&'a crate::maths::Coefficients>,
+    uic: Option<bool>,
+    explicit_bias: bool,
+    attempt: Option<&'a mut PreparedTransient<'p>>,
+}
+
+impl<'p> CircuitLoad<'_, 'p> {
+    const fn bind(&mut self) -> BoundCircuitLoad<'_, 'p> {
+        match self {
+            Self::Bias {
+                prepared,
+                context,
+                history,
+                forcing,
+                explicit_bias,
+            } => BoundCircuitLoad {
+                prepared,
+                context,
+                history,
+                forcing: *forcing,
+                time: 0.,
+                integration: None,
+                uic: None,
+                explicit_bias: *explicit_bias,
+                attempt: None,
+            },
+            Self::Transient { attempt, uic } => BoundCircuitLoad {
+                prepared: attempt.run(),
+                context: attempt.context(),
+                history: attempt.history(),
+                forcing: None,
+                time: attempt.time(),
+                integration: Some(attempt.coefficients()),
+                uic: Some(*uic),
+                explicit_bias: false,
+                attempt: Some(&mut **attempt),
+            },
+        }
+    }
 }
 
 /// The shared device-backed Newton driver. Each iteration creates its trial
@@ -397,27 +447,17 @@ impl CircuitNewton<'_, '_> {
     ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
         // Both stamping and convergence read the same attempt-bound model
         // and accepted history, with no second caller-supplied identity.
-        let (prepared, context, history, forcing, time, integration, uic, mut attempt) =
-            match &mut self.load {
-                CircuitLoad::Bias {
-                    prepared,
-                    context,
-                    history,
-                    forcing,
-                } => (
-                    *prepared, *context, *history, *forcing, 0., None, None, None,
-                ),
-                CircuitLoad::Transient { attempt, uic } => (
-                    attempt.run(),
-                    attempt.context(),
-                    attempt.history(),
-                    None,
-                    attempt.time(),
-                    Some(attempt.coefficients()),
-                    Some(*uic),
-                    Some(&mut **attempt),
-                ),
-            };
+        let BoundCircuitLoad {
+            prepared,
+            context,
+            history,
+            forcing,
+            time,
+            integration,
+            uic,
+            explicit_bias,
+            mut attempt,
+        } = self.load.bind();
         let circuit = prepared.circuit();
         let nodal_regularization = circuit.regularization_nodes();
         let gmin = self.options.diag_gmin;
@@ -448,7 +488,12 @@ impl CircuitNewton<'_, '_> {
                 let mut trial = history
                     .trial_in_reusing(phase, previous, spare)?
                     .with_device_limiting(options.limiting.is_device())
-                    .with_convergence_tolerances(options.reltol, options.abstol);
+                    .with_convergence_tolerances(options.reltol, options.abstol)
+                    .with_prepared_exact(
+                        explicit_bias
+                            || (options.had_nodeset
+                                && matches!(phase, IterationPhase::Junction | IterationPhase::Fix)),
+                    );
                 if let Some(uic) = uic {
                     trial = trial
                         .with_initial_transient(
@@ -936,28 +981,18 @@ impl Correction {
     }
 }
 
-/// A conservative roundoff envelope (eight binary64 epsilons) on the
-/// scale of the largest original stamped product or RHS term. This is
-/// only a trigger for a physical correction, never a singularity test.
-/// No row traversal, exact sums or factorization are required here.
+/// A roundoff envelope on the scale of the original stamped products and
+/// RHS terms. Compare the coefficient with the coordinate it actually
+/// multiplies: a large auxiliary coefficient and an unrelated voltage do
+/// not imply cancellation in any physical equation.
 fn correction_risk(
     matrix: &SparseMatrix,
     rhs: &Vector,
     values: &Vector,
     options: &NewtonOptions,
 ) -> bool {
-    let roundoff = 8. * Real::EPSILON;
-    let source = roundoff * rhs.peak_stamp();
-    if source >= options.abstol {
-        return true;
-    }
-    let coefficient = roundoff * matrix.peak_stamp();
-    // The solution has already passed the finite check. Integer magnitude
-    // reduction avoids a serial floating-point max and NaN handling.
-    let largest = values.as_slice().iter().fold(0_u64, |peak, value| {
-        peak.max(value.to_bits() & i64::MAX.cast_unsigned())
-    });
-    coefficient * Real::from_bits(largest) >= options.abstol
+    let threshold = options.abstol / (8. * Real::EPSILON);
+    rhs.peak_stamp() >= threshold || matrix.has_large_original_product(values, threshold)
 }
 
 /// [`StepLimiting::Global`]: scale the step so no watched nodal voltage moves

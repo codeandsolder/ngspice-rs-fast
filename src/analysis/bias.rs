@@ -1409,6 +1409,15 @@ impl Engine<'_> {
         }
     }
 
+    fn explicit_bias(&self) -> bool {
+        !self.nodes.initial.is_empty()
+            || self.context.bias_analysis.is_some_and(|analysis| {
+                self.prepared
+                    .circuit()
+                    .has_explicit_bias_constraints(analysis)
+            })
+    }
+
     /// One disposable Newton solve of the typed stage; charges the budget.
     /// `continued` is the preceding stage's converged trial, if any.
     fn stage(
@@ -1475,6 +1484,7 @@ impl Engine<'_> {
                 context: &context,
                 history: self.history,
                 forcing: self.forcing,
+                explicit_bias: self.explicit_bias(),
             },
             workspace: &mut self.workspace,
         }
