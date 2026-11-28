@@ -155,6 +155,7 @@ fn descriptor(charge: Capability) -> Descriptor {
         charge,
         noise: Capability::Computed,
         trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
+        taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
     }
 }
 
@@ -948,6 +949,7 @@ fn electrothermal_descriptor() -> Descriptor {
         charge: Capability::Computed,
         noise: Capability::Zero,
         trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
+        taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
     }
 }
 
@@ -1223,10 +1225,15 @@ fn actual_vdmos_artifact_binds_hidden_rows_solves_and_reprepares_candidates() {
         .count();
     assert!(hidden >= 3);
     assert_eq!(circuit.unknown_count(), 3 * (hidden + 4));
-    assert_eq!(
-        circuit.state_len(),
-        3 * 2 * model.descriptor().equations.len()
+    // The accepted VDMOS artifact now owns its trial-limiting policy. Each
+    // occurrence has two storage-history slots per equation, plus the full
+    // previous trial coordinate vector and its validity marker.
+    let width = model.descriptor().equations.len();
+    assert_ne!(
+        model.descriptor().trial,
+        model_kernel_api::trial::TrialCapabilities::ENGINE
     );
+    assert_eq!(circuit.state_len(), 3 * (2 * width + width + 1));
     let context = ModelContext::default();
     let options = NewtonOptions {
         reltol: 1e-10,

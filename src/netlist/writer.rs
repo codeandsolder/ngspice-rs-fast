@@ -872,7 +872,9 @@ impl Writer<'_> {
                     }
                     append_named_value(&mut parts, parameter, true)?;
                 }
-                ParameterKind::Expression(_) if parameter.name == "level" => {
+                ParameterKind::Expression(_)
+                    if parameter.name == "level" && base != "ltspice_diode" =>
+                {
                     return Err(refuse("expression-valued model level", Some(location)));
                 }
                 _ => append_named_value(&mut parts, parameter, false)?,
@@ -2097,7 +2099,8 @@ fn transistor_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> Spice
     let designator = device.designator;
     let scalars: &[&str] = match designator {
         'd' => &[
-            "pj", "area", "w", "l", "m", "ic", "temp", "dtemp", "lm", "lp", "wm", "wp",
+            "pj", "perim", "area", "w", "l", "m", "n", "d", "ic", "temp", "dtemp", "lm", "lp",
+            "wm", "wp",
         ],
         'q' => &[
             "area", "areab", "areac", "m", "icvbe", "icvce", "temp", "dtemp",
