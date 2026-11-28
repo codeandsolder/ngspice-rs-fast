@@ -108,18 +108,18 @@ petgraph = "0.8.3"
 [dependencies]
 winnow.workspace = true
 petgraph.workspace = true
-model-kernel-api = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
-model-normalize-ngspice = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
-model-kernel-diode = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
-model-preprocess-command = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
-model-statistics = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
+model-kernel-api = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "ce6d20fe2a59df3e1bc4a6f738d5312cd3625b71" }
+model-normalize-ngspice = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "ce6d20fe2a59df3e1bc4a6f738d5312cd3625b71" }
+model-kernel-diode = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "ce6d20fe2a59df3e1bc4a6f738d5312cd3625b71" }
+model-preprocess-command = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "ce6d20fe2a59df3e1bc4a6f738d5312cd3625b71" }
+model-statistics = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "ce6d20fe2a59df3e1bc4a6f738d5312cd3625b71" }
 sha2 = "0.11"
 anyhow = "1"
 
 [dev-dependencies]
 ngspice-conformance = { path = "conformance/support" }
-model-kernel-vdmos = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
-ngspice-rs-preprocess = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
+model-kernel-vdmos = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "ce6d20fe2a59df3e1bc4a6f738d5312cd3625b71" }
+ngspice-rs-preprocess = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "ce6d20fe2a59df3e1bc4a6f738d5312cd3625b71" }
 tempfile = "3"
 
 [workspace.lints.rust]
