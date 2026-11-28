@@ -202,11 +202,7 @@ impl PassiveInitialization {
         if !context.mode.is_bias() {
             return None;
         }
-        self.constraint(context.bias_analysis?)
-    }
-
-    pub(super) fn constraint(&self, analysis: AnalysisKind) -> Option<PassiveBias> {
-        self.bias.get(&analysis).copied()
+        self.bias.get(&context.bias_analysis?).copied()
     }
 
     /// Bias-only capacitor current or voltage relation; keep a reserved

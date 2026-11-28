@@ -9,7 +9,7 @@ use crate::devices::{
     linear::LinearContext,
     noise::{DeviceNoise, NoiseContext, NoiseSource},
     nonlinear::charge::ChargeBranch,
-    passive_bias::{self, PassiveBias, PassiveInitialization},
+    passive_bias::{self, PassiveInitialization},
     physical_dae::TaylorContext,
     schema::{
         ScalarDomain as D, ScalarParameter, ScalarSchema, ScalarUnit as U, ScalarValues,
@@ -522,46 +522,14 @@ impl Device for PolynomialDevice {
     }
 
     fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        // With no integration the owned branch equation is linear (whether
+        // physical DC or an analysis-selected bias constraint). Only the
+        // nonlinear storage companion requires a device Newton check.
+        let Some(integration) = context.integration else {
+            return Ok(false);
+        };
         let rows = self.rows(context.unknowns, context.branch)?;
         let x = rows.coordinate(context.solution)?;
-        let constraint = if context.integration.is_none() {
-            context.model_context.bias_analysis.and_then(|analysis| {
-                self.bias
-                    .as_ref()
-                    .and_then(|bias| bias.constraint(analysis))
-            })
-        } else {
-            None
-        };
-        if let Some(constraint) = constraint {
-            let voltage = context.voltage(self.terminals[0]) - context.voltage(self.terminals[1]);
-            let current = context
-                .solution
-                .get(rows.branch)
-                .ok_or_else(|| SpiceError::circuit("missing polynomial branch current"))?;
-            let (actual, expected, absolute) = match constraint {
-                PassiveBias::Voltage {
-                    voltage: target,
-                    conductance: None,
-                } => (voltage, target, context.vntol),
-                PassiveBias::Voltage {
-                    voltage: target,
-                    conductance: Some(g),
-                } => (current, g * (voltage - target), context.abstol),
-                PassiveBias::Current {
-                    current: target,
-                    conductance,
-                } => (
-                    current,
-                    conductance.mul_add(voltage, target),
-                    context.abstol,
-                ),
-            };
-            return Ok((actual - expected).abs()
-                > context
-                    .reltol
-                    .mul_add(actual.abs().max(expected.abs()), absolute));
-        }
         let point = self.prepared.at(x)?;
         let actual = match self.recipe.kind {
             Kind::Capacitor => context
@@ -576,18 +544,13 @@ impl Device for PolynomialDevice {
             Kind::Capacitor => context.abstol,
             Kind::Inductor => context.vntol,
         };
-        let (expected, rounding) = if let Some(integration) = context.integration {
-            let storage = ChargeBranch::new(0, point.stored, 1.);
-            let companion =
-                storage.companion(integration, |age, slot| context.accepted(age, slot))?;
-            let roundoff = (8. * Real::EPSILON * companion.conductance.abs()).mul_add(
-                point.stored.abs(),
-                8. * Real::EPSILON * companion.current.abs(),
-            );
-            (companion.derivative, roundoff)
-        } else {
-            (0., 0.)
-        };
+        let storage = ChargeBranch::new(0, point.stored, 1.);
+        let companion = storage.companion(integration, |age, slot| context.accepted(age, slot))?;
+        let expected = companion.derivative;
+        let rounding = (8. * Real::EPSILON * companion.conductance.abs()).mul_add(
+            point.stored.abs(),
+            8. * Real::EPSILON * companion.current.abs(),
+        );
         Ok((actual - expected).abs()
             > context
                 .reltol
