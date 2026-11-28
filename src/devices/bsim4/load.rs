@@ -22,7 +22,7 @@
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{LoadCkt, mode, state};
 use crate::devices::bsim_physics::{
-    depletion_charge, positive_half_sum, smooth_drain, smooth_positive,
+    SaturationRoot, depletion_charge, smooth_drain, smooth_positive,
 };
 use crate::maths::taylor::arithmetic::Constitutive;
 use crate::primitives::SpiceResult;
@@ -79,27 +79,6 @@ fn DEXP<S: Constitutive>(argument: S) -> (S, S) {
     } else {
         let exponential = argument.exp();
         (exponential.clone(), exponential)
-    }
-}
-
-/// Smaller physical saturation root of a*y²/2 - b*y + c = 0.
-struct SaturationRoot {
-    value: f64,
-    discriminant_root: f64,
-}
-
-impl SaturationRoot {
-    fn new(a: f64, b: f64, c: f64) -> Self {
-        let discriminant_root = (-2. * a).mul_add(c, b * b).sqrt();
-        Self {
-            value: 2. * c / (b + discriminant_root),
-            discriminant_root,
-        }
-    }
-
-    fn derivative(&self, da: f64, db: f64, dc: f64) -> f64 {
-        let y = self.value;
-        (0.5 * y * y).mul_add(da, (-y).mul_add(db, dc)) / self.discriminant_root
     }
 }
 

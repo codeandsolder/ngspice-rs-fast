@@ -26,8 +26,8 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use crate::devices::bsim_physics::{
-    ChargeChain, JunctionCapacitance, channel_inversion, depletion, depletion_charge, overlap,
-    smooth_positive,
+    ChargeChain, JunctionCapacitance, channel_inversion, charge_overdrive, depletion,
+    depletion_charge, overlap, smooth_drain, smooth_positive,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -271,17 +271,10 @@ impl ChargeModel<'_> {
         };
 
         let link = 1.0e-3 * tox;
-        // C reuses V3/V4/T1 here, after the Vfb-eff computation.
-        let v3 = ldeb - tcen - link;
-        let v4 = (4.0 * link).mul_add(ldeb, v3 * v3).sqrt();
-        let tcen = if ldeb > 0.0 && tcen >= 0.0 {
-            tcen * (2.0 * (ldeb / (ldeb + tcen + link + v4)))
-        } else {
-            ldeb - Real::midpoint(v3, v4)
-        };
-        let t1 = Real::midpoint(1.0, v3 / v4);
-        dtcen_dvg *= t1;
-        dtcen_dvb *= t1;
+        let centroid = smooth_drain(ldeb, tcen, link)?;
+        let tcen = centroid.effective;
+        dtcen_dvg *= centroid.drain_partial;
+        dtcen_dvb *= centroid.drain_partial;
 
         let ccen = EPS_SI / tcen;
         let t2 = cox / (cox + ccen);
@@ -314,29 +307,8 @@ impl ChargeModel<'_> {
             -t2 * (dvfbeff_dvb + dvbseff_cv_dvb + dvgsteff_dvb),
         );
 
-        // Gate-bias-dependent surface potential (C's "Delta Phis").
-        let (denomi, t0) = if k1ox <= 0.0 {
-            (0.25 * p.binned.moin * cv.vtm, 0.5 * p.derived.sqrtphi)
-        } else {
-            (
-                p.binned.moin * cv.vtm * k1ox * k1ox,
-                k1ox * p.derived.sqrtphi,
-            )
-        };
-        let t1 = 2.0f64.mul_add(t0, vgsteff);
-        let delta_phi = cv.vtm * (t1 * vgsteff / denomi).ln_1p();
-        let ddelta_phi_dvg = 2.0 * cv.vtm * (t1 - t0) / f64::mul_add(t1, vgsteff, denomi);
-
-        // Effective gate overdrive, `VgDP`.
-        let t0 = vgsteff - delta_phi - 0.001;
-        let dt0_dvg = 1.0 - ddelta_phi_dvg;
-        let t1 = f64::mul_add(vgsteff, 0.004, t0 * t0).sqrt();
-        let vgdp = if t0 < 0.0 {
-            0.002 * vgsteff / (t1 - t0)
-        } else {
-            Real::midpoint(t0, t1)
-        };
-        let dvgdp_dvg = f64::midpoint(dt0_dvg, t0.mul_add(dt0_dvg, 0.002) / t1);
+        let (vgdp, dvgdp_dvg) =
+            charge_overdrive(vgsteff, k1ox, p.binned.moin, cv.vtm, p.derived.sqrtphi)?;
 
         // Bias-dependent channel thickness for the inversion charge.
         let t3 = 4.0 * (cv.vth - vfbzb - cv.phi);
@@ -378,44 +350,11 @@ impl ChargeModel<'_> {
         let abulk_cv = cv.abulk0 * p.thermal.abulkcvfactor;
         let dabulk_cv_dvb = p.thermal.abulkcvfactor * cv.d_abulk0_dvb;
         let vdsat_cv = vgdp / abulk_cv;
-        let t0 = vdsat_cv - vds_mode - DELTA_4;
-        let dt0_dvg = dvgdp_dvg / abulk_cv;
-        let dt0_dvb = -vdsat_cv * dabulk_cv_dvb / abulk_cv;
-        let t1 = (4.0 * DELTA_4).mul_add(vdsat_cv, t0 * t0).sqrt();
-        let dt1_dvg0 = (t0 + DELTA_4 + DELTA_4) / t1;
-        let dt1_dvd = -t0 / t1;
-        let dt1_dvb0 = dt1_dvg0 * dt0_dvb;
-        let dt1_dvg = dt1_dvg0 * dt0_dvg;
-        let (mut vdseff_cv, mut dvdseff_cv_dvg, dvdseff_cv_dvd, mut dvdseff_cv_dvb) = if t0 >= 0.0 {
-            (
-                if vdsat_cv > 0.0 {
-                    vds_mode * (2.0 * (vdsat_cv / (vdsat_cv + vds_mode + DELTA_4 + t1)))
-                } else {
-                    vdsat_cv - Real::midpoint(t0, t1)
-                },
-                0.5 * (dt0_dvg - dt1_dvg),
-                0.5 * (1.0 - dt1_dvd),
-                0.5 * (dt0_dvb - dt1_dvb0),
-            )
-        } else {
-            let twice_delta = DELTA_4 + DELTA_4;
-            let t3 = twice_delta / (t1 - t0);
-            let t4 = 1.0 - t3;
-            let t5 = vdsat_cv * t3 / (t1 - t0);
-            (
-                vdsat_cv * t4,
-                t5.mul_add(dt1_dvg - dt0_dvg, dt0_dvg * t4),
-                t5 * (dt1_dvd + 1.0),
-                t5.mul_add(dt1_dvb0, dt0_dvb * (1.0 - t5)),
-            )
-        };
-        // C zeroes VdseffCV's gate/body derivatives at Vds = 0 (not the drain
-        // one, which the published code leaves alone).
-        if vds_mode == 0.0 {
-            vdseff_cv = 0.0;
-            dvdseff_cv_dvg = 0.0;
-            dvdseff_cv_dvb = 0.0;
-        }
+        let smoothing = smooth_drain(vdsat_cv, vds_mode, DELTA_4)?;
+        let vdseff_cv = smoothing.effective;
+        let dvdseff_cv_dvg = smoothing.saturation_partial * dvgdp_dvg / abulk_cv;
+        let dvdseff_cv_dvd = smoothing.drain_partial;
+        let dvdseff_cv_dvb = -smoothing.saturation_partial * vdsat_cv * dabulk_cv_dvb / abulk_cv;
 
         let [inversion, bulk, source] = channel_inversion(
             &vgdp,

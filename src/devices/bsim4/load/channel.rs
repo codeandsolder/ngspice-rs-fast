@@ -1021,11 +1021,11 @@ pub(super) fn transport(
         dT2_dVg = EsatL + Vgst2Vtm * dEsatL_dVg + T6 * (4.0 + 2.0 * Vgst2Vtm * tmp2);
         dT2_dVb = Vgst2Vtm * (dEsatL_dVb + 2.0 * T6 * tmp3);
         dT2_dVd = Vgst2Vtm * dEsatL_dVd;
-        let root = SaturationRoot::new(T0, T1, T2);
+        let root = SaturationRoot::new(T0, T1, T2)?;
         Vdsat = root.value;
-        dVdsat_dVg = root.derivative(dT0_dVg, dT1_dVg, dT2_dVg);
-        dVdsat_dVd = root.derivative(dT0_dVd, dT1_dVd, dT2_dVd);
-        dVdsat_dVb = root.derivative(dT0_dVb, dT1_dVb, dT2_dVb);
+        dVdsat_dVg = root.derivative(&dT0_dVg, &dT1_dVg, &dT2_dVg)?;
+        dVdsat_dVd = root.derivative(&dT0_dVd, &dT1_dVd, &dT2_dVd)?;
+        dVdsat_dVb = root.derivative(&dT0_dVb, &dT1_dVb, &dT2_dVb)?;
     }
     here.vdsat = Vdsat;
     let smoothing = smooth_drain(Vdsat, Vds, pParam.delta)?;

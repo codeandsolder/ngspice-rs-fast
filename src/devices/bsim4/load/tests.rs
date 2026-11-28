@@ -592,7 +592,7 @@ fn saturation_quadratic_has_regular_linear_limit() {
     for a in [0., 1e-20, 1e-12, 0.1, -0.1] {
         let b = 1_f64;
         let c = 0.125_f64;
-        let root = super::SaturationRoot::new(a, b, c);
+        let root = super::SaturationRoot::new(a, b, c).unwrap();
         let y = root.value;
         assert!((0.5 * a * y * y - b * y + c).abs() < 4. * f64::EPSILON);
         if a.abs() < 1e-15 {
@@ -604,11 +604,12 @@ fn saturation_quadratic_has_regular_linear_limit() {
             let (expected, error) = richardson(
                 samples.map(|d| {
                     super::SaturationRoot::new(da.mul_add(d, a), db.mul_add(d, b), dc.mul_add(d, c))
+                        .unwrap()
                         .value
                 }),
                 h,
             );
-            let derivative = root.derivative(da, db, dc);
+            let derivative = root.derivative(&da, &db, &dc).unwrap();
             assert!((derivative - expected).abs() < 1e-9 * expected.abs() + error * 0.1 + 1e-12);
         }
     }

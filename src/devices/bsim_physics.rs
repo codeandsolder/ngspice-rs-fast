@@ -179,11 +179,20 @@ pub(super) fn smooth_drain<S: Constitutive>(
         .clone()
         .mul_add(&x, &saturation.clone().scale(4. * delta))
         .sqrt()?;
-    let effective = saturation
-        .clone()
-        .scale(2.)
-        .divide(&saturation.clone().add(&drain).offset(delta).add(&root))?
-        .multiply(&drain);
+    let denominator = saturation.clone().add(&drain).offset(delta).add(&root);
+    // Use the conjugate where its denominator is nonzero. Outside that
+    // numerical region the direct quadratic root is still the same law.
+    let effective = if denominator.primal() > 0. && delta >= 0. {
+        saturation
+            .clone()
+            .divide(&denominator)?
+            .scale(2.)
+            .multiply(&drain)
+    } else {
+        saturation
+            .clone()
+            .add(&x.clone().midpoint(&root).scale(-1.))
+    };
     let drain_excess = positive_half_sum(
         drain
             .clone()
@@ -199,6 +208,79 @@ pub(super) fn smooth_drain<S: Constitutive>(
         drain_partial: saturation_excess.divide(&root)?,
         drain_excess,
     })
+}
+
+/// Smaller root of a*y²/2 - b*y + c = 0, regular in the linear limit.
+pub(super) struct SaturationRoot<S> {
+    pub(super) value: S,
+    discriminant: S,
+}
+
+impl<S: Constitutive> SaturationRoot<S> {
+    pub(super) fn new(a: S, b: S, c: S) -> SpiceResult<Self> {
+        let discriminant = a
+            .clone()
+            .scale(-2.)
+            .mul_add(&c, &b.clone().multiply(&b))
+            .sqrt()?;
+        let value = if b.primal() > 0. {
+            c.divide(&b.add(&discriminant))?.scale(2.)
+        } else {
+            b.add(&discriminant.clone().scale(-1.)).divide(&a)?
+        };
+        Ok(Self {
+            value,
+            discriminant,
+        })
+    }
+
+    pub(super) fn derivative(&self, da: &S, db: &S, dc: &S) -> SpiceResult<S> {
+        let y = &self.value;
+        y.clone()
+            .scale(0.5)
+            .multiply(y)
+            .mul_add(da, &y.clone().scale(-1.).mul_add(db, dc))
+            .divide(&self.discriminant)
+    }
+}
+
+/// Charge-thickness effective overdrive and its gate partial. The smooth
+/// positive root also retains the dependence of its width on overdrive.
+pub(super) fn charge_overdrive<S: Constitutive>(
+    overdrive: S,
+    k1ox: Real,
+    moin: Real,
+    thermal: Real,
+    sqrt_phi: Real,
+) -> SpiceResult<(S, S)> {
+    let (denominator, surface) = if k1ox <= 0. {
+        (0.25 * moin * thermal, 0.5 * sqrt_phi)
+    } else {
+        (moin * thermal * k1ox * k1ox, k1ox * sqrt_phi)
+    };
+    let product = overdrive.clone().offset(2. * surface).multiply(&overdrive);
+    let delta_phi = product
+        .clone()
+        .divide(&overdrive.constant(denominator))?
+        .ln_1p()?
+        .scale(thermal);
+    let delta_phi_slope = overdrive
+        .clone()
+        .offset(surface)
+        .scale(2. * thermal)
+        .divide(&product.offset(denominator))?;
+    let argument = overdrive.clone().add(&delta_phi.scale(-1.)).offset(-0.001);
+    let root = argument
+        .clone()
+        .mul_add(&argument, &overdrive.clone().scale(0.004))
+        .sqrt()?;
+    let value = positive_half_sum(argument, root.clone(), overdrive.scale(0.001))?;
+    let slope = delta_phi_slope
+        .scale(-1.)
+        .offset(1.)
+        .mul_add(&value, &value.constant(0.001))
+        .divide(&root)?;
+    Ok((value, slope))
 }
 
 /// Normalized bulk depletion charge, with its differential capacitance.
@@ -619,6 +701,53 @@ mod tests {
     }
 
     #[test]
+    fn saturation_and_charge_overdrive_preserve_higher_order_partials() -> SpiceResult<()> {
+        type Local = Differential<3>;
+        let rates = [0.01, -0.02, 0.005];
+        for a in [-0.1, 0., 0.1] {
+            let b = 1.;
+            let c = 0.125;
+            let root = SaturationRoot::new(
+                Local::variable(0, Jet::affine(ORDER, a, rates[0]))?,
+                Local::variable(1, Jet::affine(ORDER, b, rates[1]))?,
+                Local::variable(2, Jet::affine(ORDER, c, rates[2]))?,
+            )?;
+            for i in 0..3 {
+                let basis: [Local; 3] =
+                    std::array::from_fn(|j| Local::constant(ORDER, if i == j { 1. } else { 0. }));
+                let partial = root.derivative(&basis[0], &basis[1], &basis[2])?;
+                for (&actual, &expected) in root.value.gradient[i]
+                    .as_ref()
+                    .unwrap()
+                    .coefficients()
+                    .iter()
+                    .zip(partial.value.coefficients())
+                {
+                    close(actual, expected, 2e-15);
+                }
+            }
+            for time in [-0.02, 0.02] {
+                let x = value_at(&root.value.value, time);
+                let aa = rates[0].mul_add(time, a);
+                let bb = rates[1].mul_add(time, b);
+                let cc = rates[2].mul_add(time, c);
+                close(aa * x * x * 0.5 - bb * x + cc, 0., 3e-15);
+            }
+        }
+        for k1 in [0., 0.4] {
+            for (bias, rate) in [(1e-20, 1e-21), (0.001, 0.0001), (0.5, 0.01)] {
+                let (value, slope) = charge_overdrive(variable(bias, rate)?, k1, 15., 0.026, 0.8)?;
+                check_charge_gradient(&value, &slope);
+                let time = 0.02;
+                let (expected, _) =
+                    charge_overdrive(rate.mul_add(time, bias), k1, 15., 0.026, 0.8)?;
+                close(value_at(&value.value, time), expected, 1e-30);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn inversion_partitions_match_independent_charge_formulas_and_full_partial_germs()
     -> SpiceResult<()> {
         type Local = Differential<4>;
@@ -706,7 +835,7 @@ mod tests {
                     close(actual, expected, 3e-15);
                 }
             }
-            let reconstructed = law.effective.value.add(&law.drain_excess.value);
+            let reconstructed = law.effective.value.clone().add(&law.drain_excess.value);
             let reference = Jet::affine(ORDER, drain, dd);
             for (&actual, &expected) in reconstructed
                 .coefficients()

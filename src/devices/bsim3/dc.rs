@@ -21,7 +21,7 @@
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
-use crate::devices::bsim_physics::{bsim3_junction, poly_depletion};
+use crate::devices::bsim_physics::{SaturationRoot, bsim3_junction, poly_depletion, smooth_drain};
 use crate::primitives::{Real, SpiceResult};
 
 const EXP_THRESHOLD: Real = 34.0;
@@ -647,52 +647,25 @@ impl DcModel<'_> {
             );
             let dt2_dvb = vgst2vtm * (2.0 * t6).mul_add(tmp3v, desatl_dvb);
             let dt2_dvd = vgst2vtm * desatl_dvd;
-            let t3 = (2.0 * t0).mul_add(-t2v, t1v * t1v).sqrt();
-            // Root of t0*x² - 2*t1v*x + 2*t2v = 0. For t1v > 0
-            // the conjugate avoids subtracting nearly equal roots and
-            // remains valid in the linear (t0 == 0) limit. Differentiate
-            // the quadratic implicitly: its derivative denominator is
-            // the same discriminant root, not the small coefficient t0.
-            vdsat = if t1v > 0.0 {
-                2.0 * (t2v / (t1v + t3))
-            } else {
-                (t1v - t3) / t0
-            };
-            let half_square = 0.5 * vdsat * vdsat;
-            dvdsat_dvg = dt0_dvg.mul_add(half_square, dt1_dvg.mul_add(-vdsat, dt2_dvg)) / t3;
-            dvdsat_dvb = dt0_dvb.mul_add(half_square, dt1_dvb.mul_add(-vdsat, dt2_dvb)) / t3;
-            dvdsat_dvd = dt1_dvd.mul_add(-vdsat, dt2_dvd) / t3;
+            let root = SaturationRoot::new(t0, t1v, t2v)?;
+            vdsat = root.value;
+            dvdsat_dvg = root.derivative(&dt0_dvg, &dt1_dvg, &dt2_dvg)?;
+            dvdsat_dvb = root.derivative(&dt0_dvb, &dt1_dvb, &dt2_dvb)?;
+            dvdsat_dvd = root.derivative(&0., &dt1_dvd, &dt2_dvd)?;
         }
 
-        // Effective drain voltage.
-        let delta = p.binned.delta;
-        let t1d = vdsat - vds - delta;
-        let dt1_dvg = dvdsat_dvg;
-        let dt1_dvd = dvdsat_dvd - 1.0;
-        let dt1_dvb = dvdsat_dvb;
-        let t2d = (4.0 * delta).mul_add(vdsat, t1d * t1d).sqrt();
-        let t0d = t1d / t2d;
-        let t3d = 2.0 * delta / t2d;
-        let dt2_dvg = t3d.mul_add(dvdsat_dvg, t0d * dt1_dvg);
-        let dt2_dvd = t3d.mul_add(dvdsat_dvd, t0d * dt1_dvd);
-        let dt2_dvb = t3d.mul_add(dvdsat_dvb, t0d * dt1_dvb);
-        let (mut vdseff, dvdseff_dvg, dvdseff_dvb) = if vds == 0.0 {
-            (0.0, 0.0, 0.0)
+        let smoothing = smooth_drain(vdsat, vds, p.binned.delta)?;
+        let vdseff = if smoothing.effective > vds {
+            vds
         } else {
-            (
-                // Conjugate of vdsat - (t1d + t2d)/2. This retains
-                // first-order dependence on vds even far below an ulp
-                // of vdsat, in the physical positive-root region.
-                if vdsat > 0.0 && delta >= 0.0 {
-                    vds * (2.0 * (vdsat / (vdsat + vds + delta + t2d)))
-                } else {
-                    vdsat - Real::midpoint(t1d, t2d)
-                },
-                dvdsat_dvg - f64::midpoint(dt1_dvg, dt2_dvg),
-                dvdsat_dvb - f64::midpoint(dt1_dvb, dt2_dvb),
-            )
+            smoothing.effective
         };
-        let dvdseff_dvd = dvdsat_dvd - f64::midpoint(dt1_dvd, dt2_dvd);
+        let dvdseff_dvg = smoothing.saturation_partial * dvdsat_dvg;
+        let dvdseff_dvb = smoothing.saturation_partial * dvdsat_dvb;
+        let dvdseff_dvd = smoothing
+            .saturation_partial
+            .mul_add(dvdsat_dvd, smoothing.drain_partial);
+        let diff_vds = smoothing.drain_excess;
 
         // Early voltage: saturation, CLM and DIBL components.
         let tmp4v = 1.0 - 0.5 * abulk * vdsat / vgst2vtm;
@@ -721,10 +694,6 @@ impl DcModel<'_> {
         let dvasat_dvg = vasat.mul_add(-dt1_dvg, dt0_dvg) / t1e;
         let dvasat_dvb = vasat.mul_add(-dt1_dvb, dt0_dvb) / t1e;
         let dvasat_dvd = dt0_dvd / t1e;
-        if vdseff > vds {
-            vdseff = vds;
-        }
-        let diff_vds = vds - vdseff;
 
         let (vaclm, dvaclm_dvg, dvaclm_dvd, dvaclm_dvb) = if p.binned.pclm > 0.0
             && diff_vds > 1.0e-10
