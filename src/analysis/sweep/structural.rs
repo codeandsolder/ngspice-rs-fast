@@ -165,6 +165,7 @@ pub(in crate::analysis) fn run(
             result.push_point(&row)?;
             workspace.recycle_current(std::mem::replace(&mut previous, x));
             history = Some(next_history);
+            drop(solver);
             previous_circuit = Some(circuit);
         }
     }
