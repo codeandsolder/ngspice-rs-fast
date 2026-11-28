@@ -652,3 +652,67 @@ fn source_bound_sequential_timing_policies() -> SpiceResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn powered_digital_output_conductance_and_supply_current() -> SpiceResult<()> {
+    for (data, enable, strength, conflict, high, low) in [
+        (4, 4, 2, false, 0.01, 0.),
+        (0, 4, 2, false, 0., 0.02),
+        (4, 4, 1, false, 0.001, 0.),
+        (0, 4, 1, false, 0., 0.002),
+        (4, 4, 2, true, 0.002, 0.003),
+        (4, 0, 2, false, 0., 0.),
+    ] {
+        let conflicting_driver = if conflict {
+            "a4 %v[0] q opposite\n.model opposite preprocess_logic_event(operation=25)"
+        } else {
+            ""
+        };
+        let mut c = circuit(&format!(
+            "vhi hi 0 7\nvlo lo 0 -2\nvd data 0 {data}\nve en 0 {enable}\n\
+             a1 %v[data en] q tri\n.model tri preprocess_logic_event(operation=21 strength={strength})\n\
+             a2 q %gd(out hi) high\n.model high preprocess_logic_conductance(conductance=[0 .01 .002 0 .001 .0002 0])\n\
+             a3 q %gd(out lo) low\n.model low preprocess_logic_conductance(conductance=[.02 0 .003 .002 0 .0003 0])\n\
+             {conflicting_driver}\nrload out 0 1k"
+        ))?;
+        let expected = (7. * high - 2. * low) / (high + low + 0.001);
+        let plot = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+        close(output(&plot, 0), expected);
+        close(plot.value("i(vhi)", 0).unwrap().re, high * (expected - 7.));
+        close(plot.value("i(vlo)", 0).unwrap().re, low * (expected + 2.));
+    }
+    Ok(())
+}
+
+#[test]
+fn powered_output_reacts_to_strength_only_transitions() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 4\nve en 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 4u 0)\n\
+         a1 %v[data en] q tri\n.model tri preprocess_logic_event(operation=21)\n\
+         a2 %v[data] q pull\n.model pull preprocess_logic_event(operation=25 strength=1)\n\
+         a3 q %gd(out hi) drive\n.model drive preprocess_logic_conductance(conductance=[0 .01 0 0 .001 0 0])\n\
+         rload out 0 1k\ncload out 0 1n",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "4u", "0", "1n"])?;
+    let rise = 1.0015e-6;
+    let fall = 2.001e-6;
+    let strong = 5. * 0.01 / 0.011;
+    let weak = 2.5;
+    let at_fall = strong + (weak - strong) * (-0.011_f64 * (fall - rise) / 1e-9).exp();
+    for index in 0..plot.point_count() {
+        let time = plot.value("time", index).unwrap().re;
+        let expected = if time <= rise {
+            weak
+        } else if time <= fall {
+            strong + (weak - strong) * (-0.011 * (time - rise) / 1e-9).exp()
+        } else {
+            weak + (at_fall - weak) * (-0.002 * (time - fall) / 1e-9).exp()
+        };
+        assert!(
+            (output(&plot, index) - expected).abs() < 0.005,
+            "t={time:e}: {} != {expected}",
+            output(&plot, index)
+        );
+    }
+    Ok(())
+}

@@ -14,6 +14,8 @@ pub enum SourceModel {
     LogicEvent,
     /// Ideal digital-to-voltage bridge.
     LogicVoltage,
+    /// Digital drive-selected passive conductance.
+    LogicConductance,
     /// Timed conductance switch.
     TimedSwitch,
 }
@@ -100,6 +102,8 @@ impl SourceModel {
             Some(Self::LogicEvent)
         } else if base.eq_ignore_ascii_case("preprocess_logic_voltage") {
             Some(Self::LogicVoltage)
+        } else if base.eq_ignore_ascii_case("preprocess_logic_conductance") {
+            Some(Self::LogicConductance)
         } else if base.eq_ignore_ascii_case("preprocess_timed_switch") {
             Some(Self::TimedSwitch)
         } else {
@@ -122,6 +126,10 @@ impl SourceModel {
             PortSpec::new(Digital, EVENT, false, true),
             PortSpec::new(Voltage, ANALOG, false, false),
         ];
+        const CONDUCTANCE_PORTS: &[PortSpec] = &[
+            PortSpec::new(Digital, EVENT, false, true),
+            PortSpec::new(ConductanceDifferential, BRANCH, false, false),
+        ];
         const SWITCH_PORTS: &[PortSpec] = &[
             PortSpec::new(VoltageDifferential, ANALOG, false, false),
             PortSpec::new(ConductanceDifferential, BRANCH, false, false),
@@ -130,6 +138,7 @@ impl SourceModel {
             Self::RationalTransfer => TRANSFER_PORTS,
             Self::LogicEvent => LOGIC_PORTS,
             Self::LogicVoltage => VOLTAGE_PORTS,
+            Self::LogicConductance => CONDUCTANCE_PORTS,
             Self::TimedSwitch => SWITCH_PORTS,
         }
     }
@@ -157,6 +166,10 @@ impl SourceModel {
             },
             Self::LogicVoltage => match name {
                 "out_low" | "out_high" => Some(Real),
+                _ => None,
+            },
+            Self::LogicConductance => match name {
+                "conductance" => Some(RealVector),
                 _ => None,
             },
             Self::TimedSwitch => match name {
@@ -288,8 +301,11 @@ fn validate_value(
 
 use super::sequential_timing::TimingSpec;
 use super::source_logic::{AsyncPolicy, LogicKernel, Operation};
-use super::{Adc, DacConfig, DacPort, DacSource, DelayMode, Delays, Logic, Strength};
-use crate::analysis::digital::{AdcBinding, DacBinding, NativeTopology, NetId, Network};
+use super::{
+    Adc, AnalogOutputConfig, AnalogOutputDevice, ConductanceConfig, DacConfig, DelayMode, Delays,
+    Logic, OutputPort, Strength,
+};
+use crate::analysis::digital::{AdcBinding, AnalogOutputBinding, NativeTopology, NetId, Network};
 use crate::devices::circuit::ElaboratedDevice;
 use crate::devices::models::{PreparationKey, ResolvedModel};
 use crate::devices::{Device, ElaborationLimits};
@@ -548,10 +564,9 @@ impl Device for LogicReceiverDevice {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct NativeVoltageBinding {
+pub(crate) struct NativeOutputBinding {
     pub(crate) model: String,
     net: String,
-    config: DacConfig,
 }
 
 fn analog_pair(terminal: &CodeTerminal, nodes: &mut NodeAppend<'_>) -> SpiceResult<[NodeId; 2]> {
@@ -572,6 +587,20 @@ fn voltage_material(card: &ModelCard) -> SpiceResult<[Real; 2]> {
         }
     }
     Ok(rails)
+}
+
+fn conductance_material(card: &ModelCard) -> SpiceResult<[Real; 7]> {
+    SourceModel::LogicConductance.validate_parameters(card)?;
+    let [parameter] = card.parameters.as_slice() else {
+        return Err(SpiceError::circuit(
+            "logic conductance requires one seven-entry conductance table",
+        ));
+    };
+    let values = numeric_vector(parameter)?
+        .try_into()
+        .map_err(|_| SpiceError::circuit("logic conductance table requires seven entries"))?;
+    ConductanceConfig::new(values, false)?;
+    Ok(values)
 }
 
 pub(in crate::devices) fn instantiate(
@@ -599,30 +628,40 @@ pub(in crate::devices) fn instantiate(
                 inputs,
             }))
         }
-        SourceModel::LogicVoltage => {
-            let rails = model.prepare(PreparationKey::Inputs, || voltage_material(model.card()))?;
+        SourceModel::LogicVoltage | SourceModel::LogicConductance => {
             let [input, output] = instance.code_ports.as_slice() else {
-                return Err(SpiceError::circuit("logic voltage port count mismatch"));
+                return Err(SpiceError::circuit(
+                    "logic analog-output port count mismatch",
+                ));
             };
             let input = &input.terminals[0];
             let terminals = analog_pair(&output.terminals[0], nodes)?;
             if terminals[0] == terminals[1] {
-                return Err(SpiceError::circuit("shorted logic voltage output"));
+                return Err(SpiceError::circuit("shorted logic analog output"));
             }
-            let [low, high] = *rails;
-            let config = if input.inverted {
-                DacConfig::ideal(high, low)?
+            let config = if schema == SourceModel::LogicVoltage {
+                let rails =
+                    model.prepare(PreparationKey::Inputs, || voltage_material(model.card()))?;
+                let [low, high] = *rails;
+                AnalogOutputConfig::Voltage(if input.inverted {
+                    DacConfig::ideal(high, low)?
+                } else {
+                    DacConfig::ideal(low, high)?
+                })
             } else {
-                DacConfig::ideal(low, high)?
+                let values = model.prepare(PreparationKey::Inputs, || {
+                    conductance_material(model.card())
+                })?;
+                AnalogOutputConfig::Conductance(ConductanceConfig::new(*values, input.inverted)?)
             };
-            Ok(Box::new(DacSource {
+            Ok(Box::new(AnalogOutputDevice {
                 name: instance.name.clone(),
                 terminals,
-                port: DacPort::default(),
-                native: Some(NativeVoltageBinding {
+                port: OutputPort::default(),
+                config,
+                native: Some(NativeOutputBinding {
                     model: model.card().name.clone(),
                     net: input.positive.clone(),
-                    config,
                 }),
             }))
         }
@@ -718,29 +757,31 @@ pub(in crate::devices) fn mixed_topology(
         let any = device.as_ref() as &dyn std::any::Any;
         let receiver = any.downcast_ref::<LogicReceiverDevice>();
         let voltage = any
-            .downcast_ref::<DacSource>()
+            .downcast_ref::<AnalogOutputDevice>()
             .and_then(|device| device.native.as_ref().map(|binding| (device, binding)));
         if receiver.is_none() && voltage.is_none() {
             continue;
         }
-        let (network, names, adcs, dacs): &mut (
+        let (network, names, adcs, analog_outputs): &mut (
             Network,
             BTreeMap<String, NetId>,
             Vec<AdcBinding>,
-            Vec<DacBinding>,
+            Vec<AnalogOutputBinding>,
         ) = topology.get_or_insert_with(Default::default);
         if let Some(receiver) = receiver {
             bind_receiver(receiver, network, names, adcs, limits)?;
         }
         if let Some((device, binding)) = voltage {
             let net = digital_net(network, names, &binding.net, limits.nodes)?;
-            dacs.push(DacBinding {
+            analog_outputs.push(AnalogOutputBinding {
                 name: device.name.clone(),
                 net,
-                config: binding.config,
+                config: device.config,
                 port: device.port.clone(),
             });
         }
     }
-    Ok(topology.map(|(network, _, adcs, dacs)| NativeTopology::new(network, adcs, dacs)))
+    Ok(topology.map(|(network, _, adcs, analog_outputs)| {
+        NativeTopology::new(network, adcs, analog_outputs)
+    }))
 }

@@ -948,7 +948,9 @@ impl Trial<'_> {
 }
 
 use crate::devices::Circuit;
-use crate::devices::code_model::{Adc, DacConfig, DacPort, DacRamp, DacSource, Delays};
+use crate::devices::code_model::{
+    Adc, AnalogOutputConfig, AnalogOutputDevice, DacConfig, Delays, OutputPort, OutputRamp,
+};
 use crate::maths::Vector;
 use crate::primitives::NodeId;
 
@@ -968,11 +970,11 @@ pub struct AdcBinding {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DacBinding {
+pub(crate) struct AnalogOutputBinding {
     pub(crate) name: String,
     pub(crate) net: NetId,
-    pub(crate) config: DacConfig,
-    pub(crate) port: DacPort,
+    pub(crate) config: AnalogOutputConfig,
+    pub(crate) port: OutputPort,
 }
 
 /// Immutable source-bound topology. Each analysis receives a new event
@@ -981,15 +983,19 @@ pub(crate) struct DacBinding {
 pub(crate) struct NativeTopology {
     network: std::rc::Rc<Network>,
     adcs: Vec<AdcBinding>,
-    dacs: Vec<DacBinding>,
+    analog_outputs: Vec<AnalogOutputBinding>,
 }
 
 impl NativeTopology {
-    pub(crate) fn new(network: Network, adcs: Vec<AdcBinding>, dacs: Vec<DacBinding>) -> Self {
+    pub(crate) fn new(
+        network: Network,
+        adcs: Vec<AdcBinding>,
+        analog_outputs: Vec<AnalogOutputBinding>,
+    ) -> Self {
         Self {
             network: std::rc::Rc::new(network),
             adcs,
-            dacs,
+            analog_outputs,
         }
     }
 
@@ -999,7 +1005,7 @@ impl NativeTopology {
             Limits::default(),
         )?);
         mixed.adcs.clone_from(&self.adcs);
-        mixed.dacs.clone_from(&self.dacs);
+        mixed.analog_outputs.clone_from(&self.analog_outputs);
         Ok(mixed)
     }
 }
@@ -1010,7 +1016,7 @@ impl NativeTopology {
 pub struct MixedSignal {
     engine: Engine,
     adcs: Vec<AdcBinding>,
-    dacs: Vec<DacBinding>,
+    analog_outputs: Vec<AnalogOutputBinding>,
     previous: Option<(Time, Vec<Real>)>,
     changes: Vec<Change>,
     initial_backup: Option<State>,
@@ -1036,7 +1042,7 @@ pub(super) struct MixedPoint {
     time: Time,
     voltages: Vec<Real>,
     state: Option<State>,
-    ramps: Vec<DacRamp>,
+    ramps: Vec<OutputRamp>,
     changes: Vec<Change>,
     boundary: bool,
 }
@@ -1049,7 +1055,7 @@ impl MixedSignal {
         Self {
             engine,
             adcs: Vec::new(),
-            dacs: Vec::new(),
+            analog_outputs: Vec::new(),
             previous: None,
             changes: Vec::new(),
             initial_backup: None,
@@ -1113,17 +1119,18 @@ impl MixedSignal {
             return Err(SpiceError::circuit("DAC output terminals must differ"));
         }
         let name = name.into();
-        let port = DacPort::default();
-        circuit.add_device(Box::new(DacSource {
+        let port = OutputPort::default();
+        circuit.add_device(Box::new(AnalogOutputDevice {
             name: name.clone(),
             terminals,
             port: port.clone(),
+            config: AnalogOutputConfig::Voltage(config),
             native: None,
         }))?;
-        self.dacs.push(DacBinding {
+        self.analog_outputs.push(AnalogOutputBinding {
             name,
             net,
-            config,
+            config: AnalogOutputConfig::Voltage(config),
             port,
         });
         Ok(())
@@ -1147,36 +1154,41 @@ impl MixedSignal {
                 return Err(SpiceError::circuit("ADC terminal is not in the circuit"));
             }
         }
-        for dac in &self.dacs {
+        for binding in &self.analog_outputs {
             let device = circuit
-                .device(&dac.name)
-                .and_then(|device| (device as &dyn std::any::Any).downcast_ref::<DacSource>())
-                .ok_or_else(|| SpiceError::circuit("DAC device is missing from the circuit"))?;
-            if !device.port.same(&dac.port) {
+                .device(&binding.name)
+                .and_then(|device| {
+                    (device as &dyn std::any::Any).downcast_ref::<AnalogOutputDevice>()
+                })
+                .ok_or_else(|| {
+                    SpiceError::circuit("analog output device is missing from the circuit")
+                })?;
+            if !device.port.same(&binding.port) {
                 return Err(SpiceError::circuit(
-                    "DAC binding belongs to a different circuit",
+                    "analog output binding belongs to a different circuit",
                 ));
             }
         }
         let ramps = self
-            .dacs
+            .analog_outputs
             .iter()
-            .map(|dac| {
-                dac.config
-                    .target(self.engine.accepted.nets[dac.net.0].logic)
-                    .map(DacRamp::initial)
+            .map(|binding| {
+                binding
+                    .config
+                    .target(self.engine.accepted.nets[binding.net.0])
+                    .map(OutputRamp::initial)
             })
             .collect::<SpiceResult<Vec<_>>>()?;
         self.initial_backup = Some(self.engine.accepted.clone());
-        for (dac, ramp) in self.dacs.iter().zip(ramps) {
-            dac.port.set(Some(ramp));
+        for (binding, ramp) in self.analog_outputs.iter().zip(ramps) {
+            binding.port.set(Some(ramp));
         }
         Ok(())
     }
 
     pub(super) fn deactivate(&mut self) {
-        for dac in &self.dacs {
-            dac.port.set(None);
+        for binding in &self.analog_outputs {
+            binding.port.set(None);
         }
         if let Some(previous) = self.initial_backup.take() {
             self.engine.accepted = previous;
@@ -1245,8 +1257,8 @@ impl MixedSignal {
     /// Earliest end of an accepted DAC ramp.
     pub(super) fn next_ramp_boundary(&self, now: Real) -> SpiceResult<Option<Real>> {
         let mut next: Option<Real> = None;
-        for dac in &self.dacs {
-            if let Some(end) = dac.port.ramp()?.next_break(now) {
+        for binding in &self.analog_outputs {
+            if let Some(end) = binding.port.ramp()?.next_break(now) {
                 next = Some(next.map_or(end, |old| old.min(end)));
             }
         }
@@ -1257,7 +1269,7 @@ impl MixedSignal {
     /// change, rather than forcing an analog solve for every digital event.
     /// Reuse this state on acceptance if the analog endpoint is unchanged.
     pub(super) fn preview(&self, horizon: Real) -> SpiceResult<Option<EventPreview>> {
-        if self.dacs.is_empty()
+        if self.analog_outputs.is_empty()
             || (!self.engine.has_lookahead()
                 && self
                     .engine
@@ -1275,11 +1287,11 @@ impl MixedSignal {
             self.engine.limits,
             &mut changes,
             |trial| {
-                for dac in &self.dacs {
-                    let old = dac
+                for binding in &self.analog_outputs {
+                    let old = binding
                         .config
-                        .target(self.engine.accepted.nets[dac.net.0].logic)?;
-                    let new = dac.config.target(trial.nets[dac.net.0].logic)?;
+                        .target(self.engine.accepted.nets[binding.net.0])?;
+                    let new = binding.config.target(trial.nets[binding.net.0])?;
                     if old.to_bits() != new.to_bits() {
                         return Ok(true);
                     }
@@ -1343,11 +1355,16 @@ impl MixedSignal {
                 .engine
                 .next_event_time()
                 .is_some_and(|next| next <= time);
-        let ramp_boundary = self.dacs.iter().try_fold(false, |found, dac| {
-            let ramp = dac.port.ramp()?;
-            let previous = self.engine.time();
-            Ok::<_, SpiceError>(found || ramp.next_break(previous).is_some_and(|end| end <= time))
-        })?;
+        let ramp_boundary = self
+            .analog_outputs
+            .iter()
+            .try_fold(false, |found, binding| {
+                let ramp = binding.port.ramp()?;
+                let previous = self.engine.time();
+                Ok::<_, SpiceError>(
+                    found || ramp.next_break(previous).is_some_and(|end| end <= time),
+                )
+            })?;
         let mut point = MixedPoint {
             time: end,
             voltages,
@@ -1365,13 +1382,13 @@ impl MixedSignal {
         // Previews can discover tentative timing failures. Only the replay
         // with converged receiver values may prevent analog acceptance.
         state.check_acceptance()?;
-        for dac in &self.dacs {
-            let logic = state.nets[dac.net.0].logic;
-            let previous_ramp = dac.port.ramp()?;
+        for binding in &self.analog_outputs {
+            let drive = state.nets[binding.net.0];
+            let previous_ramp = binding.port.ramp()?;
             let ramp = if end == Time(0) {
-                DacRamp::initial(dac.config.target(logic)?)
+                OutputRamp::initial(binding.config.target(drive)?)
             } else {
-                dac.config.retarget(previous_ramp, time, logic)?
+                binding.config.retarget(previous_ramp, time, drive)?
             };
             point.boundary |= !ramp.same_target(previous_ramp);
             point.ramps.push(ramp);
@@ -1423,8 +1440,8 @@ impl MixedSignal {
     }
 
     pub(super) fn initial_changed(&self, point: &MixedPoint) -> SpiceResult<bool> {
-        for (dac, ramp) in self.dacs.iter().zip(&point.ramps) {
-            if dac.port.ramp()?.value(0.).to_bits() != ramp.value(0.).to_bits() {
+        for (binding, ramp) in self.analog_outputs.iter().zip(&point.ramps) {
+            if binding.port.ramp()?.value(0.).to_bits() != ramp.value(0.).to_bits() {
                 return Ok(true);
             }
         }
@@ -1434,17 +1451,20 @@ impl MixedSignal {
     /// Update the initial linear source RHS to match the current mixed bias
     /// candidate; the companion system's topology and A/E remain immutable.
     pub(super) fn initial_rhs(&self, circuit: &Circuit, rhs: &mut Vector) -> SpiceResult<()> {
-        for dac in &self.dacs {
+        for binding in &self.analog_outputs {
+            if !binding.config.is_voltage() {
+                continue;
+            }
             let index = circuit
                 .devices()
                 .iter()
-                .position(|device| device.name().eq_ignore_ascii_case(&dac.name))
+                .position(|device| device.name().eq_ignore_ascii_case(&binding.name))
                 .ok_or_else(|| SpiceError::circuit("missing DAC device"))?;
             let row = circuit
                 .branch_rows(index)
                 .and_then(|mut rows| rows.next())
                 .ok_or_else(|| SpiceError::circuit("missing DAC branch row"))?;
-            let value = dac.port.ramp()?.value(0.);
+            let value = binding.port.ramp()?.value(0.);
             let slot = rhs
                 .as_mut_slice()
                 .get_mut(row)
@@ -1457,8 +1477,8 @@ impl MixedSignal {
     pub(super) fn commit_point(&mut self, point: MixedPoint) {
         if let Some(state) = point.state {
             self.engine.accepted = state;
-            for (dac, ramp) in self.dacs.iter().zip(point.ramps) {
-                dac.port.set(Some(ramp));
+            for (binding, ramp) in self.analog_outputs.iter().zip(point.ramps) {
+                binding.port.set(Some(ramp));
             }
         } else if self.engine.accepted.time < point.time {
             self.engine.accepted.time = point.time;

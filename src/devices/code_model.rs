@@ -840,13 +840,18 @@ impl DacConfig {
         self.levels.target(logic)
     }
 
-    pub(crate) fn retarget(self, ramp: DacRamp, time: Real, logic: Logic) -> SpiceResult<DacRamp> {
+    pub(crate) fn retarget(
+        self,
+        ramp: OutputRamp,
+        time: Real,
+        logic: Logic,
+    ) -> SpiceResult<OutputRamp> {
         let target = self.target(logic)?;
         if ramp.target.to_bits() == target.to_bits() {
             return Ok(ramp);
         }
         let Some((slew, span)) = self.slew else {
-            return Ok(DacRamp {
+            return Ok(OutputRamp {
                 start: time,
                 end: time,
                 from: target,
@@ -862,7 +867,7 @@ impl DacConfig {
                 "DAC transition outside representable time range",
             ));
         }
-        Ok(DacRamp {
+        Ok(OutputRamp {
             start: time,
             end,
             from,
@@ -871,15 +876,92 @@ impl DacConfig {
     }
 }
 
+/// A passive output branch selected by the full resolved digital drive.
+/// Entry order: strong L/H/X, resistive L/H/X, high impedance. Explicit
+/// zero conductance is an open circuit, not a simulator-imposed leakage.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DacRamp {
+pub(crate) struct ConductanceConfig {
+    values: [Real; 7],
+    inverted: bool,
+}
+
+impl ConductanceConfig {
+    pub(crate) fn new(values: [Real; 7], inverted: bool) -> SpiceResult<Self> {
+        if values.iter().any(|value| !value.is_finite() || *value < 0.) {
+            return Err(SpiceError::circuit("invalid digital output conductance"));
+        }
+        Ok(Self { values, inverted })
+    }
+
+    fn target(self, drive: Drive) -> Real {
+        let logic = if self.inverted {
+            drive.logic.invert()
+        } else {
+            drive.logic
+        };
+        let index = match logic {
+            Logic::Zero => 0,
+            Logic::One => 1,
+            Logic::Unknown => 2,
+        };
+        self.values[match drive.strength {
+            Strength::Strong => index,
+            Strength::Resistive => 3 + index,
+            Strength::HighImpedance => 6,
+        }]
+    }
+}
+
+/// Shared scalar forcing port; voltage and conductance have different
+/// electrical stamps, but identical accepted event publication semantics.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AnalogOutputConfig {
+    Voltage(DacConfig),
+    Conductance(ConductanceConfig),
+}
+
+impl AnalogOutputConfig {
+    pub(crate) const fn is_voltage(self) -> bool {
+        matches!(self, Self::Voltage(_))
+    }
+
+    pub(crate) fn target(self, drive: Drive) -> SpiceResult<Real> {
+        match self {
+            Self::Voltage(config) => config.target(drive.logic),
+            Self::Conductance(config) => Ok(config.target(drive)),
+        }
+    }
+
+    pub(crate) fn retarget(
+        self,
+        ramp: OutputRamp,
+        time: Real,
+        drive: Drive,
+    ) -> SpiceResult<OutputRamp> {
+        match self {
+            Self::Voltage(config) => config.retarget(ramp, time, drive.logic),
+            Self::Conductance(config) => {
+                let target = config.target(drive);
+                Ok(OutputRamp {
+                    start: time,
+                    end: time,
+                    from: target,
+                    target,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutputRamp {
     start: Real,
     end: Real,
     from: Real,
     target: Real,
 }
 
-impl DacRamp {
+impl OutputRamp {
     pub(crate) const fn initial(target: Real) -> Self {
         Self {
             start: 0.,
@@ -916,17 +998,17 @@ impl DacRamp {
 /// The mixed-signal analysis owns this accepted forcing signal; stamps only
 /// read it. An unbound port cannot accidentally run as an ordinary source.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct DacPort(std::rc::Rc<std::cell::Cell<Option<DacRamp>>>);
+pub(crate) struct OutputPort(std::rc::Rc<std::cell::Cell<Option<OutputRamp>>>);
 
-impl DacPort {
-    pub(crate) fn set(&self, ramp: Option<DacRamp>) {
+impl OutputPort {
+    pub(crate) fn set(&self, ramp: Option<OutputRamp>) {
         self.0.set(ramp);
     }
 
-    pub(crate) fn ramp(&self) -> SpiceResult<DacRamp> {
-        self.0
-            .get()
-            .ok_or_else(|| SpiceError::circuit("DAC requires an active mixed-signal transient"))
+    pub(crate) fn ramp(&self) -> SpiceResult<OutputRamp> {
+        self.0.get().ok_or_else(|| {
+            SpiceError::circuit("analog output requires an active mixed-signal analysis")
+        })
     }
 
     pub(crate) fn same(&self, other: &Self) -> bool {
@@ -934,17 +1016,18 @@ impl DacPort {
     }
 }
 
-/// Ideal differential voltage output driven by the accepted DAC ramp.
-/// Constructed and bound by the analysis layer, not by the netlist parser.
+/// Differential analog voltage or passive conductance output, driven by
+/// the accepted mixed-signal forcing port.
 #[derive(Debug)]
-pub(crate) struct DacSource {
+pub(crate) struct AnalogOutputDevice {
     pub(crate) name: String,
     pub(crate) terminals: [crate::primitives::NodeId; 2],
-    pub(crate) port: DacPort,
-    pub(crate) native: Option<source::NativeVoltageBinding>,
+    pub(crate) port: OutputPort,
+    pub(crate) config: AnalogOutputConfig,
+    pub(crate) native: Option<source::NativeOutputBinding>,
 }
 
-impl crate::devices::Device for DacSource {
+impl crate::devices::Device for AnalogOutputDevice {
     fn model_name(&self) -> Option<&str> {
         self.native.as_ref().map(|binding| binding.model.as_str())
     }
@@ -958,10 +1041,16 @@ impl crate::devices::Device for DacSource {
         &self.terminals
     }
     fn branch_currents(&self) -> usize {
-        1
+        usize::from(self.config.is_voltage())
     }
     fn findable_branch(&self) -> Option<usize> {
-        Some(0)
+        self.config.is_voltage().then_some(0)
+    }
+    fn is_nonlinear(&self) -> bool {
+        !self.config.is_voltage()
+    }
+    fn limits_voltage_steps(&self) -> bool {
+        false
     }
     fn depends_on_time(&self) -> bool {
         true
@@ -971,18 +1060,26 @@ impl crate::devices::Device for DacSource {
         &self,
         _inductors_short: bool,
     ) -> Vec<crate::devices::InitialVoltageRelation> {
-        vec![crate::devices::InitialVoltageRelation {
-            terminals: self.terminals,
-            law: crate::devices::InitialVoltageLaw::Source(0),
-        }]
+        if self.config.is_voltage() {
+            vec![crate::devices::InitialVoltageRelation {
+                terminals: self.terminals,
+                law: crate::devices::InitialVoltageLaw::Source(0),
+            }]
+        } else {
+            Vec::new()
+        }
     }
 
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        let branch = setup.branch(0)?;
-        setup.voltage_branch(self.terminals[0], self.terminals[1], branch);
+        if self.config.is_voltage() {
+            let branch = setup.branch(0)?;
+            setup.voltage_branch(self.terminals[0], self.terminals[1], branch);
+        } else {
+            setup.conductance(self.terminals[0], self.terminals[1]);
+        }
         Ok(true)
     }
 
@@ -990,14 +1087,29 @@ impl crate::devices::Device for DacSource {
         use crate::devices::traits::AnalysisMode;
         let ramp = self.port.ramp()?;
         let value = match context.mode {
-            AnalysisMode::OperatingPoint => ramp.value(0.) * context.source_factor,
-            AnalysisMode::Transient { time, .. } => ramp.value(time),
+            AnalysisMode::OperatingPoint => ramp.value(0.),
+            AnalysisMode::Transient { time, .. } | AnalysisMode::Instantaneous { time } => {
+                ramp.value(time)
+            }
             _ => {
                 return Err(SpiceError::not_yet_ported(
                     "DAC outside mixed-signal transient",
                     "src/xspice/icm/digital/dac_bridge/cfunc.mod",
                 ));
             }
+        };
+        if !self.config.is_voltage() {
+            return crate::devices::linear::nodal_stamp(
+                context.matrix,
+                context.unknowns,
+                self.terminals,
+                value,
+            );
+        }
+        let value = if matches!(context.mode, AnalysisMode::OperatingPoint) {
+            value * context.source_factor
+        } else {
+            value
         };
         let branch = context.branch(0)?;
         crate::devices::linear::branch_stamp(
@@ -1009,12 +1121,26 @@ impl crate::devices::Device for DacSource {
         context.rhs.add_to(branch, value)
     }
 
+    fn assemble_nonlinear_charge(
+        &self,
+        _context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        // The output branch is memoryless. Any electrical storage is an
+        // explicit circuit element attached to its physical terminals.
+        Ok(())
+    }
+
     fn assemble_linear(
         &self,
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
         use crate::devices::linear::{LinearSource, SourceRows, Waveform};
         use crate::primitives::Complex;
+        if !self.config.is_voltage() {
+            return Err(SpiceError::circuit(
+                "event-controlled conductance requires dynamic assembly",
+            ));
+        }
         let value = self.port.ramp()?.value(0.);
         let mut rows = SourceRows::new();
         rows.push(context.branch(self.terminals)?, 1.)?;

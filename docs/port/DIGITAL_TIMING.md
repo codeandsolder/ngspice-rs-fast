@@ -62,3 +62,18 @@ publish them; analog Newton retries cannot duplicate warnings. Successful
 mixed analyses expose them through `Circuit::last_digital_diagnostics` and
 batch/control output. These policies are generic: a source dialect may select
 one only after its own timing semantics have been independently established.
+
+## Physical output conductance
+
+`a1 q %gd(out supply) drive` with
+`.model drive preprocess_logic_conductance(conductance=[...])` selects
+one of seven nonnegative conductances in siemens from the resolved drive:
+strong L/H/X, resistive L/H/X, then Z. Inversion exchanges L and H within
+each strength; the X and Z entries remain unchanged. Zero is exactly open
+circuit. The branch stamps conductance between the specified physical
+terminals, not an ideal source or a ground-referenced voltage. Two such
+branches to real supply rails implement a powered push-pull stage with
+independent resistances. Ordinary R/C devices supply input loading,
+leakage and storage; supply currents follow Kirchhoff's laws. Accepted
+strength-only transitions are electrical breakpoints when their conductance
+differs. No DAC approximation or implicit pull resistor is used.
