@@ -307,6 +307,8 @@ impl SidedPwl {
                 || knots[0].time.abs().to_bits() != 0
                 || knots[knots.len() - 1].time >= r.period
                 || r.hold.is_some_and(|v| !v.is_finite())
+                || r.limit
+                    .is_some_and(|limit| !limit.time.is_finite() || !limit.value.is_finite())
             {
                 return Err(invalid("invalid repeating knot geometry"));
             }
@@ -387,7 +389,11 @@ impl SidedPwl {
     fn cycle_or_hold(&self, time: Real, limit: Limit) -> SpiceResult<CycleOrHold> {
         Ok(match self.repeat {
             Some(r) => {
-                if let Some(hold) = r.hold
+                if let Some(end) = r.limit
+                    && (time > end.time || (time == end.time && limit == Limit::Right))
+                {
+                    CycleOrHold::Hold(end.value)
+                } else if let Some(hold) = r.hold
                     && (time < r.origin || (time == r.origin && limit == Limit::Left))
                 {
                     CycleOrHold::Hold(hold)
@@ -515,6 +521,19 @@ impl SidedPwl {
     }
 
     fn events(&self, start: Real, end: Real) -> SpiceResult<PwlEvents> {
+        let cutoff = self.repeat.and_then(|r| r.limit).map(|limit| limit.time);
+        let termination = cutoff.filter(|time| (start..=end).contains(time));
+        let end = cutoff.map_or(end, |time| end.min(time));
+        if cutoff.is_some_and(|time| time <= start) {
+            return Ok(PwlEvents {
+                pwl: self.clone(),
+                cycle: 0.,
+                index: 0,
+                end,
+                done: true,
+                cutoff: termination,
+            });
+        }
         let (cycle, done) = match self.repeat {
             Some(r) if r.hold.is_some() && end < r.origin => (0., true),
             Some(r) => {
@@ -523,7 +542,12 @@ impl SidedPwl {
                 } else {
                     self.cycle_at(start, r)?
                 };
-                let last = self.cycle_at(end, r)?;
+                let last_time = if termination.is_some() {
+                    end.next_down().max(start)
+                } else {
+                    end
+                };
+                let last = self.cycle_at(last_time, r)?;
                 // Each endpoint cycle has been checked exactly if necessary.
                 // For an arbitrarily long window require a uniform proof:
                 // iterating all intervening cycles would destroy laziness.
@@ -545,6 +569,7 @@ impl SidedPwl {
             index,
             end,
             done,
+            cutoff: termination,
         })
     }
 }
@@ -589,12 +614,13 @@ struct PwlEvents {
     index: usize,
     end: Real,
     done: bool,
+    cutoff: Option<Real>,
 }
 
 impl PwlEvents {
     fn next_time(&mut self) -> Option<Real> {
         if self.done {
-            return None;
+            return self.cutoff.take();
         }
         if self.index == self.pwl.knots.len() {
             if self.pwl.repeat.is_none() {
@@ -605,9 +631,9 @@ impl PwlEvents {
             self.index = 0;
         }
         let time = self.pwl.time_at(self.cycle, self.index);
-        if time > self.end {
+        if time > self.end || self.cutoff.is_some_and(|cutoff| time >= cutoff) {
             self.done = true;
-            return None;
+            return self.cutoff.take();
         }
         self.index += 1;
         Some(time)

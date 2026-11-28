@@ -73,6 +73,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
                 origin,
                 period: 1.,
                 hold: None,
+                limit: None,
             }),
             0.,
             if origin < 0. { 3. } else { 5. },
@@ -98,6 +99,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
             origin: 0.25,
             period: 1.,
             hold: Some(-3.),
+            limit: None,
         }),
         -3.,
         -3.,
@@ -403,6 +405,7 @@ fn rounded_periodic_knots_cannot_silently_collapse() {
             origin,
             period,
             hold: None,
+            limit: None,
         }),
         0.,
         0.,
@@ -445,6 +448,7 @@ fn prepared_repeat_jets_follow_previous_cycle_and_startup_hold() {
                 origin: -0.25,
                 period: 1.,
                 hold,
+                limit: None,
             }),
             0.,
             8.,
@@ -783,6 +787,7 @@ fn prepared_periodic_jets_agree_with_every_generated_interval_at_wide_time_scale
                     origin,
                     period,
                     hold: None,
+                    limit: None,
                 }),
                 0.,
                 if origin < 0. {
@@ -884,4 +889,35 @@ fn explicit_exponential_fall_before_rise_is_not_reordered() {
     let wave = Waveform::Prepared(prepared);
     assert_eq!(wave.taylor_at(1., 1., 1, Limit::Left).unwrap(), [1., 0.]);
     assert_eq!(wave.taylor_at(1., 1., 1, Limit::Right).unwrap(), [1., -2.]);
+}
+
+#[test]
+fn finite_repeat_cutoff_has_one_sided_limits_and_exact_event() {
+    use model_normalize_ngspice::waveform::RepeatLimit;
+    let wave = pwl(
+        vec![knot(0., 0., 0.), knot(0.5, 2., 2.)],
+        Some(Repeat {
+            origin: 0.,
+            period: 1.,
+            hold: None,
+            limit: Some(RepeatLimit {
+                time: 2.5,
+                value: -1.,
+            }),
+        }),
+        0.,
+        0.,
+    );
+    close(wave.value_at(2.5, Limit::Left).unwrap(), 2., 0.);
+    close(wave.value_at(2.5, Limit::Right).unwrap(), -1., 0.);
+    close(wave.value_at(1e100, Limit::Right).unwrap(), -1., 0.);
+    let events = |start, end| {
+        wave.breakpoints_in(start, end)
+            .unwrap()
+            .map(|event| event.time)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(events(0., 1e100), [0., 0.5, 1., 1.5, 2., 2.5]);
+    assert_eq!(events(2.5, 2.5), [2.5]);
+    assert!(events(1e50, 1e100).is_empty());
 }

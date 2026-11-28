@@ -419,3 +419,101 @@ fn physical_noise_matches_independent_native_dc_measurements() {
         }
     }
 }
+
+#[test]
+#[ignore = "opt-in prepared BSIM physical-load benchmark; timing is not an assertion"]
+fn legacy_bsim_tile_load_throughput() {
+    use ngspice_rs::devices::{AnalysisMode, LoadRequest};
+    use ngspice_rs::maths::Vector;
+    use std::{fmt::Write, hint::black_box, time::Instant};
+
+    const LANES: usize = 128;
+    const LOADS: u32 = 200;
+    for (level, family) in [(4, FAMILY1), (5, FAMILY2)] {
+        let build = |shared: bool| {
+            let mut deck = String::from("legacy BSIM load benchmark\n");
+            for lane in 0..LANES {
+                let model = if shared {
+                    "mm".to_owned()
+                } else {
+                    format!("mm{lane}")
+                };
+                if !shared || lane == 0 {
+                    writeln!(deck, ".model {model} nmos(level={level} {MODEL} {family})").unwrap();
+                }
+                writeln!(deck, "vd{lane} d{lane} 0 .8\nvg{lane} g{lane} 0 2\nvb{lane} b{lane} 0 -.2\nm{lane} d{lane} g{lane} 0 b{lane} {model} {GEOMETRY}").unwrap();
+            }
+            deck.push_str(".end\n");
+            let netlist = parse(&deck);
+            let start = Instant::now();
+            let circuit = Circuit::from_netlist_with_context(&netlist, &context()).unwrap();
+            eprintln!(
+                "level={level} shared={shared} binding={:?}",
+                start.elapsed()
+            );
+            circuit
+        };
+        let tiled = build(true);
+        let scalar = build(false);
+        let measure = |circuit: &Circuit| {
+            let context = context();
+            let solution = solve_dc(circuit, &context, &options(), &[], None, None)
+                .unwrap()
+                .values;
+            let run = circuit.prepare_run();
+            let history = circuit.state_history().unwrap();
+            let mut trial = history.trial();
+            let mut matrix = circuit.new_matrix().unwrap();
+            let mut rhs = Vector::zeros(circuit.unknown_count());
+            let request = LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &solution,
+                model_context: &context,
+                integration: None,
+                history: &history,
+                forcing: None,
+            };
+            run.load(&request, &mut matrix, &mut rhs, &mut trial)
+                .unwrap();
+            let start = Instant::now();
+            for _ in 0..LOADS {
+                matrix.clear();
+                rhs.clear();
+                run.load(&request, &mut matrix, &mut rhs, &mut trial)
+                    .unwrap();
+                black_box((&matrix, &rhs));
+            }
+            let elapsed = start.elapsed().as_secs_f64() * 1e6 / f64::from(LOADS);
+            let snapshot: Vec<_> = matrix
+                .bound_values()
+                .unwrap()
+                .1
+                .iter()
+                .chain(rhs.as_slice())
+                .map(|value| value.to_bits())
+                .collect();
+            (elapsed, snapshot)
+        };
+        let mut tiles = Vec::new();
+        let mut scalars = Vec::new();
+        for round in 0..8 {
+            let ((a, x), (b, y)) = if round % 2 == 0 {
+                (measure(&tiled), measure(&scalar))
+            } else {
+                let b = measure(&scalar);
+                (measure(&tiled), b)
+            };
+            assert_eq!(x, y);
+            if round > 0 {
+                tiles.push(a);
+                scalars.push(b);
+            }
+        }
+        tiles.sort_by(f64::total_cmp);
+        scalars.sort_by(f64::total_cmp);
+        eprintln!(
+            "BSIM level {level}: {LANES} lanes; tiled {:.3} us/load, scalar {:.3} us/load",
+            tiles[3], scalars[3]
+        );
+    }
+}

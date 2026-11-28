@@ -155,6 +155,7 @@ fn descriptor(charge: Capability) -> Descriptor {
         charge,
         noise: Capability::Computed,
         trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
+        taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
     }
 }
 
@@ -948,6 +949,7 @@ fn electrothermal_descriptor() -> Descriptor {
         charge: Capability::Computed,
         noise: Capability::Zero,
         trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
+        taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
     }
 }
 
