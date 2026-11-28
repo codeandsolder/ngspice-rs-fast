@@ -172,13 +172,14 @@ pub(super) fn intrinsic_constitutive<S: Constitutive>(
         surface.scale(-1.).offset(p.phi)
     };
     let [qgate, qbulk, qdrn] = if model.capMod == 0 {
-        let [gate, bulk, drain] = cap_zero(
+        let surface = root.scale(p.k1ox);
+        let parts = cap_zero(
             &CapZeroBias {
-                gate,
-                body_cv,
-                surface: root.scale(p.k1ox),
-                drain,
-                bulk_factor: bulk,
+                gate: gate.value.clone(),
+                body_cv: body_cv.value.clone(),
+                surface: surface.value.clone(),
+                drain: drain.value.clone(),
+                bulk_factor: bulk.value.clone(),
             },
             CapZeroParameters {
                 flatband: p.vfbcv,
@@ -188,7 +189,7 @@ pub(super) fn intrinsic_constitutive<S: Constitutive>(
                 partition: model.xpart,
             },
         )?;
-        [gate.value, bulk.value, drain.value]
+        parts.map(|part| part.into_local([&gate, &body_cv, &surface, &drain, &bulk]))
     } else {
         let vgst = Local::new(
             electro.Vgst.clone(),
@@ -266,17 +267,18 @@ pub(super) fn intrinsic_constitutive<S: Constitutive>(
         let saturation = inversion_overdrive.clone().divide(&bulk)?;
         let effective = smooth_drain(saturation, drain, DELTA_4)?.effective;
         let [inversion, bulk, source] = channel_inversion(
-            &inversion_overdrive,
-            &effective,
-            &bulk,
-            &inversion_area,
+            &inversion_overdrive.value,
+            &effective.value,
+            &bulk.value,
+            &inversion_area.value,
             model.xpart,
             1e-20,
-        )?;
+        )?
+        .map(|part| part.into_local([&inversion_overdrive, &effective, &bulk, &inversion_area]));
         let accumulated = accumulation.add(&depletion);
-        let qbulk = bulk.value.add(&accumulated.scale(-1.));
-        let qgate = inversion.value.clone().add(&qbulk.clone().scale(-1.));
-        let qdrn = inversion.value.add(&source.value).scale(-1.);
+        let qbulk = bulk.add(&accumulated.scale(-1.));
+        let qgate = inversion.clone().add(&qbulk.clone().scale(-1.));
+        let qdrn = inversion.add(&source).scale(-1.);
         [qgate, qbulk, qdrn]
     };
     let [gg, gd, gb] = qgate.partials;

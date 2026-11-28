@@ -1160,31 +1160,6 @@ pub(super) struct LocalPart<S, const N: usize = 3> {
     partials: [S; N],
 }
 
-/// The scalar load's existing local-coordinate derivatives. Oxide area
-/// changes in proportion to effective oxide capacitance.
-pub(super) struct ChargeChain {
-    pub(super) overdrive: [Real; 3],
-    pub(super) drain: [Real; 3],
-    pub(super) bulk: [Real; 3],
-    pub(super) relative_oxide: [Real; 3],
-}
-
-impl ChargeChain {
-    pub(super) fn apply<S: Constitutive>(&self, part: &LocalPart<S>) -> [Real; 3] {
-        std::array::from_fn(|i| {
-            part.partials[0].primal().mul_add(
-                self.overdrive[i],
-                part.partials[1].primal().mul_add(
-                    self.drain[i],
-                    part.partials[2]
-                        .primal()
-                        .mul_add(self.bulk[i], part.value.primal() * self.relative_oxide[i]),
-                ),
-            )
-        })
-    }
-}
-
 /// Conservative channel inversion, bulk and source charges in reference
 /// orientation, before accumulation/depletion, overlap or junction terms.
 /// The 50/50 source fraction is half the inversion charge, not half the
@@ -1197,7 +1172,7 @@ pub(super) fn channel_inversion<S: Constitutive>(
     oxide_area: &S,
     partition: Real,
     regularization: Real,
-) -> SpiceResult<[LocalPart<S>; 3]> {
+) -> SpiceResult<[LocalPart<S, 4>; 3]> {
     let one = overdrive.constant(1.);
     let weighted_drain = bulk.clone().multiply(drain);
     let width = weighted_drain
@@ -1217,8 +1192,13 @@ pub(super) fn channel_inversion<S: Constitutive>(
         .add(&edge.clone().scale(-1.));
     let inversion_value = weighted_drain.clone().scale(-1.).mul_add(&edge, overdrive);
     let part = |value: S, du: S, dd: S, da: S| LocalPart {
-        value: value.multiply(oxide_area),
-        partials: [du, dd, da].map(|derivative| derivative.multiply(oxide_area)),
+        value: value.clone().multiply(oxide_area),
+        partials: [
+            du.multiply(oxide_area),
+            dd.multiply(oxide_area),
+            da.multiply(oxide_area),
+            value,
+        ],
     };
     let inversion = part(
         inversion_value.clone(),
@@ -1320,7 +1300,7 @@ impl<S: Constitutive, const N: usize> LocalPart<S, N> {
 
 impl<S: Constitutive, const N: usize> LocalPart<S, N> {
     /// Project the independent constitutive partials onto terminal biases.
-    pub(super) fn project(&self, coordinates: &[[Real; 3]; N]) -> [Real; 3] {
+    pub(super) fn project<const M: usize>(&self, coordinates: &[[Real; M]; N]) -> [Real; M] {
         std::array::from_fn(|column| {
             self.partials
                 .iter()
@@ -1329,6 +1309,19 @@ impl<S: Constitutive, const N: usize> LocalPart<S, N> {
                     partial.primal().mul_add(direction[column], sum)
                 })
         })
+    }
+}
+
+impl<S: Constitutive, const N: usize> LocalPart<S, N> {
+    /// Compose reference-local first derivatives with an outer coordinate
+    /// basis while retaining the shared constitutive value unchanged.
+    #[inline]
+    pub(super) fn into_local<const M: usize>(
+        self,
+        inputs: [&crate::maths::taylor::Local<S, M>; N],
+    ) -> crate::maths::taylor::Local<S, M> {
+        let partials = self.project(&inputs.map(|input| input.partials));
+        crate::maths::taylor::Local::new(self.value, partials)
     }
 }
 
@@ -1406,8 +1399,8 @@ pub(super) fn cap_zero<S: Constitutive>(
         partition,
         0.,
     )?;
-    let project = |part: LocalPart<S>| {
-        let [gate, drain, factor] = part.partials;
+    let project = |part: LocalPart<S, 4>| {
+        let [gate, drain, factor, _oxide] = part.partials;
         let surface = gate.clone().scale(-1.);
         LocalPart {
             value: part.value,

@@ -579,7 +579,14 @@ pub(super) fn transport_constitutive<S: Constitutive>(
     here.EsatL = field.primal();
     let drive = gate.clone().offset(2. * vtm);
     let (shape, _) = saturation_shape(&gate, p.a1, p.a2)?;
-    let saturation = saturation_voltage(&drive, &bulk, &field, &resistance_product, &shape)?.value;
+    let saturation = saturation_voltage(
+        &drive.value,
+        &bulk.value,
+        &field.value,
+        &resistance_product.value,
+        &shape.value,
+    )?
+    .into_local([&drive, &bulk, &field, &resistance_product, &shape]);
     here.vdsat = saturation.primal();
     let smoothing = smooth_drain(saturation.clone(), drain.clone(), p.delta)?;
     let effective = smoothing.effective;
@@ -602,15 +609,22 @@ pub(super) fn transport_constitutive<S: Constitutive>(
         here.EsatL = field.primal();
     }
     let vasat = saturation_early_voltage(
+        &gate.value,
+        &bulk.value,
+        &saturation.value,
+        &field.value,
+        &resistance_product.value,
+        &shape.value,
+        vtm,
+    )?
+    .into_local([
         &gate,
         &bulk,
         &saturation,
         &field,
         &resistance_product,
         &shape,
-        vtm,
-    )?
-    .value;
+    ]);
     let centroid_argument = gate
         .clone()
         .offset(here.vtfbphi2)
@@ -622,8 +636,16 @@ pub(super) fn transport_constitutive<S: Constitutive>(
     let oxide_width = oxide.clone().multiply(&width).scale(leff.recip());
     let beta = mobility.multiply(&oxide_width);
     here.AbovVgst2Vtm = bulk.primal() / drive.primal();
-    let gche = channel_conductance(&gate, &bulk, &effective, &field, &beta, vtm)?.value;
-    let idl = series_conductance(&gche, &rds)?.value;
+    let gche = channel_conductance(
+        &gate.value,
+        &bulk.value,
+        &effective.value,
+        &field.value,
+        &beta.value,
+        vtm,
+    )?
+    .into_local([&gate, &bulk, &effective, &field, &beta]);
+    let idl = series_conductance(&gche.value, &rds.value)?.into_local([&gche, &rds]);
     let fp = if p.fprout <= 0. {
         c(1.)
     } else {
@@ -646,9 +668,16 @@ pub(super) fn transport_constitutive<S: Constitutive>(
         (c(MAX_EXP), c(MAX_EXP))
     };
     let vadibl = if p.thetaRout > MIN_EXP {
-        dibl_early_voltage(&drive, &bulk, &saturation, &body, p.thetaRout, p.pdiblb)?
-            .value
-            .multiply(&pvag)
+        dibl_early_voltage(
+            &drive.value,
+            &bulk.value,
+            &saturation.value,
+            &body.value,
+            p.thetaRout,
+            p.pdiblb,
+        )?
+        .into_local([&drive, &bulk, &saturation, &body])
+        .multiply(&pvag)
     } else {
         c(MAX_EXP)
     };

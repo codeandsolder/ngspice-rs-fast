@@ -26,8 +26,8 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use crate::devices::bsim_physics::{
-    ChargeChain, JunctionCapacitance, channel_inversion, charge_overdrive, depletion,
-    depletion_charge, overlap, smooth_drain, smooth_positive, thermal_softplus,
+    JunctionCapacitance, channel_inversion, charge_overdrive, depletion, depletion_charge, overlap,
+    smooth_drain, smooth_positive, thermal_softplus,
 };
 use crate::maths::taylor::Constitutive;
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -374,20 +374,19 @@ impl ChargeModel<'_> {
             m.values.xpart.value,
             1e-20,
         )?;
-        let chain = ChargeChain {
-            overdrive: [dvgsteff_dvg, dvgsteff_dvd, dvgsteff_dvb].map(|slope| dvgdp_dvg * slope),
-            drain: [
+        let coordinates = [
+            [dvgsteff_dvg, dvgsteff_dvd, dvgsteff_dvb].map(|slope| dvgdp_dvg * slope),
+            [
                 dvdseff_cv_dvg * dvgsteff_dvg,
                 dvdseff_cv_dvg.mul_add(dvgsteff_dvd, dvdseff_cv_dvd),
                 dvdseff_cv_dvg.mul_add(dvgsteff_dvb, dvdseff_cv_dvb),
             ],
-            bulk: [0., 0., dabulk_cv_dvb],
-            relative_oxide: [dcoxeff_dvg, dcoxeff_dvd, dcoxeff_dvb]
-                .map(|slope| slope / coxeff.primal()),
-        };
-        let [cgg1, cgd1, cgb1] = chain.apply(&inversion);
-        let [cbg1, cbd1, cbb1] = chain.apply(&bulk);
-        let [csg, csd, mut csb] = chain.apply(&source);
+            [0., 0., dabulk_cv_dvb],
+            [dcoxeff_dvg, dcoxeff_dvd, dcoxeff_dvb].map(|slope| area * slope),
+        ];
+        let [cgg1, cgd1, cgb1] = inversion.project(&coordinates);
+        let [cbg1, cbd1, cbb1] = bulk.project(&coordinates);
+        let [csg, csd, mut csb] = source.project(&coordinates);
         let qgate = inversion.value;
         let qinoi = qgate.clone();
         let qbulk = bulk.value;
