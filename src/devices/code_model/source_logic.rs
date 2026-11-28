@@ -77,7 +77,7 @@ impl ClockedKind {
         }
     }
 
-    fn capture(self, inputs: &[Drive], previous: Logic) -> SpiceResult<Logic> {
+    pub(super) fn capture(self, inputs: &[Drive], previous: Logic) -> SpiceResult<Logic> {
         match (self, inputs) {
             (Self::Sr, [set, reset, _]) => {
                 Ok(SrPolicy::HoldOnEqual.next(set.logic, reset.logic, previous))
@@ -110,7 +110,13 @@ pub(super) enum Edge {
 }
 
 impl Edge {
-    fn capture(self, before: Logic, after: Logic, previous: Logic, captured: Logic) -> Logic {
+    pub(super) fn capture(
+        self,
+        before: Logic,
+        after: Logic,
+        previous: Logic,
+        captured: Logic,
+    ) -> Logic {
         // No observed change is not an edge, including a timer wakeup
         // while a receiver remains unknown.
         if before == after {
@@ -231,7 +237,7 @@ pub(super) struct AsyncPolicy {
 }
 
 impl AsyncPolicy {
-    fn resolve(self, preset: Logic, clear: Logic, normal: Logic) -> Logic {
+    pub(super) fn resolve(self, preset: Logic, clear: Logic, normal: Logic) -> Logic {
         consensus(possible(preset).iter().flat_map(|&preset| {
             possible(clear).iter().map(move |&clear| {
                 match (preset == self.preset, clear == self.clear) {

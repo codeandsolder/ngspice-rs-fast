@@ -71,17 +71,28 @@ impl EventDiagnostic {
 impl std::fmt::Display for EventDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.detail {
-            DiagnosticDetail::Timing(detail) => write!(
-                f,
-                "{}: {} violation at t={:e} (delta {}): input {} interval {:e} < required {:e}",
-                self.model,
-                detail.kind,
-                self.time,
-                self.delta,
-                detail.input + 1,
-                detail.elapsed,
-                detail.minimum
-            ),
+            DiagnosticDetail::Timing(detail) => {
+                let possible = if detail.certainty == super::timing::Certainty::PossibleViolation {
+                    "possible "
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "{}: {possible}{} violation at t={:e} (delta {}): input {} interval ",
+                    self.model,
+                    detail.kind,
+                    self.time,
+                    self.delta,
+                    detail.input + 1
+                )?;
+                if detail.elapsed == detail.maximum_elapsed {
+                    write!(f, "{:e}", detail.elapsed)?;
+                } else {
+                    write!(f, "[{:e},{:e}]", detail.elapsed, detail.maximum_elapsed)?;
+                }
+                write!(f, " < required {:e}", detail.minimum)
+            }
             DiagnosticDetail::CumulativeAmbiguity {
                 earlier,
                 later,
@@ -206,6 +217,8 @@ mod tests {
                 kind: "setup",
                 input: 0,
                 elapsed: 0.,
+                maximum_elapsed: 0.,
+                certainty: super::super::timing::Certainty::DefiniteViolation,
                 minimum: 1.,
             }),
         };

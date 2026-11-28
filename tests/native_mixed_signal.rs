@@ -928,3 +928,36 @@ fn ordered_receiver_gap_diagnostics_and_nearest_midpoint_are_transactional() -> 
     assert!(c.last_digital_diagnostics().is_empty());
     Ok(())
 }
+
+#[test]
+fn deck_bound_causal_clock_cancels_common_path_uncertainty() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::timing::Certainty;
+    for (setup, policy, expected, classification) in [
+        (9, 2, 5., None),
+        (11, 2, 5., Some(Certainty::PossibleViolation)),
+        (11, 1, 2.5, Some(Certainty::PossibleViolation)),
+        (51, 2, 5., Some(Certainty::DefiniteViolation)),
+    ] {
+        let mut c = circuit(&format!(
+            "vd data 0 PWL(0 0 1u 0 1002n 4 2u 4)\n\
+             a0 %v[data] root common\n.model common preprocess_logic_event(operation=25 delay_windows=[15n 30n 15n 30n])\n\
+             a1 %d[root] d data_delay\n.model data_delay preprocess_logic_event(operation=25 delay_windows=[10n 30n 10n 30n])\n\
+             a2 %d[root] clk clock_delay\n.model clock_delay preprocess_logic_event(operation=25 delay_windows=[40n 60n 40n 60n])\n\
+             a3 %d[d clk] q ff\n.model ff preprocess_logic_event(operation=11 delay_windows=[1n 2n 1n 2n] timing_setup=[{setup}n] timing_violation={policy})\n\
+             a4 q out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+        ))?;
+        let plot = run(&mut c, AnalysisKind::Transient, &["1n", "2u", "0", "5n"])?;
+        close(output(&plot, plot.point_count() - 1), expected);
+        let diagnostics = c.last_digital_diagnostics();
+        if let Some(classification) = classification {
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            let timing = diagnostics[0].timing().expect("timing diagnostic");
+            assert_eq!((timing.kind, timing.certainty), ("setup", classification));
+            assert!((timing.elapsed - 10e-9).abs() < 1e-18);
+            assert!((timing.maximum_elapsed - 50e-9).abs() < 1e-18);
+        } else {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+    }
+    Ok(())
+}

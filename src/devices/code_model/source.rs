@@ -682,10 +682,11 @@ impl LogicMaterial {
         let operation = Operation::from_value(self.operation, inputs, self.asynchronous)?;
         self.causal.validate(operation)?;
         let timing = self.timing.bind(operation, inputs)?;
-        if self.windows.is_some() && (!matches!(operation, Operation::Gate(_)) || timing.is_some())
+        if self.windows.is_some()
+            && !matches!(operation, Operation::Gate(_) | Operation::Clocked { .. })
         {
             return Err(SpiceError::circuit(
-                "causal arrival windows require a combinational gate",
+                "causal arrival windows require a combinational gate or clocked storage",
             ));
         }
         let kernel = LogicKernel {
@@ -1088,12 +1089,20 @@ fn bind_receiver(
         windows = windows.map(|w| w.with_load(load)).transpose()?;
     }
     if let Some(windows) = windows {
-        let Operation::Gate(kind) = kernel.operation else {
-            return Err(SpiceError::circuit("causal window gate binding mismatch"));
-        };
-        let model = super::WindowGate::new(kind, inputs.len(), windows)?
-            .with_binding(kernel.strength, kernel.invert);
-        network.add_named_model(&device.name, model, &inputs, &[output])
+        match kernel.operation {
+            Operation::Gate(kind) => {
+                let model = super::WindowGate::new(kind, inputs.len(), windows)?
+                    .with_binding(kernel.strength, kernel.invert);
+                network.add_named_model(&device.name, model, &inputs, &[output])
+            }
+            Operation::Clocked { .. } => network.add_named_model(
+                &device.name,
+                super::window_clocked::WindowClocked::new(kernel, windows)?,
+                &inputs,
+                &[output],
+            ),
+            _ => Err(SpiceError::circuit("causal window logic binding mismatch")),
+        }
     } else {
         network.add_named_model(&device.name, kernel, &inputs, &[output])
     }

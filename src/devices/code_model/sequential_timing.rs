@@ -131,16 +131,16 @@ impl TimingSpec {
 
 #[derive(Clone, Debug)]
 pub(super) struct TimingContract {
-    inputs: usize,
-    clock: usize,
-    edge: Edge,
-    asynchronous: Option<AsyncPolicy>,
-    setup: Vec<Real>,
-    hold: Vec<Real>,
-    clock_min: [Real; 2],
-    async_min: [Real; 2],
-    recovery: [Real; 2],
-    policy: ViolationPolicy,
+    pub(super) inputs: usize,
+    pub(super) clock: usize,
+    pub(super) edge: Edge,
+    pub(super) asynchronous: Option<AsyncPolicy>,
+    pub(super) setup: Vec<Real>,
+    pub(super) hold: Vec<Real>,
+    pub(super) clock_min: [Real; 2],
+    pub(super) async_min: [Real; 2],
+    pub(super) recovery: [Real; 2],
+    pub(super) policy: ViolationPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -170,12 +170,14 @@ fn check(
             kind,
             input,
             elapsed: now - previous,
+            maximum_elapsed: now - previous,
+            certainty: crate::analysis::digital::timing::Certainty::DefiniteViolation,
             minimum,
         });
     }
 }
 
-fn may_trigger(edge: Edge, before: Logic, after: Logic) -> bool {
+pub(super) fn may_trigger(edge: Edge, before: Logic, after: Logic) -> bool {
     if before == after {
         return false;
     }

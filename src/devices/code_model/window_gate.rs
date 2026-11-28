@@ -42,6 +42,50 @@ impl WindowDelays {
         }
     }
 
+    pub(super) fn exact(delays: Delays) -> SpiceResult<Self> {
+        let exact = |value| DelayWindow::new(value, value);
+        Ok(if let Some(p) = delays.impedance {
+            Self::paths([
+                exact(delays.rise)?,
+                exact(delays.fall)?,
+                exact(p.low_to_z)?,
+                exact(p.high_to_z)?,
+                exact(p.z_to_low)?,
+                exact(p.z_to_high)?,
+            ])
+        } else {
+            Self::binary(exact(delays.rise)?, exact(delays.fall)?)
+        })
+    }
+
+    pub(super) fn latest(self, other: Self) -> SpiceResult<Self> {
+        let latest = |a: DelayWindow, b: DelayWindow| {
+            DelayWindow::new(
+                a.bounds().minimum().max(b.bounds().minimum()),
+                a.bounds().maximum().max(b.bounds().maximum()),
+            )
+        };
+        let impedance = match (self.impedance, other.impedance) {
+            (Some(a), Some(b)) => Some([
+                latest(a[0], b[0])?,
+                latest(a[1], b[1])?,
+                latest(a[2], b[2])?,
+                latest(a[3], b[3])?,
+            ]),
+            (None, None) => None,
+            _ => {
+                return Err(SpiceError::circuit(
+                    "incompatible causal propagation path dimensions",
+                ));
+            }
+        };
+        Ok(Self {
+            rise: latest(self.rise, other.rise)?,
+            fall: latest(self.fall, other.fall)?,
+            impedance,
+        })
+    }
+
     fn envelope(a: DelayWindow, b: DelayWindow) -> SpiceResult<DelayWindow> {
         DelayWindow::new(
             a.bounds().minimum().min(b.bounds().minimum()),
@@ -49,7 +93,7 @@ impl WindowDelays {
         )
     }
 
-    fn transition(self, from: Drive, to: Drive) -> SpiceResult<DelayWindow> {
+    pub(super) fn transition(self, from: Drive, to: Drive) -> SpiceResult<DelayWindow> {
         if let Some([lz, hz, zl, zh]) = self.impedance {
             match (
                 from.strength == Strength::HIGH_IMPEDANCE,

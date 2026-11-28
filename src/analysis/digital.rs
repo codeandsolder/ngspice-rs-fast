@@ -1136,6 +1136,11 @@ impl State {
                 TimedOutput::Retain => {}
                 TimedOutput::Scalar(output) => self.model_output(driver, output)?,
                 TimedOutput::Arrival(arrival) => self.model_arrival(driver, arrival)?,
+                TimedOutput::Waveform(arrivals) => {
+                    for arrival in arrivals {
+                        self.model_arrival(driver, arrival)?;
+                    }
+                }
             }
         }
         self.update_wakeup(network, index)

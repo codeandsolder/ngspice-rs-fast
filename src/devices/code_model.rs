@@ -3,6 +3,7 @@
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
+mod causal_history;
 mod pulse;
 mod range_receiver;
 pub mod rational;
@@ -12,6 +13,7 @@ pub mod source;
 mod source_logic;
 mod timed_switch;
 mod timed_switch_device;
+mod window_clocked;
 mod window_gate;
 pub use window_gate::{WindowDelays, WindowGate, WindowGateState};
 
@@ -342,8 +344,12 @@ pub struct ModelDiagnostic {
     pub kind: &'static str,
     /// Zero-based input port involved in the constraint.
     pub input: usize,
-    /// Observed interval in seconds.
+    /// Earliest possible observed interval in seconds.
     pub elapsed: Real,
+    /// Latest possible observed interval in seconds.
+    pub maximum_elapsed: Real,
+    /// Whether violation of the constraint is possible or definite.
+    pub certainty: crate::analysis::digital::timing::Certainty,
     /// Required minimum interval in seconds.
     pub minimum: Real,
 }

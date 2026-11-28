@@ -105,4 +105,6 @@ pub enum TimedOutput {
     Scalar(Output),
     /// A guaranteed transition with an absolute causal arrival expression.
     Arrival(Arrival),
+    /// Multiple causally ordered transitions requested by a single evaluation.
+    Waveform(Vec<Arrival>),
 }

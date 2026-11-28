@@ -101,21 +101,36 @@ impl ApertureResult {
     /// # Errors
     /// Negative or nonfinite setup/hold.
     pub fn from_bounds(capture_minus_data: Bounds, setup: Real, hold: Real) -> SpiceResult<Self> {
+        Self::from_ordered_bounds(capture_minus_data, setup, hold, true)
+    }
+
+    /// Classify both aperture sides, assigning a coincident edge to setup
+    /// if data is evaluated first and to hold if a later delta delivers it.
+    ///
+    /// # Errors
+    /// Negative or nonfinite setup/hold.
+    pub fn from_ordered_bounds(
+        capture_minus_data: Bounds,
+        setup: Real,
+        hold: Real,
+        data_first: bool,
+    ) -> SpiceResult<Self> {
         if [setup, hold].iter().any(|v| !v.is_finite() || *v < 0.) {
             return Err(SpiceError::circuit("invalid setup/hold aperture"));
         }
         let low = capture_minus_data.minimum();
         let high = capture_minus_data.maximum();
-        let setup = if setup == 0. || high < 0. || low >= setup {
+        let after = |value: Real| value < 0. || (value == 0. && !data_first);
+        let setup = if setup == 0. || after(high) || low >= setup {
             Certainty::Satisfied
-        } else if low >= 0. && high < setup {
+        } else if !after(low) && high < setup {
             Certainty::DefiniteViolation
         } else {
             Certainty::PossibleViolation
         };
-        let hold = if hold == 0. || low >= 0. || high <= -hold {
+        let hold = if hold == 0. || !after(low) || high <= -hold {
             Certainty::Satisfied
-        } else if high < 0. && low > -hold {
+        } else if after(high) && low > -hold {
             Certainty::DefiniteViolation
         } else {
             Certainty::PossibleViolation
