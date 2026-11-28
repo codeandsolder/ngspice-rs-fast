@@ -696,6 +696,7 @@ mod tests {
             capacitors: Vec::new(),
             charges: BTreeMap::new(),
             local_charges: Vec::new(),
+            path_voltages: Vec::new(),
         }
     }
 

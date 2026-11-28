@@ -949,3 +949,123 @@ fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
         }
     }
 }
+
+#[test]
+fn statz_physical_history_coordinates_and_rate_jacobians() -> Result<(), SpiceError> {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    let mut c = circuit(
+        "z1 d g s zm area=2 m=3\n.model zm nmf(vto=-1.8 beta=3m lambda=0.05 alpha=2.5 b=0.4 is=1p cgs=20p cgd=5p pb=0.8)",
+    )?;
+    c.finalize()?;
+    let width = c.unknown_count();
+    let prepared = c.prepare_run();
+    let mut dae = prepared
+        .prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
+    assert_eq!(dae.state_width(), width + 2);
+    let [drain, gate, source] = ["d", "g", "s"].map(|name| mos_jfet::row(&c, name));
+    let mut state = vec![Vector::zeros(dae.state_width()); 4];
+    state[0].set(gate, -0.5)?;
+    state[0].set(drain, 0.3)?;
+    state[0].set(width, 3e-12)?;
+    state[0].set(width + 1, -2e-12)?;
+    state[1].set(gate, 0.02)?;
+    state[1].set(drain, -0.03)?;
+    state[1].set(source, 0.01)?;
+    state[1].set(width, 7e-14)?;
+    state[1].set(width + 1, -8e-14)?;
+    state[2].set(drain, 0.005)?;
+    let h = 1e-6;
+    let right = dae.evaluate_taylor(&state, 0., h, Limit::Right)?;
+    let left = dae.evaluate_taylor(&state, 0., h, Limit::Left)?;
+    let rate = right.rate.as_ref().unwrap();
+    let left_rate = left.rate.as_ref().unwrap();
+    for degree in 0..state.len() - 1 {
+        for row in 0..dae.state_width() {
+            close(
+                rate.values[degree].get(row).unwrap(),
+                left_rate.values[degree].get(row).unwrap(),
+                1e-10,
+                1e-17,
+            );
+        }
+    }
+    // q remains independent of voltage and each branch stamp retains its own
+    // charge and equal/opposite electrical incidence.
+    close(right.charge[0].get(gate).unwrap(), 3e-12, 1e-12, 1e-25);
+    close(right.charge[0].get(source).unwrap(), -9e-12, 1e-12, 1e-25);
+    close(right.charge[0].get(drain).unwrap(), 6e-12, 1e-12, 1e-25);
+    assert!(matches!(
+        dae.evaluate(&Vector::zeros(width), 0., Limit::Right),
+        Err(SpiceError::Unsupported { .. })
+    ));
+    // Independent perturbations of the state and rate jets: test the
+    // two Jacobian convolutions, including the j/h factor for a rate
+    // coefficient, rather than a companion-load finite difference.
+    for (input_degree, column) in [(0, gate), (0, drain), (1, gate), (1, drain), (2, source)] {
+        let delta = 1e-5;
+        let mut plus = state.clone();
+        let mut minus = state.clone();
+        plus[input_degree].add_to(column, delta)?;
+        minus[input_degree].add_to(column, -delta)?;
+        let a = dae.evaluate_taylor(&plus, 0., h, Limit::Right)?;
+        let b = dae.evaluate_taylor(&minus, 0., h, Limit::Right)?;
+        for degree in 0..state.len() - 1 {
+            for row in width..width + 2 {
+                let numeric = (a.rate.as_ref().unwrap().values[degree].get(row).unwrap()
+                    - b.rate.as_ref().unwrap().values[degree].get(row).unwrap())
+                    / (2. * delta);
+                let mut expected = rate
+                    .state_gradients
+                    .get(degree.wrapping_sub(input_degree))
+                    .map_or(0., |m| m.get(row, column));
+                if input_degree > 0 && input_degree <= degree + 1 {
+                    expected += input_degree as f64 / h
+                        * rate.rate_gradients[degree + 1 - input_degree].get(row, column);
+                }
+                close(numeric, expected, 2e-6, 1e-13);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn physical_statz_ramp_currents_match_continuous_partition() -> Result<(), SpiceError> {
+    for (family, pol) in [("nmf", 1.), ("pmf", -1.)] {
+        for method in ["gear", "trap"] {
+            let plots = FIXTURE.run_all(&format!(
+                "vd d 0 PWL(0 {} 1m {})\nvg g 0 PWL(0 {} 1m {})\nz1 d g 0 zm area=2 m=3\n.model zm {family}(vto=-1.8 beta=3m lambda=0.05 alpha=2.5 b=0.4 is=1p cgs=20p cgd=5p pb=0.8)\nb1 first 0 v=1m*ddt(v(g))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 20u 0 1u uic",
+                pol*0.3,pol*(-0.2),pol*(-0.7),pol*(-0.5)
+            ))?;
+            let p = &plots[0];
+            for index in 0..p.point_count() {
+                let t = value(p, "time", index);
+                let gs = -0.7 + 200. * t;
+                let ds = 0.3 - 500. * t;
+                let gd = gs - ds;
+                let q = |a, b| qggnew(a, b, 0.8, 1. / 2.5, -1.8, 40e-12, 10e-12);
+                let delta = 1e-5;
+                let cgs = (q(gs + delta, gd) - q(gs - delta, gd)) / (2. * delta);
+                let cgd = (q(gs, gd + delta) - q(gs, gd - delta)) / (2. * delta);
+                let gate_source = reverse_leakage(2e-12, gs) + 200. * cgs;
+                let gate_drain = reverse_leakage(2e-12, gd) + 700. * cgd;
+                let channel = statz(6e-3, 0.05, 0.4, 2.5, -1.8, gs, ds);
+                close(
+                    value(p, "i(vg)", index),
+                    -pol * 3. * (gate_source + gate_drain),
+                    2e-6,
+                    1e-14,
+                );
+                close(
+                    value(p, "i(vd)", index),
+                    -pol * 3. * (channel - gate_drain),
+                    1e-7,
+                    1e-13,
+                );
+                close(value(p, "v(first)", index), pol * 0.2, 1e-8, 1e-10);
+                close(value(p, "v(out)", index), 0., 0., 1e-9);
+            }
+        }
+    }
+    Ok(())
+}

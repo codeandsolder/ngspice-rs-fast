@@ -2062,12 +2062,14 @@ impl Device for Diode {
             slot: DIODE_CHARGE_SLOT,
             nodes: self.junction,
             scale: 1.,
+            path_dependent: false,
         })?;
         if self.recovery_node.is_some() {
             visit(PhysicalChargeHistory {
                 slot: recovery::CHARGE_SLOT,
                 nodes: self.junction,
                 scale: 1. - self.parameters.model.vp,
+                path_dependent: false,
             })?;
         }
         Ok(())

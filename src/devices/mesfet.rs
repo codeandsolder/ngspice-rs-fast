@@ -66,6 +66,8 @@
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
 
+mod taylor;
+
 use crate::devices::jfet::{
     self, BOLTZMANN, CHARGE, REFTEMP,
     lifecycle::{self, GateStamp, GateUpdate, LoadPhase},
@@ -724,6 +726,33 @@ impl Device for Mesfet {
         }
         .finish(context, start, &l)
     }
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        use crate::devices::traits::PhysicalChargeHistory;
+        if self.model.cgs == 0. && self.model.cgd == 0. {
+            return Ok(());
+        }
+        let [drain, gate, source] = self.inner;
+        for (slot, nodes) in [(slot::QGS, [gate, source]), (slot::QGD, [gate, drain])] {
+            visit(PhysicalChargeHistory {
+                slot,
+                nodes,
+                scale: self.model.pol * self.instance.m,
+                path_dependent: true,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
     /// `mesacl.c`: conductances at the bias plus `j omega` times `qggnew`'s
     /// gate-source and gate-drain capacitances (each a two-terminal element,
     /// as in C), every term scaled by `m`.

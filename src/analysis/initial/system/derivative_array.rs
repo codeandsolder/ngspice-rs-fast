@@ -1,6 +1,7 @@
 //! Coupled physical derivative arrays. A normalized time coefficient X[k]
 //! represents x^(k)(0) * h^k/k!. The equation in degree k is
-//! F[k] + (k+1)/h Q[k+1] = 0, with state Jacobians acting by convolution.
+//! F[k] + (k+1)/h Q[k+1] + (M(x,t) xdot)[k] = 0. Both state and
+//! rate Jacobians act by convolution, with j/h on the latter.
 //! Higher-degree variables are projected away before initial constraints
 //! are selected. No arbitrary zero derivative gauge enters the prefix.
 
@@ -8,7 +9,7 @@ use super::rank;
 mod recovery;
 use crate::analysis::initial::{
     CapacitorInitial, ChargeInitial, DerivativeGuess, FixedCoordinate, ImpulseStorage,
-    LocalChargeInitial, Tolerances,
+    LocalChargeInitial, PathVoltageInitial, Tolerances,
     constraints::{AbsoluteRow, VoltageVertex},
     failure,
 };
@@ -91,6 +92,7 @@ enum Constraint<'a> {
     Voltage(&'a CapacitorInitial),
     Charge(usize, &'a ChargeInitial),
     LocalCharge(&'a LocalChargeInitial),
+    PathVoltage(&'a PathVoltageInitial),
     Companion(CompanionConstraint<'a>),
 }
 
@@ -105,6 +107,7 @@ impl<'a> Constraint<'a> {
         match self {
             Self::Coordinate(_, coordinate) => Some((&coordinate.name, "coordinate")),
             Self::Voltage(cap) => Some((&cap.name, "voltage")),
+            Self::PathVoltage(path) => Some((&path.name, "nonholonomic control voltage")),
             Self::Charge(_, charge) if charge.policy == InitialStoragePolicy::Physical => {
                 Some((&charge.name, "charge"))
             }
@@ -150,6 +153,25 @@ impl<'a> Constraint<'a> {
                     ResidualScale::comparison(actual, cap.voltage, positive.abs() + negative.abs()),
                 ))
             }
+            Self::PathVoltage(path) => {
+                let [positive, negative] = path
+                    .rows
+                    .map(|column| column.map_or(0., |c| state.as_slice()[c]));
+                for (column, sign) in path.rows.into_iter().zip([1., -1.]) {
+                    if let Some(column) = column {
+                        matrix.add(row, column, sign)?;
+                    }
+                }
+                let actual = positive - negative;
+                Ok((
+                    actual - path.voltage,
+                    ResidualScale::comparison(
+                        actual,
+                        path.voltage,
+                        positive.abs() + negative.abs(),
+                    ),
+                ))
+            }
             Self::Charge(equation, charge) => {
                 let mut backward = 0.;
                 for term in folded_row(&point.capacitance[0], equation) {
@@ -189,7 +211,7 @@ impl<'a> Constraint<'a> {
 
     fn absolute(self, tol: Tolerances) -> Real {
         match self {
-            Self::Voltage(..) => tol.vntol,
+            Self::Voltage(..) | Self::PathVoltage(..) => tol.vntol,
             Self::Charge(_, charge) if charge.policy == InitialStoragePolicy::Derived => tol.vntol,
             Self::Charge(..) | Self::LocalCharge(..) => tol.chgtol,
             Self::Companion(c) if c.derived => tol.vntol,
@@ -217,6 +239,7 @@ fn constraints(storage: &ImpulseStorage) -> Vec<Constraint<'_>> {
         .map(|(&AbsoluteRow(row), item)| Constraint::Coordinate(row, item))
         .chain(storage.capacitors.iter().map(Constraint::Voltage))
         .chain(storage.local_charges.iter().map(Constraint::LocalCharge))
+        .chain(storage.path_voltages.iter().map(Constraint::PathVoltage))
         .chain(
             storage
                 .charges
@@ -476,16 +499,37 @@ impl Array {
                 .zip(point.charge[k + 1].as_slice())
                 .enumerate()
             {
-                array.residual[offset + r] = multiplier.mul_add(q, f);
+                let rate = point
+                    .rate
+                    .as_ref()
+                    .map_or(0., |rate| rate.values[k].as_slice()[r]);
+                array.residual[offset + r] = multiplier.mul_add(q, f) + rate;
                 array.scale[offset + r] =
-                    ResidualScale::equal(multiplier.mul_add(q.abs(), f.abs()));
+                    ResidualScale::equal(multiplier.mul_add(q.abs(), f.abs()) + rate.abs());
             }
+            let mut input_degree = 0.;
             for (j, coefficient_state) in state.iter().enumerate().take(k + 2) {
                 for (matrix, factor) in [
                     (point.conductance.get(k.wrapping_sub(j)), 1.),
                     (point.capacitance.get(k + 1 - j), multiplier),
+                    (
+                        point
+                            .rate
+                            .as_ref()
+                            .and_then(|rate| rate.state_gradients.get(k.wrapping_sub(j))),
+                        1.,
+                    ),
+                    (
+                        point
+                            .rate
+                            .as_ref()
+                            .and_then(|rate| rate.rate_gradients.get(k + 1 - j)),
+                        input_degree / scale,
+                    ),
                 ] {
-                    let Some(matrix) = matrix else { continue };
+                    let Some(matrix) = matrix.filter(|_| factor != 0.) else {
+                        continue;
+                    };
                     for term in matrix.triplets() {
                         let row = offset + term.row;
                         let coefficient = factor * term.value;
@@ -496,6 +540,7 @@ impl Array {
                         ));
                     }
                 }
+                input_degree += 1.;
             }
             degree += 1.;
         }
@@ -753,7 +798,7 @@ pub(in crate::analysis::initial) fn solve_right_limit(
 ) -> SpiceResult<RightLimit> {
     solve(
         dae,
-        seed,
+        &physical_seed(dae, seed, storage)?,
         &constraints(storage),
         LocalPoint {
             time: 0.,
@@ -785,7 +830,7 @@ pub(in crate::analysis::initial) fn solve_event(
     };
     solve(
         dae,
-        request.solution,
+        &physical_seed(dae, request.solution, storage)?,
         &constraints(storage),
         LocalPoint {
             time,
@@ -821,7 +866,7 @@ pub(in crate::analysis::initial) fn solve_step(
     };
     solve(
         dae,
-        request.solution,
+        &physical_seed(dae, request.solution, storage)?,
         &companions(circuit, storage, request.history, coefficients)?,
         LocalPoint {
             time,
@@ -848,6 +893,30 @@ enum CoreOutcome {
     Exhausted(Option<Vec<Vector>>),
 }
 
+fn physical_seed(
+    dae: &PhysicalDae<'_, '_>,
+    original: &Vector,
+    storage: &ImpulseStorage,
+) -> SpiceResult<Vector> {
+    let mut values = original.as_slice().to_vec();
+    values.resize(dae.state_width(), 0.);
+    for (binding, charge) in dae.storage_bindings().iter().zip(&storage.local_charges) {
+        if binding.slot != charge.slot {
+            return Err(failure("inconsistent path charge seed binding"));
+        }
+        if let Some(coordinate) = binding.coordinate {
+            values[coordinate] = charge.target;
+        }
+    }
+    Ok(Vector::from(values))
+}
+
+fn project(vector: &mut Vector, width: usize) {
+    if vector.len() != width {
+        *vector = Vector::from(vector.as_slice()[..width].to_vec());
+    }
+}
+
 fn solve(
     dae: &PhysicalDae<'_, '_>,
     seed: &Vector,
@@ -869,11 +938,11 @@ fn solve(
                 .map(|value| value * local.scale)
                 .collect::<Vec<_>>(),
         );
-        if normalized.len() == seed.len() && normalized.is_finite() {
-            state[1] = normalized;
+        if normalized.len() == dae.original_width() && normalized.is_finite() {
+            state[1].as_mut_slice()[..normalized.len()].copy_from_slice(normalized.as_slice());
         }
     }
-    match solve_core(dae, state, initial, local, tol, iterations)? {
+    let mut outcome = match solve_core(dae, state, initial, local, tol, iterations)? {
         CoreOutcome::Converged(candidate) => Ok(SolveOutcome::Converged(Box::new(candidate.right))),
         CoreOutcome::NotConverged { last, reason } => {
             Ok(SolveOutcome::NotConverged { last, reason })
@@ -883,7 +952,21 @@ fn solve(
                 .map(|right| SolveOutcome::Converged(Box::new(right)))
         }
         CoreOutcome::Exhausted(None) => Err(order_limit()),
+    }?;
+    match &mut outcome {
+        SolveOutcome::Converged(right) => {
+            for vector in [
+                &mut right.state,
+                &mut right.rate,
+                &mut right.charge,
+                &mut right.charge_rate,
+            ] {
+                project(vector, dae.original_width());
+            }
+        }
+        SolveOutcome::NotConverged { last, .. } => project(last, dae.original_width()),
     }
+    Ok(outcome)
 }
 
 fn solve_core(

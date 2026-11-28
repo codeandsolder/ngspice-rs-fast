@@ -45,6 +45,9 @@ pub struct PhysicalChargeHistory {
     pub nodes: [NodeId; 2],
     /// Conversion from device-local charge to signed electrical charge.
     pub scale: Real,
+    /// True for a separately integrated charge whose rate depends on the
+    /// normalized voltage rate, rather than a state function.
+    pub path_dependent: bool,
 }
 
 /// Physical nonlinear charge and its exact Jacobian in MNA coordinates.

@@ -431,6 +431,7 @@ struct ImpulseStorage {
     capacitors: Vec<CapacitorInitial>,
     charges: BTreeMap<AbsoluteRow, ChargeInitial>,
     local_charges: Vec<LocalChargeInitial>,
+    path_voltages: Vec<PathVoltageInitial>,
 }
 
 struct FixedCoordinate {
@@ -451,6 +452,12 @@ struct CapacitorInitial {
     slot: usize,
     history: crate::devices::traits::VoltageStorageHistory,
     exact_startup: bool,
+}
+
+struct PathVoltageInitial {
+    name: String,
+    rows: [Option<usize>; 2],
+    voltage: Real,
 }
 
 struct LocalChargeInitial {
@@ -485,6 +492,7 @@ impl ImpulseStorage {
             capacitors: Vec::new(),
             charges: BTreeMap::new(),
             local_charges: Vec::new(),
+            path_voltages: Vec::new(),
         };
         for index in 0..circuit.device_count() {
             for (row, coordinate) in bound_initial_coordinates(circuit, index, context)? {
@@ -1025,27 +1033,43 @@ impl ImpulseStorage {
         dae: &crate::devices::physical_dae::PhysicalDae<'_, '_>,
         values: &[Real],
         optional: bool,
+        continuity: Option<&Vector>,
     ) -> SpiceResult<()> {
         self.local_charges = dae
             .storage_bindings()
             .iter()
-            .map(|(slot, name)| {
+            .map(|binding| {
                 let target = *values
-                    .get(*slot)
+                    .get(binding.slot)
                     .ok_or_else(|| failure("missing physical device charge history"))?;
                 if !target.is_finite() {
                     return Err(failure(format!(
-                        "{name}: nonfinite physical device charge history"
+                        "{}: nonfinite physical device charge history",
+                        binding.name
                     )));
                 }
                 Ok(LocalChargeInitial {
-                    name: name.clone(),
-                    slot: *slot,
+                    name: binding.name.clone(),
+                    slot: binding.slot,
                     target,
                     optional,
                 })
             })
             .collect::<SpiceResult<_>>()?;
+        self.path_voltages.clear();
+        if let Some(state) = continuity {
+            for binding in dae.storage_bindings() {
+                if let Some(rows) = binding.path {
+                    let [positive, negative] =
+                        rows.map(|row| row.map_or(0., |r| state.as_slice()[r]));
+                    self.path_voltages.push(PathVoltageInitial {
+                        name: binding.name.clone(),
+                        rows,
+                        voltage: positive - negative,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1169,7 +1193,12 @@ pub(super) fn consistent_derivative_start(
         // Like C's junction UIC load, unspecified device charge is a seed.
         // Prescribed sources may determine it instead; after initialization
         // the actual accepted charge is retained at events.
-        storage.bind_local_charges(&dae, trial.values(), uic)?;
+        storage.bind_local_charges(
+            &dae,
+            trial.values(),
+            uic,
+            (!uic).then_some(request.solution),
+        )?;
         let solve = |seed: &Vector| {
             system::solve_right_limit(
                 &dae,
@@ -1254,7 +1283,7 @@ pub(super) fn consistent_derivative_step(
     let mut storage =
         ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    storage.bind_local_charges(&dae, values, false)?;
+    storage.bind_local_charges(&dae, values, false, None)?;
     let right = match system::solve_step(
         &dae, circuit, request, &storage, tolerances, iterations, guess,
     )? {
@@ -1298,7 +1327,7 @@ pub(super) fn consistent_derivative_event(
     )?;
     storage.retain_operating_point(request.solution);
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    storage.bind_local_charges(&dae, left.values(), false)?;
+    storage.bind_local_charges(&dae, left.values(), false, Some(request.solution))?;
     let right = match system::solve_event(&dae, request, &storage, tolerances, iterations, guess) {
         // A one-sided germ may have a different admissible derivative
         // domain than the incoming one. Retry without the disposable rate

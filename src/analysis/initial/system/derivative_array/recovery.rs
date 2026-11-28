@@ -118,7 +118,10 @@ impl Search<'_, '_, '_> {
             let residual = multiplier.mul_add(
                 point.charge[degree + 1].as_slice()[coordinate],
                 point.residual[degree].as_slice()[coordinate],
-            );
+            ) + point
+                .rate
+                .as_ref()
+                .map_or(0., |rate| rate.values[degree].as_slice()[coordinate]);
             response = response.max((residual / base - 1.).abs());
         }
         Ok(response)

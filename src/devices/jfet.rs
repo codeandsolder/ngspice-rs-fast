@@ -1025,11 +1025,13 @@ impl Device for Jfet {
             slot: slot::QGS,
             nodes: [gate, source],
             scale,
+            path_dependent: false,
         })?;
         visit(PhysicalChargeHistory {
             slot: slot::QGD,
             nodes: [gate, drain],
             scale,
+            path_dependent: false,
         })
     }
 

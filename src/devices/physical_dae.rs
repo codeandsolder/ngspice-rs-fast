@@ -1,12 +1,16 @@
-//! Exact, unintegrated real residuals for a memoryless physical DAE.
+//! Exact, unintegrated real residuals for a physical DAE.
 //!
 //! The same prepared devices and original MNA coordinates are used for both
-//! F(x,t) and Q(x,t), so the equation is F + dQ/dt = 0. No integration
+//! F(x,t) and Q(x,t), with additional independent history coordinates and
+//! rate terms for non-exact differential forms. The equation is
+//! F + dQ/dt + M(x,t) dx/dt = 0. No integration
 //! coefficient, time discretization, or device limiting is introduced. A
 //! retained continuation conductance, if present, acts only on original
 //! electrical KCL rows in both residual and Taylor evaluations.
 
 mod guards;
+mod path;
+pub use path::RateTaylor;
 
 use crate::devices::{
     AnalysisMode, Forcing, Limit, LoadRequest, ModelContext, PreparedRun, StateHistory,
@@ -60,6 +64,14 @@ pub struct PhysicalDaePoint {
     pub capacitance: SparseMatrix,
 }
 
+/// Absolute binding from a device charge history to the derivative layout.
+pub(crate) struct StorageBinding {
+    pub(crate) slot: usize,
+    pub(crate) name: String,
+    pub(crate) coordinate: Option<usize>,
+    pub(crate) path: Option<[Option<usize>; 2]>,
+}
+
 /// A topology-bound evaluator reusing the static matrix, charge operator,
 /// and disposable trial storage. Evaluating a point never publishes history.
 pub struct PhysicalDae<'run, 'circuit> {
@@ -72,7 +84,8 @@ pub struct PhysicalDae<'run, 'circuit> {
     trial: Option<TrialState>,
     rhs: Vector,
     point: PhysicalDaePoint,
-    storage_bindings: Vec<(usize, String)>,
+    storage_bindings: Vec<StorageBinding>,
+    augmented: Option<crate::devices::linear::LinearSystem>,
 }
 
 impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
@@ -92,6 +105,8 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         linear.bind_transient_timing(&timing)?;
         let regularization = circuit.continuation_diagonal();
         circuit.stamp_nodal_regularization(&mut linear.a, regularization)?;
+        let storage_bindings = run.physical_taylor_storage_bindings(&model)?;
+        let augmented = path::augment(&linear, &storage_bindings)?;
         Ok(Self {
             run,
             model,
@@ -101,7 +116,8 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             history: circuit.independent_state_history()?,
             trial: None,
             rhs: Vector::zeros(n),
-            storage_bindings: run.physical_taylor_storage_bindings(&model)?,
+            storage_bindings,
+            augmented,
             point: PhysicalDaePoint {
                 residual: Vector::zeros(n),
                 charge: Vector::zeros(n),
@@ -111,8 +127,22 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         })
     }
 
-    pub(crate) fn storage_bindings(&self) -> &[(usize, String)] {
+    pub(crate) fn storage_bindings(&self) -> &[StorageBinding] {
         &self.storage_bindings
+    }
+
+    pub(crate) fn original_width(&self) -> usize {
+        self.linear.a.rows()
+    }
+
+    /// Width of the physical derivative state, including independent local charges.
+    #[must_use = "the Taylor state must have the complete physical width"]
+    pub fn state_width(&self) -> usize {
+        self.taylor_linear().a.rows()
+    }
+
+    fn taylor_linear(&self) -> &crate::devices::linear::LinearSystem {
+        self.augmented.as_ref().unwrap_or(&self.linear)
     }
 
     /// Analytic coefficients of the independent forcing in the same
@@ -127,7 +157,8 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         order: usize,
         limit: Limit,
     ) -> SpiceResult<Vec<Vector>> {
-        self.linear.transient_taylor_rhs(time, scale, order, limit)
+        self.taylor_linear()
+            .transient_taylor_rhs(time, scale, order, limit)
     }
 
     /// Assemble exact one-sided physical Taylor coefficients from the same prepared
@@ -165,7 +196,7 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         collect_guards: bool,
     ) -> SpiceResult<PhysicalDaeTaylor> {
         use crate::maths::taylor::{Jet, MAX_ORDER};
-        let n = self.run.circuit().unknown_count();
+        let n = self.state_width();
         if state.is_empty()
             || state.len() > MAX_ORDER + 1
             || state
@@ -187,13 +218,21 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         } else {
             (state, Jet::affine(order, time, scale))
         };
-        let mut output = PhysicalDaeTaylor::linear(&self.linear, state, forcing)?;
+        let mut output = PhysicalDaeTaylor::linear(self.taylor_linear(), state, forcing)?;
         output.guards = collect_guards.then(BranchTrace::default);
-        self.run
-            .dae_nonlinear_taylor(&self.model, state, &time, &mut output)?;
+        self.run.dae_nonlinear_taylor(
+            &self.model,
+            state,
+            &time,
+            &self.storage_bindings,
+            &mut output,
+        )?;
         if limit == Limit::Left {
             negate_odd_vectors(&mut output.residual);
             negate_odd_vectors(&mut output.charge);
+            if let Some(rate) = &mut output.rate {
+                rate.reverse_odd()?;
+            }
             for storage in output.storage.values_mut() {
                 for coefficients in std::iter::once(&mut storage.values).chain(
                     storage
@@ -221,7 +260,7 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             .storage
             .keys()
             .copied()
-            .eq(self.storage_bindings.iter().map(|(slot, _)| *slot))
+            .eq(self.storage_bindings.iter().map(|binding| binding.slot))
         {
             return Err(SpiceError::circuit(
                 "physical Taylor storage does not match declared history bindings",
@@ -240,6 +279,12 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         time: Real,
         limit: Limit,
     ) -> SpiceResult<&PhysicalDaePoint> {
+        if self.augmented.is_some() {
+            return Err(SpiceError::Unsupported {
+                feature: "memoryless evaluation of path-dependent physical charge".into(),
+                location: None,
+            });
+        }
         if !time.is_finite() {
             return Err(SpiceError::circuit("nonfinite physical DAE time"));
         }
@@ -337,6 +382,8 @@ pub struct PhysicalDaeTaylor {
     pub(crate) candidate_states: Vec<(usize, Real)>,
     pub(crate) storage: BTreeMap<usize, LocalChargeTaylor>,
     storage_coefficients: usize,
+    /// Non-exact differential rate terms, present only for path-dependent laws.
+    pub rate: Option<RateTaylor>,
 }
 
 impl PhysicalDaeTaylor {
@@ -355,6 +402,7 @@ impl PhysicalDaeTaylor {
             candidate_states: Vec::new(),
             storage: BTreeMap::new(),
             storage_coefficients: 0,
+            rate: None,
         };
         for (degree, x) in state.iter().enumerate() {
             let mut f = system.a.mul_vector(x)?;
@@ -382,6 +430,9 @@ impl PhysicalDaeTaylor {
     }
 
     fn validate(&mut self) -> SpiceResult<()> {
+        if let Some(rate) = &mut self.rate {
+            rate.validate()?;
+        }
         for matrix in self.conductance.iter_mut().chain(&mut self.capacitance) {
             matrix.fold_duplicates();
             if matrix
@@ -470,6 +521,7 @@ pub struct TaylorContext<'a> {
     pub(crate) controls: &'a [usize],
     pub(crate) state: &'a [Vector],
     pub(crate) time: &'a crate::maths::taylor::Jet,
+    pub(crate) bindings: &'a [StorageBinding],
     pub(crate) output: &'a mut PhysicalDaeTaylor,
 }
 

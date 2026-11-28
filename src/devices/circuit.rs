@@ -761,7 +761,7 @@ impl<'a> PreparedRun<'a> {
         self.transient_forcing_system(context)
     }
 
-    /// Prepare the memoryless physical DAE with independent forcing at the
+    /// Prepare the physical DAE with independent forcing at the
     /// requested time, rather than treating it as a DC or integrated load.
     ///
     /// # Errors
@@ -822,7 +822,8 @@ impl<'a> PreparedRun<'a> {
     pub(crate) fn physical_taylor_storage_bindings(
         &self,
         context: &ModelContext,
-    ) -> SpiceResult<Vec<(usize, String)>> {
+    ) -> SpiceResult<Vec<crate::devices::physical_dae::StorageBinding>> {
+        use crate::devices::physical_dae::StorageBinding;
         let point = self.point(context)?;
         let mut bindings = Vec::new();
         for index in self.circuit.load_order() {
@@ -837,18 +838,36 @@ impl<'a> PreparedRun<'a> {
                         "physical Taylor history pair outside device",
                     ));
                 }
-                bindings.push((range.start + history.slot, device.name().to_owned()));
+                bindings.push(StorageBinding {
+                    slot: range.start + history.slot,
+                    name: device.name().to_owned(),
+                    coordinate: None,
+                    path: history.path_dependent.then(|| {
+                        history
+                            .nodes
+                            .map(|node| self.circuit.bindings.unknowns.node_row(node))
+                    }),
+                });
                 Ok(())
             })?;
         }
-        bindings.sort_unstable_by_key(|binding| binding.0);
+        bindings.sort_unstable_by_key(|binding| binding.slot);
         if bindings
             .windows(2)
-            .any(|pair| pair[0].0.saturating_add(1) >= pair[1].0)
+            .any(|pair| pair[0].slot.saturating_add(1) >= pair[1].slot)
         {
             return Err(SpiceError::circuit(
                 "overlapping physical Taylor history pairs",
             ));
+        }
+        let mut next = self.circuit.unknown_count();
+        for binding in &mut bindings {
+            if binding.path.is_some() {
+                binding.coordinate = Some(next);
+                next = next
+                    .checked_add(1)
+                    .ok_or_else(|| SpiceError::circuit("physical history coordinate overflow"))?;
+            }
         }
         Ok(bindings)
     }
@@ -858,6 +877,7 @@ impl<'a> PreparedRun<'a> {
         model: &ModelContext,
         state: &[Vector],
         time: &crate::maths::taylor::Jet,
+        bindings: &[crate::devices::physical_dae::StorageBinding],
         output: &mut crate::devices::physical_dae::PhysicalDaeTaylor,
     ) -> SpiceResult<()> {
         let point = self.point(model)?;
@@ -877,6 +897,7 @@ impl<'a> PreparedRun<'a> {
                         controls: self.circuit.controls(index)?,
                         state,
                         time,
+                        bindings,
                         output,
                     })
                     .map_err(|error| match error {

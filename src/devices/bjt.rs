@@ -1621,7 +1621,12 @@ impl Device for Bjt {
             (slot::QSUB, [n.s, n.sc], scale * self.subs),
             (slot::QBX, [n.b, n.cp], scale),
         ] {
-            visit(PhysicalChargeHistory { slot, nodes, scale })?;
+            visit(PhysicalChargeHistory {
+                slot,
+                nodes,
+                scale,
+                path_dependent: false,
+            })?;
         }
         Ok(())
     }
