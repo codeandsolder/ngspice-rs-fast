@@ -255,6 +255,26 @@ fn electrothermal_junction_case_dc_matches_ngspice47() {
 }
 
 #[test]
+fn producer_allocated_thermal_terminals_match_explicit_terminals() {
+    let source = include_str!("../fixtures/vdmos/thermal_dc_n.cir");
+    let implicit = source.replace("M1 d g 0 junction case dut thermal", "M1 d g 0 dut thermal");
+    let explicit = run(source).unwrap();
+    let implicit = run(&implicit).unwrap();
+    for (a, b) in [
+        ("i(vd)", "i(vd)"),
+        ("v(junction)", "v(m1-thermal-junction)"),
+        ("v(case)", "v(m1-thermal-case)"),
+    ] {
+        let expected = explicit.value(a, 0).unwrap().re;
+        let actual = implicit.value(b, 0).unwrap().re;
+        assert!(
+            (actual - expected).abs() <= 1e-10 * expected.abs() + 1e-10,
+            "implicit {b}: {actual:e} vs explicit {a}: {expected:e}"
+        );
+    }
+}
+
+#[test]
 fn electrothermal_junction_case_switching_transient_matches_ngspice47() {
     let checkpoint_times = [50e-6, 110e-6, 500e-6, 1e-3, 1.1e-3, 1.8e-3];
     for (name, deck, junctions, cases) in [
