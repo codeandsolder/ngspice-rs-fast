@@ -1750,3 +1750,60 @@ fn behavioural_event_preserves_independent_semiconductor_charge_histories() -> S
     }
     Ok(())
 }
+
+#[test]
+fn singular_germ_recovers_distinct_semiconductor_histories() -> SpiceResult<()> {
+    // The nonlinear singular coordinate drives both junctions through a
+    // voltage law. The local physical charge constraints must be retained
+    // across a coincident behavioural corner, including their separate
+    // terminal-current observations and their sum in source KCL.
+    let body = "b1 x 0 i=v(x)^3-((time-0.5u)/1u)^3\nb2 out 0 v=1u*ddt(abs(v(x)))\nr1 out 0 1k\nbdrive in 0 v=0.1*v(x)-0.4\nd1 in 0 dm1\nd2 in 0 dm2\n.model dm1 d(is=1e-12 n=10 cjo=20p vj=.8 m=.4 tt=5n)\n.model dm2 d(is=2e-12 n=10 cjo=70p vj=.7 m=.3 tt=9n)\n.ic v(x)=-0.5\n.options reltol=1e-8 vntol=1n";
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+            &["@d1[i]", "@d2[i]"],
+        )?;
+        let mut previous = -1.;
+        let mut event = None;
+        for index in 0..plot.point_count() {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let time = at("time");
+            let x = (time - 0.5e-6) / 1e-6;
+            let voltage = 0.1_f64.mul_add(x, -0.4);
+            let rate = at("v(out)");
+            close(at("v(x)"), x, 1e-8);
+            close(at("v(in)"), voltage, 1e-9);
+            close(rate.abs(), 1., 1e-7);
+            if (time - 0.5e-6).abs() > 1e-14 {
+                close(rate, x.signum(), 1e-7);
+            }
+            close(at("i(b2)"), -rate * 1e-3, 1e-10);
+            let diode = |sat: f64, cap: f64, potential: f64, grading: f64, transit: f64| {
+                let current = sat * (voltage / thermal).exp_m1() + 1e-12 * voltage;
+                let conductance = sat / thermal * (voltage / thermal).exp() + 1e-12;
+                current
+                    + 1e5
+                        * (cap * (1. - voltage / potential).powf(-grading) + transit * conductance)
+            };
+            let first = diode(1e-12, 20e-12, 0.8, 0.4, 5e-9);
+            let second = diode(2e-12, 70e-12, 0.7, 0.3, 9e-9);
+            close(at("@d1[i]"), first, 1e-13);
+            close(at("@d2[i]"), second, 1e-13);
+            close(at("i(bdrive)"), -(first + second), 1e-13);
+            if rate > 0. && previous < 0. {
+                assert!(event.is_none());
+                event = Some(time);
+            }
+            previous = rate;
+        }
+        close(
+            event.expect("missing singular semiconductor event"),
+            0.5e-6,
+            1e-14,
+        );
+    }
+    Ok(())
+}
