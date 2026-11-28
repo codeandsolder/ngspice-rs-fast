@@ -54,6 +54,9 @@ pub struct BehaviouralExpression {
     /// and literals are rounded to 11 significant digits (`inp_modify_exp()`
     /// prints them with `%18.10e`).
     pub verbatim: bool,
+    /// Original scalar interpretation of an ambiguous passive. This is
+    /// consumed if lexical expansion erases every runtime quantity.
+    pub scalar_alternative: Option<Box<SpiceResult<ParameterExpression>>>,
     /// The syntax tree.
     pub root: BExpr,
 }
@@ -291,6 +294,22 @@ pub fn is_builtin_function(name: &str) -> bool {
 pub const SPECIAL_NAMES: &[&str] = &["time", "temper", "hertz", "pi", "e"];
 
 impl BExpr {
+    /// Whether the tree contains any native runtime quantity. For a passive
+    /// with macro calls, this must also be checked after lexical expansion.
+    #[must_use = "runtime dependencies select the behavioural evaluation phase"]
+    pub fn uses_runtime(&self) -> bool {
+        let mut runtime = false;
+        self.visit(&mut |node| {
+            runtime |= match &node.kind {
+                BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
+                BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
+                BExprKind::Call { name, .. } => name == "ddt",
+                _ => false,
+            };
+        });
+        runtime
+    }
+
     /// Visit behavioural children in original preorder. The embedded numparam
     /// tree inside Value is not a behavioural child: callers decide whether
     /// to account for it, since compiled programs reject unevaluated values.
@@ -503,6 +522,7 @@ mod tests {
             text: "inner".into(),
             braced: true,
             quoted: false,
+            behavioural_alternative: None,
             span: span(90),
             root: Expr {
                 kind: ExprKind::Identifier("inner".into()),

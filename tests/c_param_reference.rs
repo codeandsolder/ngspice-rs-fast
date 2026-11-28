@@ -27,6 +27,7 @@ fn evaluate(expr: &Expr, names: &BTreeMap<&str, f64>) -> f64 {
         ExprKind::Unary { op, operand } => match op {
             UnaryOp::Plus => evaluate(operand, names),
             UnaryOp::Minus => -evaluate(operand, names),
+            UnaryOp::Not => f64::from(evaluate(operand, names) == 0.0),
         },
         ExprKind::Binary { op, lhs, rhs } => {
             let (x, y) = (evaluate(lhs, names), evaluate(rhs, names));
@@ -36,8 +37,30 @@ fn evaluate(expr: &Expr, names: &BTreeMap<&str, f64>) -> f64 {
                 BinaryOp::Mul => x * y,
                 BinaryOp::Div => x / y,
                 BinaryOp::Pow => x.abs().powf(y),
+                BinaryOp::Rem => x % y,
+                BinaryOp::IntDiv => (x / y).abs().trunc(),
+                BinaryOp::Eq => f64::from(x == y),
+                BinaryOp::Ne => f64::from(x != y),
+                BinaryOp::Lt => f64::from(x < y),
+                BinaryOp::Le => f64::from(x <= y),
+                BinaryOp::Gt => f64::from(x > y),
+                BinaryOp::Ge => f64::from(x >= y),
+                BinaryOp::And => f64::from(x != 0.0 && y != 0.0),
+                BinaryOp::Or => f64::from(x != 0.0 || y != 0.0),
             }
         }
+        ExprKind::Ternary {
+            condition,
+            then,
+            otherwise,
+        } => evaluate(
+            if evaluate(condition, names) != 0.0 {
+                then
+            } else {
+                otherwise
+            },
+            names,
+        ),
         ExprKind::Call {
             function,
             arguments,
