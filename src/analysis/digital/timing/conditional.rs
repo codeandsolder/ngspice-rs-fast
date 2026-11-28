@@ -336,6 +336,15 @@ pub struct Guarded<T> {
 }
 
 impl<T> Guarded<T> {
+    // Internal algorithms construct a complete partition by exact
+    // case splitting; do not expose unchecked guard lists to callers.
+    pub(super) fn from_partitioned(branches: Vec<(TimingGuard, T)>) -> SpiceResult<Self> {
+        if branches.is_empty() {
+            return Err(SpiceError::circuit("empty timing partition"));
+        }
+        Ok(Self { branches })
+    }
+
     /// An unconditional payload, without uncertain case selection.
     pub fn unconditional(payload: T) -> Self {
         Self {
@@ -344,6 +353,7 @@ impl<T> Guarded<T> {
     }
 
     /// Retain the guards of a verified order partition.
+    #[must_use = "the partition retains every feasible guard"]
     pub fn from_conditional(conditional: Conditional<T>) -> Self {
         let Conditional {
             partition,
@@ -390,14 +400,23 @@ impl<T> Guarded<T> {
         &self,
         other: &Guarded<U>,
         mut budget: usize,
+        transform: impl FnMut(&T, &U) -> SpiceResult<V>,
+    ) -> SpiceResult<Guarded<V>> {
+        self.zip_with_budget(other, &mut budget, transform)
+    }
+
+    pub(super) fn zip_with_budget<U, V>(
+        &self,
+        other: &Guarded<U>,
+        budget: &mut usize,
         mut transform: impl FnMut(&T, &U) -> SpiceResult<V>,
     ) -> SpiceResult<Guarded<V>> {
         let mut branches = Vec::new();
         for (lhs, a) in &self.branches {
             for (rhs, b) in &other.branches {
-                charge(&mut budget, 1)?;
+                charge(budget, 1)?;
                 let guard = lhs.clone().and(rhs.clone());
-                if guard.status_with_budget(&mut budget)? != GuardStatus::Impossible {
+                if guard.status_with_budget(budget)? != GuardStatus::Impossible {
                     branches.push((guard, transform(a, b)?));
                 }
             }

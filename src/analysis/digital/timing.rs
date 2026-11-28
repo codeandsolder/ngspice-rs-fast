@@ -18,10 +18,16 @@ use std::sync::Arc;
 mod constraints;
 pub use constraints::{ApertureResult, Certainty, ConstraintResult};
 mod delivery;
+mod queue;
+pub use queue::EventDelta;
 mod waveform;
+mod waveform_execution;
 pub(super) use delivery::phase_between;
 pub use delivery::{Arrival, TimedInput, TimedOutput};
-pub use waveform::{DriveTrace, GuardedWaveform, ProjectedDriveChange, WaveformProjection};
+pub use waveform::{
+    DriveTrace, GuardedWaveform, ProjectedDriveChange, WaveformProjection, WaveformRequest,
+};
+pub use waveform_execution::DeadlineEquality;
 
 /// Identity of one uncertain delay variable. Reusing an identity expresses
 /// the same normalized uncertainty, not another independent random draw.

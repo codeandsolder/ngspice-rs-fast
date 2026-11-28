@@ -5,17 +5,43 @@
 //! arrival when its physical delivery precedes that older event.
 
 use super::conditional::exact_at;
-use super::{Arrival, Guarded, Origin, TimingRelation, TimingWindow, charge};
+use super::{Arrival, EventDelta, Guarded, Origin, TimingRelation, TimingWindow, charge};
 use crate::devices::code_model::{Drive, Logic, Strength};
 use crate::primitives::{ExactSum, Real, SpiceError, SpiceResult};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+/// One posted transition, retaining its physical-time expression and
+/// conditional same-time delta ordering.
+#[derive(Clone, Debug)]
+pub struct WaveformRequest {
+    arrival: Arrival,
+    delta: EventDelta,
+}
+
+impl WaveformRequest {
+    /// Bind an arrival to its explicit or propagated delta semantics.
+    #[must_use = "the request retains arrival and delta provenance"]
+    pub fn new(arrival: Arrival, delta: EventDelta) -> Self {
+        Self { arrival, delta }
+    }
+    /// Stable requested endpoints and physical arrival expression.
+    #[must_use = "the request retains physical arrival provenance"]
+    pub const fn arrival(&self) -> &Arrival {
+        &self.arrival
+    }
+    /// Same-time ordering specification.
+    #[must_use = "the delta determines causal equality order"]
+    pub const fn delta(&self) -> &EventDelta {
+        &self.delta
+    }
+}
+
 /// A complete transport waveform within one guard.
 #[derive(Clone, Debug)]
 pub struct DriveTrace {
     initial: Drive,
-    requests: Vec<Arrival>,
+    requests: Vec<WaveformRequest>,
 }
 
 impl DriveTrace {
@@ -25,7 +51,7 @@ impl DriveTrace {
     ///
     /// # Errors
     /// A directional initial phase, or inconsistent requested endpoints.
-    pub fn new(initial: Drive, requests: Vec<Arrival>) -> SpiceResult<Self> {
+    pub fn new(initial: Drive, requests: Vec<WaveformRequest>) -> SpiceResult<Self> {
         if matches!(initial.logic, Logic::Rising | Logic::Falling) {
             return Err(SpiceError::circuit(
                 "guarded waveform initial drive is not stable",
@@ -33,14 +59,28 @@ impl DriveTrace {
         }
         let mut prior = initial;
         for request in &requests {
-            if prior != request.from() {
+            if prior != request.arrival.from() {
                 return Err(SpiceError::circuit(
                     "inconsistent guarded waveform endpoints",
                 ));
             }
-            prior = request.to();
+            prior = request.arrival.to();
         }
         Ok(Self { initial, requests })
+    }
+
+    /// Construct a source waveform whose requests use delta zero.
+    ///
+    /// # Errors
+    /// Invalid stable drive or inconsistent requested endpoints.
+    pub fn source(initial: Drive, arrivals: Vec<Arrival>) -> SpiceResult<Self> {
+        Self::new(
+            initial,
+            arrivals
+                .into_iter()
+                .map(|arrival| WaveformRequest::new(arrival, EventDelta::Fixed(0)))
+                .collect(),
+        )
     }
 
     /// Drive before any request has physically arrived.
@@ -51,14 +91,16 @@ impl DriveTrace {
 
     /// Transport requests in posting order.
     #[must_use = "posting order determines physical supersession"]
-    pub fn requests(&self) -> &[Arrival] {
+    pub fn requests(&self) -> &[WaveformRequest] {
         &self.requests
     }
 
     /// The final requested drive after all events complete.
     #[must_use = "the final drive follows the last posted request"]
     pub fn final_drive(&self) -> Drive {
-        self.requests.last().map_or(self.initial, Arrival::to)
+        self.requests
+            .last()
+            .map_or(self.initial, |request| request.arrival.to())
     }
 
     fn realize_at(
@@ -70,10 +112,10 @@ impl DriveTrace {
         let mut observation = ExactSum::new();
         observation.add_product(time, 1.);
         for request in self.requests.iter().rev() {
-            if exact_at(request.window(), origins, budget)?.exact_cmp(&observation)
+            if exact_at(request.arrival.window(), origins, budget)?.exact_cmp(&observation)
                 != Ordering::Greater
             {
-                return Ok(request.to());
+                return Ok(request.arrival.to());
             }
         }
         Ok(self.initial)
@@ -89,6 +131,7 @@ pub struct GuardedWaveform {
 
 impl GuardedWaveform {
     /// Bind an exhaustive, mutually exclusive guarded trace partition.
+    #[must_use = "the waveform retains the complete guarded trace partition"]
     pub fn new(traces: Guarded<DriveTrace>) -> Self {
         Self { traces }
     }
@@ -129,12 +172,12 @@ impl GuardedWaveform {
                 .requests
                 .iter()
                 .rev()
-                .map(|request| (request.to(), Some(request)))
+                .map(|request| (request.arrival.to(), Some(request)))
                 .chain(std::iter::once((trace.initial, None)))
             {
                 charge(&mut budget, conditions.len().saturating_add(1))?;
                 if let Some(request) = request {
-                    conditions.push((request.window().clone(), TimingRelation::NoLater));
+                    conditions.push((request.arrival.window().clone(), TimingRelation::NoLater));
                 }
                 let intervals =
                     guard.observation_intervals_with_budget(&conditions, &mut budget)?;
@@ -280,7 +323,7 @@ mod tests {
             } else {
                 Vec::new()
             };
-            DriveTrace::new(low, requests)
+            DriveTrace::source(low, requests)
         })?;
         let waveform = GuardedWaveform::new(Guarded::from_conditional(traces));
         let projection = waveform.project(1_000_000)?;
@@ -339,7 +382,7 @@ mod tests {
         let high = Drive::strong(Logic::One);
         let rise = TimingWindow::exact(10.)?.after(DelayWindow::new(0., 10.)?, u)?;
         let fall = TimingWindow::exact(15.)?;
-        let waveform = GuardedWaveform::new(Guarded::unconditional(DriveTrace::new(
+        let waveform = GuardedWaveform::new(Guarded::unconditional(DriveTrace::source(
             low,
             vec![
                 Arrival::new(low, high, rise)?,
