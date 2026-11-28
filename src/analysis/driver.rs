@@ -118,6 +118,10 @@ impl AnalysisInput {
         crate::analysis::RunConfig::default().plan(self)
     }
 
+    pub(super) fn set_location(&mut self, location: SourceLoc) {
+        self.location = Some(location);
+    }
+
     pub(super) const fn location(&self) -> Option<&SourceLoc> {
         self.location.as_ref()
     }

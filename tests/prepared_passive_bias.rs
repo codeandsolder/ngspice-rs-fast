@@ -578,6 +578,7 @@ fn parameter_candidates_rebind_the_source_prepared_bias() {
         dir.path(),
         InitialConditions {
             devices: vec![PassiveInitialCondition {
+                missing_storage: model_normalize_ngspice::passive_ic::MissingStorage::NodeHints,
                 artifact: "deck.cir".into(),
                 scope: Vec::new(),
                 device: "c1".into(),

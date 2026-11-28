@@ -56,6 +56,7 @@ pub mod periodic_noise;
 mod periodic_orbit;
 pub mod periodic_small_signal;
 mod plan;
+pub mod prepared_plan;
 mod pss;
 mod pz;
 pub mod rawfile;

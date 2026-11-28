@@ -28,8 +28,8 @@ pub enum OutputSampling {
 }
 
 /// Validated, source-independent timing for a continuous transient.
-/// Output times form a lazy grid starting at the output gate, including each
-/// subsequent output-segment boundary and final stop exactly once.
+/// Output is either accepted integration points or a lazy segment grid.
+/// Grid sampling retains each subsequent segment boundary and the final stop.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransientSchedule {
     start: Real,
@@ -63,7 +63,8 @@ fn validate(segments: &[TimingSegment]) -> SpiceResult<Real> {
 
 impl TransientSchedule {
     /// Build independent output and integration schedules. Both must cover
-    /// the same complete simulation duration starting from zero.
+    /// the same complete simulation duration starting from zero. The startup
+    /// and implicit forcing hint is independent of the output sampling mode.
     ///
     /// # Errors
     /// Empty schedules, nonfinite or nonpositive intervals, nonincreasing
