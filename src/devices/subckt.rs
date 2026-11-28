@@ -877,7 +877,7 @@ impl<'a> Expander<'a> {
                 }
             }
             FrontendAction::Save(save) => {
-                self.output_directive(save, terminals, path, directives.definition)?
+                self.output_directive(save, terminals, path, directives.definition)?;
             }
             FrontendAction::Print(print) => {
                 let mut print = print.clone();

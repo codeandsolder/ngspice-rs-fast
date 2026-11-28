@@ -137,10 +137,16 @@ struct DeviceOrigin {
     internal_nodes: Vec<NodeId>,
     /// The URC setup which generated this device and its model.
     generated_by: Option<usize>,
-    /// A source-level storage network is not an independently settable primitive.
-    prepared_storage: bool,
+    /// Source-level passive-network membership, independent of URC setup ordering.
+    prepared_network: Option<PreparedNetworkRole>,
     /// The resolved occurrence-level choice is immutable with its network.
     conditional_network_selection: Option<super::passive_network::ConditionalNetworkSelection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedNetworkRole {
+    StoragePrimary,
+    Member,
 }
 
 /// One elaborated device together with its setup provenance.
@@ -1614,8 +1620,7 @@ impl Circuit {
             .get(index)
             .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?
             .origin;
-        if origin.prepared_storage
-            || origin.conditional_network_selection.is_some()
+        if origin.prepared_network.is_some()
             || !origin.internal_nodes.is_empty()
             || origin.generated_by.is_some()
             || self
@@ -2507,13 +2512,13 @@ impl Circuit {
         replacement: Option<(usize, &'a dyn Device)>,
         addition: Option<&'a dyn Device>,
     ) -> SpiceResult<()> {
+        use super::passive_network::ConditionalNetworkSelection;
         if !devices
             .clone()
             .any(|entry| entry.origin.conditional_network_selection.is_some())
         {
             return Ok(());
         }
-        use super::passive_network::ConditionalNetworkSelection;
         let resolved = || {
             devices
                 .clone()
@@ -2521,7 +2526,7 @@ impl Circuit {
                 .map(|(index, entry)| {
                     replacement
                         .filter(|(ordinal, _)| *ordinal == index)
-                        .map_or(entry.device.as_ref(), |(_, device)| device)
+                        .map_or_else(|| entry.device.as_ref(), |(_, device)| device)
                 })
                 .chain(addition)
         };
@@ -3582,7 +3587,7 @@ impl Circuit {
             });
         };
         let device = &self.devices[index];
-        if device.origin.prepared_storage {
+        if device.origin.prepared_network == Some(PreparedNetworkRole::StoragePrimary) {
             return Err(SpiceError::Unsupported {
                 feature: format!(
                     "prepared storage network {name}: re-elaborate the source occurrence to change {keyword}"
@@ -5175,7 +5180,11 @@ impl Circuit {
         let existing = self.physical_elaboration_size()?;
         let limits = self.elaboration_limits;
         let mut absent = self.absent_storage.clone();
-        let present = absent.partition(instances, &self.nodes)?;
+        let network_references = crate::devices::behavioural::dynamic::NetworkReferences::collect(
+            instances,
+            &self.devices,
+        );
+        let present = absent.partition(instances, &self.nodes, &network_references)?;
         let mut seen: BTreeSet<String> = self
             .devices
             .iter()
@@ -5195,7 +5204,7 @@ impl Circuit {
             present.as_ref(),
             &self.nodes,
             models,
-            &self.devices,
+            &network_references,
             limits
                 .devices
                 .saturating_sub(existing.devices)
@@ -5204,7 +5213,6 @@ impl Circuit {
             &absent,
         )?;
         let aliases = instances.probe_aliases;
-        let network_references = instances.network_references;
         let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
@@ -5434,8 +5442,15 @@ impl Circuit {
                     device.name()
                 )));
             }
-            let prepared_storage = matches!(instance.designator, 'c' | 'l')
-                && device.name().eq_ignore_ascii_case(&instance.name);
+            let prepared_network = Some(
+                if matches!(instance.designator, 'c' | 'l')
+                    && device.name().eq_ignore_ascii_case(&instance.name)
+                {
+                    PreparedNetworkRole::StoragePrimary
+                } else {
+                    PreparedNetworkRole::Member
+                },
+            );
             let conditional_network_selection =
                 if device.name().eq_ignore_ascii_case(&instance.name) {
                     network.conditional_selection()
@@ -5445,7 +5460,7 @@ impl Circuit {
             staged.push(ElaboratedDevice {
                 device,
                 origin: DeviceOrigin {
-                    prepared_storage,
+                    prepared_network,
                     conditional_network_selection,
                     ..DeviceOrigin::default()
                 },

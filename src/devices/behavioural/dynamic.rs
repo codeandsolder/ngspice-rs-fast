@@ -38,7 +38,7 @@ use crate::netlist::ast::{CodePortKind, DeviceInstance, ParameterAssignment, Par
 use crate::netlist::bexpr::{
     BExpr, BExprKind, BehaviouralExpression, CurrentPolicy, DynamicOperator,
 };
-use crate::primitives::NodeTable;
+use crate::primitives::{NodeTable, SourceLoc};
 
 pub(super) const DERIVATIVE: &str = "__dynamic_derivative";
 const SAMPLED_CURRENT: &str = "__dynamic_sampled_current";
@@ -84,8 +84,9 @@ fn dynamic_operator(expr: &BExpr) -> Option<DynamicOperator> {
     }
 }
 
-#[derive(Default)]
-pub(in crate::devices) struct NetworkReferences {
+pub(in crate::devices) struct NetworkReferences<'a> {
+    existing: &'a [crate::devices::ElaboratedDevice],
+    behavioural: BTreeMap<String, SourceLoc>,
     pub current: BTreeSet<String>,
     pub coupled: BTreeSet<String>,
 }
@@ -95,7 +96,6 @@ struct CurrentTargets {
     probes: BTreeSet<usize>,
     zero: BTreeSet<String>,
     instantaneous: BTreeSet<String>,
-    network_references: NetworkReferences,
 }
 
 /// A genuine voltage-imposing or winding branch, not merely an internal
@@ -140,14 +140,27 @@ fn has_native_current(
     })
 }
 
-/// Electrical consumers before dynamic lowering or numerical simplification.
-fn network_references(
-    instances: &[DeviceInstance],
-    existing: &[crate::devices::ElaboratedDevice],
-    behavioural: impl Iterator<Item = String>,
-) -> NetworkReferences {
-    NetworkReferences {
-        current: behavioural
+impl<'a> NetworkReferences<'a> {
+    /// Electrical consumers before absent partition, dynamic lowering or
+    /// numerical simplification. Zero-copy storage has only scalar parameters;
+    /// absent partition never changes current reads in surviving expressions.
+    pub(in crate::devices) fn collect(
+        instances: &[DeviceInstance],
+        existing: &'a [crate::devices::ElaboratedDevice],
+    ) -> Self {
+        let mut behavioural = BTreeMap::new();
+        for expression in instances.iter().flat_map(expressions) {
+            expression.root.visit(&mut |node| {
+                if let BExprKind::Current(name) = &node.kind {
+                    behavioural
+                        .entry(name.to_ascii_lowercase())
+                        .or_insert_with(|| node.span.start.clone());
+                }
+            });
+        }
+        let current = behavioural
+            .keys()
+            .cloned()
             .chain(
                 instances
                     .iter()
@@ -171,8 +184,8 @@ fn network_references(
                     .flat_map(|device| device.controlling_sources())
                     .map(|control| control.name.to_ascii_lowercase()),
             )
-            .collect(),
-        coupled: instances
+            .collect();
+        let coupled = instances
             .iter()
             .filter(|instance| instance.designator == 'k')
             .flat_map(|instance| &instance.parameters)
@@ -185,7 +198,13 @@ fn network_references(
                     .flat_map(|coupling| coupling.inductors)
                     .map(|inductor| inductor.name.to_ascii_lowercase()),
             )
-            .collect(),
+            .collect();
+        Self {
+            existing,
+            behavioural,
+            current,
+            coupled,
+        }
     }
 }
 
@@ -193,23 +212,11 @@ fn measured_targets(
     instances: &[DeviceInstance],
     models: &crate::devices::models::ModelResolver<'_>,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
-    existing: &[crate::devices::ElaboratedDevice],
+    references: &NetworkReferences<'_>,
     absent: &crate::devices::passive_network::AbsentStorage,
 ) -> SpiceResult<CurrentTargets> {
-    let mut referenced = BTreeMap::new();
-    for expression in instances.iter().flat_map(expressions) {
-        expression.root.visit(&mut |node| {
-            if let BExprKind::Current(name) = &node.kind {
-                referenced
-                    .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| node.span.start.clone());
-            }
-        });
-    }
-    let mut targets = CurrentTargets {
-        network_references: network_references(instances, existing, referenced.keys().cloned()),
-        ..CurrentTargets::default()
-    };
+    let referenced = &references.behavioural;
+    let mut targets = CurrentTargets::default();
     if referenced.is_empty() {
         return Ok(targets);
     }
@@ -221,7 +228,7 @@ fn measured_targets(
             targets.instantaneous.insert(name.clone());
         }
     }
-    for device in existing {
+    for device in references.existing {
         let name = device.name().to_ascii_lowercase();
         if referenced.contains_key(&name)
             && is_instantaneous_branch(device.designator(), device.findable_branch().is_some())
@@ -266,14 +273,13 @@ fn measured_targets(
 pub(in crate::devices) struct ExpandedInstances<'a> {
     pub instances: Cow<'a, [DeviceInstance]>,
     pub probe_aliases: Vec<String>,
-    pub network_references: NetworkReferences,
 }
 
 pub(in crate::devices) fn expand<'a>(
     instances: &'a [DeviceInstance],
     nodes: &NodeTable,
     models: &crate::devices::models::ModelResolver<'_>,
-    existing: &[crate::devices::ElaboratedDevice],
+    references: &NetworkReferences<'_>,
     capacity: usize,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
     absent: &crate::devices::passive_network::AbsentStorage,
@@ -283,13 +289,11 @@ pub(in crate::devices) fn expand<'a>(
         probes: measured,
         zero,
         instantaneous,
-        network_references,
-    } = measured_targets(instances, models, resistors, existing, absent)?;
+    } = measured_targets(instances, models, resistors, references, absent)?;
     if count == 0 && measured.is_empty() && zero.is_empty() {
         return Ok(ExpandedInstances {
             instances: Cow::Borrowed(instances),
             probe_aliases: Vec::new(),
-            network_references,
         });
     }
     // Selection may remove wrappers, zero-copy reads become constants, and
@@ -303,7 +307,8 @@ pub(in crate::devices) fn expand<'a>(
     let (mut occupied_nodes, occupied_devices) = occupied_names(
         instances,
         nodes,
-        existing
+        references
+            .existing
             .iter()
             .map(|device| device.name())
             .chain(absent.names.iter().map(String::as_str)),
@@ -370,7 +375,6 @@ pub(in crate::devices) fn expand<'a>(
     Ok(ExpandedInstances {
         instances: Cow::Owned(expansion.output),
         probe_aliases,
-        network_references,
     })
 }
 

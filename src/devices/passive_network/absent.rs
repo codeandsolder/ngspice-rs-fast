@@ -62,10 +62,11 @@ impl AbsentStorage {
         &mut self,
         instances: &'a [DeviceInstance],
         nodes: &NodeTable,
+        references: &crate::devices::behavioural::dynamic::NetworkReferences<'_>,
     ) -> SpiceResult<Cow<'a, [DeviceInstance]>> {
         let mut removed = BTreeSet::new();
         for (index, instance) in instances.iter().enumerate() {
-            if !NetworkPlan::is_removed(instance)? {
+            if !NetworkPlan::is_removed(instance, references)? {
                 continue;
             }
             if !self.names.insert(instance.name.to_lowercase()) {

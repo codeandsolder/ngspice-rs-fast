@@ -212,7 +212,7 @@ impl<'a> PlannedBatch<'a> {
         nodes: &NodeTable,
         existing: ElaborationSize,
         limits: ElaborationLimits,
-        references: &super::behavioural::dynamic::NetworkReferences,
+        references: &super::behavioural::dynamic::NetworkReferences<'_>,
     ) -> SpiceResult<Self> {
         let mut known = existing;
         let mut expansions = Vec::new();

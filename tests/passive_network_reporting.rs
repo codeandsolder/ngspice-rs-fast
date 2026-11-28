@@ -724,3 +724,78 @@ fn late_coupling_membership_requires_atomic_reelaboration() -> SpiceResult<()> {
     assert_eq!(existing.nodes().len(), nodes);
     Ok(())
 }
+
+#[test]
+fn generated_conditional_network_members_cannot_be_replaced_independently() -> SpiceResult<()> {
+    use ngspice_rs::devices::Resistor;
+    use ngspice_rs::primitives::NodeId;
+
+    let mut existing = circuit(
+        "immutable physical network\nv1 out 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nr1 out 0 3\n.end\n",
+    )?;
+    let out = existing.nodes().get("out").unwrap();
+    let generated = existing
+        .devices()
+        .iter()
+        .enumerate()
+        .filter(|(_, device)| device.name() != "r1")
+        .map(|(index, device)| (index, device.name().to_owned()))
+        .collect::<Vec<_>>();
+    assert!(generated.len() >= 3);
+    for (index, name) in generated {
+        let replacement = Resistor::new(&name, [out, NodeId::GROUND], 5.)?;
+        let result = existing.replace_device(index, Box::new(replacement));
+        assert!(matches!(result, Err(error) if error.to_string().contains("re-elaboration")));
+        assert_eq!(existing.devices()[index].name(), name);
+    }
+    let ac = run(
+        &mut existing,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    close(
+        ac.value("v(out)", 0).unwrap(),
+        Complex::new(0.596_608_345_906_663_5, -0.044_983_209_517_697_58),
+        1e-10,
+        1e-12,
+    );
+    Ok(())
+}
+
+#[test]
+fn redundant_current_consumer_can_be_replaced_but_last_consumer_cannot() -> SpiceResult<()> {
+    use ngspice_rs::devices::Resistor;
+    use ngspice_rs::primitives::NodeId;
+
+    let mut existing = circuit(
+        "redundant references\nv1 out 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nr1 out 0 3\nh1 sense1 0 v1 1\nh2 sense2 0 v1 1\n.end\n",
+    )?;
+    for (name, node, expected) in [("h1", "sense1", true), ("h2", "sense2", false)] {
+        let index = existing
+            .devices()
+            .iter()
+            .position(|device| device.name() == name)
+            .unwrap();
+        let sense = existing.nodes().get(node).unwrap();
+        let replacement = Resistor::new(format!("r{node}"), [sense, NodeId::GROUND], 1.)?;
+        let result = existing.replace_device(index, Box::new(replacement));
+        if expected {
+            result?;
+        } else {
+            assert!(matches!(result, Err(error) if error.to_string().contains("re-elaborate")));
+            assert_eq!(existing.devices()[index].name(), name);
+        }
+    }
+    let ac = run(
+        &mut existing,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    close(
+        ac.value("v(out)", 0).unwrap(),
+        Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+        1e-10,
+        1e-12,
+    );
+    Ok(())
+}

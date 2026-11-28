@@ -765,7 +765,10 @@ impl NetworkPlan {
     }
 
     /// Detect a resolved zero-copy prepared network before dynamic expansion.
-    pub(super) fn is_removed(instance: &crate::netlist::ast::DeviceInstance) -> SpiceResult<bool> {
+    pub(super) fn is_removed(
+        instance: &crate::netlist::ast::DeviceInstance,
+        references: &super::behavioural::dynamic::NetworkReferences<'_>,
+    ) -> SpiceResult<bool> {
         if !matches!(instance.designator, 'c' | 'l')
             || !instance
                 .parameters
@@ -781,7 +784,14 @@ impl NetworkPlan {
             return Ok(false);
         }
         Ok(matches!(
-            Self::prepare(instance, false, false)?,
+            Self::prepare(
+                instance,
+                false,
+                instance.designator == 'l'
+                    && references
+                        .coupled
+                        .contains(&instance.name.to_ascii_lowercase())
+            )?,
             Some(Self::Storage(None))
         ))
     }
