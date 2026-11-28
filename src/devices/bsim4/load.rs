@@ -1,5 +1,4 @@
-//! `b4ld.c` (`BSIM4load`): the DC/transient load of one instance, and
-//! `BSIM4polyDepletion`.
+//! `b4ld.c` (`BSIM4load`): the DC/transient load of one instance.
 //!
 //! Physics stages retain the C model and host-call ordering. Numerically
 //! unstable forms use independently verified equivalent constitutive laws.
@@ -165,34 +164,6 @@ fn depletion_charge(k1: f64, increment: f64) -> (f64, f64) {
     (k1 * difference, base / root)
 }
 
-/// `BSIM4polyDepletion`: the poly-gate depletion effective gate voltage and
-/// its gate derivative, `(Vgs_eff, dVgs_eff_dVg)`.
-pub(super) fn BSIM4polyDepletion(
-    phi: f64,
-    ngate: f64,
-    epsgate: f64,
-    coxe: f64,
-    Vgs: f64,
-) -> (f64, f64) {
-    // Poly gate Si depletion effect.
-    if (ngate > 1.0e18) && (ngate < 1.0e25) && (Vgs > phi) && (epsgate != 0.0) {
-        let T1 = 1.0e6 * CHARGE * epsgate * ngate / (coxe * coxe);
-        let T8 = Vgs - phi;
-        let T4 = (2.0_f64.mul_add(T8 / T1, 1.0)).sqrt();
-        let T2 = 2.0 * T8 / (T4 + 1.0);
-        let T3 = 0.5 * T2 * T2 / T1; // Vpoly
-        let T7 = 1.07 - T3;
-        let T6 = T7.mul_add(T7, 0.224).sqrt();
-        // Rationalized band-bending drop. The original difference
-        // 1.12 - (T7+T6)/2 loses the entire drop near the onset of depletion.
-        let T5 = 2.24 * T3 / (2.24 - T7 + T6);
-        let slope = (-(0.5 - 0.5 / T4)).mul_add(1.0 + T7 / T6, 1.0);
-        (Vgs - T5, slope)
-    } else {
-        (Vgs, 1.0)
-    }
-}
-
 /// `BSIM4load` for one instance: evaluates the device at the voltages C's
 /// mode selects, writes `CKTstate0`, integrates charges and adds the
 /// matrix and right-hand-side terms, as C does.
@@ -211,7 +182,7 @@ pub(super) fn load(
         drain: bias.vbd_jct,
     };
     junction::current(model, here, pParam, ckt, junction_bias)?;
-    let electrostatics = channel::electrostatics(model, here, pParam, ckt, &bias);
+    let electrostatics = channel::electrostatics(model, here, pParam, ckt, &bias)?;
     let transport = channel::transport(model, here, pParam, &bias, &electrostatics);
     let cdrain = leakage::evaluate(model, here, pParam, &bias, &electrostatics, &transport);
     let charges = charge::intrinsic(model, here, pParam, ckt, &bias, &electrostatics, &transport)?;
@@ -227,13 +198,14 @@ pub(super) fn load(
 
 #[cfg(test)]
 mod tests {
-    use super::BSIM4polyDepletion;
+    use super::CHARGE;
+    use crate::devices::bsim_physics::poly_depletion;
 
     #[test]
     fn poly_depletion_matches_hand_evaluation() {
         // Independent 80-digit evaluation of the physical equations:
         // a 55.80412553677218 mV drop, not a particular C rounding order.
-        let (vgs_eff, d) = BSIM4polyDepletion(0.9, 2e19, 1.03594e-10, 0.0115, 1.5);
+        let (vgs_eff, d) = poly_depletion(1.5, 0.9, 2e19, 1.03594e-10, 0.0115, CHARGE).unwrap();
         assert!((vgs_eff - 1.444_195_874_463_227_8).abs() <= 2. * f64::EPSILON);
         assert!((d - 0.830_890_287_421_742_1).abs() <= 2. * f64::EPSILON);
     }
@@ -247,7 +219,10 @@ mod tests {
             (0.9, 1e25, 1.03594e-10, 1.5),
             (0.9, 2e19, 0.0, 1.5),
         ] {
-            assert_eq!(BSIM4polyDepletion(phi, ngate, eps, 0.0115, vgs), (vgs, 1.0));
+            assert_eq!(
+                poly_depletion(vgs, phi, ngate, eps, 0.0115, CHARGE).unwrap(),
+                (vgs, 1.0)
+            );
         }
     }
 }

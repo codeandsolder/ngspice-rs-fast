@@ -121,6 +121,55 @@ pub(super) fn depletion<S: Constitutive>(
     }
 }
 
+/// Effective gate voltage and local gate derivative after poly-Si depletion.
+/// BSIM3 and BSIM4 use the same law, but their reference electron-charge
+/// constants differ. The prepared scale preserves that distinction.
+pub(super) fn poly_depletion<S: Constitutive>(
+    voltage: S,
+    threshold: Real,
+    doping: Real,
+    permittivity: Real,
+    oxide_capacitance: Real,
+    electron_charge: Real,
+) -> SpiceResult<(S, S)> {
+    if !(1e18 < doping && doping < 1e25 && permittivity != 0.)
+        || voltage.compare(threshold) != Some(Ordering::Greater)
+    {
+        let slope = voltage.constant(1.);
+        return Ok((voltage, slope));
+    }
+    let scale =
+        1e6 * electron_charge * permittivity * doping / (oxide_capacitance * oxide_capacitance);
+    let overdrive = voltage.clone().offset(-threshold);
+    let root = overdrive
+        .clone()
+        .scale(2.)
+        .divide(&voltage.constant(scale))?
+        .offset(1.)
+        .sqrt()?;
+    // Rationalize the two small square-root differences; the gate slope
+    // must not subtract nearly equal halves near the depletion threshold.
+    let gate_drop = overdrive.scale(2.).divide(&root.clone().offset(1.))?;
+    let poly = gate_drop
+        .clone()
+        .scale(0.5)
+        .multiply(&gate_drop)
+        .divide(&voltage.constant(scale))?;
+    let barrier = poly.clone().scale(-1.).offset(1.07);
+    let band_root = barrier
+        .clone()
+        .mul_add(&barrier, &voltage.constant(0.224))
+        .sqrt()?;
+    let band_drop = poly
+        .scale(2.24)
+        .divide(&barrier.clone().scale(-1.).offset(2.24).add(&band_root))?;
+    let slope = gate_drop.scale(-0.5).divide(&root.scale(scale))?.mul_add(
+        &barrier.divide(&band_root)?.offset(1.),
+        &voltage.constant(1.),
+    );
+    Ok((voltage.add(&band_drop.scale(-1.)), slope))
+}
+
 /// BSIM3's prepared diode saturation and optional linear forward tail.
 /// Returns the actual static residual and its differential conductance.
 pub(super) fn bsim3_junction<S: Constitutive>(
@@ -285,6 +334,53 @@ mod tests {
                 let reference =
                     (base + extra) * v - extra * (half + 0.5 * kappa * (secondary - 1.));
                 close(value_at(&charge.value, sample), reference, 2e-23);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn poly_depletion_preserves_local_curvature_and_one_sided_threshold() -> SpiceResult<()> {
+        const PHI: Real = 0.9;
+        const DOPING: Real = 2e19;
+        const EPS: Real = 1.03594e-10;
+        const COX: Real = 0.0115;
+        for electron_charge in [1.602_19e-19, 1.602_176_620_8e-19] {
+            let evaluate =
+                |voltage| poly_depletion(voltage, PHI, DOPING, EPS, COX, electron_charge);
+            let scalar = |voltage| poly_depletion(voltage, PHI, DOPING, EPS, COX, electron_charge);
+            for (bias, rate) in [
+                (0.7, 0.02),
+                (PHI, -0.02),
+                (PHI, 0.02),
+                (1.5, 0.02),
+                (2., -0.02),
+            ] {
+                let (effective, slope) = evaluate(variable(bias, rate)?)?;
+                let (value, derivative) = scalar(bias)?;
+                close(effective.value.value(), value, 2e-15);
+                close(slope.value.value(), derivative, 2e-15);
+                let gradient = effective.gradient[0].as_ref().unwrap();
+                for (&actual, &expected) in gradient
+                    .coefficients()
+                    .iter()
+                    .zip(slope.value.coefficients())
+                {
+                    close(actual, expected, 2e-15);
+                }
+                let time = 0.03;
+                let (expected, expected_slope) = scalar(rate.mul_add(time, bias))?;
+                close(value_at(&effective.value, time), expected, 2e-15);
+                close(value_at(&slope.value, time), expected_slope, 2e-15);
+                if bias.to_bits() == PHI.to_bits() {
+                    let scale = 1e6 * electron_charge * EPS * DOPING / (COX * COX);
+                    let expected = if rate > 0. {
+                        -0.5 * rate * rate / scale * (0.5 + 0.5 * 1.07 / 1.17)
+                    } else {
+                        0.
+                    };
+                    close(effective.value.coefficients()[2], expected, 1e-18);
+                }
             }
         }
         Ok(())
