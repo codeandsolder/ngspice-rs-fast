@@ -398,13 +398,13 @@ fn poly_forms_lower_onto_spice2poly_in_spice2_term_order() {
     let v = expression(&netlist.devices[0], "v");
     assert_eq!(
         shape(&v.root),
-        "(((((1 + (2 * v(a,0))) + (3 * v(b,0))) + (4 * (v(a,0) * v(a,0)))) + \
-         (5 * (v(a,0) * v(b,0)))) + (6 * (v(b,0) * v(b,0))))"
+        "((1 + ((2 * v(a,0)) + (3 * v(b,0)))) + ((4 * (v(a,0) * v(a,0))) + \
+         ((5 * (v(a,0) * v(b,0))) + (6 * (v(b,0) * v(b,0))))))"
     );
     assert_eq!(names(&netlist.devices[1]), ["i", "m"]);
     assert_eq!(
         shape(&expression(&netlist.devices[1], "i").root),
-        "(0 + (2 * i(vx)))"
+        "(2 * i(vx))"
     );
 }
 
@@ -417,7 +417,7 @@ fn poly_dimensions_use_one_validation_rule_across_frontend() {
         let netlist = lowered(&body);
         assert_eq!(
             shape(&expression(&netlist.devices[0], "v").root),
-            "((1 + (2 * v(a,0))) + (3 * v(b,0)))"
+            "(1 + ((2 * v(a,0)) + (3 * v(b,0))))"
         );
     }
     // atoi in the C translator reads a decimal prefix, not a scaled SPICE
@@ -611,10 +611,18 @@ fn generated_and_embedded_expression_nodes_obey_the_same_limits() {
     );
     let error = try_parse(&embedded).unwrap_err();
     assert!(error.to_string().contains("node limit"), "{error}");
+    // Balanced polynomial lowering accepts a dense 256-term tree, but
+    // rejects the larger tree by total generated node count, not fold depth.
     let n = parse(&format!(
         "e1 o 0 poly(1) in 0 {}",
         "1 ".repeat(MAX_TREE_DEPTH)
     ));
+    lower_nonlinear_sources(&n).unwrap();
+    let n = parse(&format!("e1 o 0 poly(1) in 0 {}", "1 ".repeat(400)));
+    let error = lower_nonlinear_sources(&n).unwrap_err();
+    assert!(error.to_string().contains("node limit"), "{error}");
+    // A deeply nested unresolved coefficient still consumes its real depth.
+    let n = parse(&format!("e1 o 0 poly(1) in 0 1 {{{chain}}}"));
     let error = lower_nonlinear_sources(&n).unwrap_err();
     assert!(
         error.to_string().contains("structural depth limit"),
