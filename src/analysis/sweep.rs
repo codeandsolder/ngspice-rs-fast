@@ -228,7 +228,7 @@ impl AccumulatedGrid {
         } else {
             0.
         };
-        GridValues {
+        GridValues::Accumulated {
             stored: self.range.start + offset,
             offset,
             step: self.range.step,
@@ -237,21 +237,86 @@ impl AccumulatedGrid {
     }
 }
 
+/// A source-bound continuation target, independent of positional card grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DcAxisTarget {
+    /// An independent voltage or current source, verified by physical metadata.
+    Source(String),
+    /// A resistor's supplied resistance.
+    Resistance(String),
+    /// Circuit temperature in Celsius.
+    Temperature,
+    /// An emitted device and its scalar native parameter.
+    Instance {
+        /// Expanded native instance name.
+        instance: String,
+        /// Native scalar setter name.
+        parameter: String,
+    },
+}
+
+/// Explicit validated-coordinate input; order and repeated values are meaningful.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DcSweepAxis {
+    /// The physical target, prior to circuit binding.
+    pub target: DcAxisTarget,
+    /// Source-selected ordered coordinates, in the target's physical units.
+    pub coordinates: std::sync::Arc<[Real]>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Grid {
+    Accumulated(AccumulatedGrid),
+    Explicit(std::sync::Arc<[Real]>),
+}
+
+impl Grid {
+    fn values(&self) -> GridValues {
+        match self {
+            Self::Accumulated(grid) => grid.values(),
+            Self::Explicit(values) => GridValues::Explicit {
+                values: std::sync::Arc::clone(values),
+                next: 0,
+            },
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Accumulated(grid) => grid.count,
+            Self::Explicit(values) => values.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-struct GridValues {
-    stored: Real,
-    offset: Real,
-    step: Real,
-    remaining: usize,
+enum GridValues {
+    Accumulated {
+        stored: Real,
+        offset: Real,
+        step: Real,
+        remaining: usize,
+    },
+    Explicit {
+        values: std::sync::Arc<[Real]>,
+        next: usize,
+    },
 }
 
 impl GridValues {
     const fn singleton(value: Real) -> Self {
-        Self {
+        Self::Accumulated {
             stored: value,
             offset: 0.,
             step: 0.,
             remaining: 1,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        match self {
+            Self::Accumulated { remaining, .. } => *remaining,
+            Self::Explicit { values, next } => values.len() - *next,
         }
     }
 }
@@ -260,19 +325,34 @@ impl Iterator for GridValues {
     type Item = Real;
 
     fn next(&mut self) -> Option<Real> {
-        if self.remaining == 0 {
-            return None;
+        match self {
+            Self::Accumulated {
+                stored,
+                offset,
+                step,
+                remaining,
+            } => {
+                if *remaining == 0 {
+                    return None;
+                }
+                let value = *stored - *offset;
+                *remaining -= 1;
+                if *remaining != 0 {
+                    *stored += *step;
+                }
+                Some(value)
+            }
+            Self::Explicit { values, next } => {
+                let value = values.get(*next).copied()?;
+                *next += 1;
+                Some(value)
+            }
         }
-        let value = self.stored - self.offset;
-        self.remaining -= 1;
-        if self.remaining != 0 {
-            self.stored += self.step;
-        }
-        Some(value)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        let remaining = self.remaining();
+        (remaining, Some(remaining))
     }
 }
 impl ExactSizeIterator for GridValues {}
@@ -372,6 +452,7 @@ fn parameter_target(text: &str) -> SpiceResult<Option<(&str, &str)>> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AxisTarget {
+    Typed(DcAxisTarget),
     Temperature,
     Name(String),
     Parameter { instance: String, parameter: String },
@@ -396,13 +477,13 @@ impl AxisTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DcSweepPlan {
     axes: Vec<AxisPlan>,
-    grids: Vec<AccumulatedGrid>,
+    grids: Vec<Grid>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct AxisPlan {
     target: AxisTarget,
-    exact: ExactGrid,
+    exact: Option<ExactGrid>,
 }
 
 pub(super) fn parse_axes(args: &[String]) -> SpiceResult<DcSweepPlan> {
@@ -433,15 +514,47 @@ pub(super) fn parse_axes(args: &[String]) -> SpiceResult<DcSweepPlan> {
                 check_domain(value, true, false)?;
             }
         }
-        axes.push(AxisPlan { target, exact });
-        grids.push(values);
+        axes.push(AxisPlan {
+            target,
+            exact: Some(exact),
+        });
+        grids.push(Grid::Accumulated(values));
     }
     Ok(DcSweepPlan { axes, grids })
 }
 
 impl DcSweepPlan {
+    pub(super) fn from_explicit(axes: Vec<DcSweepAxis>) -> SpiceResult<Self> {
+        if !matches!(axes.len(), 1 | 2) {
+            return Err(unsupported("DC requires one or two continuation axes"));
+        }
+        let mut work = 1;
+        let mut plan = Self {
+            axes: Vec::with_capacity(axes.len()),
+            grids: Vec::with_capacity(axes.len()),
+        };
+        for axis in axes {
+            let values = axis.coordinates;
+            if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+                return Err(unsupported("empty or nonfinite DC coordinate grid"));
+            }
+            work = bounded_product(work, values.len())?;
+            if axis.target == DcAxisTarget::Temperature {
+                for &value in values.iter() {
+                    check_domain(value, true, false)?;
+                }
+            }
+            plan.axes.push(AxisPlan {
+                target: AxisTarget::Typed(axis.target),
+                exact: None,
+            });
+            plan.grids.push(Grid::Explicit(values));
+        }
+        Ok(plan)
+    }
+
     pub(super) fn point_count(&self) -> usize {
-        self.grids.iter().map(|grid| grid.count).product()
+        self.grids.iter().map(Grid::len).product()
     }
 }
 
@@ -467,10 +580,24 @@ enum Written<'a> {
     Other(&'a str, &'a str),
 }
 impl<'a> Written<'a> {
-    fn classify(circuit: &'a Circuit, target: &'a AxisTarget) -> Self {
+    fn classify(circuit: &'a Circuit, target: &'a AxisTarget) -> SpiceResult<Self> {
         let (instance, parameter) = match target {
-            AxisTarget::Temperature => return Self::Temperature,
-            AxisTarget::Name(name) => return Self::Name(name),
+            AxisTarget::Temperature | AxisTarget::Typed(DcAxisTarget::Temperature) => {
+                return Ok(Self::Temperature);
+            }
+            AxisTarget::Name(name) => return Ok(Self::Name(name)),
+            AxisTarget::Typed(DcAxisTarget::Source(name)) => {
+                circuit.bind_source_target(name)?;
+                return Ok(Self::Name(name));
+            }
+            AxisTarget::Typed(DcAxisTarget::Resistance(name)) => {
+                circuit.bind_resistor_target(name)?;
+                return Ok(Self::Name(name));
+            }
+            AxisTarget::Typed(DcAxisTarget::Instance {
+                instance,
+                parameter,
+            }) => (instance.as_str(), parameter.as_str()),
             AxisTarget::Parameter {
                 instance,
                 parameter,
@@ -483,20 +610,20 @@ impl<'a> Written<'a> {
                 .binned_deck()
                 .is_some_and(|deck| deck.contains(instance, keyword))
         {
-            return Self::Geometry(instance, keyword);
+            return Ok(Self::Geometry(instance, keyword));
         }
         if (parameter.eq_ignore_ascii_case("r") || parameter.eq_ignore_ascii_case("resistance"))
             && let Ok(target) = circuit.bind_resistor_target(instance)
         {
-            return Self::Resistance(instance, target);
+            return Ok(Self::Resistance(instance, target));
         }
         if let Ok(target) = circuit.bind_instance_target(instance, parameter) {
             let name = circuit.devices()[target.device()]
                 .numeric_parameter_name(target.parameter())
                 .unwrap_or(parameter);
-            return Self::Device(instance, target, name);
+            return Ok(Self::Device(instance, target, name));
         }
-        Self::Other(instance, parameter)
+        Ok(Self::Other(instance, parameter))
     }
     /// The swept quantity: `r1` and `@r1[r]`, `v1` and `@v1[dc]` are one.
     fn key(&self) -> String {
@@ -641,8 +768,33 @@ impl AxisBinding {
 
 #[derive(Debug, Clone)]
 struct BoundAxis {
-    spec: SweepSpec,
+    spec: ResolvedSweepAxis,
     binding: AxisBinding,
+}
+
+/// A resolved physical continuation axis with the actual execution grid.
+#[derive(Debug, Clone)]
+pub struct ResolvedSweepAxis {
+    /// Canonical physical target and output scale.
+    pub target: SweepTarget,
+    grid: Grid,
+}
+
+impl ResolvedSweepAxis {
+    /// Coordinates in actual continuation order, including repeated values.
+    pub fn coordinates(&self) -> impl ExactSizeIterator<Item = Real> + Clone + use<> {
+        self.grid.values()
+    }
+
+    fn start(&self) -> SpiceResult<Real> {
+        match &self.grid {
+            Grid::Accumulated(grid) => Ok(grid.range.start),
+            Grid::Explicit(values) => values
+                .first()
+                .copied()
+                .ok_or_else(|| unsupported("empty DC execution grid")),
+        }
+    }
 }
 
 /// Resolve one or two DC sweep axes against circuit devices and parameters.
@@ -661,7 +813,7 @@ pub fn resolve(
     circuit: &Circuit,
     request: &AnalysisPlan,
     context: &AnalysisContext,
-) -> SpiceResult<Vec<SweepSpec>> {
+) -> SpiceResult<Vec<ResolvedSweepAxis>> {
     let crate::analysis::plan::PlanKind::Dc { axes, .. } = request.analysis() else {
         return Err(unsupported("typed sweep requires a DC request"));
     };
@@ -682,7 +834,7 @@ fn bind_axes(circuit: &Circuit, plan: &DcSweepPlan) -> SpiceResult<Vec<BoundAxis
     let mut names = std::collections::BTreeSet::new();
     let mut written = Vec::new();
     for axis in &plan.axes {
-        let target = Written::classify(circuit, &axis.target);
+        let target = Written::classify(circuit, &axis.target)?;
         if !names.insert(target.key()) {
             return Err(unsupported("duplicate nested DC target"));
         }
@@ -692,17 +844,19 @@ fn bind_axes(circuit: &Circuit, plan: &DcSweepPlan) -> SpiceResult<Vec<BoundAxis
     for ((axis, written), grid) in plan.axes.iter().zip(&written).zip(&plan.grids) {
         let (target, binding) = resolve_target(circuit, written)?;
         if target.is_resistance() {
-            for value in axis.exact.values().chain(grid.values()) {
+            for value in axis
+                .exact
+                .into_iter()
+                .flat_map(ExactGrid::values)
+                .chain(grid.values())
+            {
                 check_domain(value, false, true)?;
             }
         }
-        let SweepRange { start, stop, step } = axis.exact.range;
         axes.push(BoundAxis {
-            spec: SweepSpec {
+            spec: ResolvedSweepAxis {
                 target,
-                start,
-                stop,
-                step,
+                grid: grid.clone(),
             },
             binding,
         });
@@ -717,8 +871,8 @@ fn validate_start(
 ) -> SpiceResult<()> {
     // The public resolver checks the first written value, not every point.
     let start = [
-        axes[0].spec.start,
-        axes.get(1).map_or(0., |axis| axis.spec.start),
+        axes[0].spec.start()?,
+        axes.get(1).map_or(Ok(0.), |axis| axis.spec.start())?,
     ];
     let point = point_context(prepared.circuit(), axes, start, base)?;
     prepared.validate_context(&point.model)
@@ -789,7 +943,7 @@ struct GridPair {
 }
 
 impl GridPair {
-    fn new(grids: &[AccumulatedGrid]) -> Self {
+    fn new(grids: &[Grid]) -> Self {
         Self {
             inner: grids[0].values(),
             outer: grids
@@ -801,16 +955,9 @@ impl GridPair {
     fn physical_contexts(mut self, sources: [bool; 2]) -> Self {
         let unique = |grid: GridValues, is_source| {
             if is_source {
-                match (grid.clone().next(), grid.clone().last()) {
-                    (Some(first), Some(last)) => {
-                        GridValues::singleton(if last.abs() > first.abs() {
-                            last
-                        } else {
-                            first
-                        })
-                    }
-                    _ => grid,
-                }
+                grid.clone()
+                    .reduce(|a, b| if b.abs() > a.abs() { b } else { a })
+                    .map_or(grid, GridValues::singleton)
             } else {
                 grid
             }
@@ -834,7 +981,7 @@ impl GridPair {
 fn preflight(
     prepared: &crate::devices::PreparedRun<'_>,
     axes: &[BoundAxis],
-    grids: &[AccumulatedGrid],
+    grids: &[Grid],
     context: &AnalysisContext,
 ) -> SpiceResult<()> {
     let circuit = prepared.circuit();
@@ -851,8 +998,8 @@ fn preflight(
     let start = [inner, outer];
     // Check every coupled physical combination, but unchanged devices only
     // need validation once at each scalar temperature context. The grids
-    // are strictly monotone, so the first value of the other axis identifies
-    // the first visit to each temperature in either C traversal order.
+    // retain their ordered coordinates, including duplicates. The first
+    // visit in the other axis validates the complete scalar context.
     // Rebuild replacements every visit; no live device or trial state is
     // reused for a different ModelContext.
     if axes.iter().any(|axis| axis.binding.changes_physics()) {
@@ -862,12 +1009,14 @@ fn preflight(
         let coupling_may_change = axes
             .iter()
             .any(|axis| matches!(axis.binding, AxisBinding::Device(_)));
-        for values in contexts.points() {
+        let inner_count = contexts.inner.len();
+        for (index, values) in contexts.points().enumerate() {
             let point = point_context(circuit, axes, values, base)?;
-            let first_scalar_context = temperature.map_or_else(
-                || values.map(Real::to_bits) == start.map(Real::to_bits),
-                |axis| values[1 - axis].to_bits() == start[1 - axis].to_bits(),
-            );
+            let first_scalar_context = match temperature {
+                Some(0) => index < inner_count,
+                Some(1) => index % inner_count == 0,
+                _ => index == 0,
+            };
             if first_scalar_context {
                 prepared.validate_dc_inputs(&point.model)?;
             } else {
@@ -1173,20 +1322,24 @@ mod grid_tests {
     #[test]
     fn preflight_projects_only_source_axes_out_of_the_physical_grid() {
         let grids = [
-            SweepRange {
-                start: 1.,
-                stop: 3.,
-                step: 1.,
-            }
-            .accumulate(false)
-            .unwrap(),
-            SweepRange {
-                start: 10.,
-                stop: 20.,
-                step: 10.,
-            }
-            .accumulate(false)
-            .unwrap(),
+            Grid::Accumulated(
+                SweepRange {
+                    start: 1.,
+                    stop: 3.,
+                    step: 1.,
+                }
+                .accumulate(false)
+                .unwrap(),
+            ),
+            Grid::Accumulated(
+                SweepRange {
+                    start: 10.,
+                    stop: 20.,
+                    step: 10.,
+                }
+                .accumulate(false)
+                .unwrap(),
+            ),
         ];
         assert_eq!(GridPair::new(&grids).points().count(), 6);
         assert_eq!(

@@ -518,6 +518,9 @@ fn validate_input(input: &AnalysisInput) -> SpiceResult<()> {
             | AnalysisKind::Noise
             | AnalysisKind::Distortion
     );
+    if input.dc_axes.is_some() && input.kind != AnalysisKind::DcSweep {
+        return Err(unsupported("continuation axes require a DC analysis"));
+    }
     if input.transient_schedule.is_some() && input.kind != AnalysisKind::Transient {
         return Err(unsupported("timing schedule requires a transient analysis"));
     }
@@ -627,8 +630,18 @@ impl AnalysisPlan {
                 let SpecificOptions::Dc { point_iterations } = specific else {
                     return Err(unsupported("missing DC sweep options"));
                 };
+                let axes = if let Some(axes) = input.dc_axes {
+                    if !positional.is_empty() {
+                        return Err(unsupported(
+                            "typed continuation axes conflict with positional DC operands",
+                        ));
+                    }
+                    sweep::DcSweepPlan::from_explicit(axes)?
+                } else {
+                    sweep::parse_axes(&positional)?
+                };
                 PlanKind::Dc {
-                    axes: sweep::parse_axes(&positional)?,
+                    axes,
                     point_iterations,
                 }
             }

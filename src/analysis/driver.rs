@@ -62,6 +62,9 @@ pub struct AnalysisInput {
     /// Independently resolved transient sampling and integration schedules.
     /// Mutually exclusive with positional transient time arguments.
     pub transient_schedule: Option<crate::analysis::TransientSchedule>,
+    /// Source-bound continuation axes in inner-to-outer order.
+    /// Mutually exclusive with positional DC sweep arguments.
+    pub dc_axes: Option<Vec<crate::analysis::sweep::DcSweepAxis>>,
     /// The deck's `.ic` entries in deck order (see [`NodeCondition`]). Enforced
     /// by the companion transient initial operating point unless `uic`; ignored
     /// by `.op`/`.dc`/`.ac`, exactly as C (`cktload.c`), but always validated.
@@ -86,6 +89,7 @@ impl AnalysisInput {
             arguments: Vec::new(),
             uic: false,
             transient_schedule: None,
+            dc_axes: None,
             initial_conditions: Vec::new(),
             nodesets: Vec::new(),
             noise: None,

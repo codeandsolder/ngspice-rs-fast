@@ -1200,3 +1200,92 @@ fn passive_geometry_scale_does_not_change_electrical_scale_or_default_geometry()
     assert_column(&p, "@c1[w]", &[3e-6, 6e-6], 1e-12, 1e-24);
     assert_eq!(op(&mut circuit, &context), baseline);
 }
+
+#[test]
+fn explicit_continuation_grids_keep_nonuniform_order_and_duplicates() {
+    use ngspice_rs::analysis::sweep::{DcAxisTarget, DcSweepAxis};
+    let mut c = circuit("v1 a 0 1\nr1 a 0 1k tc1=0.01");
+    let mut request = AnalysisInput::new(AnalysisKind::DcSweep);
+    request.dc_axes = Some(vec![
+        DcSweepAxis {
+            target: DcAxisTarget::Source("v1".into()),
+            coordinates: [0., 4., -1., 4., 0.].into(),
+        },
+        DcSweepAxis {
+            target: DcAxisTarget::Temperature,
+            coordinates: [27., 77., 27.].into(),
+        },
+    ]);
+    let plan = request.resolve().unwrap();
+    let axes = resolve(&c, &plan, &AnalysisContext::default()).unwrap();
+    assert_eq!(
+        axes[0].coordinates().collect::<Vec<_>>(),
+        [0., 4., -1., 4., 0.]
+    );
+    let plot = plan.run(&mut c, &AnalysisContext::default()).unwrap();
+    let expected = [0., 4., -1., 4., 0.].repeat(3);
+    assert_column(&plot, "v(v-sweep)", &expected, 0., 1e-14);
+    assert_column(&plot, "v(a)", &expected, 0., 1e-14);
+    let currents = [27., 77., 27.]
+        .into_iter()
+        .flat_map(|temp| [0., 4., -1., 4., 0.].map(|v| -v / (1000. * (1. + 0.01 * (temp - 27.)))))
+        .collect::<Vec<_>>();
+    assert_column(&plot, "i(v1)", &currents, 1e-12, 1e-14);
+}
+
+#[test]
+fn explicit_continuation_targets_and_domains_are_checked() {
+    use ngspice_rs::analysis::sweep::{DcAxisTarget, DcSweepAxis};
+    let mut c = circuit("v1 a 0 1\nr1 a 0 1k");
+    for (target, coordinates) in [
+        (DcAxisTarget::Source("r1".into()), vec![1.]),
+        (DcAxisTarget::Resistance("v1".into()), vec![1.]),
+        (DcAxisTarget::Resistance("r1".into()), vec![0.]),
+        (DcAxisTarget::Temperature, vec![-273.15]),
+        (DcAxisTarget::Source("v1".into()), vec![f64::NAN]),
+        (DcAxisTarget::Source("v1".into()), vec![]),
+    ] {
+        let mut request = AnalysisInput::new(AnalysisKind::DcSweep);
+        request.dc_axes = Some(vec![DcSweepAxis {
+            target,
+            coordinates: coordinates.into(),
+        }]);
+        let result = request
+            .resolve()
+            .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()));
+        assert!(result.is_err());
+    }
+    let mut request = AnalysisInput::with_arguments(AnalysisKind::DcSweep, ["v1", "0", "1", "1"]);
+    request.dc_axes = Some(vec![DcSweepAxis {
+        target: DcAxisTarget::Source("v1".into()),
+        coordinates: [1.].into(),
+    }]);
+    assert!(request.resolve().is_err());
+}
+
+#[test]
+fn explicit_continuation_does_not_restart_hysteresis_at_direction_changes() {
+    use ngspice_rs::analysis::sweep::{DcAxisTarget, DcSweepAxis};
+    let mut c = circuit(
+        "vc c 0 0\nvin in 0 1\nr1 in a 1k\ns1 a 0 c 0 sm\n.model sm sw(vt=1 vh=0.5 ron=10 roff=1meg)",
+    );
+    let mut input = AnalysisInput::new(AnalysisKind::DcSweep);
+    input.dc_axes = Some(vec![DcSweepAxis {
+        target: DcAxisTarget::Source("vc".into()),
+        coordinates: [0., 1., 2., 1., 1., 0., 1., 2.].into(),
+    }]);
+    let plot = input
+        .resolve()
+        .unwrap()
+        .run(&mut c, &AnalysisContext::default())
+        .unwrap();
+    let closed = 10. / 1010.;
+    let open = 1e6 / 1001000.;
+    assert_column(
+        &plot,
+        "v(a)",
+        &[open, open, closed, closed, closed, open, open, closed],
+        1e-12,
+        1e-14,
+    );
+}

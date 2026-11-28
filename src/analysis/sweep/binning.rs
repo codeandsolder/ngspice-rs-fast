@@ -133,8 +133,8 @@ pub(super) fn validate_start(
         .ok_or_else(|| unsupported("missing binned source graph"))?
         .resolver(base.geometry_scale)?;
     let values = [
-        axes[0].spec.start,
-        axes.get(1).map_or(0., |axis| axis.spec.start),
+        axes[0].spec.start()?,
+        axes.get(1).map_or(Ok(0.), |axis| axis.spec.start())?,
     ];
     let candidate = candidate(baseline, &resolver, axes, values, base)?;
     let point = point_context(&candidate.circuit, &candidate.axes, values, candidate.base)?;
