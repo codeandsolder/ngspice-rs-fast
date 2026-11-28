@@ -1052,3 +1052,108 @@ fn coupled_derivative_array_transient_uses_mos_physical_charge()
     }
     Ok(())
 }
+
+/// Exercise the branch-event machinery in a coupled derivative-array
+/// transient, with a physical drain/source exchange in the middle of a
+/// smooth forcing interval rather than at an independent source knot.
+#[test]
+fn coupled_derivative_array_crosses_channel_reversal()
+-> Result<(), ngspice_rs::primitives::SpiceError> {
+    use ngspice_rs::devices::{Circuit, Limit, ModelContext, TransientTiming};
+    use ngspice_rs::maths::Vector;
+    const GATE: f64 = 1.4;
+    const BODY: f64 = -0.5;
+    const INITIAL_DRAIN: f64 = -0.02;
+    const RATE: f64 = 2000.;
+
+    for (level, cap) in [(8, 3), (54, 0), (54, 1), (54, 2)] {
+        for (family, polarity) in [("nmos", 1.), ("pmos", -1.)] {
+            let model = format!(
+                "m1 d g s b nch l=1u w=10u m=2 ad=10p as=12p pd=12u ps=14u\n.model nch {family} level={level} capmod={cap} cgdo=1n cgso=2n cgbo=1n"
+            );
+            let deck = Parser::new().parse_deck(&parse_deck_text(
+                Path::new("mos-reversal-reference.cir"),
+                &format!("MOS reversal reference\n{model}\n.end"),
+            ))?;
+            let mut reference = Circuit::from_netlist(&deck)?;
+            reference.finalize()?;
+            let prepared = reference.prepare_run();
+            let mut dae = prepared.prepare_physical_dae(
+                &ModelContext::default(),
+                TransientTiming::new(1e-6, 40e-6)?,
+            )?;
+            let rows = ["d", "g", "s", "b"].map(|name| {
+                reference
+                    .unknowns()
+                    .node_row(reference.nodes().get(name).unwrap())
+                    .unwrap()
+            });
+            let scalar = |drain: f64| -> Result<Vector, ngspice_rs::primitives::SpiceError> {
+                let mut state = Vector::zeros(reference.unknown_count());
+                for (row, value) in rows.into_iter().zip([drain, GATE, 0., BODY]) {
+                    state.set(row, polarity * value)?;
+                }
+                Ok(state)
+            };
+
+            for method in ["gear", "trap"] {
+                let text = format!(
+                    "MOS reversal derivative array\nvd d 0 PWL(0 {} 40u {})\nvg g 0 {}\nvs s 0 0\nvb b 0 {}\n{model}\nb1 first 0 v=1m*ddt(v(d))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 20u 0 1u uic\n.end",
+                    polarity * INITIAL_DRAIN,
+                    polarity * RATE.mul_add(40e-6, INITIAL_DRAIN),
+                    polarity * GATE,
+                    polarity * BODY,
+                );
+                let netlist = Parser::new()
+                    .parse_deck(&parse_deck_text(Path::new("mos-reversal.cir"), &text))?;
+                let config = RunConfig::from_netlist(&netlist)?;
+                let mut c = config.circuit(&netlist)?;
+                let plot = config
+                    .plan_for(&netlist.analyses[0])?
+                    .run(&mut c, &config.context())?;
+                let mut sides = [false; 2];
+                for i in 0..plot.point_count() {
+                    let value = |name| plot.value(name, i).unwrap().re;
+                    let time = value("time");
+                    let drain = RATE.mul_add(time, INITIAL_DRAIN);
+                    sides[usize::from(drain >= 0.)] = true;
+                    let actual = ["i(vd)", "i(vg)", "i(vs)", "i(vb)"].map(value);
+                    let magnitude = actual.iter().map(|x| x.abs()).sum::<f64>();
+                    assert!(actual.iter().all(|v| v.is_finite()));
+                    assert!(actual.iter().sum::<f64>().abs() <= 1e-12 + 1e-9 * magnitude);
+                    let point = dae.evaluate(&scalar(drain)?, time, Limit::Right)?;
+                    let residual = point.residual.clone();
+                    let charge = point.charge.clone();
+                    // Use a second-order one-sided independent charge
+                    // difference on the selected orientation. Never form
+                    // a centered quotient across source/drain exchange.
+                    let h = 1e-5 * if drain < 0. { -1. } else { 1. };
+                    let q1 = dae
+                        .evaluate(&scalar(drain + h)?, time, Limit::Right)?
+                        .charge
+                        .clone();
+                    let q2 = dae
+                        .evaluate(&scalar(drain + 2. * h)?, time, Limit::Right)?
+                        .charge
+                        .clone();
+                    for (row, measured) in rows.into_iter().zip(actual) {
+                        let q0 = charge.get(row).unwrap();
+                        let derivative = (4. * (q1.get(row).unwrap() - q0)
+                            - (q2.get(row).unwrap() - q0))
+                            / (2. * h);
+                        let expected = -residual.get(row).unwrap() - RATE * derivative;
+                        assert!(
+                            (measured - expected).abs()
+                                <= 1e-12 + 2e-6 * measured.abs().max(expected.abs()),
+                            "level={level} cap={cap} p={polarity} {method} t={time:e} row={row}: {measured:e} vs {expected:e}"
+                        );
+                    }
+                    assert!((value("v(first)") - polarity * RATE * 1e-3).abs() <= 1e-9);
+                    assert!(value("v(out)").abs() <= 1e-8);
+                }
+                assert_eq!(sides, [true; 2]);
+            }
+        }
+    }
+    Ok(())
+}
