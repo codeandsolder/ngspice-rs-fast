@@ -160,7 +160,7 @@ impl Material {
                     g: self.endpoint_conductance(t, log_r),
                     coefficients: [
                         self.log_ratio * 6. * t * s,
-                        self.log_ratio * 3. * (1. - 2. * t),
+                        self.log_ratio * 3. * 2_f64.mul_add(-t, 1.),
                         -2. * self.log_ratio,
                     ],
                 })
@@ -245,7 +245,7 @@ impl Material {
         let delta = t.clone().with_value(0.);
         if let Some(guards) = guards {
             if self.limited && t.value().is_finite() {
-                guards.push(LocalGuard::interval(0, t.clone(), &[0., 1.]));
+                guards.push(LocalGuard::interval(0, t, &[0., 1.]));
             }
             if let Some(floor) = local.floor {
                 let argument = delta.clone().scale(floor.slope).offset(floor.value);
