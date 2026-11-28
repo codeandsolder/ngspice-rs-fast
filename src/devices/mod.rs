@@ -48,6 +48,7 @@ pub mod breaks;
 pub mod bsim3;
 pub mod bsim4;
 mod bsim_model_inputs;
+mod bsim_physics;
 pub use breaks::{BreakTable, SourceBreaks};
 pub mod circuit;
 pub mod code_model;

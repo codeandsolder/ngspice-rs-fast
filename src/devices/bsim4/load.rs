@@ -41,7 +41,6 @@ const EXP_THRESHOLD: f64 = 34.0;
 const EPS0: f64 = 8.85418e-12;
 const EPSSI: f64 = 1.03594e-10;
 const Charge_q: f64 = 1.60219e-19;
-const DELTA_1: f64 = 0.02;
 const DELTA_3: f64 = 0.02;
 const DELTA_4: f64 = 0.02;
 /// Smoothing coefficient.
@@ -211,7 +210,7 @@ pub(super) fn load(
     let cdrain = leakage::evaluate(model, here, pParam, &bias, &electrostatics, &transport);
     let charges = charge::intrinsic(model, here, pParam, ckt, &bias, &electrostatics, &transport)?;
     if bias.ChargeComputationNeeded != 0 {
-        junction::charge(model, here, pParam, ckt, junction_bias);
+        junction::charge(model, here, pParam, ckt, junction_bias)?;
     }
     bias::commit(here, ckt, &bias);
     if let Some(companion) = charge::companion(model, here, pParam, ckt, &bias, &charges)? {
