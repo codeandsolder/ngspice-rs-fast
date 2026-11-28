@@ -486,7 +486,7 @@ fn conditional_voltage_capacitance_depends_on_expanded_electrical_consumers() ->
         writeln!(deck, "r{index} out{index} 0 3")
             .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
     }
-    deck.push_str(".func probe(x) {branch_or_sampled_current(i(x))}\n.func nested(y) {probe(y)}\n.func direct() {branch_or_sampled_current(i(v2))}\n.func unused() {branch_or_sampled_current(i(v3))}\nb1 b1out 0 v=nested(v1)\nb2 b2out 0 v=direct()\n.save i(v3)\nf1 0 f1out v4 1\nrf1 f1out 0 1\nh1 h1out 0 v5 1\nfpoly 0 fpolyout poly(2) v6 v7 0 1 1\nrfpoly fpolyout 0 1\nb8 b8out 0 v=0*i(v8)\nb9 b9out 0 v=if(0,i(v9),1)\nb10 b10out 0 v=if(v(out1)>0,i(v10),0)\n.end\n");
+    deck.push_str(".func probe(x) {branch_or_sampled_current(i(x))}\n.func nested(y) {probe(y)}\n.func direct() {branch_or_sampled_current(i(v2))}\n.func unused() {branch_or_sampled_current(i(v3))}\nb1 b1out 0 v=nested(v1)\nb2 b2out 0 v=direct()\n.save i(v3)\nf1 0 f1out v4 1\nrf1 f1out 0 1\nh1 h1out 0 v5 1\nfpoly 0 fpolyout poly(2) v6 v7 0 1 1\nrfpoly fpolyout 0 1\nb8 b8out 0 v=0*i(v8)\nb9 b9out 0 v=ternary_fcn(0,i(v9),1)\nb10 b10out 0 v=ternary_fcn(v(out1)>0,i(v10),0)\n.end\n");
     let mut circuit = circuit(&deck)?;
     let ac = run(
         &mut circuit,
