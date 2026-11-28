@@ -154,6 +154,7 @@ fn descriptor(charge: Capability) -> Descriptor {
             .collect(),
         charge,
         noise: Capability::Computed,
+        trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
     }
 }
 
@@ -946,6 +947,7 @@ fn electrothermal_descriptor() -> Descriptor {
         .collect(),
         charge: Capability::Computed,
         noise: Capability::Zero,
+        trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
     }
 }
 
@@ -1645,4 +1647,474 @@ fn prepared_run_reuses_unaffected_tiles_across_context_changes() {
     assert_eq!(count(), after);
     assert_eq!(load(&context).to_bits(), original.to_bits());
     assert_eq!(count(), after + 64);
+}
+
+#[derive(Debug, Default)]
+struct TrialPolynomial;
+
+impl Kernel for TrialPolynomial {
+    type Prepared = Polynomial;
+
+    fn prepare(
+        &self,
+        parameters: &[Real],
+        temperature: Real,
+    ) -> model_kernel_api::Result<Polynomial> {
+        PolynomialKernel.prepare(parameters, temperature)
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &Polynomial,
+        coordinates: &[Real],
+        point: &mut Point<'_>,
+    ) -> model_kernel_api::Result<()> {
+        PolynomialKernel.evaluate(prepared, coordinates, point)
+    }
+
+    fn initialize_trial(
+        &self,
+        _: &Polynomial,
+        coordinates: &mut [Real],
+    ) -> model_kernel_api::Result<()> {
+        coordinates[0] = coordinates[1] + 0.1;
+        Ok(())
+    }
+
+    fn limit_trial(
+        &self,
+        _: &Polynomial,
+        reference: model_kernel_api::trial::TrialReference<'_>,
+        coordinates: &mut [Real],
+    ) -> model_kernel_api::Result<()> {
+        use model_kernel_api::trial::TrialReference;
+        let limit = match reference {
+            TrialReference::PreviousNewton(_) => 0.25,
+            TrialReference::AcceptedStep(_) => 0.125,
+        };
+        let reference = reference.coordinates();
+        let last = reference[0] - reference[1];
+        let raw = coordinates[0] - coordinates[1];
+        coordinates[0] = coordinates[1] + raw.clamp(last - limit, last + limit);
+        Ok(())
+    }
+
+    fn trial_convergence(
+        &self,
+        _: &Polynomial,
+        input: model_kernel_api::trial::ConvergenceInput<'_>,
+    ) -> model_kernel_api::Result<model_kernel_api::trial::Convergence> {
+        let old = input.previous;
+        let next = input.candidate;
+        let delta =
+            (next.coordinates[0] - next.coordinates[1]) - (old.coordinates[0] - old.coordinates[1]);
+        input.compare_residual(
+            0,
+            old.jacobian[0].mul_add(delta, old.residual[0]),
+            next.residual[0],
+        )
+    }
+}
+
+fn trial_artifact() -> Arc<Artifact<TrialPolynomial>> {
+    use model_kernel_api::trial::{TrialCapabilities, TrialPolicy};
+    let mut desc = descriptor(Capability::Computed);
+    desc.trial = TrialCapabilities {
+        initialization: TrialPolicy::Kernel,
+        limiting: TrialPolicy::Kernel,
+        convergence: TrialPolicy::Kernel,
+    };
+    desc.noise = Capability::Zero;
+    Artifact::new(desc, TrialPolynomial).unwrap()
+}
+
+fn trial_circuit(count: usize) -> Circuit {
+    let artifact = trial_artifact();
+    let mut circuit = Circuit::new();
+    for index in 0..count {
+        let node = circuit.add_node(&format!("p{index}")).unwrap();
+        PreparedDevice::bind(
+            &mut circuit,
+            &artifact,
+            &format!("x{index}"),
+            &[node, NodeId::GROUND],
+            &[1e-3, 2e-4, 1e-6, 2e-7],
+            InstanceTemperature::circuit(27.),
+        )
+        .unwrap();
+    }
+    circuit.finalize().unwrap();
+    circuit
+}
+
+fn trial_load(
+    circuit: &Circuit,
+    history: &ngspice_rs::devices::StateHistory,
+    proposed: &[Real],
+    mut trial: ngspice_rs::devices::TrialState,
+    integration: Option<&Coefficients>,
+) -> (SparseMatrix, Vector, ngspice_rs::devices::TrialState) {
+    let n = circuit.unknown_count();
+    let mut matrix = SparseMatrix::new(n, n);
+    let mut rhs = Vector::zeros(n);
+    let mode = integration.map_or(AnalysisMode::OperatingPoint, |coeff| {
+        AnalysisMode::Transient {
+            time: coeff.dt(),
+            dt: coeff.dt(),
+        }
+    });
+    circuit
+        .load(
+            &LoadRequest {
+                mode,
+                solution: &Vector::from_slice(proposed),
+                model_context: &ModelContext::default(),
+                integration,
+                history,
+                forcing: None,
+            },
+            &mut matrix,
+            &mut rhs,
+            &mut trial,
+        )
+        .unwrap();
+    matrix.fold_duplicates();
+    (matrix, rhs, trial)
+}
+
+#[test]
+fn kernel_trial_policy_preserves_reference_provenance_and_exact_acceptance() {
+    use ngspice_rs::devices::{ConvergenceRequest, IterationPhase};
+    // One instance uses the scalar path; three share the same homogeneous tile.
+    for count in [1, 3] {
+        let circuit = trial_circuit(count);
+        let mut history = circuit.state_history().unwrap();
+        let proposed = vec![2.; count];
+        let (matrix, rhs, cold) = trial_load(
+            &circuit,
+            &history,
+            &proposed,
+            history.trial_in(IterationPhase::Junction, None).unwrap(),
+            None,
+        );
+        assert!(cold.is_nonconvergent());
+        assert!(
+            circuit
+                .accept_point(
+                    &Vector::from_slice(&proposed),
+                    None,
+                    &mut history,
+                    cold.clone()
+                )
+                .is_err()
+        );
+        assert_eq!(history.depth(), 0);
+        let x: Real = 0.1;
+        let g = 1e-3 + 6e-4 * x * x;
+        let i = 1e-3 * x + 2e-4 * x.powi(3);
+        for lane in 0..count {
+            close(cold.values()[7 * lane + 4], x);
+            close(matrix.get(lane, lane), g);
+            close(rhs.as_slice()[lane], g * x - i);
+        }
+        let (_, _, limited) = trial_load(
+            &circuit,
+            &history,
+            &proposed,
+            history.trial_in(IterationPhase::Fix, Some(&cold)).unwrap(),
+            None,
+        );
+        assert!(limited.is_nonconvergent());
+        for lane in 0..count {
+            close(limited.values()[7 * lane + 4], 0.35);
+        }
+        let (_, _, exact) = trial_load(&circuit, &history, &proposed, history.trial(), None);
+        assert!(!exact.is_nonconvergent());
+        for lane in 0..count {
+            close(exact.values()[7 * lane + 4], 2.);
+        }
+        circuit
+            .accept_point(&Vector::from_slice(&proposed), None, &mut history, exact)
+            .unwrap();
+        let accepted = history.accepted(1).unwrap().to_vec();
+        let coeff = StepHistory::new()
+            .trial(IntegrationMethod::Trapezoidal, 1, 1e-6, DEFAULT_XMU)
+            .unwrap();
+        let predictor = history.trial_in(IterationPhase::Predict, None).unwrap();
+        let (matrix, rhs, rejected) = trial_load(
+            &circuit,
+            &history,
+            &vec![3.; count],
+            predictor,
+            Some(&coeff),
+        );
+        assert!(rejected.is_nonconvergent());
+        assert!(
+            circuit
+                .accept_point(
+                    &Vector::from_slice(&vec![3.; count]),
+                    Some(1e-6),
+                    &mut history,
+                    rejected.clone()
+                )
+                .is_err()
+        );
+        assert_eq!(history.accepted(1).unwrap(), accepted);
+        for lane in 0..count {
+            let x: Real = 2.125;
+            let stored = 1e-6 * x + 2e-7 * x.powi(3);
+            let accepted_charge = 1e-6 * 2. + 2e-7 * 8.;
+            let current = 1e-3 * x + 2e-4 * x.powi(3) + (stored - accepted_charge) / 1e-6;
+            let jac = 1e-3 + 6e-4 * x * x + (1e-6 + 6e-7 * x * x) / 1e-6;
+            close(rejected.values()[7 * lane + 4], x);
+            close(rejected.values()[7 * lane], stored);
+            close(matrix.get(lane, lane), jac);
+            close(rhs.as_slice()[lane], jac * x - current);
+        }
+        assert_eq!(history.accepted(1).unwrap(), accepted);
+        let explicit = history
+            .trial_in(IterationPhase::Predict, None)
+            .unwrap()
+            .with_initial_conditions(true);
+        let (_, _, explicit) =
+            trial_load(&circuit, &history, &vec![3.; count], explicit, Some(&coeff));
+        assert!(!explicit.is_nonconvergent());
+        for lane in 0..count {
+            close(explicit.values()[7 * lane + 4], 3.);
+        }
+        let (_, _, last_exact) = trial_load(&circuit, &history, &proposed, history.trial(), None);
+        let previous = Vector::from_slice(&proposed);
+        let changed = Vector::from_slice(&vec![2.2; count]);
+        let context = ModelContext::default();
+        let request = ConvergenceRequest {
+            solution: &changed,
+            previous: &previous,
+            trial: &last_exact,
+            history: &history,
+            model_context: &context,
+            time: 0.,
+            integration: None,
+            reltol: 1e-8,
+            abstol: 1e-12,
+            vntol: 1e-6,
+        };
+        assert!(circuit.convergence_test(&request).unwrap());
+        assert!(
+            !circuit
+                .convergence_test(&ConvergenceRequest {
+                    solution: &previous,
+                    ..request
+                })
+                .unwrap()
+        );
+    }
+}
+
+#[derive(Debug)]
+struct TrialElectrothermal;
+
+impl Kernel for TrialElectrothermal {
+    type Prepared = ElectrothermalPrepared;
+
+    fn prepare(
+        &self,
+        parameters: &[Real],
+        temperature: Real,
+    ) -> model_kernel_api::Result<Self::Prepared> {
+        ElectrothermalKernel.prepare(parameters, temperature)
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &Self::Prepared,
+        coordinates: &[Real],
+        point: &mut Point<'_>,
+    ) -> model_kernel_api::Result<()> {
+        ElectrothermalKernel.evaluate(prepared, coordinates, point)
+    }
+
+    fn initialize_trial(
+        &self,
+        prepared: &Self::Prepared,
+        coordinates: &mut [Real],
+    ) -> model_kernel_api::Result<()> {
+        coordinates[2] = prepared.ambient_kelvin + 5.;
+        coordinates[3] = 0.125;
+        Ok(())
+    }
+
+    fn limit_trial(
+        &self,
+        _: &Self::Prepared,
+        reference: model_kernel_api::trial::TrialReference<'_>,
+        coordinates: &mut [Real],
+    ) -> model_kernel_api::Result<()> {
+        let reference = reference.coordinates();
+        coordinates[2] = coordinates[2].clamp(reference[2] - 2., reference[2] + 2.);
+        coordinates[3] = coordinates[3].clamp(reference[3] - 0.1, reference[3] + 0.1);
+        Ok(())
+    }
+}
+
+#[test]
+fn kernel_trial_policy_stamps_limited_thermal_and_internal_coordinates() {
+    use model_kernel_api::trial::{TrialCapabilities, TrialPolicy};
+    use ngspice_rs::devices::IterationPhase;
+
+    let mut descriptor = electrothermal_descriptor();
+    descriptor.trial = TrialCapabilities {
+        initialization: TrialPolicy::Kernel,
+        limiting: TrialPolicy::Kernel,
+        convergence: TrialPolicy::Engine,
+    };
+    let artifact = Artifact::new(descriptor, TrialElectrothermal).unwrap();
+    // A one-lane instance and a homogeneous tile must stamp the same
+    // affine residuals even when local thermal and internal coordinates
+    // differ from the circuit's proposed MNA coordinates.
+    for count in [1, 2] {
+        let mut circuit = Circuit::new();
+        let mut nodes = Vec::new();
+        for index in 0..count {
+            let p = circuit.add_node(&format!("p{index}")).unwrap();
+            let t = circuit.add_node(&format!("t{index}")).unwrap();
+            let q = circuit.add_node(&format!("q{index}")).unwrap();
+            nodes.push([p, t, q]);
+            PreparedDevice::bind(
+                &mut circuit,
+                &artifact,
+                &format!("x{index}"),
+                &[p, NodeId::GROUND, t, q],
+                &ELECTROTHERMAL_PARAMETERS,
+                InstanceTemperature::circuit(27.),
+            )
+            .unwrap();
+        }
+        circuit.finalize().unwrap();
+        let n = circuit.unknown_count();
+        let rows: Vec<_> = nodes
+            .iter()
+            .map(|nodes| nodes.map(|node| circuit.unknowns().node_row(node).unwrap()))
+            .collect();
+        let mut solution = Vector::zeros(n);
+        for [p, t, q] in &rows {
+            solution.set(*p, 0.5).unwrap();
+            solution.set(*t, 10.).unwrap();
+            solution.set(*q, 0.8).unwrap();
+        }
+        let history = circuit.state_history().unwrap();
+        let (matrix, rhs, cold) = trial_load(
+            &circuit,
+            &history,
+            solution.as_slice(),
+            history.trial_in(IterationPhase::Junction, None).unwrap(),
+            None,
+        );
+        assert!(cold.is_nonconvergent());
+        let prepared = artifact
+            .prepare(&ELECTROTHERMAL_PARAMETERS, 300.15)
+            .unwrap();
+        let mut buffer = model_kernel_api::PointBuffer::new(4).unwrap();
+        let mut point = buffer.point();
+        let actual = [0.5, 0., 305.15, 0.125];
+        artifact.evaluate(&prepared, &actual, &mut point).unwrap();
+        let mna = [0.5, 0., 5., 0.125];
+        for (lane, [p, t, q]) in rows.iter().enumerate() {
+            let local_rows = [Some(*p), None, Some(*t), Some(*q)];
+            for (i, row) in local_rows.into_iter().enumerate() {
+                let Some(row) = row else {
+                    continue;
+                };
+                let expected_rhs = (0..4).fold(-point.current[i], |r, j| {
+                    point.conductance[4 * i + j].mul_add(mna[j], r)
+                });
+                close(rhs.as_slice()[row], expected_rhs);
+                for (j, col) in local_rows.into_iter().enumerate() {
+                    if let Some(col) = col {
+                        close(matrix.get(row, col), point.conductance[4 * i + j]);
+                    }
+                }
+                close(cold.values()[13 * lane + 2 * i], point.charge[i]);
+            }
+            close(cold.values()[13 * lane + 10], 305.15);
+            close(cold.values()[13 * lane + 11], 0.125);
+        }
+        let (_, _, limited) = trial_load(
+            &circuit,
+            &history,
+            solution.as_slice(),
+            history.trial_in(IterationPhase::Fix, Some(&cold)).unwrap(),
+            None,
+        );
+        assert!(limited.is_nonconvergent());
+        for lane in 0..count {
+            close(limited.values()[13 * lane + 10], 307.15);
+            close(limited.values()[13 * lane + 11], 0.225);
+        }
+        let (_, _, exact) = trial_load(
+            &circuit,
+            &history,
+            solution.as_slice(),
+            history.trial(),
+            None,
+        );
+        assert!(!exact.is_nonconvergent());
+        for lane in 0..count {
+            close(exact.values()[13 * lane + 10], 310.15);
+            close(exact.values()[13 * lane + 11], 0.8);
+        }
+    }
+}
+
+#[test]
+fn explicit_bias_constraints_do_not_invoke_kernel_initialization_or_limiting() {
+    use model_kernel_api::trial::{TrialCapabilities, TrialPolicy};
+    use ngspice_rs::analysis::bias::{
+        DcOutcome, DcSettings, DcStrategy, NodeForcing, solve_dc_forced,
+    };
+    // This witness intentionally declares specialized trial capabilities
+    // without implementing those callbacks. The producer's default callbacks
+    // return Unsupported if invoked, so the real constrained driver must
+    // keep the entire load exact rather than merely converge eventually.
+    let mut descriptor = descriptor(Capability::Computed);
+    descriptor.trial = TrialCapabilities {
+        initialization: TrialPolicy::Kernel,
+        limiting: TrialPolicy::Kernel,
+        convergence: TrialPolicy::Engine,
+    };
+    let artifact = Artifact::new(descriptor, PolynomialKernel).unwrap();
+    let mut circuit = Circuit::new();
+    let p = circuit.add_node("p").unwrap();
+    PreparedDevice::bind(
+        &mut circuit,
+        &artifact,
+        "x1",
+        &[p, NodeId::GROUND],
+        &[1e-3, 2e-4, 1e-6, 2e-7],
+        InstanceTemperature::circuit(27.),
+    )
+    .unwrap();
+    circuit.finalize().unwrap();
+    let row = circuit.unknowns().node_row(p).unwrap();
+    let settings = DcSettings::default();
+    let result = solve_dc_forced(
+        &circuit,
+        &ModelContext::default(),
+        &settings,
+        &[],
+        None,
+        None,
+        &NodeForcing {
+            initial: vec![(row, 2.)],
+            nodesets: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        result.report.outcome,
+        DcOutcome::Converged(DcStrategy::Direct)
+    );
+    close(result.solution.values.get(row).unwrap(), 2.);
+    assert!(!result.solution.trial.is_nonconvergent());
+    close(result.solution.trial.values()[4], 2.);
+    close(result.solution.trial.values()[0], 3.6e-6);
 }

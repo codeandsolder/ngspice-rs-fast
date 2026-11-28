@@ -5,14 +5,19 @@ use std::{cell::RefCell, sync::Arc};
 
 use model_kernel_api::noise::{Sink, Source};
 use model_kernel_api::{
-    Artifact, Binding, Capability, EquationKind, Kernel, Point, PointBuffer, Prepared,
+    Artifact, Binding, Capability, Descriptor, EquationKind, Kernel, Point, PointBuffer, Prepared,
+    trial::{
+        Convergence, ConvergenceInput, TrialCapabilities, TrialInput, TrialOutcome, TrialPhase,
+        TrialPolicy, TrialSample,
+    },
 };
 
-use crate::devices::limiting::{Limiter, Linearization};
 use crate::devices::linear::LinearContext;
 use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseCoordinate, NoiseFamily, NoiseSource};
 use crate::devices::traits::{AnalysisMode, ChargeContext, Device, StampContext};
-use crate::devices::{Circuit, DeviceState, elaboration::ElaborationSize};
+use crate::devices::{
+    Circuit, ConvergenceContext, DeviceState, IterationPhase, elaboration::ElaborationSize,
+};
 
 pub mod batch;
 use crate::maths::Vector;
@@ -126,61 +131,52 @@ pub(super) struct SourceParameter {
     pub offset: Real,
 }
 
-/// Solver-side junction linearization recipe for a source family.
-pub(super) trait JunctionPolicy: std::fmt::Debug + Send + Sync {
-    fn prepare(
-        &self,
-        values: &[Real],
-        temperature: InstanceTemperature,
-    ) -> SpiceResult<JunctionLimit>;
-}
-
-/// Intrinsic junction coordinates and directional exponential scales.
-/// The physical kernel remains unaware of Newton iteration and history.
+/// Reusable numerical workspace, allocated only for a kernel that declares
+/// a trial policy. No accepted or previous Newton state is owned here.
 #[derive(Debug)]
-pub(super) struct JunctionLimit {
-    pub positive: usize,
-    pub negative: usize,
-    pub forward: Option<(Real, Real)>,
-    pub reverse: Option<(Real, Real)>,
+struct TrialWorkspace {
+    proposed: Vec<Real>,
+    reference: Vec<Real>,
+    previous: PointBuffer,
+    candidate: PointBuffer,
+    tolerances: Vec<Real>,
 }
 
-impl JunctionLimit {
-    fn linearize(
-        &self,
-        states: &mut DeviceState<'_>,
-        slot: usize,
-        coordinates: &mut [Real],
-    ) -> SpiceResult<()> {
-        let raw = coordinates[self.positive] - coordinates[self.negative];
-        let mut limiter = Limiter::new(states);
-        let previous = limiter.previous(states, slot).unwrap_or(0.);
-        let voltage = match limiter.mode() {
-            Linearization::Initial if self.forward.is_some() || self.reverse.is_some() => 0.,
-            Linearization::InitialTransient => states.accepted(1, slot).unwrap_or(raw),
-            Linearization::Limited => {
-                if let Some((scale, critical)) = self.forward.filter(|_| raw > 0.) {
-                    limiter.pn_junction(raw, Some(previous.max(0.)), scale, critical)
-                } else if let Some((scale, breakdown)) =
-                    self.reverse.filter(|&(_, breakdown)| raw < -breakdown)
-                {
-                    -breakdown
-                        - limiter.pn_junction(
-                            -raw - breakdown,
-                            Some((-previous - breakdown).max(0.)),
-                            scale,
-                            0.,
-                        )
-                } else {
-                    raw
-                }
-            }
-            _ => raw,
-        };
-        if voltage.to_bits() != raw.to_bits() {
-            coordinates[self.positive] = coordinates[self.negative] + voltage;
+impl TrialWorkspace {
+    fn new(width: usize) -> SpiceResult<Self> {
+        Ok(Self {
+            proposed: vec![0.; width],
+            reference: vec![0.; width],
+            previous: PointBuffer::new(width).map_err(kernel_error)?,
+            candidate: PointBuffer::new(width).map_err(kernel_error)?,
+            tolerances: vec![0.; width],
+        })
+    }
+
+    fn reference(&mut self, values: impl Fn(usize) -> Option<Real>, offset: usize) -> bool {
+        for (index, coordinate) in self.reference.iter_mut().enumerate() {
+            let Some(value) = values(offset + index).filter(|value| value.is_finite()) else {
+                return false;
+            };
+            *coordinate = value;
         }
-        limiter.finish(states, &[(slot, voltage)])
+        true
+    }
+}
+
+fn trial_state_count(descriptor: &Descriptor) -> usize {
+    if descriptor.trial == TrialCapabilities::ENGINE {
+        0
+    } else {
+        descriptor.equations.len() + 1
+    }
+}
+
+fn charge_state_count(descriptor: &Descriptor) -> usize {
+    if descriptor.charge == Capability::Computed {
+        descriptor.equations.len() * 2
+    } else {
+        0
     }
 }
 
@@ -189,7 +185,6 @@ impl JunctionLimit {
 pub(super) struct SourceBinding {
     pub model_name: String,
     pub designator: char,
-    pub junction_policy: Box<dyn JunctionPolicy>,
     pub parameters: &'static [SourceParameter],
     pub gmin_slot: Option<usize>,
     pub model_ambient: AmbientTemperature,
@@ -208,7 +203,7 @@ pub struct PreparedDevice<K: Kernel> {
     temperature: InstanceTemperature,
     prepared: Prepared<K>,
     source: Option<Arc<SourceBinding>>,
-    junction_limit: Option<JunctionLimit>,
+    trial_workspace: Option<RefCell<TrialWorkspace>>,
     voltage: RefCell<Vec<Real>>,
     output: RefCell<PointBuffer>,
     dynamic: RefCell<Vec<Real>>,
@@ -283,7 +278,9 @@ impl<K: Kernel> PreparedDevice<K> {
             temperature,
             prepared,
             source: None,
-            junction_limit: None,
+            trial_workspace: (artifact.descriptor().trial != TrialCapabilities::ENGINE)
+                .then(|| TrialWorkspace::new(width).map(RefCell::new))
+                .transpose()?,
             voltage: RefCell::new(vec![0.; width]),
             output: RefCell::new(PointBuffer::new(width).map_err(kernel_error)?),
             dynamic: RefCell::new(vec![0.; width]),
@@ -314,11 +311,7 @@ impl<K: Kernel> PreparedDevice<K> {
                 "prepared public terminal count mismatch",
             ));
         }
-        let states = if descriptor.charge == Capability::Computed {
-            2 * descriptor.equations.len()
-        } else {
-            0
-        };
+        let states = charge_state_count(descriptor) + trial_state_count(descriptor);
         circuit.add_prepared_devices(ElaborationSize::new(1, hidden, states), |nodes| {
             Ok(vec![Box::new(Self::bind_nodes(
                 nodes,
@@ -378,22 +371,13 @@ impl<K: Kernel> PreparedDevice<K> {
         })
     }
 
-    pub(super) fn with_source(mut self, source: SourceBinding) -> SpiceResult<Self> {
-        self.junction_limit = Some(
-            source
-                .junction_policy
-                .prepare(&self.values, self.temperature)?,
-        );
+    pub(super) fn with_source(mut self, source: SourceBinding) -> Self {
         self.source = Some(Arc::new(source));
-        Ok(self)
+        self
     }
 
     fn charge_state_count(&self) -> usize {
-        if self.artifact.descriptor().charge == Capability::Computed {
-            self.terminals.len() * 2
-        } else {
-            0
-        }
+        charge_state_count(self.artifact.descriptor())
     }
 
     fn rebound(&self, values: &[Real], temperature: InstanceTemperature) -> SpiceResult<Self> {
@@ -405,7 +389,6 @@ impl<K: Kernel> PreparedDevice<K> {
             temperature,
         )?;
         if let Some(source) = &self.source {
-            device.junction_limit = Some(source.junction_policy.prepare(values, temperature)?);
             device.source = Some(Arc::clone(source));
         }
         Ok(device)
@@ -577,7 +560,7 @@ impl<K: Kernel> PreparedDevice<K> {
                 context.stamp(row, col, derivative)?;
                 let coordinate =
                     if self.artifact.descriptor().equations[j].kind == EquationKind::Thermal {
-                        context.node_voltage(col)
+                        coordinates[j] - (self.temperature.circuit_celsius + CELSIUS_TO_KELVIN)
                     } else {
                         coordinates[j]
                     };
@@ -645,7 +628,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.artifact.descriptor().noise == Capability::Computed
     }
     fn limits_voltage_steps(&self) -> bool {
-        self.junction_limit.is_some()
+        self.trial_workspace.is_some()
     }
     fn setup_matrix(
         &self,
@@ -659,11 +642,11 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         Ok(true)
     }
     fn state_count(&self) -> usize {
-        self.charge_state_count() + usize::from(self.junction_limit.is_some())
+        self.charge_state_count() + trial_state_count(self.artifact.descriptor())
     }
 
     fn needs_prepared_linearization(&self) -> bool {
-        self.junction_limit.is_some()
+        self.trial_workspace.is_some()
     }
 
     fn linearize_prepared(
@@ -671,8 +654,149 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         states: &mut DeviceState<'_>,
         coordinates: &mut [Real],
     ) -> SpiceResult<()> {
-        if let Some(limit) = &self.junction_limit {
-            limit.linearize(states, self.charge_state_count(), coordinates)?;
+        let Some(workspace) = &self.trial_workspace else {
+            return Ok(());
+        };
+        let mut workspace = workspace.borrow_mut();
+        let offset = self.charge_state_count();
+        workspace.proposed.copy_from_slice(coordinates);
+        let exact = !states.device_limiting()
+            || states.initial_conditions()
+            || states.prepared_exact()
+            || (states.uic() && states.initial_transient());
+        let phase = if exact {
+            TrialPhase::Exact
+        } else {
+            match states.phase() {
+                IterationPhase::Junction if states.depth() == 0 => TrialPhase::ColdStart,
+                IterationPhase::Predict
+                    if workspace.reference(|slot| states.accepted(1, slot), offset) =>
+                {
+                    TrialPhase::Predictor {
+                        accepted: &workspace.reference,
+                    }
+                }
+                IterationPhase::Fix | IterationPhase::Float
+                    if workspace.reference(|slot| states.iterate(slot), offset) =>
+                {
+                    TrialPhase::Newton {
+                        previous: &workspace.reference,
+                    }
+                }
+                _ => TrialPhase::Exact,
+            }
+        };
+        let outcome = self
+            .artifact
+            .linearize_trial(
+                &self.prepared,
+                TrialInput {
+                    proposed: &workspace.proposed,
+                    phase,
+                },
+                coordinates,
+            )
+            .map_err(evaluation_error)?;
+        for (index, &coordinate) in coordinates.iter().enumerate() {
+            states.set(offset + index, coordinate)?;
+        }
+        let exact = outcome == TrialOutcome::Exact;
+        states.set(offset + coordinates.len(), if exact { 1. } else { 0. })?;
+        if !exact {
+            states.report_nonconvergence()?;
+        }
+        Ok(())
+    }
+
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        let Some(workspace) = &self.trial_workspace else {
+            return Ok(false);
+        };
+        let width = self.terminals.len();
+        let offset = self.charge_state_count();
+        let previous = context
+            .states
+            .get(offset..offset + width)
+            .ok_or_else(|| SpiceError::circuit("missing prepared trial coordinates"))?;
+        if context
+            .states
+            .get(offset + width)
+            .is_none_or(|value| value.to_bits() != 1_f64.to_bits())
+        {
+            return Ok(true);
+        }
+        if self.artifact.descriptor().trial.convergence != TrialPolicy::Kernel {
+            return Ok(false);
+        }
+        let mut workspace = workspace.borrow_mut();
+        let TrialWorkspace {
+            proposed,
+            previous: previous_buffer,
+            candidate: candidate_buffer,
+            tolerances,
+            ..
+        } = &mut *workspace;
+        self.read_coordinates(proposed, |node| context.voltage(node));
+        let mut old = previous_buffer.point();
+        let mut candidate = candidate_buffer.point();
+        self.artifact
+            .evaluate(&self.prepared, previous, &mut old)
+            .map_err(evaluation_error)?;
+        self.artifact
+            .evaluate(&self.prepared, proposed, &mut candidate)
+            .map_err(evaluation_error)?;
+        // The ABI row kinds distinguish residual dimensions. Only electrical
+        // rows have an engine-supplied absolute current tolerance today.
+        // For non-electrical family equations use relative comparison, not
+        // a dimensionally incorrect ampere/volt tolerance.
+        for (absolute, equation) in tolerances
+            .iter_mut()
+            .zip(&self.artifact.descriptor().equations)
+        {
+            *absolute = if equation.kind == EquationKind::Electrical {
+                context.abstol
+            } else {
+                0.
+            };
+        }
+        let outcome = self
+            .artifact
+            .check_trial_convergence(
+                &self.prepared,
+                ConvergenceInput {
+                    previous: TrialSample {
+                        coordinates: previous,
+                        residual: old.current,
+                        jacobian: old.conductance,
+                    },
+                    candidate: TrialSample {
+                        coordinates: proposed,
+                        residual: candidate.current,
+                        jacobian: candidate.conductance,
+                    },
+                    candidate_outcome: TrialOutcome::Exact,
+                    relative_tolerance: context.reltol,
+                    absolute_tolerances: tolerances,
+                },
+            )
+            .map_err(evaluation_error)?;
+        Ok(outcome == Convergence::Retry)
+    }
+
+    fn validate_accept(
+        &self,
+        context: &crate::devices::traits::AcceptContext<'_>,
+    ) -> SpiceResult<()> {
+        if self.trial_workspace.is_some()
+            && let Some(states) = context.states
+            && states
+                .get(self.charge_state_count() + self.terminals.len())
+                .is_none_or(|value| value.to_bits() != 1_f64.to_bits())
+        {
+            return Err(SpiceError::circuit(format!(
+                "{}: initialized or limited prepared trial cannot be accepted",
+                self.name
+            )));
         }
         Ok(())
     }

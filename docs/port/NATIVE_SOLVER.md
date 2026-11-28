@@ -305,6 +305,41 @@ The robustness tests cover resistance ratios, common modes, explicit and
 model RESMIN clamps, controlled branch constraints, and cancellation within
 matrix/RHS entries, including an independent local-voltage resolution bound.
 
+## Prolonged bias recovery and retained real operators (#262)
+
+A physical bias solve can fail to reach nominal convergence because rounded
+absolute-coordinate factor solves amplify cancellation. When the initial
+eight inexpensive ordinary loads have not converged, use the existing #244
+original-stamp correction coordinates for the remaining bias loads. This
+changes neither the Newton convergence tolerances nor the stage/total work
+budgets. The ordinary nominal-convergence roundoff trigger is retained, and
+transient time-step recovery and legacy hidden diagonal regularization keep
+their existing policy.
+
+DC transfer and sensitivity analyses explicitly request original-Jacobian
+retention. The ledger belongs to the exact numeric factor frame, not just
+the pattern or the rounded coefficient values. Every real refactor/load,
+including a bit-identical numeric cache hit, invalidates the previous
+ledger; a captured load transfers its own entries within the frame
+transaction. The previous buffer is recycled. Complex factorization and
+ordinary non-recorded loads do not retain this operator.
+
+Normal and transposed retained RHS solves use the rounded factors as a
+preconditioner for exact original-operator residual corrections. This
+addresses branch-current and gain errors even when the underlying bias
+already converged correctly. The refinement uses a bounded number of
+corrections and stops on small relative coordinate updates. A stalled,
+divergent or exhausted correction escalates to a two-word real sparse
+factorization of the unfolded coefficients, accumulated with exact
+products before rounding to two words. Both normal and transposed
+right-hand sides reuse the promoted frame. The promotion is invalidated
+with the original operator, even if the rounded coefficients do not
+change. The two-word solve checks the physical residual in its own
+precision and reports a numerical failure if correction still fails.
+The update criterion is not a general certificate of forward error. The legacy hidden SPARSE internal
+diagonal cannot be represented by the physical stamp ledger; its
+nonzero stages use the ordinary retained solve.
+
 ## Opt-in original-operator residual telemetry (#104)
 
 Ordinary C-compatible DC/Newton/AC solves still perform no implicit

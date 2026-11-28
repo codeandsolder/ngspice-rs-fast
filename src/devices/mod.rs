@@ -82,6 +82,7 @@ pub mod nonlinear;
 pub mod nport;
 pub mod passive;
 pub mod passive_bias;
+pub mod passive_network;
 pub mod physical_dae;
 mod polynomial_storage;
 pub mod prepared_model;

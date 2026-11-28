@@ -1,7 +1,10 @@
 //! Linear analysis orchestration. Nonlinear SPICE convergence policies stay separate.
 use crate::analysis::results::{PlotFlags, Variable};
 use crate::analysis::{AnalysisPlan, Plot};
-use crate::devices::Circuit;
+use crate::devices::{
+    BranchQuantity, Circuit,
+    passive_network::{CurrentOutputLaw, ReportPhase},
+};
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_number};
 
 pub(super) fn unsupported(feature: impl Into<String>) -> SpiceError {
@@ -16,13 +19,31 @@ pub(super) fn number(text: Option<&str>, name: &str) -> SpiceResult<Real> {
         .ok_or_else(|| unsupported(format!("expected finite {name}")))
 }
 
+/// The output schema and additional affine projections of the physical solution.
+/// Only the output path sees these projections; they do not add MNA coordinates.
+pub(super) struct LinearOutput {
+    pub(super) header: Plot,
+    pub(super) reports: Vec<CurrentOutputLaw>,
+    first_unknown: usize,
+}
+
+impl LinearOutput {
+    pub(super) fn append_reports(&self, point: &mut Vec<Complex>) {
+        for &report in &self.reports {
+            let value = report.evaluate(|row| point[self.first_unknown + row]);
+            point.push(value);
+        }
+    }
+}
+
 pub(super) fn plot(
     circuit: &Circuit,
     name: &str,
     title: &str,
     scale: Option<(&str, &str)>,
     complex: bool,
-) -> SpiceResult<Plot> {
+    phase: ReportPhase,
+) -> SpiceResult<LinearOutput> {
     let mut plot = Plot::builder(
         name,
         title,
@@ -66,6 +87,7 @@ pub(super) fn plot(
                 device.name()
             ))
         })?;
+        let report = circuit.current_report(index);
         for (local, row) in rows.enumerate() {
             let entry = names.get_mut(row).ok_or_else(|| {
                 SpiceError::circuit(format!(
@@ -73,16 +95,30 @@ pub(super) fn plot(
                     device.name()
                 ))
             })?;
-            *entry = Some(device.branch_quantity(local).observation(device.name()));
+            let quantity = device.branch_quantity(local);
+            let name = match report {
+                Some(report) if quantity == BranchQuantity::Current => &report.intrinsic,
+                _ => device.name(),
+            };
+            *entry = Some(quantity.observation(name));
         }
     }
     for (name, unit) in names.into_iter().flatten() {
         plot.push_variable(var(name, unit));
     }
+    let mut reports = Vec::new();
+    for report in circuit.reported_currents() {
+        plot.push_variable(var(format!("i({})", report.original), "current"));
+        reports.push(report.law(phase)?);
+    }
     for observation in circuit.observations() {
         plot.push_variable(Variable::new(observation.name(), observation.unit()));
     }
-    Ok(plot.build())
+    Ok(LinearOutput {
+        header: plot.build(),
+        reports,
+        first_unknown: usize::from(scale.is_some()),
+    })
 }
 
 pub(super) fn op(
@@ -143,7 +179,14 @@ fn op_inner(
             ));
         }
     }
-    let mut plot = plot(circuit, "op1", "Operating Point", None, false)?;
+    let output = plot(
+        circuit,
+        "op1",
+        "Operating Point",
+        None,
+        false,
+        ReportPhase::Steady,
+    )?;
     circuit.accept_solution(&x, None)?;
     let history = circuit.state_history()?;
     let values = prepared.observe_real(
@@ -160,7 +203,9 @@ fn op_inner(
         None,
     )?;
     let mut point: Vec<_> = x.as_slice().iter().map(|v| Complex::real(*v)).collect();
+    output.append_reports(&mut point);
     point.extend(values);
+    let mut plot = output.header;
     plot.push_point(&point)?;
     // dcop.c performs MODEINITSMSIG after CKTop. Publish its persistent
     // device fields for the next analysis, just as the AC preparation does.

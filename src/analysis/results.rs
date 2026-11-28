@@ -70,25 +70,31 @@ pub(crate) struct SelectedOutput {
     columns: Vec<usize>,
     observations: Vec<usize>,
     first_unknown: usize,
+    first_report: usize,
     first_observation: usize,
+    reports: Vec<crate::devices::passive_network::CurrentOutputLaw>,
     buffer: Vec<Complex>,
 }
 
 impl SelectedOutput {
     /// Negotiate exactly once, after the full header has been validated by
     /// the sink. The output is scale, unknowns, then observations.
-    pub(crate) fn bind(
+    pub(super) fn bind(
         sink: &dyn PointSink,
-        header: &Plot,
+        output: &super::linear::LinearOutput,
         unknowns: usize,
         has_scale: bool,
     ) -> SpiceResult<Option<Self>> {
         let Some(columns) = sink.selected_columns() else {
             return Ok(None);
         };
+        let header = &output.header;
         let first_unknown = usize::from(has_scale);
-        let first_observation = first_unknown
+        let first_report = first_unknown
             .checked_add(unknowns)
+            .ok_or_else(|| lifecycle_error("selected output has invalid unknown layout"))?;
+        let first_observation = first_report
+            .checked_add(output.reports.len())
             .filter(|&first| first <= header.variable_count())
             .ok_or_else(|| lifecycle_error("selected output has invalid unknown layout"))?;
         if columns
@@ -108,7 +114,9 @@ impl SelectedOutput {
             columns: columns.to_vec(),
             observations,
             first_unknown,
+            first_report,
             first_observation,
+            reports: output.reports.clone(),
             buffer: Vec::with_capacity(columns.len()),
         }))
     }
@@ -132,7 +140,7 @@ impl SelectedOutput {
                 "selected device observation width mismatch",
             ));
         }
-        if self.first_observation != unknown_count + self.first_unknown {
+        if self.first_report != unknown_count + self.first_unknown {
             return Err(lifecycle_error("selected output unknown dimension changed"));
         }
         self.buffer.clear();
@@ -140,8 +148,10 @@ impl SelectedOutput {
         for &column in &self.columns {
             let value = if column < self.first_unknown {
                 Complex::real(scale.ok_or_else(|| lifecycle_error("missing output scale"))?)
-            } else if column < self.first_observation {
+            } else if column < self.first_report {
                 unknown(column - self.first_unknown)
+            } else if column < self.first_observation {
+                self.reports[column - self.first_report].evaluate(&mut unknown)
             } else {
                 let value = observations[observation];
                 observation += 1;

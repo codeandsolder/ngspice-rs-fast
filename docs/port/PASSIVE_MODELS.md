@@ -293,3 +293,14 @@ claim that PSpice accepts these instance keywords. Nonlinear mutual
 inductance is rejected until a coupled energy law is available.
 Source-specific non-UIC initial bias semantics require a separate producer
 policy; the native instance IC alone does not impose a DC clamp.
+
+
+## Explicit physical passive networks
+
+The native normalized C/L grammar accepts explicit per-copy series resistance and inductance (`pn_rseries`, `pn_lseries`), resistance across the series inductance (`pn_rseries_shunt`), resistance across the main storage (`pn_rstorage_shunt`), and external parallel resistance and capacitance (`pn_rparallel`, `pn_cparallel`). Omitted or zero optional parasitics mean no corresponding element. Ordinary `m`, `temp` and `ic` are resolved per occurrence; multiplicity scales the physical parallel copies. A voltage source supports signed `pn_rseries`, `pn_cparallel` across its output, `pn_cseries_shunt` across its series resistance, and `pn_temp`. The original source excitation and winding identities remain available for sweeps and mutual inductance.
+
+For source-prepared bias, `pn_bias_op`, `pn_bias_dc`, `pn_bias_ac` and `pn_bias_tran` specify the per-copy constraint conductance; presence is significant (zero is a hard constraint). Analysis-dependent damping may be placed across the series inductance, storage or terminal nodes using `pn_gseries_{dc,ac,tran}`, `pn_gstorage_{dc,ac,tran}` or `pn_gterminal_{dc,ac,tran}` and their `_gmin` variants. The latter multiply configured junction gmin rather than continuation conductance. The corresponding `pn_gseries_noise`, `pn_gstorage_noise` and `pn_gterminal_noise` flags select physical thermal noise. The enclosing analysis selects damping even during UIC, independently of bias constraints.
+
+Reporting and controlled-device references are independent of electrical loading. With explicit reporting, `pn_report_{dc,ac,tran}` selects the primary (0) or external terminal (1) current; omitted selectors default to terminal. The optional `_g` term multiplies external differential voltage, and `_rparallel_factor` multiplies the actual aggregate external parallel conductance before multiplying that voltage. These signed terms are projections of solved physical rows, never injected currents. `pn_control` selects the physical control current (0 primary, 1 terminal). The generated ideal port-current probe is not an independent excitation. An intrinsic branch current remains separately available as `i(<name>#intrinsic)` when a reported projection replaces its ordinary output name; the physical port probe is `i(v<name>#port)`.
+
+Source-language omission rules, source-dependent parasitic placement, and reporting/control choices belong to preprocessing, not to the native solver. The independent synthetic fixtures in `tests/fixtures/passive_network` cover the observed distinctions without embedding a vendor-specific compatibility mode.

@@ -1,0 +1,11 @@
+Synthetic smooth controlled-source transient
+.options reltol=1e-4 abstol=1e-9 vntol=1e-6
+V1 a 0 SINE(0 1 10k) Rser=2 Cpar=1u
+R1 a 0 3
+V2 b 0 SINE(0 1 10k) Rser=2 Cpar=1u
+R2 b 0 3
+F2 0 f V2 1
+RF f 0 1
+.tran 0 2u 0 20n
+.save V(a) V(b) V(f) I(V1) I(V2)
+.end

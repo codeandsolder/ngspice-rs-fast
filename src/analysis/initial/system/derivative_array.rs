@@ -5,9 +5,10 @@
 //! are selected. No arbitrary zero derivative gauge enters the prefix.
 
 use super::rank;
+mod recovery;
 use crate::analysis::initial::{
-    CapacitorInitial, ChargeInitial, FixedCoordinate, ImpulseStorage, LocalChargeInitial,
-    Tolerances,
+    CapacitorInitial, ChargeInitial, DerivativeGuess, FixedCoordinate, ImpulseStorage,
+    LocalChargeInitial, Tolerances,
     constraints::{AbsoluteRow, VoltageVertex},
     failure,
 };
@@ -572,19 +573,24 @@ pub(in crate::analysis::initial) struct RightLimit {
 }
 
 #[derive(Clone, Copy)]
-struct LocalPoint {
+struct LocalPoint<'a> {
     time: Real,
     scale: Real,
     limit: Limit,
     order_hint: usize,
+    recovery: Option<&'a recovery::Budget>,
+    rate_seed: Option<&'a Vector>,
 }
 
-impl LocalPoint {
+impl LocalPoint<'_> {
     fn evaluate(
         self,
         dae: &PhysicalDae<'_, '_>,
         state: &[Vector],
     ) -> SpiceResult<PhysicalDaeTaylor> {
+        if let Some(budget) = self.recovery {
+            budget.charge(state)?;
+        }
         dae.evaluate_taylor(state, self.time, self.scale, self.limit)
     }
 
@@ -595,36 +601,40 @@ impl LocalPoint {
     }
 }
 
-fn extend(state: &mut Vec<Vector>) -> SpiceResult<()> {
+fn extend(state: &mut Vec<Vector>) -> bool {
     let width = state[0].len();
     if state.len() > MAX_ORDER || width.saturating_mul(state.len() + 1) > MAX_ARRAY_VARIABLES {
-        return Err(failure(
-            "physical DAE derivative order or state budget exhausted: required coordinates may be noncausal or underdetermined",
-        ));
+        return false;
     }
     state.push(Vector::zeros(width));
-    Ok(())
+    true
+}
+
+fn order_limit() -> crate::primitives::SpiceError {
+    failure(
+        "physical DAE derivative order or state budget exhausted: required coordinates may be noncausal or underdetermined, or have an unresolved singular nonlinear tangent",
+    )
 }
 
 fn stable_rank_order(
     dae: &PhysicalDae<'_, '_>,
     state: &mut Vec<Vector>,
-    local: LocalPoint,
-) -> SpiceResult<()> {
+    local: LocalPoint<'_>,
+) -> SpiceResult<bool> {
     let mut previous = local.prefix_rank(dae, state)?;
-    loop {
-        extend(state)?;
+    while extend(state) {
         let next = local.prefix_rank(dae, state)?;
         if next == previous {
-            return Ok(());
+            return Ok(true);
         }
         previous = next;
     }
+    Ok(false)
 }
 
 enum ArrayNewton {
     Converged,
-    NeedOrder,
+    NeedOrder { nonlinear_residual: bool },
     NotConverged(String),
 }
 
@@ -647,7 +657,7 @@ fn apply_step(state: &mut [Vector], correction: &Vector) -> SpiceResult<()> {
 fn newton(
     dae: &PhysicalDae<'_, '_>,
     state: &mut [Vector],
-    local: LocalPoint,
+    local: LocalPoint<'_>,
     initial: &[Constraint<'_>],
     tol: Tolerances,
     iterations: usize,
@@ -670,8 +680,15 @@ fn newton(
             // then recover after the determined coordinates are corrected.
             // Do not confuse a deficient tangent with a noncausal DAE.
             // The expanded array must prove the whole prefix before use.
+            let nonlinear_residual = array.residual[..array.physical_rows]
+                .iter()
+                .zip(&array.scale)
+                .zip(&step.independent)
+                .any(|((&residual, scale), &independent)| {
+                    !independent && residual.abs() > scale.roundoff()
+                });
             apply_step(state, &step.values)?;
-            return Ok(ArrayNewton::NeedOrder);
+            return Ok(ArrayNewton::NeedOrder { nonlinear_residual });
         }
         let (ratio, roundoff) = array.merit(initial, &step.independent, tol);
         if ratio > 1. {
@@ -681,6 +698,16 @@ fn newton(
             if roundoff <= 1. {
                 return Ok(ArrayNewton::Converged);
             }
+            // A recovery probe must reach rounding consistency in the
+            // original physical rows. A small residual near a repeated
+            // nonlinear root is not by itself a rank certificate.
+            let physical_roundoff = array.residual[..array.physical_rows]
+                .iter()
+                .zip(&array.scale)
+                .all(|(residual, scale)| residual.abs() <= scale.roundoff());
+            if local.recovery.is_some() && physical_roundoff {
+                return Ok(ArrayNewton::Converged);
+            }
             if best.as_ref().is_some_and(|(score, _)| roundoff >= *score) {
                 break;
             }
@@ -688,7 +715,7 @@ fn newton(
         }
         apply_step(state, &step.values)?;
     }
-    if let Some((_, best)) = best {
+    if let Some((_, best)) = best.filter(|_| local.recovery.is_none()) {
         state.clone_from_slice(&best);
         Ok(ArrayNewton::Converged)
     } else {
@@ -733,6 +760,8 @@ pub(in crate::analysis::initial) fn solve_right_limit(
             scale,
             limit: Limit::Right,
             order_hint: 2,
+            recovery: None,
+            rate_seed: None,
         },
         tol,
         iterations,
@@ -746,7 +775,7 @@ pub(in crate::analysis::initial) fn solve_event(
     storage: &ImpulseStorage,
     tol: Tolerances,
     iterations: usize,
-    order_hint: usize,
+    guess: DerivativeGuess<'_>,
 ) -> SpiceResult<RightLimit> {
     let forcing = request
         .forcing
@@ -762,7 +791,9 @@ pub(in crate::analysis::initial) fn solve_event(
             time,
             scale: forcing.timing.step(),
             limit: Limit::Right,
-            order_hint,
+            order_hint: guess.order_hint,
+            recovery: None,
+            rate_seed: guess.rate,
         },
         tol,
         iterations,
@@ -777,7 +808,7 @@ pub(in crate::analysis::initial) fn solve_step(
     storage: &ImpulseStorage,
     tol: Tolerances,
     iterations: usize,
-    order_hint: usize,
+    guess: DerivativeGuess<'_>,
 ) -> SpiceResult<SolveOutcome> {
     let forcing = request
         .forcing
@@ -796,92 +827,193 @@ pub(in crate::analysis::initial) fn solve_step(
             time,
             scale: forcing.timing.step(),
             limit: forcing.limit,
-            order_hint,
+            order_hint: guess.order_hint,
+            recovery: None,
+            rate_seed: guess.rate,
         },
         tol,
         iterations,
     )
 }
 
+struct Candidate {
+    right: RightLimit,
+    mandatory_rank: usize,
+    uncertainty: Option<Vector>,
+}
+
+enum CoreOutcome {
+    Converged(Box<Candidate>),
+    NotConverged { last: Vector, reason: String },
+    Exhausted(Option<Vec<Vector>>),
+}
+
 fn solve(
     dae: &PhysicalDae<'_, '_>,
     seed: &Vector,
     initial: &[Constraint<'_>],
-    local: LocalPoint,
+    local: LocalPoint<'_>,
     tol: Tolerances,
     iterations: usize,
 ) -> SpiceResult<SolveOutcome> {
     let mut state = vec![seed.clone()];
     for _ in 0..local.order_hint.max(2) {
-        extend(&mut state)?;
+        if !extend(&mut state) {
+            return Err(order_limit());
+        }
     }
+    if let Some(rate) = local.rate_seed {
+        let normalized = Vector::from(
+            rate.as_slice()
+                .iter()
+                .map(|value| value * local.scale)
+                .collect::<Vec<_>>(),
+        );
+        if normalized.len() == seed.len() && normalized.is_finite() {
+            state[1] = normalized;
+        }
+    }
+    match solve_core(dae, state, initial, local, tol, iterations)? {
+        CoreOutcome::Converged(candidate) => Ok(SolveOutcome::Converged(Box::new(candidate.right))),
+        CoreOutcome::NotConverged { last, reason } => {
+            Ok(SolveOutcome::NotConverged { last, reason })
+        }
+        CoreOutcome::Exhausted(Some(seed)) => {
+            recovery::recover(dae, seed, initial, local, tol, iterations)
+                .map(|right| SolveOutcome::Converged(Box::new(right)))
+        }
+        CoreOutcome::Exhausted(None) => Err(order_limit()),
+    }
+}
+
+fn solve_core(
+    dae: &PhysicalDae<'_, '_>,
+    mut state: Vec<Vector>,
+    initial: &[Constraint<'_>],
+    local: LocalPoint<'_>,
+    tol: Tolerances,
+    iterations: usize,
+) -> SpiceResult<CoreOutcome> {
+    let mut recovery_seed = None;
     loop {
-        stable_rank_order(dae, &mut state, local)?;
+        if !stable_rank_order(dae, &mut state, local)? {
+            break;
+        }
         match newton(dae, &mut state, local, initial, tol, iterations)? {
             ArrayNewton::Converged => {}
-            ArrayNewton::NeedOrder => {
-                extend(&mut state)?;
+            ArrayNewton::NeedOrder { nonlinear_residual } => {
+                if nonlinear_residual && local.recovery.is_none() && recovery_seed.is_none() {
+                    recovery_seed = Some(state.clone());
+                }
+                if !extend(&mut state) {
+                    break;
+                }
                 continue;
             }
             ArrayNewton::NotConverged(reason) => {
-                return Ok(SolveOutcome::NotConverged {
+                return Ok(CoreOutcome::NotConverged {
                     last: state.remove(0),
                     reason,
                 });
             }
         }
         let rank = local.prefix_rank(dae, &state)?;
-        extend(&mut state)?;
-        if local.prefix_rank(dae, &state)? == rank {
-            // Re-solve the extended array: rank equality alone does not
-            // establish its affine residual or the chosen right-hand branch.
-            match newton(dae, &mut state, local, initial, tol, iterations)? {
-                ArrayNewton::Converged => {}
-                ArrayNewton::NeedOrder => continue,
-                ArrayNewton::NotConverged(reason) => {
-                    return Ok(SolveOutcome::NotConverged {
-                        last: state.remove(0),
-                        reason,
-                    });
+        if !extend(&mut state) {
+            break;
+        }
+        if local.prefix_rank(dae, &state)? != rank {
+            continue;
+        }
+        // Rank equality alone does not establish the affine residual.
+        match newton(dae, &mut state, local, initial, tol, iterations)? {
+            ArrayNewton::Converged => {}
+            ArrayNewton::NeedOrder { nonlinear_residual } => {
+                if nonlinear_residual && local.recovery.is_none() && recovery_seed.is_none() {
+                    recovery_seed = Some(state.clone());
                 }
-            }
-            if local.prefix_rank(dae, &state)? != rank {
                 continue;
             }
-            let point =
-                dae.evaluate_taylor_with_guards(&state, local.time, local.scale, local.limit)?;
-            let to_rate = |vector: &Vector| {
-                Vector::from_slice(
-                    &vector
-                        .as_slice()
-                        .iter()
-                        .map(|value| value / local.scale)
-                        .collect::<Vec<_>>(),
-                )
-            };
-            return Ok(SolveOutcome::Converged(Box::new(RightLimit {
-                state: state[0].clone(),
-                rate: to_rate(&state[1]),
-                charge: point.charge[0].clone(),
-                charge_rate: to_rate(&point.charge[1]),
-                local_history: point
-                    .storage
-                    .iter()
-                    .flat_map(|(&slot, charge)| {
-                        [
-                            (slot, charge.values[0]),
-                            (slot + 1, charge.values[1] / local.scale),
-                        ]
-                    })
-                    .collect(),
-                // The two extra orders were rank/affine lookahead checks;
-                // retain a lower bound so the next trial still repeats them.
-                order_hint: state.len().saturating_sub(3).max(2),
-                guards: point.guards.unwrap_or_default(),
-                candidate_states: point.candidate_states,
-            })));
+            ArrayNewton::NotConverged(reason) => {
+                return Ok(CoreOutcome::NotConverged {
+                    last: state.remove(0),
+                    reason,
+                });
+            }
         }
+        if local.prefix_rank(dae, &state)? != rank {
+            continue;
+        }
+        return candidate(dae, &state, initial, local)
+            .map(|candidate| CoreOutcome::Converged(Box::new(candidate)));
     }
+    Ok(CoreOutcome::Exhausted(recovery_seed))
+}
+
+fn candidate(
+    dae: &PhysicalDae<'_, '_>,
+    state: &[Vector],
+    initial: &[Constraint<'_>],
+    local: LocalPoint<'_>,
+) -> SpiceResult<Candidate> {
+    if let Some(budget) = local.recovery {
+        budget.charge(state)?;
+    }
+    let point = dae.evaluate_taylor_with_guards(state, local.time, local.scale, local.limit)?;
+    let (mandatory_rank, uncertainty) = if local.recovery.is_some() {
+        let array = Array::build(&point, state, local.scale, initial)?;
+        let prefix = 2 * state[0].len();
+        let physical_rank =
+            rank::probe_space(&array.matrix, &array.late, &array.optional, prefix, 0)?.rank;
+        let bounds = array
+            .scale
+            .iter()
+            .map(|scale| scale.roundoff())
+            .collect::<Vec<_>>();
+        let uncertainty = rank::projected_uncertainty(
+            &array.matrix,
+            &bounds,
+            &array.late,
+            &array.optional,
+            prefix,
+        )?;
+        (physical_rank, Some(uncertainty))
+    } else {
+        (0, None)
+    };
+    let to_rate = |vector: &Vector| {
+        Vector::from_slice(
+            &vector
+                .as_slice()
+                .iter()
+                .map(|value| value / local.scale)
+                .collect::<Vec<_>>(),
+        )
+    };
+    Ok(Candidate {
+        right: RightLimit {
+            state: state[0].clone(),
+            rate: to_rate(&state[1]),
+            charge: point.charge[0].clone(),
+            charge_rate: to_rate(&point.charge[1]),
+            local_history: point
+                .storage
+                .iter()
+                .flat_map(|(&slot, charge)| {
+                    [
+                        (slot, charge.values[0]),
+                        (slot + 1, charge.values[1] / local.scale),
+                    ]
+                })
+                .collect(),
+            // The two extra orders were rank/affine lookahead checks;
+            // retain a lower bound so the next trial still repeats them.
+            order_hint: state.len().saturating_sub(3).max(2),
+            guards: point.guards.unwrap_or_default(),
+            candidate_states: point.candidate_states,
+        },
+        mandatory_rank,
+        uncertainty,
+    })
 }
 
 #[cfg(test)]

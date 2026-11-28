@@ -38,7 +38,7 @@
 //! delta*reltol`.
 
 use crate::analysis::frequency::{Advance, FrequencyPlan};
-use crate::analysis::linear::{number, plot, unsupported};
+use crate::analysis::linear::{LinearOutput, number, plot, unsupported};
 use crate::analysis::results::Plot;
 use crate::analysis::{AnalysisContext, AnalysisPlan};
 use crate::devices::Circuit;
@@ -173,7 +173,7 @@ pub(super) fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Frequen
     FrequencyPlan::new(card.start, card.stop, tolerance, advance, ".disto")
 }
 
-fn output_plots(circuit: &Circuit, intermodulation: bool) -> SpiceResult<Vec<Plot>> {
+fn output_plots(circuit: &Circuit, intermodulation: bool) -> SpiceResult<Vec<LinearOutput>> {
     let titles: &[&str] = if intermodulation {
         &INTERMODULATION_PLOTNAMES
     } else {
@@ -189,6 +189,7 @@ fn output_plots(circuit: &Circuit, intermodulation: bool) -> SpiceResult<Vec<Plo
                 title,
                 Some(("frequency", "frequency")),
                 true,
+                crate::devices::passive_network::ReportPhase::SmallSignal,
             )
         })
         .collect()
@@ -226,7 +227,7 @@ pub(super) fn run(
     for freq in grid.values() {
         workspace.frequency(&distortion, freq, two_pi * freq, omega2, &mut plots)?;
     }
-    retained.extend(plots);
+    retained.extend(plots.into_iter().map(|output| output.header));
     Ok(retained)
 }
 

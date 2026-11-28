@@ -95,6 +95,8 @@ pub enum ModelFamily {
     Pmf,
     /// XSPICE rational transfer function (`s_xfer`).
     RationalTransfer,
+    /// Tabulated complex frequency response.
+    FrequencyTransfer,
     /// Native hybrid analog receiver/event logic.
     LogicEvent,
     /// Native ideal logic voltage bridge.
@@ -134,6 +136,7 @@ impl ModelFamily {
             "txl" => Some(Self::Txl),
             "cpl" | "cpllines" => Some(Self::Cpl),
             "s_xfer" => Some(Self::RationalTransfer),
+            "xfer" => Some(Self::FrequencyTransfer),
             "preprocess_logic_event" => Some(Self::LogicEvent),
             "preprocess_logic_voltage" => Some(Self::LogicVoltage),
             "preprocess_timed_switch" => Some(Self::TimedSwitch),
@@ -163,9 +166,11 @@ impl ModelFamily {
             Self::Ltra => 'o',
             Self::Txl => 'y',
             Self::Cpl => 'p',
-            Self::RationalTransfer | Self::LogicEvent | Self::LogicVoltage | Self::TimedSwitch => {
-                'a'
-            }
+            Self::RationalTransfer
+            | Self::FrequencyTransfer
+            | Self::LogicEvent
+            | Self::LogicVoltage
+            | Self::TimedSwitch => 'a',
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -235,6 +240,8 @@ pub enum ModelBackend {
     Cpl,
     /// Native rational transfer model.
     RationalTransfer,
+    /// Tabulated complex frequency response.
+    FrequencyTransfer,
     /// Native hybrid event logic.
     LogicEvent,
     /// Native ideal logic voltage bridge.
@@ -347,6 +354,8 @@ impl ModelBackend {
                 const {
                     &[
                         BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
+                        BackendSpec::new(Self::FrequencyTransfer, "Tabulated AC transfer", &[1])
+                            .for_family(ModelFamily::FrequencyTransfer),
                         BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
                             .for_family(ModelFamily::LogicEvent),
                         BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
@@ -883,6 +892,8 @@ impl TopologyShunts {
 /// resistor and instance-parameter overrides here (see [`crate::devices::sweep`]) instead of mutating devices.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelContext {
+    /// Enclosing analysis for physical, phase-dependent device coefficients.
+    pub analysis_kind: Option<crate::primitives::AnalysisKind>,
     /// Enclosing analysis for resolved, bias-only passive initialization.
     pub bias_analysis: Option<crate::primitives::AnalysisKind>,
     /// Use SPICE3 MOS1 flicker noise (`mos1noi.c`, newcompat.s3).
@@ -903,6 +914,9 @@ pub struct ModelContext {
     /// artificial nodal continuation conductance of DC gmin stepping. Default
     /// [`DEFAULT_GMIN`]; must be finite and nonnegative.
     pub gmin: Real,
+    /// Configured junction conductance, unchanged by temporary continuation.
+    /// Source-resolved physical damping may depend on this setting.
+    pub configured_gmin: Real,
     /// Physical shunts used at topology elaboration.
     pub shunts: TopologyShunts,
     /// Global source geometry scale, applied only when resolving setters.
@@ -948,6 +962,7 @@ impl ModelContext {
             resistor_overrides: [None; MAX_RESISTOR_OVERRIDES],
             instance_overrides: [None; MAX_INSTANCE_OVERRIDES],
             gmin: DEFAULT_GMIN,
+            configured_gmin: DEFAULT_GMIN,
             shunts: TopologyShunts {
                 resistance: None,
                 capacitance: 0.,
@@ -959,6 +974,7 @@ impl ModelContext {
             pivot: crate::maths::PivotTolerances::DEFAULT,
             source_factor: 1.,
             noise_analysis: false,
+            analysis_kind: None,
             bias_analysis: None,
         }
     }
@@ -996,6 +1012,13 @@ impl ModelContext {
     /// [`Self::gmin`]).
     #[must_use = "discarding the returned context loses the requested minimum conductance"]
     pub const fn with_gmin(mut self, gmin: Real) -> Self {
+        self.gmin = gmin;
+        self.configured_gmin = gmin;
+        self
+    }
+
+    /// Temporary junction-only conductance for a convergence attempt.
+    pub(crate) const fn with_junction_gmin(mut self, gmin: Real) -> Self {
         self.gmin = gmin;
         self
     }
@@ -1119,6 +1142,12 @@ impl ModelContext {
                     "junction gmin must be finite and nonnegative, got {}",
                     self.gmin
                 ),
+            ));
+        }
+        if !(self.configured_gmin.is_finite() && self.configured_gmin >= 0.) {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "configured gmin must be finite and nonnegative",
             ));
         }
         if !(self.reltol.is_finite() && self.reltol > 0.) {
