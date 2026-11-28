@@ -81,8 +81,8 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter, SensitivityRecord,
+    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -2331,18 +2331,12 @@ impl SensitivityKernel for BjtSensitivity<'_> {
         Ok(())
     }
 
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "a BJT's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(self.bjt(current)?)))
+    ) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::replacement(self.bjt(current)?))
     }
 
     /// `BJTacLoad` after `cktsens.c`'s reset load: `gpi`, `gmu`, `gm`, `go`,
@@ -2351,20 +2345,20 @@ impl SensitivityKernel for BjtSensitivity<'_> {
     /// capacitances (`cqbe`, ... written only by a small-signal or transient
     /// load) are zero, and `RC`/`RE`, `m` and the excess-phase factor
     /// `PTF/(180/pi) TF` (`bjttemp.c`) come from `current`.
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<AcSensitivityLoad> {
         let (m, i) = (current.model, current.instance);
-        Ok(SensitivityLoad::Replacement(Box::new(ResetBjt {
+        Ok(AcSensitivityLoad::stamp(ResetBjt {
             state: self.bjt(reset.state)?,
             current: self.bjt(current)?,
             multiplier: i.value("m")?,
             excess_phase: m.value("ptf")? / (180.0 / std::f64::consts::PI) * m.value("tf")?,
             omega: reset.omega,
-        })))
+        }))
     }
 }
 
@@ -2487,7 +2481,7 @@ impl BjtSensitivity<'_> {
 }
 
 /// A BJT's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
 #[derive(Debug)]
 struct ResetBjt {
     /// Built from the reset load's records: the junction conductances.
@@ -2502,30 +2496,11 @@ struct ResetBjt {
     omega: Real,
 }
 
-impl Device for ResetBjt {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'q'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl AcSensitivityStamp for ResetBjt {
     /// `bjtacld.c`'s stamps in its order with zero capacitances: the real
     /// parts, then the excess phase's imaginary `xgm` parts.
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        use crate::devices::sensitivity::{ResetStamp, ResetStamps, StampAt, StampPart};
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+        use crate::devices::sensitivity::{StampPart, node_stamps, stamp_reset};
         let gmin = context.model_context.gmin;
         let t = self.state.thermal(context.model_context)?;
         let p = c_point(&t, Bias::default(), gmin)?;
@@ -2590,32 +2565,23 @@ impl Device for ResetBjt {
             (sc, s, m * (-gdsub)),
             (s, sc, m * (-gdsub)),
         ];
-        let mut stamps: Vec<ResetStamp> = real
-            .into_iter()
-            .map(|(a, b, value)| ResetStamp {
-                at: StampAt::Nodes(a, b),
-                value,
-                part: StampPart::Real,
-            })
-            .collect();
-        if xgm != 0. {
-            // `xcpi`, `xcmu` and `xcmcb` are zero: `m * (0 + xgm)`,
-            // `m * (-0 + xgm)`, `m * (-xgm)`, `m * (-0 - xgm - 0)`.
-            for (a, b, value) in [
-                (ep, ep, m * xgm),
-                (cp, bp, m * xgm),
-                (cp, ep, m * (-xgm)),
-                (ep, bp, m * (-xgm)),
-            ] {
-                stamps.push(ResetStamp {
-                    at: StampAt::Nodes(a, b),
-                    value,
-                    part: StampPart::Imaginary,
-                });
-            }
-        }
-        ResetStamps::new(&self.current.name, 'q', &self.current.terminals, stamps)?
-            .assemble_linear(context)
+        // Preserve the absence of imaginary stamps when xgm is zero.
+        let imaginary = [
+            (ep, ep, m * xgm),
+            (cp, bp, m * xgm),
+            (cp, ep, m * (-xgm)),
+            (ep, bp, m * (-xgm)),
+        ];
+        let imaginary = if xgm == 0. {
+            &imaginary[..0]
+        } else {
+            &imaginary[..]
+        };
+        stamp_reset(
+            &self.current.name,
+            node_stamps(&real, StampPart::Real).chain(node_stamps(imaginary, StampPart::Imaginary)),
+            context,
+        )
     }
 }
 

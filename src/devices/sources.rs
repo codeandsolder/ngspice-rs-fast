@@ -985,9 +985,7 @@ mod tests {
 
     #[test]
     fn source_ac_construction_sweep_and_replay_share_reference_coefficients() {
-        use crate::devices::sensitivity::{
-            ParameterScope, RecordPair, SensitivityLoad, SensitivityMode,
-        };
+        use crate::devices::sensitivity::{AcReset, AcSensitivityLoad, ParameterScope, RecordPair};
 
         let context = crate::devices::ModelContext::default();
         for voltage in [true, false] {
@@ -1033,8 +1031,17 @@ mod tests {
                     model: &model,
                     instance: &instance,
                 };
-                let SensitivityLoad::Replacement(replayed) = sensitivity
-                    .load(records, records, SensitivityMode::Ac)
+                let AcSensitivityLoad::Device(replayed) = sensitivity
+                    .ac_load(
+                        records,
+                        AcReset {
+                            state: records,
+                            omega: 0.,
+                            small_signal: None,
+                            transient: None,
+                        },
+                        records,
+                    )
                     .unwrap()
                 else {
                     panic!("expected replacement");
@@ -1129,7 +1136,7 @@ mod tests {
     }
     #[test]
     fn current_multiplier_is_replayed_once_with_its_given_state() {
-        use crate::devices::sensitivity::{RecordPair, SensitivityLoad, SensitivityMode};
+        use crate::devices::sensitivity::{DcSensitivityLoad, RecordPair};
         let context = crate::devices::ModelContext::default();
         let source = polar_source(
             false,
@@ -1149,9 +1156,8 @@ mod tests {
             model: &model,
             instance: &instance,
         };
-        let SensitivityLoad::Replacement(replayed) = sensitivity
-            .load(records, records, SensitivityMode::Dc)
-            .unwrap()
+        let DcSensitivityLoad::Replacement(replayed) =
+            sensitivity.dc_load(records, records).unwrap()
         else {
             panic!("expected replacement");
         };

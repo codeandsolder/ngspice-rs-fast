@@ -50,7 +50,7 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{ParameterScope, RecordPair, SensitivityRecord};
-use crate::devices::{LinearContext, ModelFamily, ResolvedModel};
+use crate::devices::{ModelFamily, ResolvedModel};
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
@@ -403,42 +403,6 @@ fn set_hfet(
         }
         ParameterScope::Instance => instance.set(keyword, value),
     }
-}
-
-type NodeStamp = (NodeId, NodeId, Real);
-
-/// Assemble borrowed reset stamps in their original real-then-imaginary order.
-/// Validate all addends before touching the matrix, including ground entries,
-/// just as `ResetStamps::new` does. No temporary owned device or stamp vector.
-fn stamp_reset(
-    name: &str,
-    context: &mut LinearContext<'_>,
-    real: &[NodeStamp],
-    imaginary: &[NodeStamp],
-) -> SpiceResult<()> {
-    if let Some((_, _, value)) = real
-        .iter()
-        .chain(imaginary)
-        .find(|(_, _, value)| !value.is_finite())
-    {
-        return Err(SpiceError::Numerical {
-            context: format!("AC sensitivity of {name}"),
-            message: format!("the reset load gives a nonfinite matrix element {value}"),
-        });
-    }
-    for &(a, b, value) in real {
-        if let (Some(row), Some(col)) = (context.unknowns.node_row(a), context.unknowns.node_row(b))
-        {
-            context.system.a.add(row, col, value)?;
-        }
-    }
-    for &(a, b, value) in imaginary {
-        if let (Some(row), Some(col)) = (context.unknowns.node_row(a), context.unknowns.node_row(b))
-        {
-            context.dynamic_prescaled(row, col, value)?;
-        }
-    }
-    Ok(())
 }
 
 /// Model setters of `MESAmPTable` with `mesasetup.c`'s defaults. `vto` is the
@@ -918,9 +882,12 @@ mod tests {
     #[test]
     fn borrowed_reset_stamps_match_owned_assembly_and_validate_before_mutation() {
         use crate::devices::linear::LinearSystem;
-        use crate::devices::sensitivity::{ResetStamp, ResetStamps, StampAt, StampPart};
+        use crate::devices::sensitivity::{
+            AcSensitivityStamp, ResetStamp, ResetStamps, StampAt, StampPart, node_stamps,
+            stamp_reset,
+        };
         use crate::devices::traits::MnaUnknowns;
-        use crate::devices::{Device, ModelContext};
+        use crate::devices::{LinearContext, ModelContext};
 
         let mut nodes = NodeTable::new();
         let a = nodes.intern("a").unwrap();
@@ -936,21 +903,55 @@ mod tests {
             (a, b, -2.),
             (ground, a, 5.),
         ];
-        let imaginary = [(a, b, 3.), (a, b, -4.), (b, b, 0.), (a, ground, 6.)];
-        let owned_stamps = real
-            .into_iter()
-            .map(|(a, b, value)| ResetStamp {
-                at: StampAt::Nodes(a, b),
-                value,
+        let imaginary = [(a, b, 3.), (a, b, -4.), (b, b, -0.), (a, ground, 6.)];
+        let owned_stamps = [
+            ResetStamp {
+                at: StampAt::Nodes(a, a),
+                value: 1e16,
                 part: StampPart::Real,
-            })
-            .chain(imaginary.into_iter().map(|(a, b, value)| ResetStamp {
+            },
+            ResetStamp {
+                at: StampAt::Nodes(a, a),
+                value: -1e16,
+                part: StampPart::Real,
+            },
+            ResetStamp {
+                at: StampAt::Nodes(a, a),
+                value: 1.,
+                part: StampPart::Real,
+            },
+            ResetStamp {
                 at: StampAt::Nodes(a, b),
-                value,
+                value: -2.,
+                part: StampPart::Real,
+            },
+            ResetStamp {
+                at: StampAt::Nodes(ground, a),
+                value: 5.,
+                part: StampPart::Real,
+            },
+            ResetStamp {
+                at: StampAt::Nodes(a, b),
+                value: 3.,
                 part: StampPart::Imaginary,
-            }))
-            .collect();
-        let owned = ResetStamps::new("z1", 'z', &[a, b], owned_stamps).unwrap();
+            },
+            ResetStamp {
+                at: StampAt::Nodes(a, b),
+                value: -4.,
+                part: StampPart::Imaginary,
+            },
+            ResetStamp {
+                at: StampAt::Nodes(b, b),
+                value: -0.,
+                part: StampPart::Imaginary,
+            },
+            ResetStamp {
+                at: StampAt::Nodes(a, ground),
+                value: 6.,
+                part: StampPart::Imaginary,
+            },
+        ];
+        let owned = ResetStamps::new("z1", owned_stamps).unwrap();
         let mut reference = LinearSystem::new(unknowns.len());
         let mut actual = LinearSystem::new(unknowns.len());
         for (system, reference_path) in [(&mut reference, true), (&mut actual, false)] {
@@ -966,19 +967,69 @@ mod tests {
                 pole_zero_setups: 0,
             };
             if reference_path {
-                owned.assemble_linear(&mut context).unwrap();
+                owned.stamp_ac(&mut context).unwrap();
             } else {
                 assert!(
-                    stamp_reset("z1", &mut context, &real, &[(ground, ground, Real::NAN)]).is_err()
+                    stamp_reset(
+                        "z1",
+                        node_stamps(&real, StampPart::Real).chain(node_stamps(
+                            &[(ground, ground, Real::NAN)],
+                            StampPart::Imaginary
+                        )),
+                        &mut context
+                    )
+                    .is_err()
                 );
                 assert!(context.system.a.triplets().is_empty());
                 assert!(context.system.e.triplets().is_empty());
-                stamp_reset("z1", &mut context, &real, &imaginary).unwrap();
+                stamp_reset(
+                    "z1",
+                    node_stamps(&real, StampPart::Real)
+                        .chain(node_stamps(&imaginary, StampPart::Imaginary)),
+                    &mut context,
+                )
+                .unwrap();
             }
         }
         assert_eq!(actual.a.triplets(), reference.a.triplets());
         assert_eq!(actual.e.triplets(), reference.e.triplets());
         assert_eq!(actual.e_groups, reference.e_groups);
+        // The owned and borrowed paths share the assembler; check the
+        // independently specified contribution sequence as well. Ground
+        // and zero entries are omitted by the sparse storage, not reordered.
+        let row_a = unknowns.node_row(a).unwrap();
+        let row_b = unknowns.node_row(b).unwrap();
+        let ordered = |matrix: &crate::maths::SparseMatrix| {
+            matrix
+                .triplets()
+                .iter()
+                .map(|term| (term.row, term.col, term.value.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ordered(&actual.a),
+            [
+                (row_a, row_a, 1e16_f64.to_bits()),
+                (row_a, row_a, (-1e16_f64).to_bits()),
+                (row_a, row_a, 1_f64.to_bits()),
+                (row_a, row_b, (-2_f64).to_bits()),
+            ]
+        );
+        assert_eq!(
+            ordered(&actual.e),
+            [
+                (row_a, row_b, 3_f64.to_bits()),
+                (row_a, row_b, (-4_f64).to_bits()),
+            ]
+        );
+        assert_eq!(
+            node_stamps(&imaginary, StampPart::Imaginary)
+                .nth(2)
+                .unwrap()
+                .value
+                .to_bits(),
+            (-0_f64).to_bits()
+        );
     }
 
     #[test]

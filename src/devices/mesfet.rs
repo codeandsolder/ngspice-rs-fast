@@ -81,8 +81,8 @@ use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter, SensitivityRecord,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, reconstructed_loads,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -965,37 +965,14 @@ impl SensitivityKernel for MesfetSensitivity<'_> {
         Ok(())
     }
 
-    fn load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "a MESFET's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(
-            self.mesfet(current)?,
-        )))
-    }
-
-    /// `MESacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
-    /// `ggd` are the `CKTstate0` values `mesload.c` stored at zero junction
-    /// voltages with the reset records, the charge slots `qgs`/`qgd` are
-    /// zero, and `RD`/`RS`, `area` and `m` come from `current`.
-    fn reset_ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(ResetMesfet {
-            state: self.mesfet(reset.state)?,
-            current: self.mesfet(current)?,
-        })))
-    }
+    reconstructed_loads!(
+        reset,
+        /// `MESacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
+        /// `ggd` are the `CKTstate0` values `mesload.c` stored at zero junction
+        /// voltages with the reset records, the charge slots `qgs`/`qgd` are
+        /// zero, and `RD`/`RS`, `area` and `m` come from `current`.
+        mesfet
+    );
 }
 
 impl MesfetSensitivity<'_> {
@@ -1035,50 +1012,24 @@ impl MesfetSensitivity<'_> {
     }
 }
 
-/// A MESFET's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
-#[derive(Debug)]
-struct ResetMesfet {
-    /// Built from the reset load's records: the junction conductances.
-    state: Mesfet,
-    /// Built from the current records: series conductances and `m`.
-    current: Mesfet,
-}
-
-impl Device for ResetMesfet {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'z'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl ResetAcDevice for Mesfet {
     /// `mesacl.c`'s real stamps (`jfetacld.c`'s list); its `xgs`/`xgd`
     /// imaginary parts are zero.
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        let state = &self.state;
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        _omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let op = state.operating()?;
         let [vgs, vgd] = state.normalized([0.; 3]);
         let point = state.point(&op, vgs, vgd, context.model_context.gmin)?;
-        let c = &self.current;
         jfet::linear::ac_conductances(
             context,
-            &c.terminals,
-            c.inner,
-            c.instance.m,
-            jfet::series_conductances(c.instance.area, c.model.rd, c.model.rs),
+            &current.terminals,
+            current.inner,
+            current.instance.m,
+            jfet::series_conductances(current.instance.area, current.model.rd, current.model.rs),
             [point.channel.gm, point.channel.gds, point.gs.1, point.gd.1],
         )
     }

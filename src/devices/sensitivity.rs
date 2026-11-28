@@ -496,25 +496,135 @@ impl RecordPair<'_> {
     }
 }
 
-/// Which load a sensitivity analysis performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SensitivityMode {
-    /// `DEVload` at the DC operating point.
-    Dc,
-    /// `DEVacLoad` at a frequency.
-    Ac,
-}
-
-/// What a device loads for one state of its records.
+/// A DC replay either uses the unchanged device or a reconstructed device
+/// with the same circuit bindings.
 #[derive(Debug)]
-pub enum SensitivityLoad {
+pub enum DcSensitivityLoad {
     /// Exactly what the circuit's own device loads.
     Original,
-    /// A stand-in with the same name, terminals, branch rows and state layout
-    /// that loads what C's device loads in this state: its Newton stamp
-    /// ([`Device::stamp`]) for DC, its small-signal assembly for AC.
+    /// Reconstructed device for the current records.
     Replacement(Box<dyn Device>),
 }
+
+impl DcSensitivityLoad {
+    pub(in crate::devices) fn replacement(device: impl Device) -> Self {
+        Self::Replacement(Box::new(device))
+    }
+}
+
+/// AC-only sensitivity assembly. A reset stamp cannot be used as a DC device.
+///
+/// ```compile_fail
+/// use ngspice_rs::devices::sensitivity::{AcSensitivityLoad, DcSensitivityLoad};
+/// fn misuse(load: AcSensitivityLoad) -> DcSensitivityLoad { load }
+/// ```
+pub trait AcSensitivityStamp: fmt::Debug {
+    /// Add this replay's ordered contributions to the bound AC system.
+    /// # Errors
+    /// Invalid physics or matrix bindings.
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()>;
+}
+
+/// A reconstructed physical device whose historical AC load combines the
+/// reset-state conductances with the current instance and model fields.
+pub(in crate::devices) trait ResetAcDevice: Device {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()>;
+}
+
+#[derive(Debug)]
+struct ResetDevicePair<D> {
+    state: D,
+    current: D,
+    omega: Real,
+}
+
+impl<D: ResetAcDevice> AcSensitivityStamp for ResetDevicePair<D> {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+        D::stamp_reset_ac(&self.state, &self.current, self.omega, context)
+    }
+}
+
+/// An explicit choice of ordinary device AC assembly or a specialized
+/// AC-only stamp (including the historical reset protocol).
+#[derive(Debug)]
+pub enum AcSensitivityLoad {
+    /// Reconstructed device with its ordinary small-signal assembly.
+    Device(Box<dyn Device>),
+    /// Specialized AC-only assembly.
+    Stamp(Box<dyn AcSensitivityStamp>),
+}
+
+impl AcSensitivityLoad {
+    /// Reconstruct the ordinary small-signal device from the current records.
+    pub(in crate::devices) fn ordinary<D: Device>(
+        _reset: AcReset<'_>,
+        current: RecordPair<'_>,
+        reconstruct: impl FnOnce(RecordPair<'_>) -> SpiceResult<D>,
+    ) -> SpiceResult<Self> {
+        Ok(Self::Device(Box::new(reconstruct(current)?)))
+    }
+
+    pub(in crate::devices) fn stamp(stamp: impl AcSensitivityStamp + 'static) -> Self {
+        Self::Stamp(Box::new(stamp))
+    }
+
+    /// Reconstruct the two distinct device snapshots in historical load order.
+    pub(in crate::devices) fn reset<D: ResetAcDevice>(
+        reset: AcReset<'_>,
+        current: RecordPair<'_>,
+        reconstruct: impl Fn(RecordPair<'_>) -> SpiceResult<D>,
+    ) -> SpiceResult<Self> {
+        Ok(Self::stamp(ResetDevicePair {
+            state: reconstruct(reset.state)?,
+            current: reconstruct(current)?,
+            omega: reset.omega,
+        }))
+    }
+
+    pub(super) fn assemble(
+        &self,
+        context: &mut LinearContext<'_>,
+        bias: &crate::maths::Vector,
+    ) -> SpiceResult<()> {
+        match self {
+            Self::Device(device) => device.assemble_small_signal(context, bias),
+            Self::Stamp(stamp) => stamp.stamp_ac(context),
+        }
+    }
+}
+
+// Implement the two disjoint replay hooks for families that reconstruct a
+// device for DC and explicitly choose ordinary AC or historical reset AC.
+// This macro only supplies the trait methods; all reconstruction and stamp
+// computation remains in the typed device implementation.
+macro_rules! reconstructed_loads {
+    ($ac:ident, $(#[$ac_doc:meta])* $reconstruct:ident) => {
+        fn dc_load(
+            &self,
+            _setup: $crate::devices::sensitivity::RecordPair<'_>,
+            current: $crate::devices::sensitivity::RecordPair<'_>,
+        ) -> $crate::primitives::SpiceResult<$crate::devices::sensitivity::DcSensitivityLoad> {
+            Ok($crate::devices::sensitivity::DcSensitivityLoad::replacement(self.$reconstruct(current)?))
+        }
+
+        $(#[$ac_doc])*
+        fn ac_load(
+            &self,
+            _setup: $crate::devices::sensitivity::RecordPair<'_>,
+            reset: $crate::devices::sensitivity::AcReset<'_>,
+            current: $crate::devices::sensitivity::RecordPair<'_>,
+        ) -> $crate::primitives::SpiceResult<$crate::devices::sensitivity::AcSensitivityLoad> {
+            $crate::devices::sensitivity::AcSensitivityLoad::$ac(reset, current, |records| self.$reconstruct(records))
+        }
+    };
+}
+
+pub(in crate::devices) use reconstructed_loads;
 
 /// One device as `.sens` sees it: C's parameter tables, its records, and its
 /// setter, setup, temperature and load routines replayed on those records.
@@ -612,12 +722,11 @@ pub trait DeviceSensitivity: fmt::Debug + sealed::Sealed {
     ///
     /// # Errors
     /// Device physics the port cannot evaluate in this state.
-    fn load(
+    fn dc_load(
         &self,
         setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad>;
+    ) -> SpiceResult<DcSensitivityLoad>;
 
     /// `DEVacLoad` as `sens_sens()` (`cktsens.c`) calls it in an AC sweep.
     /// Before every frequency C runs `CKTunsetup`/`CKTsetup` (fresh, zeroed
@@ -629,17 +738,17 @@ pub trait DeviceSensitivity: fmt::Debug + sealed::Sealed {
     /// small-signal or transient load writes (charge capacitances), and its
     /// temperature-derived instance fields from `current`.
     ///
-    /// The default is [`Self::load`] in AC mode, right for devices whose AC
-    /// load reads no state. A device with state must override it.
+    /// Stateless devices explicitly select ordinary small-signal assembly;
+    /// state-dependent families supply a specialized AC-only stamp.
     ///
     /// # Errors
-    /// As [`Self::load`]; a device whose reset AC load is not ported.
-    fn reset_ac_load(
+    /// As [`Self::dc_load`]; a device whose reset AC load is not ported.
+    fn ac_load(
         &self,
         setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad>;
+    ) -> SpiceResult<AcSensitivityLoad>;
 
     /// The C file of this device's AC load when that load reads instance
     /// fields only a small-signal (`MODEINITSMSIG`) or transient load writes
@@ -724,22 +833,18 @@ pub(in crate::devices) trait SensitivityKernel: fmt::Debug {
         Ok(())
     }
 
-    fn load(
+    fn dc_load(
         &self,
         setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad>;
+    ) -> SpiceResult<DcSensitivityLoad>;
 
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        let _ = reset;
-        self.load(setup, current, SensitivityMode::Ac)
-    }
+    ) -> SpiceResult<AcSensitivityLoad>;
 
     fn stale_ac_fields(&self) -> Option<&'static str> {
         None
@@ -834,29 +939,28 @@ impl<T: SensitivityKernel + ?Sized> DeviceSensitivity for T {
         SensitivityKernel::setup_elements(self, setup)
     }
 
-    fn load(
+    fn dc_load(
         &self,
         setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<DcSensitivityLoad> {
         let family = SensitivityKernel::family(self);
         setup.validate(family)?;
         current.validate(family)?;
-        SensitivityKernel::load(self, setup, current, mode)
+        SensitivityKernel::dc_load(self, setup, current)
     }
 
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<AcSensitivityLoad> {
         let family = SensitivityKernel::family(self);
         setup.validate(family)?;
         reset.state.validate(family)?;
         current.validate(family)?;
-        SensitivityKernel::reset_ac_load(self, setup, reset, current)
+        SensitivityKernel::ac_load(self, setup, reset, current)
     }
 
     fn stale_ac_fields(&self) -> Option<&'static str> {
@@ -868,8 +972,37 @@ impl<T: SensitivityKernel + ?Sized> DeviceSensitivity for T {
     }
 }
 
+/// Replay the common temperature defaults without changing the given flags.
+/// The model nominal temperature is handled by the family before this call.
+pub(in crate::devices) fn instance_temperature_defaults(
+    instance: &mut SensitivityRecord,
+    circuit_kelvin: Real,
+) -> SpiceResult<()> {
+    if !instance.given("dtemp") {
+        instance.store("dtemp", 0.)?;
+    }
+    if !instance.given("temp") {
+        let dtemp = instance.value("dtemp")?;
+        instance.store("temp", circuit_kelvin + dtemp)?;
+    }
+    Ok(())
+}
+
+/// Apply the nominal-model and instance-temperature defaults, in that order.
+pub(in crate::devices) fn junction_temperature_defaults(
+    model: &mut SensitivityRecord,
+    instance: &mut SensitivityRecord,
+    nominal_kelvin: Real,
+    circuit_kelvin: Real,
+) -> SpiceResult<()> {
+    if !model.given("tnom") {
+        model.store("tnom", nominal_kelvin)?;
+    }
+    instance_temperature_defaults(instance, circuit_kelvin)
+}
+
 /// What `cktsens.c`'s per-frequency reset leaves for an AC load
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`DeviceSensitivity::ac_load`]).
 #[derive(Debug, Clone, Copy)]
 pub struct AcReset<'a> {
     /// The records the reset DC load saw.
@@ -924,98 +1057,108 @@ pub struct ResetStamp {
     pub part: StampPart,
 }
 
-/// A stand-in that adds a fixed list of elements in C's order: what a C AC
-/// load stamps from the state of `cktsens.c`'s reset load
-/// ([`DeviceSensitivity::reset_ac_load`]). It has no DC load.
+/// An owned list of AC contributions in reference order.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResetStamps {
+pub struct ResetStamps<const N: usize> {
     name: String,
-    designator: char,
-    terminals: Vec<NodeId>,
-    stamps: Vec<ResetStamp>,
+    stamps: [ResetStamp; N],
 }
 
-impl ResetStamps {
-    /// A stand-in for device `name` adding `stamps` in order.
-    ///
+impl<const N: usize> ResetStamps<N> {
+    /// Validate and own a set of AC-only stamps.
     /// # Errors
     /// A nonfinite addend.
-    pub fn new(
-        name: &str,
-        designator: char,
-        terminals: &[NodeId],
-        stamps: Vec<ResetStamp>,
-    ) -> SpiceResult<Self> {
-        if let Some(stamp) = stamps.iter().find(|stamp| !stamp.value.is_finite()) {
-            return Err(SpiceError::Numerical {
-                context: format!("AC sensitivity of {name}"),
-                message: format!(
-                    "the reset load gives a nonfinite matrix element {}",
-                    stamp.value
-                ),
-            });
-        }
+    pub fn new(name: &str, stamps: [ResetStamp; N]) -> SpiceResult<Self> {
+        validate_reset_stamps(name, stamps.iter().copied())?;
         Ok(Self {
             name: name.to_owned(),
-            designator,
-            terminals: terminals.to_vec(),
             stamps,
         })
     }
 }
 
-impl Device for ResetStamps {
-    fn name(&self) -> &str {
-        &self.name
+impl<const N: usize> AcSensitivityStamp for ResetStamps<N> {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+        add_reset_stamps(&self.name, self.stamps.iter().copied(), context)
     }
+}
 
-    fn designator(&self) -> char {
-        self.designator
+fn validate_reset_stamps(
+    name: &str,
+    mut stamps: impl Iterator<Item = ResetStamp>,
+) -> SpiceResult<()> {
+    if let Some(stamp) = stamps.find(|stamp| !stamp.value.is_finite()) {
+        return Err(SpiceError::Numerical {
+            context: format!("AC sensitivity of {name}"),
+            message: format!(
+                "the reset load gives a nonfinite matrix element {}",
+                stamp.value
+            ),
+        });
     }
+    Ok(())
+}
 
-    fn terminals(&self) -> &[NodeId] {
-        &self.terminals
-    }
+/// Convert a borrowed ordered list of node contributions to reset stamps
+/// without allocating storage or changing the arithmetic.
+pub fn node_stamps(
+    values: &[(NodeId, NodeId, Real)],
+    part: StampPart,
+) -> impl Iterator<Item = ResetStamp> + Clone + '_ {
+    values.iter().map(move |&(a, b, value)| ResetStamp {
+        at: StampAt::Nodes(a, b),
+        value,
+        part,
+    })
+}
 
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.name
-        )))
-    }
+/// Validate every addend (even ground entries) before stamping in order.
+/// # Errors
+/// A nonfinite addend or an invalid matrix/branch binding.
+pub fn stamp_reset(
+    name: &str,
+    stamps: impl Iterator<Item = ResetStamp> + Clone,
+    context: &mut LinearContext<'_>,
+) -> SpiceResult<()> {
+    validate_reset_stamps(name, stamps.clone())?;
+    add_reset_stamps(name, stamps, context)
+}
 
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        for stamp in &self.stamps {
-            let (row, col) = match stamp.at {
-                StampAt::Nodes(a, b) => {
-                    match (context.unknowns.node_row(a), context.unknowns.node_row(b)) {
-                        (Some(row), Some(col)) => (row, col),
-                        _ => continue,
-                    }
+fn add_reset_stamps(
+    name: &str,
+    stamps: impl Iterator<Item = ResetStamp>,
+    context: &mut LinearContext<'_>,
+) -> SpiceResult<()> {
+    for stamp in stamps {
+        let (row, col) = match stamp.at {
+            StampAt::Nodes(a, b) => {
+                match (context.unknowns.node_row(a), context.unknowns.node_row(b)) {
+                    (Some(row), Some(col)) => (row, col),
+                    _ => continue,
                 }
-                StampAt::Rows(row, col) => (row, col),
-                StampAt::NodeBranch(node) | StampAt::BranchNode(node) => {
-                    let branch = context.branch.ok_or_else(|| {
-                        SpiceError::circuit(format!("{}: missing branch row", self.name))
-                    })?;
-                    let Some(row) = context.unknowns.node_row(node) else {
-                        continue;
-                    };
-                    if matches!(stamp.at, StampAt::NodeBranch(_)) {
-                        (row, branch)
-                    } else {
-                        (branch, row)
-                    }
-                }
-            };
-            match stamp.part {
-                StampPart::Real => context.system.a.add(row, col, stamp.value)?,
-                StampPart::Reactive => context.system.e.add(row, col, stamp.value)?,
-                StampPart::Imaginary => context.dynamic_prescaled(row, col, stamp.value)?,
             }
+            StampAt::Rows(row, col) => (row, col),
+            StampAt::NodeBranch(node) | StampAt::BranchNode(node) => {
+                let branch = context
+                    .branch
+                    .ok_or_else(|| SpiceError::circuit(format!("{name}: missing branch row")))?;
+                let Some(row) = context.unknowns.node_row(node) else {
+                    continue;
+                };
+                if matches!(stamp.at, StampAt::NodeBranch(_)) {
+                    (row, branch)
+                } else {
+                    (branch, row)
+                }
+            }
+        };
+        match stamp.part {
+            StampPart::Real => context.system.a.add(row, col, stamp.value)?,
+            StampPart::Reactive => context.system.e.add(row, col, stamp.value)?,
+            StampPart::Imaginary => context.dynamic_prescaled(row, col, stamp.value)?,
         }
-        Ok(())
     }
+    Ok(())
 }
 
 /// The explicit refusal of `.sens` for a device whose sensitivity is not
@@ -1189,6 +1332,41 @@ mod tests {
         assert!(!record.given("m"));
         assert!(record.value("nope").is_err());
         assert!(!record.given("nope"));
+    }
+
+    #[test]
+    fn temperature_defaults_preserve_every_given_flag() {
+        for model_given in [false, true] {
+            for delta_given in [false, true] {
+                for temp_given in [false, true] {
+                    let mut model =
+                        SensitivityRecord::new(SensitivityFamily::Jfet, ParameterScope::Model)
+                            .with("tnom", 320., model_given)
+                            .unwrap();
+                    let mut instance =
+                        SensitivityRecord::new(SensitivityFamily::Jfet, ParameterScope::Instance)
+                            .with("dtemp", -12., delta_given)
+                            .unwrap()
+                            .with("temp", 351., temp_given)
+                            .unwrap();
+                    super::junction_temperature_defaults(&mut model, &mut instance, 300., 310.)
+                        .unwrap();
+                    let delta = if delta_given { -12. } else { 0. };
+                    assert_eq!(
+                        model.value("tnom").unwrap(),
+                        if model_given { 320. } else { 300. }
+                    );
+                    assert_eq!(instance.value("dtemp").unwrap(), delta);
+                    assert_eq!(
+                        instance.value("temp").unwrap(),
+                        if temp_given { 351. } else { 310. + delta }
+                    );
+                    assert_eq!(model.given("tnom"), model_given);
+                    assert_eq!(instance.given("dtemp"), delta_given);
+                    assert_eq!(instance.given("temp"), temp_given);
+                }
+            }
+        }
     }
 
     #[test]

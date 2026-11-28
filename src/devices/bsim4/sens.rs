@@ -52,11 +52,11 @@ use super::host::node;
 use super::{Access, InputType, asks, elements, parameters, set, temp};
 use crate::devices::schema::temperature_kelvin;
 use crate::devices::sensitivity::{
-    AcReset, Bsim4InstanceSnapshot, ParameterScope, RecordPair, SensitivityFamily,
-    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
+    AcReset, AcSensitivityLoad, AcSensitivityStamp, Bsim4InstanceSnapshot, DcSensitivityLoad,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
     SensitivityRecord as Record,
 };
-use crate::devices::{Device, LinearContext, ModelContext, StampContext};
+use crate::devices::{LinearContext, ModelContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 
 /// The internal nodes as `(own index, member)`: drain, source, gate and
@@ -464,20 +464,17 @@ impl SensitivityKernel for Bsim4Sensitivity<'_> {
     }
 
     /// `BSIM4load` (`MODEDCOP | MODEINITFLOAT`) on the present structs.
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "BSIM4 AC sensitivity loads go through the reset load",
-            ));
-        }
+    ) -> SpiceResult<DcSensitivityLoad> {
         let (m, h, size) = Self::structs(current)?;
-        Ok(SensitivityLoad::Replacement(Box::new(
-            self.device.stand_in(m, h, size, &self.context),
+        Ok(DcSensitivityLoad::replacement(self.device.stand_in(
+            m,
+            h,
+            size,
+            &self.context,
         )))
     }
 
@@ -486,12 +483,12 @@ impl SensitivityKernel for Bsim4Sensitivity<'_> {
     }
 
     /// `BSIM4acLoad` after `cktsens.c`'s reset load (see the module notes).
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<AcSensitivityLoad> {
         if reset.transient.is_some() {
             return Err(SpiceError::not_yet_ported(
                 format!(
@@ -503,7 +500,7 @@ impl SensitivityKernel for Bsim4Sensitivity<'_> {
         }
         let (rm, rh, rsize) = Self::structs(reset.state)?;
         let (m, h, size) = Self::structs(current)?;
-        Ok(SensitivityLoad::Replacement(Box::new(ResetBsim4 {
+        Ok(AcSensitivityLoad::stamp(ResetBsim4 {
             device: self.device.stand_in(m, h, size, &self.context),
             original: self.device.stand_in(
                 self.model.clone(),
@@ -516,7 +513,7 @@ impl SensitivityKernel for Bsim4Sensitivity<'_> {
             omega: reset.omega,
             temperature: self.kelvin(self.context.temperature)?,
             gmin: self.context.gmin,
-        })))
+        }))
     }
 }
 
@@ -598,31 +595,8 @@ impl std::fmt::Debug for ResetBsim4 {
     }
 }
 
-impl Device for ResetBsim4 {
-    fn name(&self) -> &str {
-        self.device.name()
-    }
-
-    fn designator(&self) -> char {
-        'm'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        self.device.terminals()
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.device.name()
-        )))
-    }
-
-    fn assemble_small_signal(
-        &self,
-        context: &mut LinearContext<'_>,
-        _bias: &crate::maths::Vector,
-    ) -> SpiceResult<()> {
+impl AcSensitivityStamp for ResetBsim4 {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let model_context = *context.model_context;
         let (rm, mut rh, rsize) = (
             self.reset.0.clone(),

@@ -381,6 +381,7 @@ fn prepared_frequency_transfer_keeps_original_branch_through_command() {
     let normalized = model_normalize_ngspice::normalize_mapped(
         source,
         model_normalize_ngspice::linked_source::RootKind::Deck,
+        model_normalize_ngspice::NormalizationDialect::Native,
         &model_preprocess_command::WorkBudget::default(),
     )
     .unwrap();
