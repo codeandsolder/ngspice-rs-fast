@@ -80,8 +80,8 @@ impl NativeTarget {
         }
     }
 
-    fn continuation(&self, entry: &PlanEntry) -> SpiceResult<DcAxisTarget> {
-        Ok(match self {
+    fn continuation(&self) -> DcAxisTarget {
+        match self {
             Self::Source(name) => DcAxisTarget::Source(name.clone()),
             Self::Resistance(name) => DcAxisTarget::Resistance(name.clone()),
             Self::Temperature => DcAxisTarget::Temperature,
@@ -89,13 +89,21 @@ impl NativeTarget {
                 instance: name.clone(),
                 parameter: parameter.clone(),
             },
-            Self::Parameter(_) | Self::Model { .. } => {
-                return Err(at(
-                    entry,
-                    "continuation of a parameter or model requires structural DC continuation",
-                ));
-            }
-        })
+            Self::Parameter(name) => DcAxisTarget::Parameter(name.clone()),
+            Self::Model {
+                scope,
+                name,
+                parameter,
+            } => DcAxisTarget::Model {
+                scope: scope.clone(),
+                name: name.clone(),
+                parameter: parameter.clone(),
+            },
+        }
+    }
+
+    fn structural(&self) -> bool {
+        matches!(self, Self::Parameter(_) | Self::Model { .. })
     }
 
     fn edit(&self, value: Real) -> Option<CandidateEdit<'_>> {
@@ -222,7 +230,7 @@ struct Job<'a> {
     entry: &'a PlanEntry,
     sweeps: BoundIndependentSweeps<'a>,
     targets: Vec<NativeTarget>,
-    dc_targets: Vec<DcAxisTarget>,
+    dc_targets: Vec<NativeTarget>,
 }
 
 /// The original declaration and resolved coordinates remain attached to each
@@ -360,7 +368,10 @@ impl<'a> PreparedAnalysisPlan<'a> {
                         if !seen.insert(target.clone()) {
                             return Err(at(entry, "duplicate independent or continuation target"));
                         }
-                        targets.push(target.continuation(entry)?);
+                        if let NativeTarget::Parameter(name) = &target {
+                            parameters.insert(name.clone());
+                        }
+                        targets.push(target);
                     }
                     targets
                 }
@@ -443,16 +454,53 @@ impl<'a> PreparedAnalysisPlan<'a> {
                         }
                     }
                 }
-                let (mut circuit, config) =
-                    session.prepare(&values, temperature, &edits, &mut budget)?;
-                let request = bind_request(job, &config, work, &mut budget)?;
-                total_points = total_points
-                    .checked_add(request.requested_grid_points())
-                    .filter(|&count| count <= PlanningLimits::default().max_grid_points)
-                    .ok_or_else(|| {
-                        at(job.entry, "aggregate prepared analysis grid limit exceeded")
+                let plots = if job.dc_targets.iter().any(NativeTarget::structural) {
+                    let nominal = session.resolve_config(&values, temperature, &mut budget)?;
+                    let axes = bind_dc_axes(job, &nominal, work, &mut budget)?;
+                    let request = dc_plan(job.entry, &nominal, axes.clone())?;
+                    total_points = charge_points(total_points, &request, job.entry)?;
+                    let plot = super::sweep::structural::run(&request, |point| {
+                        let mut candidate_values = values.clone();
+                        let mut candidate_temperature = temperature;
+                        let mut candidate_edits = edits.clone();
+                        for (target, value) in job.dc_targets.iter().zip(point) {
+                            match target {
+                                NativeTarget::Parameter(name) => {
+                                    let index = self
+                                        .circuit
+                                        .inputs()
+                                        .iter()
+                                        .position(|input| &input.name == name)
+                                        .ok_or_else(|| {
+                                            at(job.entry, "unbound continuation parameter")
+                                        })?;
+                                    candidate_values[index] = value;
+                                }
+                                NativeTarget::Temperature => candidate_temperature = Some(value),
+                                _ => {
+                                    if let Some(edit) = target.edit(value) {
+                                        candidate_edits.push(edit);
+                                    }
+                                }
+                            }
+                        }
+                        let (circuit, config) = session.prepare(
+                            &candidate_values,
+                            candidate_temperature,
+                            &candidate_edits,
+                            &mut budget,
+                        )?;
+                        let plan = dc_plan(job.entry, &config, axes.clone())?;
+                        Ok((circuit, plan, config.context()))
                     })?;
-                let plots = request.run_plots(&mut circuit, &config.context())?;
+                    vec![plot]
+                } else {
+                    let (mut circuit, config) =
+                        session.prepare(&values, temperature, &edits, &mut budget)?;
+                    let request = bind_request(job, &config, work, &mut budget)?;
+                    total_points = charge_points(total_points, &request, job.entry)?;
+                    request.run_plots(&mut circuit, &config.context())?
+                };
                 result(PreparedResult {
                     entry_index: job.entry_index,
                     entry: job.entry,
@@ -464,6 +512,58 @@ impl<'a> PreparedAnalysisPlan<'a> {
         }
         Ok(())
     }
+}
+
+fn charge_points(total: usize, request: &AnalysisPlan, entry: &PlanEntry) -> SpiceResult<usize> {
+    total
+        .checked_add(request.requested_grid_points())
+        .filter(|&count| count <= PlanningLimits::default().max_grid_points)
+        .ok_or_else(|| at(entry, "aggregate prepared analysis grid limit exceeded"))
+}
+
+fn bind_dc_axes(
+    job: &Job<'_>,
+    config: &RunConfig,
+    work: &WorkBudget,
+    budget: &mut EvalBudget,
+) -> SpiceResult<Vec<DcSweepAxis>> {
+    let Directive::DcSweep { axes } = &job.entry.directive else {
+        return Err(at(job.entry, "missing typed DC axes"));
+    };
+    let location = location(job.entry);
+    axes.iter()
+        .zip(&job.dc_targets)
+        .map(|(axis, target)| {
+            let values = axis
+                .bind(
+                    |raw| Ok(config.prepared_scalar(raw, &location, budget)?),
+                    work,
+                )
+                .map_err(|error| at(job.entry, error.to_string()))?;
+            let coordinates = (0..values.len())
+                .map(|index| {
+                    values
+                        .value(index)
+                        .ok_or_else(|| at(job.entry, "missing continuation coordinate"))
+                })
+                .collect::<SpiceResult<Vec<_>>>()?;
+            Ok(DcSweepAxis {
+                target: target.continuation(),
+                coordinates: coordinates.into(),
+            })
+        })
+        .collect()
+}
+
+fn dc_plan(
+    entry: &PlanEntry,
+    config: &RunConfig,
+    axes: Vec<DcSweepAxis>,
+) -> SpiceResult<AnalysisPlan> {
+    let mut input = AnalysisInput::new(AnalysisKind::DcSweep);
+    input.dc_axes = Some(axes);
+    input.set_location(location(entry));
+    config.plan(input)
 }
 
 fn bind_request(
@@ -543,27 +643,8 @@ fn bind_request(
             input.uic = bound.modes.contains(TransientModifier::Uic);
             input
         }
-        Directive::DcSweep { axes } => {
-            let mut bound = Vec::with_capacity(axes.len());
-            for (axis, target) in axes.iter().zip(&job.dc_targets) {
-                let values = axis
-                    .bind(|raw| Ok(scalar(raw)?), work)
-                    .map_err(|error| at(entry, error.to_string()))?;
-                let coordinates = (0..values.len())
-                    .map(|index| {
-                        values
-                            .value(index)
-                            .ok_or_else(|| at(entry, "missing continuation coordinate"))
-                    })
-                    .collect::<SpiceResult<Vec<_>>>()?;
-                bound.push(DcSweepAxis {
-                    target: target.clone(),
-                    coordinates: coordinates.into(),
-                });
-            }
-            let mut input = AnalysisInput::new(AnalysisKind::DcSweep);
-            input.dc_axes = Some(bound);
-            input
+        Directive::DcSweep { .. } => {
+            return dc_plan(entry, config, bind_dc_axes(job, config, work, budget)?);
         }
         Directive::Analysis {
             analysis,

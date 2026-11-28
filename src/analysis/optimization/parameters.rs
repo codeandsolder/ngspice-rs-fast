@@ -454,7 +454,7 @@ pub struct IndependentCandidate<'a> {
     parameters: CandidateParameters<'a>,
 }
 
-impl IndependentCandidate<'_> {
+impl<'a> IndependentCandidate<'a> {
     /// Resolve all independent root coordinates and the selected temperature
     /// before elaborating exactly one circuit for this repetition.
     ///
@@ -468,6 +468,24 @@ impl IndependentCandidate<'_> {
         edits: &[crate::devices::circuit::CandidateEdit<'_>],
         budget: &mut EvalBudget,
     ) -> SpiceResult<(Circuit, RunConfig)> {
+        let (parameters, scope, config) = self.resolve(coordinates, temperature, budget)?;
+        let circuit = self
+            .plan
+            .elaborate(&config.context().model_context(), scope, edits)?;
+        self.parameters = parameters;
+        Ok((circuit, config))
+    }
+
+    fn resolve(
+        &self,
+        coordinates: &[Real],
+        temperature: Option<Real>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<(
+        CandidateParameters<'a>,
+        Arc<crate::netlist::eval::ParamScope>,
+        RunConfig,
+    )> {
         let mut parameters = self.parameters.clone();
         parameters.update(coordinates, budget)?;
         let scope = parameters.resolved_scope(self.plan.root)?;
@@ -475,11 +493,19 @@ impl IndependentCandidate<'_> {
         if let Some(value) = temperature {
             config = config.at_temperature(value, &self.plan.source.location)?;
         }
-        let circuit = self
-            .plan
-            .elaborate(&config.context().model_context(), scope, edits)?;
-        self.parameters = parameters;
-        Ok((circuit, config))
+        Ok((parameters, scope, config))
+    }
+
+    /// Resolve symbolic analysis operands without instantiating the nominal
+    /// circuit. The first actual sweep coordinate may supply valid geometry.
+    pub(crate) fn resolve_config(
+        &self,
+        coordinates: &[Real],
+        temperature: Option<Real>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<RunConfig> {
+        self.resolve(coordinates, temperature, budget)
+            .map(|(_, _, config)| config)
     }
 }
 

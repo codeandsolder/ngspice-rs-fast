@@ -4367,6 +4367,23 @@ impl Circuit {
                     }))
     }
 
+    /// Rebind the accepted DC history of a structurally rebuilt candidate
+    /// only when the physical row and device state interpretation is unchanged.
+    /// The caller must not carry the preceding Newton vector otherwise.
+    pub(crate) fn continuation_history(
+        &self,
+        previous: &Self,
+        history: &StateHistory,
+    ) -> SpiceResult<Option<StateHistory>> {
+        previous.validate_history(history)?;
+        if !self.compatible_topology(previous) {
+            return Ok(None);
+        }
+        let mut next = self.independent_state_history()?;
+        next.inherit_dc_accepted(history)?;
+        Ok(Some(next))
+    }
+
     /// Takes over `previous`'s matrix (C's one `CKTmatrix`, with its pivot
     /// order and reorder flags), carried state vector (C's `CKTstate0`) and
     /// final transient load snapshot (instance fields such as MOS junction

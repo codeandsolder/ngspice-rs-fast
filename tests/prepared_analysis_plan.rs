@@ -236,3 +236,129 @@ fn source_initialization_cannot_be_omitted_or_bound_for_the_wrong_analysis() -> 
     assert_eq!(count, 1);
     Ok(())
 }
+
+fn structural_plan(target: SweepTarget, values: &[&str]) -> model_analysis_plan::AnalysisPlan {
+    use model_analysis_plan::{
+        AnalysisDialect, AnalysisPlan, Directive, DirectiveOrigin, Disposition, PlanEntry,
+        PlanKind,
+        sweep::{Cardinality, CoordinateLaw, CoordinateOrder, SweepAxis, SweepExecution},
+    };
+    let mut plan = AnalysisPlan::new(
+        AnalysisDialect::Native,
+        PlanKind::Deck,
+        Some("Structural DC".into()),
+    );
+    plan.entries.push(PlanEntry {
+        origin: DirectiveOrigin::Generated {
+            artifact: "structural.cir".into(),
+            first_line: 1,
+            last_line: 1,
+        },
+        dialect: AnalysisDialect::Native,
+        scope: Vec::new(),
+        command: ".DC".into(),
+        statement: "Typed continuation witness".into(),
+        directive: Directive::DcSweep {
+            axes: vec![SweepAxis {
+                target,
+                law: CoordinateLaw::List {
+                    values: values.iter().map(|value| (*value).to_owned()).collect(),
+                },
+                execution: SweepExecution::Continuation,
+                order: CoordinateOrder::Declared,
+                cardinality: Cardinality::Nonempty,
+            }],
+        },
+        independent_axes: Vec::new(),
+        parallelism_hint: None,
+        disposition: Disposition::RequiresBinding,
+    });
+    plan
+}
+
+fn native_deck(text: &str) -> SpiceResult<Netlist> {
+    use ngspice_rs::netlist::source::parse_deck_text;
+    Parser::new().parse_deck(&parse_deck_text(
+        std::path::Path::new("structural.cir"),
+        text,
+    ))
+}
+
+#[test]
+fn structural_parameter_continuation_retains_switch_hysteresis() -> anyhow::Result<()> {
+    let source = native_deck(
+        "Structural DC\n.param control=0\nvc c 0 {control}\nvin in 0 1\nr1 in a 1k\ns1 a 0 c 0 sm\n.model sm sw(vt=1 vh=0.5 ron=10 roff=1meg)\n.end\n",
+    )?;
+    let plan = structural_plan(
+        SweepTarget::Parameter {
+            name: "control".into(),
+        },
+        &["0", "1", "2", "1", "1", "0", "1", "2"],
+    );
+    let work = WorkBudget::default();
+    let bound = PreparedAnalysisPlan::bind(
+        source,
+        &plan,
+        PreparedDeclarations::default(),
+        resolve,
+        &work,
+    )?;
+    let mut count = 0;
+    bound.run(&work, |result| {
+        let plot = &result.plots[0];
+        let open = 1e6 / 1001000.;
+        let closed = 10. / 1010.;
+        assert_eq!(plot.point_count(), 8);
+        for (index, expected) in [open, open, closed, closed, closed, open, open, closed]
+            .into_iter()
+            .enumerate()
+        {
+            assert!((plot.value("v(a)", index).unwrap().re - expected).abs() < 1e-10);
+        }
+        count += 1;
+        Ok(())
+    })?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[test]
+fn structural_model_continuation_rebuilds_every_model_use() -> anyhow::Result<()> {
+    let source =
+        native_deck("Model DC\nv1 in 0 1\nr1 in 0 rm\nr2 in 0 rm\n.model rm r(r=1k)\n.end\n")?;
+    let plan = structural_plan(
+        SweepTarget::ModelParameter {
+            family: Some("r".into()),
+            model: "rm".into(),
+            parameter: "r".into(),
+        },
+        &["1k", "2k", "500", "1k"],
+    );
+    let work = WorkBudget::default();
+    let bound = PreparedAnalysisPlan::bind(
+        source,
+        &plan,
+        PreparedDeclarations::default(),
+        |entry, target| match target {
+            SweepTarget::ModelParameter {
+                model, parameter, ..
+            } => Ok(NativeTarget::Model {
+                scope: Vec::new(),
+                name: model.clone(),
+                parameter: parameter.clone(),
+            }),
+            _ => resolve(entry, target),
+        },
+        &work,
+    )?;
+    bound.run(&work, |result| {
+        let plot = &result.plots[0];
+        assert_eq!(plot.point_count(), 4);
+        for (index, r) in [1000., 2000., 500., 1000.].into_iter().enumerate() {
+            assert!((plot.value("i(v1)", index).unwrap().re + 2. / r).abs() < 1e-12);
+            assert!((plot.value("param-sweep", index).unwrap().re - r).abs() < 1e-12);
+        }
+        Ok(())
+    })?;
+    Ok(())
+}

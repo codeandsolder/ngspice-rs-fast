@@ -319,6 +319,21 @@ impl StateHistory {
             .is_some_and(|binding| binding.topology == topology)
     }
 
+    // The circuit verifies physical layout identity before this transfer.
+    // DC never advances delay histories. Keep accepted vectors, but issue a
+    // fresh revision so outstanding trials cannot cross a topology boundary.
+    pub(super) fn inherit_dc_accepted(&mut self, previous: &Self) -> SpiceResult<()> {
+        if self.len != previous.len
+            || self.binding.as_ref().map(|b| &b.rows) != previous.binding.as_ref().map(|b| &b.rows)
+        {
+            return Err(state_error("incompatible DC state layout"));
+        }
+        self.accepted.clone_from(&previous.accepted);
+        self.carried.clone_from(&previous.carried);
+        self.revision = Arc::new(());
+        Ok(())
+    }
+
     /// Check identity without inspecting or requiring the trial's values.
     pub(super) fn check_trial(&self, trial: &TrialState) -> SpiceResult<()> {
         if trial.topology != self.binding.as_ref().map(|binding| binding.topology)

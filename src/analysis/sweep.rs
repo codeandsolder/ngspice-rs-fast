@@ -10,6 +10,8 @@
 //! travel in an immutable per-point `ModelContext`, and every point runs
 //! `NIiter`, linear circuits included. See `docs/port/DC_SWEEPS.md`.
 mod binning;
+mod output;
+pub(super) mod structural;
 
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
@@ -246,6 +248,17 @@ pub enum DcAxisTarget {
     Resistance(String),
     /// Circuit temperature in Celsius.
     Temperature,
+    /// Independent root parameter, requiring source-deck re-elaboration.
+    Parameter(String),
+    /// Lexically identified model parameter, requiring source-deck re-elaboration.
+    Model {
+        /// Lexical declaration path.
+        scope: Vec<String>,
+        /// Native model name.
+        name: String,
+        /// Native scalar parameter.
+        parameter: String,
+    },
     /// An emitted device and its scalar native parameter.
     Instance {
         /// Expanded native instance name.
@@ -524,6 +537,15 @@ pub(super) fn parse_axes(args: &[String]) -> SpiceResult<DcSweepPlan> {
 }
 
 impl DcSweepPlan {
+    fn structural(&self) -> bool {
+        self.axes.iter().any(|axis| {
+            matches!(
+                axis.target,
+                AxisTarget::Typed(DcAxisTarget::Parameter(_) | DcAxisTarget::Model { .. })
+            )
+        })
+    }
+
     pub(super) fn from_explicit(axes: Vec<DcSweepAxis>) -> SpiceResult<Self> {
         if !matches!(axes.len(), 1 | 2) {
             return Err(unsupported("DC requires one or two continuation axes"));
@@ -586,6 +608,12 @@ impl<'a> Written<'a> {
                 return Ok(Self::Temperature);
             }
             AxisTarget::Name(name) => return Ok(Self::Name(name)),
+            AxisTarget::Typed(DcAxisTarget::Parameter(_) | DcAxisTarget::Model { .. }) => {
+                return Err(unsupported(
+                    "structural DC continuation requires a prepared source deck",
+                ));
+            }
+
             AxisTarget::Typed(DcAxisTarget::Source(name)) => {
                 circuit.bind_source_target(name)?;
                 return Ok(Self::Name(name));

@@ -1,13 +1,13 @@
 //! Transactional sweep setup for geometry-dependent model declarations.
+use super::output::{Columns, emit, projection};
 use super::{
     AnalysisContext, AnalysisPlan, AxisBinding, BoundAxis, Circuit, Complex, DcSweepPlan, GridPair,
     ModelContext, ParameterRoute, Real, SpiceResult, SweepSolver, SweepTarget, Vector, plot,
     point_context, unsupported, warm_start_settings,
 };
-use crate::analysis::results::{Plot, PlotFlags, Variable};
+use crate::analysis::results::{Plot, PlotFlags};
 use crate::devices::circuit::GeometryEdit;
 use crate::devices::models::ModelResolver;
-use std::collections::BTreeMap;
 
 pub(super) fn active(axes: &[BoundAxis]) -> bool {
     axes.iter()
@@ -158,38 +158,6 @@ fn header(
     )
 }
 
-/// Include every topology's columns in deterministic first-appearance order.
-/// An internal unknown which does not exist at a point has no numeric value.
-#[derive(Default)]
-struct Columns {
-    variables: Vec<Variable>,
-    indices: BTreeMap<(String, String, bool, usize), usize>,
-}
-
-impl Columns {
-    fn map(&mut self, plot: &Plot) -> Vec<usize> {
-        let mut occurrences = BTreeMap::new();
-        plot.variables()
-            .iter()
-            .map(|variable| {
-                let identity = (
-                    variable.name.clone(),
-                    variable.unit.clone(),
-                    variable.is_real,
-                );
-                let count = occurrences.entry(identity.clone()).or_insert(0usize);
-                let key = (identity.0, identity.1, identity.2, *count);
-                *count += 1;
-                *self.indices.entry(key).or_insert_with(|| {
-                    let index = self.variables.len();
-                    self.variables.push(variable.clone());
-                    index
-                })
-            })
-            .collect()
-    }
-}
-
 fn preflight(
     baseline: &Circuit,
     request: &AnalysisPlan,
@@ -221,44 +189,6 @@ fn preflight(
         c.circuit.prepare_run().validate_dc_inputs(&point.model)?;
     }
     Ok(columns)
-}
-
-fn projection(
-    sink: &dyn crate::analysis::PointSink,
-    result: &Plot,
-) -> SpiceResult<Option<Vec<usize>>> {
-    let selected = sink.selected_columns().map(<[usize]>::to_vec);
-    if selected.as_ref().is_some_and(|indices| {
-        indices
-            .iter()
-            .any(|&index| index >= result.variable_count())
-            || indices.windows(2).any(|pair| pair[0] >= pair[1])
-    }) {
-        return Err(unsupported("invalid geometry sweep projection"));
-    }
-    Ok(selected)
-}
-
-fn emit(
-    sink: &mut dyn crate::analysis::PointSink,
-    result: &Plot,
-    row: &[Complex],
-    selected: Option<&[usize]>,
-    projected: &mut Vec<Complex>,
-) -> SpiceResult<()> {
-    if let Some(selected) = selected {
-        projected.clear();
-        for &index in selected {
-            projected.push(
-                *row.get(index)
-                    .ok_or_else(|| unsupported("invalid geometry sweep projection"))?,
-            );
-        }
-        sink.point(projected)
-    } else {
-        result.check_point(row)?;
-        sink.point(row)
-    }
 }
 
 pub(super) fn run(
