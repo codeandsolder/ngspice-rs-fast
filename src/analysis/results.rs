@@ -72,7 +72,7 @@ pub(crate) struct SelectedOutput {
     first_unknown: usize,
     first_report: usize,
     first_observation: usize,
-    reports: Vec<crate::devices::passive_network::CurrentOutputLaw>,
+    reports: Vec<crate::devices::passive_network::OutputProjection>,
     buffer: Vec<Complex>,
 }
 

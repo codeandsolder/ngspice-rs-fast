@@ -3,7 +3,7 @@ use crate::analysis::results::{PlotFlags, Variable};
 use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::{
     BranchQuantity, Circuit,
-    passive_network::{CurrentOutputLaw, ReportPhase},
+    passive_network::{OutputProjection, ReportPhase},
 };
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_number};
 
@@ -23,7 +23,7 @@ pub(super) fn number(text: Option<&str>, name: &str) -> SpiceResult<Real> {
 /// Only the output path sees these projections; they do not add MNA coordinates.
 pub(super) struct LinearOutput {
     pub(super) header: Plot,
-    pub(super) reports: Vec<CurrentOutputLaw>,
+    pub(super) reports: Vec<OutputProjection>,
     first_unknown: usize,
 }
 
@@ -110,6 +110,14 @@ pub(super) fn plot(
     for report in circuit.reported_currents() {
         plot.push_variable(var(format!("i({})", report.original), "current"));
         reports.push(report.law(phase)?);
+    }
+    for name in circuit.absent_storage_voltage_nodes() {
+        plot.push_variable(var(format!("v({name})"), "voltage"));
+        reports.push(OutputProjection::Zero);
+    }
+    for name in circuit.absent_storage_currents() {
+        plot.push_variable(var(format!("i({name})"), "current"));
+        reports.push(OutputProjection::Zero);
     }
     for observation in circuit.observations() {
         plot.push_variable(Variable::new(observation.name(), observation.unit()));
