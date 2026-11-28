@@ -45,7 +45,7 @@ fn trajectory(coefficients: &[Vector], u: Real) -> Vector {
     )
 }
 
-fn check(c: &Circuit, states: &[Vector], side: Limit) -> SpiceResult<()> {
+fn check(c: &Circuit, states: &[Vector], side: Limit, case: &str) -> SpiceResult<()> {
     let run = c.prepare_run();
     let mut dae =
         run.prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
@@ -62,7 +62,7 @@ fn check(c: &Circuit, states: &[Vector], side: Limit) -> SpiceResult<()> {
                     .fold(0., |sum: Real, x| sum.mul_add(u, x.as_slice()[r]))
             };
             close(
-                "residual",
+                &format!("residual {case} {side:?} row={r} u={u}"),
                 at(&jet.residual),
                 scalar.residual.as_slice()[r],
                 3e-9,
@@ -83,7 +83,7 @@ fn check(c: &Circuit, states: &[Vector], side: Limit) -> SpiceResult<()> {
                         .fold(0., |sum: Real, x| sum.mul_add(u, x.get(r, col)))
                 };
                 close(
-                    "static Jacobian",
+                    &format!("static Jacobian {case} {side:?} row={r} col={col} u={u}"),
                     at(&jet.conductance),
                     scalar.conductance.get(r, col),
                     5e-8,
@@ -126,7 +126,7 @@ fn xspice_floating_voltage_controls_all_laws_and_threshold_directions() -> Spice
             let (lo, hi) = (off.min(on), off.max(on));
             for control in [lo - 0.2, lo, 2.4, 3., 3.7, hi, hi + 0.2] {
                 for output in [-1.4, 0., 0.9] {
-                    let mut state = vec![Vector::zeros(c.unknown_count()); 9];
+                    let mut state = vec![Vector::zeros(c.unknown_count()); 17];
                     for (r, value, slope) in [
                         (p, 5. + output, 0.12),
                         (z, 5., 0.03),
@@ -138,7 +138,14 @@ fn xspice_floating_voltage_controls_all_laws_and_threshold_directions() -> Spice
                     // Avoid sampling across another nearby resistance-floor
                     // boundary; every endpoint is tested from both sides.
                     for side in [Limit::Left, Limit::Right] {
-                        check(&c, &state, side)?;
+                        check(
+                            &c,
+                            &state,
+                            side,
+                            &format!(
+                                "{family} log={log} limited={limited} reversed={reversed} c={control} v={output}"
+                            ),
+                        )?;
                     }
                 }
             }
@@ -162,8 +169,8 @@ fn xspice_current_controls_keep_ammeter_and_named_branch_equations() -> SpiceRes
             state[0].set(r, value)?;
             state[1].set(r, slope)?;
         }
-        check(&c, &state, Limit::Right)?;
-        check(&c, &state, Limit::Left)?;
+        check(&c, &state, Limit::Right, port)?;
+        check(&c, &state, Limit::Left, port)?;
     }
     Ok(())
 }
@@ -207,7 +214,12 @@ fn ltspice_control_current_limits_offset_epsilon_and_series_flux() -> SpiceResul
                     state[1].set(i, -0.01)?;
                 }
                 for side in [Limit::Left, Limit::Right] {
-                    check(&c, &state, side)?;
+                    check(
+                        &c,
+                        &state,
+                        side,
+                        &format!("{model} c={control} v={voltage}"),
+                    )?;
                 }
             }
         }
@@ -224,18 +236,18 @@ fn derivative_array_transient_crosses_actual_switch_joins() -> SpiceResult<()> {
         "aswitch(cntl_off=2 cntl_on=4 r_on=10 r_off=1k log=false limit=true)",
     ] {
         let body = format!(
-            "Vc c 0 pwl(0 1.5 3u 4.5)\nVb source 0 1\nRseries source out 100\nA1 %gd(c 0) %gd(out 0) m\n.model m {model}\nB1 derivative 0 v=1u*ddt(v(out))\nR1 derivative 0 1k\n.options reltol=1e-8 abstol=1e-13 vntol=1e-10"
+            "Vc c 0 pwl(0 1.47 3.14u 4.61)\nVb source 0 1\nRseries source out 100\nA1 %gd(c 0) %gd(out 0) m\n.model m {model}\nB1 derivative 0 v=1u*ddt(v(out))\nR1 derivative 0 1k\n.options reltol=1e-8 abstol=1e-13 vntol=1e-10"
         );
         let netlist = parse(&body)?;
         let config = RunConfig::from_netlist(&netlist)?;
         for method in ["method=trap", "method=gear"] {
             let mut c = config.circuit(&netlist)?;
-            let plot = config
-                .plan(AnalysisInput::with_arguments(
-                    AnalysisKind::Transient,
-                    ["50n", "3u", "0", "50n", "uic", method],
-                ))?
-                .run(&mut c, &config.context())?;
+            let mut request = AnalysisInput::with_arguments(
+                AnalysisKind::Transient,
+                ["50n", "3.14u", "0", "50n", method],
+            );
+            request.uic = true;
+            let plot = config.plan(request)?.run(&mut c, &config.context())?;
             let mut crossed = [false; 2];
             for index in 0..plot.point_count() {
                 let get = |name| plot.value(name, index).unwrap().re;
@@ -262,7 +274,7 @@ fn derivative_array_transient_crosses_actual_switch_joins() -> SpiceResult<()> {
                 // At a hard linear-resistance join the output derivative
                 // is one-sided. The emitted point uses the right-hand germ.
                 let at_join = (control - 2.).abs() < 1e-9 || (control - 4.).abs() < 1e-9;
-                if !at_join && time > 0. && time < 3e-6 {
+                if !at_join && time > 0. && time < 3.14e-6 {
                     close(
                         "output derivative",
                         get("v(derivative)"),
@@ -293,7 +305,7 @@ fn level_two_zero_bias_keeps_nonlinear_current_and_jacobian_coefficients() -> Sp
     let mut state = vec![Vector::zeros(c.unknown_count()); 6];
     state[1].set(p, 1.)?;
     let run = c.prepare_run();
-    let mut dae =
+    let dae =
         run.prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
     let result = dae.evaluate_taylor(&state, 0., 1e-6, Limit::Right)?;
     // 2*tanh(u/2) = u-u^3/12+u^5/120+...; the gmin contribution
@@ -324,6 +336,119 @@ fn level_two_zero_bias_keeps_nonlinear_current_and_jacobian_coefficients() -> Sp
         result.conductance[4].get(p, p),
         1. / 24.,
         1e-13,
+        1e-15,
+    );
+    Ok(())
+}
+
+#[test]
+fn exact_hard_limit_uses_the_one_sided_physical_tangent_not_ac_chord() -> SpiceResult<()> {
+    // All values are binary-exact, so the join is not an epsilon probe.
+    // The true DC current is clamp(V, +/- 1/8 A) plus gmin*V.
+    let c = Circuit::from_netlist(&parse(
+        "Vb p 0 0\nVc ctrl 0 0\nS1 p 0 ctrl 0 m\n.model m ltspice_switch(level=1 vt=0 vh=-1 ron=1 roff=1 ilimit=.125)",
+    )?)?;
+    let p = row(&c, "p");
+    let model = ModelContext::default();
+    let run = c.prepare_run();
+    let dae = run.prepare_physical_dae(&model, TransientTiming::new(1e-6, 1e-3)?)?;
+    for voltage in [-0.125, 0.125] {
+        for slope in [-0.25, 0.25] {
+            let mut state = vec![Vector::zeros(c.unknown_count()); 5];
+            state[0].set(p, voltage)?;
+            state[1].set(p, slope)?;
+            for side in [Limit::Left, Limit::Right] {
+                let direction = if side == Limit::Right { slope } else { -slope };
+                let clipped = voltage * direction > 0.;
+                let g = model.gmin + if clipped { 0. } else { 1. };
+                let germ = dae.evaluate_taylor(&state, 0., 1e-6, side)?;
+                close(
+                    "join current",
+                    germ.residual[0].get(p).unwrap(),
+                    (1. + model.gmin) * voltage,
+                    1e-14,
+                    1e-15,
+                );
+                close(
+                    "one-sided Jacobian",
+                    germ.conductance[0].get(p, p),
+                    g,
+                    1e-14,
+                    1e-15,
+                );
+                close(
+                    "one-sided rate",
+                    germ.residual[1].get(p).unwrap(),
+                    g * slope,
+                    1e-14,
+                    1e-15,
+                );
+                for n in 2..state.len() {
+                    close(
+                        "affine branch",
+                        germ.residual[n].get(p).unwrap(),
+                        0.,
+                        0.,
+                        1e-15,
+                    );
+                    close(
+                        "constant Jacobian",
+                        germ.conductance[n].get(p, p),
+                        0.,
+                        0.,
+                        1e-15,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cubic_threshold_retains_the_exact_interior_second_order_germ() -> SpiceResult<()> {
+    let c = Circuit::from_netlist(&parse(
+        "Vb p 0 0\nVc ctrl 0 0\nA1 %gd(ctrl 0) %gd(p 0) m\n.model m pswitch(cntl_off=2 cntl_on=4 r_off=1k r_on=10 log=true r_cntl_in=100)",
+    )?)?;
+    let p = row(&c, "p");
+    let control = row(&c, "ctrl");
+    let run = c.prepare_run();
+    let dae =
+        run.prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
+    let mut state = vec![Vector::zeros(c.unknown_count()); 5];
+    state[0].set(p, 1.)?;
+    state[0].set(control, 2.)?;
+    state[1].set(control, 1.)?;
+    // G=Goff*exp(log(100)*(3*(u/2)^2-2*(u/2)^3)).
+    let expected = 3. * 100_f64.ln() / 4000.;
+    let right = dae.evaluate_taylor(&state, 0., 1e-6, Limit::Right)?;
+    let left = dae.evaluate_taylor(&state, 0., 1e-6, Limit::Left)?;
+    close(
+        "interior second-order current",
+        right.residual[2].get(p).unwrap(),
+        expected,
+        1e-13,
+        1e-15,
+    );
+    close(
+        "interior control-gradient slope",
+        right.conductance[1].get(p, control),
+        2. * expected,
+        1e-13,
+        1e-15,
+    );
+    close(
+        "exterior second-order current",
+        left.residual[2].get(p).unwrap(),
+        0.,
+        0.,
+        1e-15,
+    );
+    close(
+        "exterior control-gradient slope",
+        left.conductance[1].get(p, control),
+        0.,
+        0.,
         1e-15,
     );
     Ok(())

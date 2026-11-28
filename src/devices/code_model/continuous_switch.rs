@@ -38,6 +38,17 @@ pub(super) struct Point {
     pub(super) dg: Real,
 }
 
+/// Local normalized distance from the nearer endpoint. Branch decisions
+/// use the original control coordinate, so rounding a long interval to
+/// t=0 or t=1 cannot erase an interior germ.
+struct Position<T> {
+    distance: T,
+    near_on: bool,
+    off_side: Ordering,
+    on_side: Ordering,
+    anchor: Option<Real>,
+}
+
 impl Material {
     pub(super) fn compile(schema: SourceModel, card: &ModelCard) -> SpiceResult<Self> {
         schema.validate_parameters(card)?;
@@ -112,18 +123,42 @@ impl Material {
         })
     }
 
-    fn normalized<T: Constitutive>(self, control: T) -> T {
-        // Preserve the exact scalar endpoint while retaining derivatives.
-        let endpoint = match control.value().partial_cmp(&self.on) {
-            Some(Ordering::Equal) => Some(1.),
-            _ if control.value().partial_cmp(&self.off) == Some(Ordering::Equal) => Some(0.),
-            _ => None,
+    fn position<T: Constitutive>(self, control: T) -> Position<T> {
+        let oriented = |order: Ordering| {
+            if self.delta.is_sign_negative() {
+                order.reverse()
+            } else {
+                order
+            }
         };
-        let t = control.offset(-self.off).divide_constant(self.delta);
-        if let Some(value) = endpoint {
-            t.with_value(value)
+        let off_side = oriented(control.compare(self.off));
+        let on_side = oriented(control.compare(self.on));
+        let midpoint = Real::midpoint(self.off, self.on);
+        let near_on = oriented(
+            control
+                .value()
+                .partial_cmp(&midpoint)
+                .unwrap_or(Ordering::Equal),
+        ) == Ordering::Greater;
+        let anchor = if control.value().partial_cmp(&self.on) == Some(Ordering::Equal) {
+            Some(self.ron.recip())
+        } else if control.value().partial_cmp(&self.off) == Some(Ordering::Equal) {
+            Some(self.roff.recip())
         } else {
-            t
+            None
+        };
+        let distance = if near_on {
+            control.scale(-1.).offset(self.on)
+        } else {
+            control.offset(-self.off)
+        }
+        .divide_constant(self.delta);
+        Position {
+            distance,
+            near_on,
+            off_side,
+            on_side,
+            anchor,
         }
     }
 
@@ -151,11 +186,17 @@ impl Material {
         mut guard: impl FnMut(usize, &T, Real),
     ) -> SpiceResult<T> {
         control.check()?;
-        let t = self.normalized(control);
+        if self.law == Law::CubicLog
+            || (self.limited && (self.law == Law::LinearBounded || self.ron <= self.roff))
+        {
+            guard(0, &control, self.off);
+            guard(1, &control, self.on);
+        }
+        let position = self.position(control);
         let point = match self.law {
-            Law::CubicLog => self.cubic(t, &mut guard),
-            Law::LinearBounded | Law::Linear => self.linear(t, &mut guard)?,
-            Law::Exponential => self.exponential(t, &mut guard),
+            Law::CubicLog => self.cubic(position),
+            Law::LinearBounded | Law::Linear => self.linear(position, &mut guard)?,
+            Law::Exponential => self.exponential(position, &mut guard),
         };
         point.check()?;
         Ok(point)
@@ -165,82 +206,76 @@ impl Material {
         t.constant_like(resistance.recip())
     }
 
-    fn cubic<T: Constitutive>(self, t: T, guard: &mut impl FnMut(usize, &T, Real)) -> T {
-        guard(0, &t, 0.);
-        guard(1, &t, 1.);
-        if t.compare(0.) == Ordering::Less {
-            return Self::endpoint(&t, self.roff);
+    fn cubic<T: Constitutive>(self, position: Position<T>) -> T {
+        let Position {
+            distance,
+            near_on,
+            off_side,
+            on_side,
+            ..
+        } = position;
+        if off_side == Ordering::Less {
+            return Self::endpoint(&distance, self.roff);
         }
-        if t.compare(1.) != Ordering::Less {
-            return Self::endpoint(&t, self.ron);
+        if on_side != Ordering::Less || self.ron > self.roff {
+            return Self::endpoint(&distance, self.ron);
         }
-        if self.ron > self.roff {
-            return Self::endpoint(&t, self.ron);
+        if off_side == Ordering::Equal || self.log_ratio == 0. {
+            return Self::endpoint(&distance, self.roff);
         }
-        if t.compare(0.) == Ordering::Equal || self.log_ratio == 0. {
-            return Self::endpoint(&t, self.roff);
-        }
-        // Near each endpoint use its own logarithmic origin.
-        let (fraction, span, origin) = if t.value() <= 0.5 {
-            (t, self.log_ratio, self.roff.ln())
+        // Smoothstep in log(R) about the nearer endpoint, without
+        // computing 1-t from an already rounded normalized coordinate.
+        let (span, origin) = if near_on {
+            (-self.log_ratio, self.ron.ln())
         } else {
-            (t.scale(-1.).offset(1.), -self.log_ratio, self.ron.ln())
+            (self.log_ratio, self.roff.ln())
         };
-        let smooth = fraction
+        let smooth = distance
             .clone()
             .square()
-            .multiply(&fraction.affine(-2., 3.));
+            .multiply(&distance.affine(-2., 3.));
         smooth.affine(-span, -origin).exp()
     }
 
-    fn bounded<T: Constitutive>(
-        self,
-        t: &T,
-        bounded: bool,
-        guard: &mut impl FnMut(usize, &T, Real),
-    ) -> Option<T> {
+    fn bounded<T: Constitutive>(self, position: &Position<T>, bounded: bool) -> Option<T> {
         if !self.limited {
             return None;
         }
+        let distance = &position.distance;
         if !bounded && self.ron > self.roff {
-            return Some(Self::endpoint(t, self.roff));
+            return Some(Self::endpoint(distance, self.roff));
         }
-        guard(0, t, 0.);
-        guard(1, t, 1.);
-        if t.compare(0.) == Ordering::Less {
+        if position.off_side == Ordering::Less {
             Some(Self::endpoint(
-                t,
+                distance,
                 if bounded {
                     self.roff.max(1e-9)
                 } else {
                     self.roff
                 },
             ))
-        } else if t.compare(1.) == Ordering::Greater {
-            Some(Self::endpoint(t, self.ron))
+        } else if position.on_side == Ordering::Greater {
+            Some(Self::endpoint(distance, self.ron))
         } else {
             None
         }
     }
 
-    fn exponential<T: Constitutive>(self, t: T, guard: &mut impl FnMut(usize, &T, Real)) -> T {
-        if let Some(point) = self.bounded(&t, false, guard) {
+    fn exponential<T: Constitutive>(
+        self,
+        position: Position<T>,
+        guard: &mut impl FnMut(usize, &T, Real),
+    ) -> T {
+        if let Some(point) = self.bounded(&position, false) {
             return point;
         }
         if self.log_ratio == 0. {
-            return Self::endpoint(&t, self.ron);
+            return Self::endpoint(&position.distance, self.ron);
         }
-        let endpoint = match t.value() {
-            0. => Some(self.roff.recip()),
-            1. => Some(self.ron.recip()),
-            _ => None,
-        };
-        let log_r = if t.value() <= 0.5 {
-            t.affine(self.log_ratio, self.roff.ln())
+        let log_r = if position.near_on {
+            position.distance.affine(-self.log_ratio, self.ron.ln())
         } else {
-            t.scale(-1.)
-                .offset(1.)
-                .affine(-self.log_ratio, self.ron.ln())
+            position.distance.affine(self.log_ratio, self.roff.ln())
         };
         if !self.limited {
             let cutoff = 1e-9_f64.ln();
@@ -250,7 +285,7 @@ impl Material {
             }
         }
         let g = log_r.scale(-1.).exp();
-        if let Some(value) = endpoint {
+        if let Some(value) = position.anchor {
             g.with_value(value)
         } else {
             g
@@ -259,21 +294,21 @@ impl Material {
 
     fn linear<T: Constitutive>(
         self,
-        t: T,
+        position: Position<T>,
         guard: &mut impl FnMut(usize, &T, Real),
     ) -> SpiceResult<T> {
         let bounded = self.law == Law::LinearBounded;
-        if let Some(point) = self.bounded(&t, bounded, guard) {
+        if let Some(point) = self.bounded(&position, bounded) {
             return Ok(point);
         }
         let difference = self.ron - self.roff;
         if difference == 0. {
-            return Ok(Self::endpoint(&t, self.ron));
+            return Ok(Self::endpoint(&position.distance, self.ron));
         }
-        let r = if t.value() <= 0.5 {
-            t.affine(difference, self.roff)
+        let r = if position.near_on {
+            position.distance.affine(-difference, self.ron)
         } else {
-            t.scale(-1.).offset(1.).affine(-difference, self.ron)
+            position.distance.affine(difference, self.roff)
         };
         if bounded || !self.limited {
             guard(2, &r, 1e-9);
@@ -282,5 +317,48 @@ impl Material {
             }
         }
         r.reciprocal()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::maths::taylor::Jet;
+
+    #[test]
+    fn wide_control_interval_keeps_the_interior_germ_close_to_either_endpoint() -> SpiceResult<()> {
+        for sign in [1., -1.] {
+            let material = Material {
+                law: Law::CubicLog,
+                on: sign,
+                off: -sign * 1e16,
+                delta: sign * 1e16,
+                ron: 10.,
+                roff: 1000.,
+                log_ratio: -100_f64.ln(),
+                limited: true,
+                control_g: 1e-12,
+            };
+            // (control-off)/delta rounds to exactly one. The physical
+            // control is still half a volt inside the interval.
+            let control = sign * 0.5;
+            let point = material.point(control)?;
+            let s = 0.5e-16;
+            let g = (material.log_ratio * s * s * (3. - 2. * s) - material.ron.ln()).exp();
+            let dg = -material.log_ratio * 6. * s * (1. - s) / material.delta * g;
+            assert!((point.dg / dg - 1.).abs() < 1e-13);
+            let mut guards = Vec::new();
+            let inside = material.taylor(
+                Differential::variable(0, Jet::affine(4, control, sign * 0.1))?,
+                &mut guards,
+            )?;
+            assert!((inside.gradient[0].as_ref().unwrap().value() / dg - 1.).abs() < 1e-13);
+            let exterior = material.taylor(
+                Differential::variable(0, Jet::affine(4, sign * 1.5, sign * 0.1))?,
+                &mut Vec::new(),
+            )?;
+            assert!(exterior.gradient[0].is_none());
+        }
+        Ok(())
     }
 }

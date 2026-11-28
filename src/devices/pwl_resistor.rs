@@ -10,11 +10,9 @@ use crate::maths::{SparseMatrix, Vector};
 use crate::netlist::ast::{DeviceInstance, Netlist, ParameterKind};
 use crate::primitives::{NodeAppend, NodeId, NodeTable, Real, SpiceError, SpiceResult};
 
-/// The physical line `y = slope*x + intercept`. The upper coordinate is
-/// exclusive except on the final, extrapolating segment.
+/// The physical line `y = slope*x + intercept`.
 #[derive(Debug, PartialEq)]
 struct Segment {
-    upper: Real,
     slope: Real,
     intercept: Real,
 }
@@ -34,6 +32,7 @@ impl Curve {
         let axis = declaration.axis;
         let count = declaration.knots.len() - 1;
         let mut segments = Vec::with_capacity(count);
+        let mut boundaries = Vec::with_capacity(count - 1);
         let coordinates = |knot: model_normalize_ngspice::pwl_resistor::Knot| match axis {
             Axis::Voltage => (knot.voltage, knot.current),
             Axis::Current => (knot.current, knot.voltage),
@@ -60,21 +59,15 @@ impl Curve {
             {
                 return Err(SpiceError::circuit("unrepresentable prepared PWL segment"));
             }
-            segments.push(Segment {
-                upper: x1,
-                slope,
-                intercept,
-            });
+            segments.push(Segment { slope, intercept });
+            if index + 1 < count {
+                boundaries.push(x1);
+            }
         }
-        let boundaries = segments
-            .iter()
-            .take(count - 1)
-            .map(|segment| segment.upper)
-            .collect();
         Ok(Self {
             axis,
             segments,
-            boundaries,
+            boundaries: boundaries.into_boxed_slice(),
         })
     }
 

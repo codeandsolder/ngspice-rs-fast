@@ -18,7 +18,10 @@ pub(crate) trait Constitutive: Clone {
     fn exp(self) -> Self;
     fn divide(self, rhs: &Self) -> SpiceResult<Self>;
     fn divide_constant(self, divisor: Real) -> Self;
-    fn tanh(self) -> SpiceResult<Self>;
+    fn scaled_tanh(self, amplitude: Real) -> SpiceResult<Self>;
+    fn tanh(self) -> SpiceResult<Self> {
+        self.scaled_tanh(1.)
+    }
     fn atan_scaled(self, width: Real) -> SpiceResult<Self>;
     fn check(&self) -> SpiceResult<()>;
 
@@ -140,9 +143,9 @@ impl<const N: usize> Constitutive for Dual<N> {
             gradient: self.gradient.map(|g| g / divisor),
         }
     }
-    fn tanh(self) -> SpiceResult<Self> {
-        let value = self.value.tanh();
-        Ok(self.lift(value, sech_squared(self.value)))
+    fn scaled_tanh(self, amplitude: Real) -> SpiceResult<Self> {
+        let argument = self.value / amplitude;
+        Ok(self.lift(amplitude * argument.tanh(), sech_squared(argument)))
     }
     fn atan_scaled(self, width: Real) -> SpiceResult<Self> {
         let value = self.value.atan2(width);
@@ -209,12 +212,15 @@ impl<const N: usize> Constitutive for Differential<N> {
             .map(|entry| entry.map(|gradient| gradient.divide_constant(divisor)));
         self
     }
-    fn tanh(self) -> SpiceResult<Self> {
-        let value = self.value.value().tanh();
-        if self.value.value().is_infinite() || (-2. * self.value.value().abs()).exp() == 0. {
+    fn scaled_tanh(self, amplitude: Real) -> SpiceResult<Self> {
+        let argument = self.value.clone().divide_constant(amplitude);
+        let value = amplitude * argument.value().tanh();
+        if argument.value().is_infinite() || (-2. * argument.value().abs()).exp() == 0. {
             return Ok(Self::constant(self.value.order(), value));
         }
-        let slope = tanh_slope(&self.value)?;
+        // d[A*tanh(I/A)]/dI = sech²(I/A). Only the time jet of the
+        // argument needs the division; its state gradient does not.
+        let slope = tanh_slope(&argument)?;
         let value = self.value.compose_derivative(value, &slope);
         Ok(self.lift(value, &slope))
     }

@@ -289,13 +289,12 @@ impl Law {
 
 fn limited_current<T: Constitutive>(g: T, limit: Real, voltage: T) -> SpiceResult<T> {
     let linear = g.multiply(&voltage);
-    let argument = linear.clone().divide_constant(limit);
-    let small = argument.value().abs() < 1e-8;
-    let current = argument.tanh()?.scale(limit);
+    let value = linear.value();
+    let current = linear.scaled_tanh(limit)?;
     // Keep the scalar rounding shortcut, not a linearized Taylor law.
     // Even at zero bias the higher odd coefficients matter.
-    Ok(if small {
-        current.with_value(linear.value())
+    Ok(if (value / limit).abs() < 1e-8 {
+        current.with_value(value)
     } else {
         current
     })
@@ -696,6 +695,42 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_current_limit_does_not_overflow_the_physical_state_jacobian() -> SpiceResult<()> {
+        // At zero bias the slope is G regardless of I_limit. A naive
+        // differentiate-then-scale implementation forms G/I_limit = infinity.
+        let p = Conductance {
+            on: 1e200,
+            off: 1e200,
+            threshold: 0.,
+            width: 1.,
+            gmin: 1e-12,
+        };
+        let law = Law::new(2, -1., Some(1e-200), Direction::Bidirectional);
+        let scalar = law.evaluate(
+            p,
+            Bias {
+                voltage: 0.,
+                control: 0.,
+            },
+            false,
+        )?;
+        assert_eq!(scalar.current, 0.);
+        assert!((scalar.jacobian.voltage / p.on - 1.).abs() < 1e-13);
+        let mut guards = Vec::new();
+        use crate::maths::taylor::Jet;
+        let germ = law.taylor(
+            p,
+            Differential::variable(0, Jet::constant(5, 0.))?,
+            Differential::variable(1, Jet::constant(5, 0.))?,
+            &mut guards,
+        )?;
+        assert!(germ.value.is_zero());
+        assert!((germ.gradient[0].as_ref().unwrap().value() / p.on - 1.).abs() < 1e-13);
+        assert!(germ.gradient[0].as_ref().unwrap().is_constant());
         Ok(())
     }
 }

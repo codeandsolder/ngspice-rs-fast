@@ -52,9 +52,10 @@ fn run(
     kind: AnalysisKind,
     args: &[&str],
 ) -> anyhow::Result<Plot> {
-    Ok(config
-        .plan(AnalysisInput::with_arguments(kind, args.iter().copied()))?
-        .run(circuit, &config.context())?)
+    let mut request =
+        AnalysisInput::with_arguments(kind, args.iter().copied().filter(|arg| *arg != "uic"));
+    request.uic = args.contains(&"uic");
+    Ok(config.plan(request)?.run(circuit, &config.context())?)
 }
 
 fn near(plot: &Plot, name: &str, index: usize, expected: f64) {
@@ -304,8 +305,13 @@ fn physical_taylor_tangent_at_knot_uses_one_sided_germ() -> anyhow::Result<()> {
 #[test]
 fn derivative_array_transient_crosses_actual_pwl_knots_on_both_axes() -> anyhow::Result<()> {
     for (model, card, drive, observed) in [
-        (VOLTAGE, "MR", "Vdrive p 0 pwl(0 -0.5 3u 2.5)", "i(vdrive)"),
-        (CURRENT, "MC", "Idrive 0 p pwl(0 -0.5 3u 2.5)", "v(p)"),
+        (
+            VOLTAGE,
+            "MR",
+            "Vdrive p 0 pwl(0 -0.47 3.14u 2.67)",
+            "i(vdrive)",
+        ),
+        (CURRENT, "MC", "Idrive 0 p pwl(0 -0.47 3.14u 2.67)", "v(p)"),
     ] {
         let (deck, bundle) = source(
             &format!(
@@ -319,13 +325,13 @@ fn derivative_array_transient_crosses_actual_pwl_knots_on_both_axes() -> anyhow:
                 &mut c,
                 &config,
                 AnalysisKind::Transient,
-                &["50n", "3u", "0", "50n", "uic", method],
+                &["50n", "3.14u", "0", "50n", "uic", method],
             )?;
             let sign = if card == "MR" { -1. } else { 1. };
             let mut crossed = [false; 3];
             for index in 0..plot.point_count() {
                 let t = plot.value("time", index).unwrap().re;
-                let x = t.mul_add(1e6, -0.5);
+                let x = t.mul_add(1e6, -0.47);
                 let (y, slope) = if x < 0. {
                     (3. * x + 2., 3.)
                 } else if x < 1. {
@@ -337,7 +343,7 @@ fn derivative_array_transient_crosses_actual_pwl_knots_on_both_axes() -> anyhow:
                 };
                 near(&plot, observed, index, sign * y);
                 let at_knot = [0., 1., 2.].iter().any(|k| (x - k).abs() < 1e-8);
-                if !at_knot && t > 0. && t < 3e-6 {
+                if !at_knot && t > 0. && t < 3.14e-6 {
                     near(&plot, "v(derivative)", index, sign * slope);
                 }
                 for (slot, knot) in [0., 1., 2.].into_iter().enumerate() {
