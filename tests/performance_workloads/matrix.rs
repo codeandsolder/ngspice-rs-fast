@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use ngspice_rs::maths::complex::{ComplexLu, ComplexMatrix};
 use ngspice_rs::maths::{
-    FactorStorage, FactorWork, NiStep, Pattern, PatternTelemetry, SparseLu, SparseMatrix, Vector,
-    solve_ni,
+    FactorStorage, FactorWork, NiStep, NiWorkspace, Pattern, PatternTelemetry, SparseLu,
+    SparseMatrix, Vector, solve_ni,
 };
 use ngspice_rs::primitives::Complex;
 
@@ -138,8 +138,18 @@ fn error(matrix: &SparseMatrix, rhs: &Vector, x: &Vector, exact: &Vector) -> (f6
 }
 
 fn ni(matrix: &SparseMatrix, rhs: &Vector, reorder: bool) -> Vector {
-    match solve_ni(matrix, rhs, &mut None, reorder, 0.).unwrap() {
-        NiStep::Solved(x) => x,
+    let mut x = Vector::default();
+    match solve_ni(
+        matrix,
+        rhs,
+        &mut NiWorkspace::default(),
+        &mut x,
+        reorder,
+        0.,
+    )
+    .unwrap()
+    {
+        NiStep::Solved => x,
         NiStep::ZeroPivot => panic!("grounded positive-definite workload returned zero pivot"),
     }
 }

@@ -1376,11 +1376,12 @@ impl SparseMatrix {
     /// Compute b - A*x from individual original stamps. Sorting by equation
     /// uses sparse storage rather than an exact accumulator per unknown.
     /// The already rounded matrix remains the numerical Jacobian.
-    pub(crate) fn original_correction(
+    pub(crate) fn original_correction_into(
         &mut self,
         rhs: &mut Vector,
         solution: &Vector,
-    ) -> SpiceResult<Vector> {
+        correction: &mut Vector,
+    ) -> SpiceResult<()> {
         let entries = self
             .original
             .as_mut()
@@ -1400,8 +1401,9 @@ impl SparseMatrix {
         entries.sort_unstable_by_key(|t| t.row);
         let mut matrix = entries.iter().peekable();
         let mut sources = sources.iter().peekable();
-        let mut correction = Vector::zeros(self.rows);
-        for (row, value) in correction.as_mut_slice().iter_mut().enumerate() {
+        let correction = correction.overwrite_storage();
+        correction.resize(self.rows, 0.);
+        for (row, value) in correction.iter_mut().enumerate() {
             let mut sum = crate::primitives::ExactSum::new();
             let mut has_entry = false;
             while let Some(t) = matrix.next_if(|t| t.row == row) {
@@ -1419,7 +1421,7 @@ impl SparseMatrix {
             }
             *value = sum.rounded_sum();
         }
-        Ok(correction)
+        Ok(())
     }
 
     /// The stored contributions. For a bound matrix: the folded nonzero
@@ -1675,18 +1677,19 @@ mod tests {
             assert_eq!(a.get(0, 0), 0.);
             assert_eq!(b.get(0), Some(0.));
             let x = Vector::from_slice(&[2., 3., 5.]);
-            assert_eq!(
-                a.original_correction(&mut b, &x).unwrap().as_slice(),
-                &[-7., -3., 2.]
-            );
+            let mut correction = Vector::default();
+            a.original_correction_into(&mut b, &x, &mut correction)
+                .unwrap();
+            assert_eq!(correction.as_slice(), &[-7., -3., 2.]);
+            let address = correction.as_slice().as_ptr();
             a.clear();
             b.clear();
             a.add(0, 0, 1.).unwrap();
             b.add_to(0, 2.).unwrap();
-            assert_eq!(
-                a.original_correction(&mut b, &x).unwrap().as_slice(),
-                &[0., -3., -5.]
-            );
+            a.original_correction_into(&mut b, &x, &mut correction)
+                .unwrap();
+            assert_eq!(correction.as_slice(), &[0., -3., -5.]);
+            assert_eq!(correction.as_slice().as_ptr(), address);
         }
     }
 
