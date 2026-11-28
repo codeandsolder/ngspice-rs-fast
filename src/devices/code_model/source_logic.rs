@@ -143,7 +143,7 @@ impl Edge {
 /// starting level. Retain the no-edge, leading-edge and completed-pulse
 /// alternatives until the ending level is known. In particular, two
 /// correlated toggles of a dual-edge T flip-flop can restore a known bit.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ClockAmbiguity {
     phase: Logic,
     before: Logic,
@@ -458,7 +458,7 @@ impl Operation {
 
 /// A simultaneous group can have more than one causally relevant path.
 /// For the deterministic contract, the latest selected path wins.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct Causes {
     pub(super) primary: bool,
     pub(super) gate: bool,
@@ -619,7 +619,7 @@ impl LogicKernel {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct LogicMemory {
     pub(super) requested: Drive,
     clock: Logic,

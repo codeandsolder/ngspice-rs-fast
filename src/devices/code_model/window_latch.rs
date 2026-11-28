@@ -4,7 +4,10 @@
 
 use super::causal_checks::{aperture, capture_enabled, check_capture, check_widths};
 use super::causal_history::{InputEdge, PortHistory, Relation, ordered_groups, qualify_inputs};
-use super::sequential_timing::may_trigger;
+use super::conditional_logic::{
+    LogicalTransition, PortEvent, common_trace, conditional_trace, settled_prefix,
+};
+use super::sequential_timing::{TimingContract, may_trigger};
 use super::source_logic::{Causes, LogicKernel, LogicMemory, Operation};
 use super::window_gate::WindowPaths;
 use super::{
@@ -28,6 +31,50 @@ pub(super) struct WindowLatchState {
     last: Option<InputEdge>,
     capture: Option<InputEdge>,
     diagnostics: Vec<ModelDiagnostic>,
+    batch: Option<ConditionalBatch>,
+}
+
+/// Retain the unresolved logical suffix and the already announced
+/// output requests. A later overlapping announcement may be replayed
+/// without changing an already delivered prefix only when all guarded
+/// alternatives prove that same prefix.
+#[derive(Clone, Debug)]
+struct ConditionalBatch {
+    initial: LogicMemory,
+    inputs: Vec<Drive>,
+    events: Vec<PortEvent>,
+    published: Vec<LogicalTransition>,
+}
+
+impl ConditionalBatch {
+    fn compact(&mut self, kernel: &LogicKernel, now: Real) -> SpiceResult<()> {
+        let prefix = settled_prefix(&self.events, now)?;
+        if prefix == 0 {
+            return Ok(());
+        }
+        let conditional =
+            conditional_trace(kernel, &self.initial, &self.inputs, &self.events[..prefix])?;
+        let Some(trace) = common_trace(&conditional)? else {
+            return Ok(());
+        };
+        if trace.transitions.len() > self.published.len() {
+            return Err(SpiceError::circuit(
+                "settled latch prefix exceeds published waveform",
+            ));
+        }
+        for (earlier, later) in trace.transitions.iter().zip(&self.published) {
+            if !earlier.equivalent(later)? {
+                return Err(SpiceError::circuit(
+                    "settled latch prefix disagrees with published waveform",
+                ));
+            }
+        }
+        self.initial = trace.memory;
+        self.inputs = trace.inputs;
+        self.events.drain(..prefix);
+        self.published.drain(..trace.transitions.len());
+        Ok(())
+    }
 }
 
 impl WindowLatch {
@@ -76,6 +123,80 @@ impl WindowLatch {
         let arrival = TimingWindow::latest(arrivals)?;
         waveform.push(Arrival::new(before, after, arrival)?);
         Ok(())
+    }
+
+    fn reduce_unconstrained(
+        &self,
+        context: EventContext,
+        inputs: &[TimedInput],
+        state: &mut WindowLatchState,
+    ) -> SpiceResult<Vec<TimedOutput>> {
+        let mut added = Vec::new();
+        for (port, (history, input)) in state.ports.iter_mut().zip(inputs).enumerate() {
+            if let Some(edge) = history.observe(context, input)? {
+                added.push(PortEvent { port, edge });
+            }
+            history.prune(context.time);
+        }
+        if added.is_empty() {
+            return Ok(vec![TimedOutput::Retain]);
+        }
+        if state.batch.as_ref().is_none_or(|batch| {
+            batch
+                .events
+                .iter()
+                .all(|event| event.edge.window.bounds().maximum() <= context.time)
+        }) {
+            state.batch = Some(ConditionalBatch {
+                initial: state.logic.clone(),
+                inputs: state.inputs.clone(),
+                events: Vec::new(),
+                published: Vec::new(),
+            });
+        }
+        let batch = state
+            .batch
+            .as_mut()
+            .ok_or_else(|| SpiceError::circuit("missing conditional latch batch"))?;
+        batch.compact(&self.kernel, context.time)?;
+        batch.events.extend(added);
+        let conditional =
+            conditional_trace(&self.kernel, &batch.initial, &batch.inputs, &batch.events)?;
+        let trace = common_trace(&conditional)?.ok_or_else(|| {
+            SpiceError::circuit(
+                "latch has distinct guarded output waveforms; conditional delivery required",
+            )
+        })?;
+        if batch.published.len() > trace.transitions.len() {
+            return Err(SpiceError::circuit(
+                "latch output waveform requires revision",
+            ));
+        }
+        for (previous, current) in batch.published.iter().zip(&trace.transitions) {
+            if !previous.equivalent(current)? {
+                return Err(SpiceError::circuit(
+                    "latch output waveform requires revision",
+                ));
+            }
+        }
+        let mut waveform = Vec::new();
+        for request in &trace.transitions[batch.published.len()..] {
+            self.emit(
+                &request.cause,
+                request.causes,
+                request.before,
+                request.after,
+                &mut waveform,
+            )?;
+        }
+        batch.published = trace.transitions;
+        state.logic = trace.memory;
+        state.inputs = trace.inputs;
+        Ok(vec![if waveform.is_empty() {
+            TimedOutput::Retain
+        } else {
+            TimedOutput::Waveform(waveform)
+        }])
     }
 
     fn prune(&self, state: &mut WindowLatchState, now: Real) {
@@ -190,6 +311,7 @@ impl CodeModel for WindowLatch {
             last: None,
             capture: None,
             diagnostics: Vec::new(),
+            batch: None,
         }
     }
     fn tracks_arrivals(&self) -> bool {
@@ -224,6 +346,7 @@ impl CodeModel for WindowLatch {
             state.inputs = inputs.iter().map(|input| input.drive).collect();
             state.last = None;
             state.capture = None;
+            state.batch = None;
             let (drive, _) = self.kernel.operation.desired(
                 &state.inputs,
                 &mut state.logic,
@@ -236,6 +359,15 @@ impl CodeModel for WindowLatch {
                 delays: Delays::ZERO,
                 mode: DelayMode::Transport,
             })]);
+        }
+
+        if self
+            .kernel
+            .timing
+            .as_ref()
+            .is_none_or(TimingContract::is_unconstrained)
+        {
+            return self.reduce_unconstrained(context, &inputs, state);
         }
 
         let preview = state
@@ -449,6 +581,55 @@ mod tests {
             (timing.kind, timing.elapsed, timing.maximum_elapsed),
             ("clock/gate pulse width", 5., 5.)
         );
+        trial.commit()
+    }
+    #[test]
+    fn asynchronous_assertion_masks_independent_overlapping_latch_events() -> SpiceResult<()> {
+        use super::super::source_logic::AsyncPolicy;
+        let mut network = Network::default();
+        let d = network.add_net();
+        let g = network.add_net();
+        let p = network.add_net();
+        let c = network.add_net();
+        let q = network.add_net();
+        let data = network.add_source(d)?;
+        let gate = network.add_source(g)?;
+        let preset = network.add_source(p)?;
+        let clear = network.add_source(c)?;
+        let mut latch = model(15., 0., 0., 2.)?;
+        latch.kernel.operation = Operation::from_value(
+            15.,
+            4,
+            Some(AsyncPolicy {
+                preset: Logic::One,
+                clear: Logic::One,
+                both: Logic::Unknown,
+            }),
+        )?;
+        latch.kernel.inputs = 4;
+        latch.kernel.invert = vec![false; 4];
+        latch.kernel.timing = None;
+        network.add_model(latch, &[d, g, p, c], &[q])?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let low = Drive::strong(Logic::Zero);
+        let high = Drive::strong(Logic::One);
+        let a = TimingWindow::exact(0.)?.after(DelayWindow::new(10., 30.)?, Origin::shared(0))?;
+        let b = TimingWindow::exact(0.)?.after(DelayWindow::new(15., 25.)?, Origin::shared(1))?;
+        let mut trial = engine.trial();
+        trial.schedule(data, 0., low)?;
+        trial.schedule(gate, 0., low)?;
+        trial.schedule(preset, 0., high)?;
+        trial.schedule(clear, 0., low)?;
+        trial.schedule_arrival(data, Arrival::new(low, high, a)?)?;
+        trial.schedule_arrival(gate, Arrival::new(low, high, b)?)?;
+        trial.schedule(preset, 40., low)?;
+        trial.schedule(data, 50., low)?;
+        trial.advance_to(39.)?;
+        assert_eq!(trial.value(q), Some(high));
+        trial.advance_to(45.)?;
+        assert_eq!(trial.value(q), Some(high));
+        trial.advance_to(53.)?;
+        assert_eq!(trial.value(q), Some(low));
         trial.commit()
     }
 }

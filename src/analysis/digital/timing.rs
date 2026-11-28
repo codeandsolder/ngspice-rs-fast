@@ -7,6 +7,9 @@
 
 use crate::primitives::{ExactSum, Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
+mod conditional;
+pub(crate) use conditional::proven_order;
+pub use conditional::{Conditional, GuardStatus, OrderCase, OrderPartition, TimingGuard};
 use std::sync::Arc;
 mod constraints;
 pub use constraints::{ApertureResult, Certainty, ConstraintResult};
@@ -326,8 +329,8 @@ impl TimingWindow {
     ///
     /// # Errors
     /// Work budget exhausted or nonfinite arithmetic.
-    pub fn relative_to(&self, reference: &Self, budget: usize) -> SpiceResult<Bounds> {
-        relative(self, reference, budget)
+    pub fn relative_to(&self, reference: &Self, mut budget: usize) -> SpiceResult<Bounds> {
+        relative(self, reference, &mut budget)
     }
 }
 
@@ -429,7 +432,7 @@ fn affine_difference(
     Bounds::new(round_outward(lower, false)?, round_outward(upper, true)?)
 }
 
-fn relative(left: &TimingWindow, right: &TimingWindow, mut budget: usize) -> SpiceResult<Bounds> {
+fn relative(left: &TimingWindow, right: &TimingWindow, budget: &mut usize) -> SpiceResult<Bounds> {
     let mut work = vec![Work::Compare(Compare {
         left,
         right,
@@ -438,7 +441,7 @@ fn relative(left: &TimingWindow, right: &TimingWindow, mut budget: usize) -> Spi
     })];
     let mut results = Vec::new();
     while let Some(task) = work.pop() {
-        charge(&mut budget, 1)?;
+        charge(budget, 1)?;
         match task {
             Work::Combine { kind, count } => {
                 let start = results
@@ -453,14 +456,14 @@ fn relative(left: &TimingWindow, right: &TimingWindow, mut budget: usize) -> Spi
                 results.push(value);
             }
             Work::Compare(mut job) => loop {
-                charge(&mut budget, 1)?;
+                charge(budget, 1)?;
                 if Arc::ptr_eq(&job.left.0, &job.right.0) {
                     results.push(affine_difference(
                         0.,
                         0.,
                         &job.left_shifts,
                         &job.right_shifts,
-                        &mut budget,
+                        budget,
                     )?);
                     break;
                 }
@@ -515,13 +518,13 @@ fn relative(left: &TimingWindow, right: &TimingWindow, mut budget: usize) -> Spi
                             *b,
                             &job.left_shifts,
                             &job.right_shifts,
-                            &mut budget,
+                            budget,
                         )?);
                         break;
                     }
                     (Expression::Extremum { kind, inputs }, _) => {
                         charge(
-                            &mut budget,
+                            budget,
                             inputs.len().saturating_mul(
                                 1_usize
                                     .saturating_add(job.left_shifts.len())
@@ -544,7 +547,7 @@ fn relative(left: &TimingWindow, right: &TimingWindow, mut budget: usize) -> Spi
                     }
                     (_, Expression::Extremum { kind, inputs }) => {
                         charge(
-                            &mut budget,
+                            budget,
                             inputs.len().saturating_mul(
                                 1_usize
                                     .saturating_add(job.left_shifts.len())

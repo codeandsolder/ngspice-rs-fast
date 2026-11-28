@@ -5,6 +5,7 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
 mod causal_checks;
 mod causal_history;
+mod conditional_logic;
 mod conductance;
 pub(crate) use conductance::ConductanceConfig;
 mod continuous_switch;

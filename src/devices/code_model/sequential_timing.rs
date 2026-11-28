@@ -201,6 +201,16 @@ pub(super) fn may_trigger(edge: Edge, before: Logic, after: Logic) -> bool {
 }
 
 impl TimingContract {
+    pub(super) fn is_unconstrained(&self) -> bool {
+        self.setup
+            .iter()
+            .chain(&self.hold)
+            .chain(&self.clock_min)
+            .chain(&self.async_min)
+            .chain(&self.recovery)
+            .all(|&minimum| minimum == 0.)
+    }
+
     pub(super) fn initial_state(&self) -> TimingState {
         TimingState {
             previous: vec![Logic::Unknown; self.inputs],

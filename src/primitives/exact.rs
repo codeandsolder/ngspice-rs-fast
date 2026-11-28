@@ -221,6 +221,23 @@ impl ExactSum {
         scale_power(normalized.mantissa, normalized.exponent)
     }
 
+    /// Compare complete accumulators before rounding. In particular,
+    /// two different weighted products can both round to zero.
+    pub(crate) fn exact_cmp(&self, other: &Self) -> Ordering {
+        let mut difference = self.clone();
+        for (lhs, rhs) in difference.bins.iter_mut().zip(other.bins) {
+            *lhs -= rhs;
+        }
+        difference.normalize();
+        if difference.bins[LIMBS - 1] < 0 {
+            Ordering::Less
+        } else if difference.bins.iter().all(|&bin| bin == 0) {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        }
+    }
+
     /// The absolute quotient of two superaccumulators. The components are
     /// rounded independently into binary mantissas and their physical
     /// exponents remain separate until the final dimensionless division.

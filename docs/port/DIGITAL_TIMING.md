@@ -137,11 +137,12 @@ and clock delay [40,60] gives data arrival [25,60] and clock arrival
 [55,90]. Independent absolute comparisons would permit a negative
 setup interval; the shared-origin comparison gives [10,50].
 
-This is a numerical/provenance foundation, not a min/max event scheduler.
-The source-bound digital runtime still uses deterministic delays.
-In particular, uncertain rising/falling transitions must not be encoded
-as an ordinary unknown logic drive. Interval propagation, sensitization,
-hazards, and storage qualification require their own event semantics.
+The source-bound causal scheduler transports this provenance through
+bounded and exact transport paths. Uncertain rising/falling transitions
+retain their original arrival expression, rather than becoming an
+ordinary unknown logic drive. Optional hazards and revisions of an
+already announced conditional waveform require the guarded representation
+described below.
 
 ## Pulse qualification and directional ambiguity
 
@@ -289,3 +290,38 @@ law's actual X and impedance-transition selections, rather than inventing
 an additional local interval. Nonzero inertial and explicit pulse-reject
 policies require their own causal cancellation semantics and are not
 silently converted into transport.
+
+
+## Level-sensitive storage and conditional ordering
+
+Enabled storage and SR latches use the same logical-state transition
+kernel as deterministic storage, with bounded primary, gate, preset and
+clear propagation paths. Transparent storage captures its closing edge
+for setup, hold and recovery checks; independent gate pulse-width and
+asynchronous pulse-width checks share the correlation-aware sequential
+constraint implementation. Rank-only changes update the electrical
+endpoint identity without discarding the preceding logical edge.
+
+An order partition retains each physically distinct ordering, including
+simultaneous groups, as a conjunction of exact arrival comparisons.
+Relative enclosures and strict-order-cycle detection eliminate proven
+contradictions. They do not prove that every retained branch has a
+jointly feasible origin assignment. For a concrete joint assignment,
+exact weighted-product sums evaluate min/max and shared affine paths,
+so one and only one order case is selected without sub-ULP time-order
+loss. The same native reducer evaluates each case's logical output
+request sequence. A later-posted arrival suppresses older events that
+would otherwise occur after it; same-time announcement delta groups
+retain the explicit native ordering convention.
+
+An unconstrained latch retains the unresolved input suffix and its
+published logical requests. If every guarded case produces the same
+state and request sequence, the common trace can be emitted or extended
+without an artificial uncertainty state. A settled prefix can be
+compacted even when its absolute envelopes overlap the remaining suffix,
+provided relative comparisons prove the physical order. If branches
+differ or an already-published request requires revision, conditional
+delivery is required. The branch representation preserves optional
+pulses; the event engine still needs guarded delivery, joint feasibility
+for nontrivial affine/extremum constraints and conditional sequential
+timing checks. These are not silently replaced by deterministic paths.

@@ -222,31 +222,10 @@ pub(super) fn qualify_inputs(
 pub(super) fn ordered_groups<'a>(
     windows: impl IntoIterator<Item = (usize, &'a TimingWindow)>,
 ) -> SpiceResult<Option<Vec<Vec<usize>>>> {
-    let mut order: Vec<_> = windows.into_iter().collect();
-    order.sort_by(|(_, a), (_, b)| {
-        let a = a.bounds();
-        let b = b.bounds();
-        a.minimum()
-            .total_cmp(&b.minimum())
-            .then_with(|| a.maximum().total_cmp(&b.maximum()))
-    });
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut previous: Option<&TimingWindow> = None;
-    for (index, window) in order {
-        if let (Some(prior), Some(group)) = (previous, groups.last_mut()) {
-            let separation = window.relative_to(prior, COMPARISON_BUDGET)?;
-            if separation.is_exact() && separation.minimum() == 0. {
-                group.push(index);
-                continue;
-            }
-            if separation.minimum() <= 0. {
-                return Ok(None);
-            }
-        }
-        groups.push(vec![index]);
-        previous = Some(window);
-    }
-    Ok(Some(groups))
+    let mut budget = COMPARISON_BUDGET;
+    let order =
+        crate::analysis::digital::timing::proven_order(windows.into_iter().collect(), &mut budget)?;
+    Ok(order.map(|case| case.groups().to_vec()))
 }
 
 #[cfg(test)]
