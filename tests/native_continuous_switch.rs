@@ -430,8 +430,12 @@ W1 p2 0 Vsen mi
 .options GMIN=1e-5
 .end
 ";
-    let prepared = pspice::normalize_mapped(text, RootKind::Deck)
-        .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
+    let prepared = pspice::normalize_mapped(
+        text,
+        RootKind::Deck,
+        &model_preprocess_command::budget::WorkBudget::default(),
+    )
+    .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
     assert_eq!(prepared.renamed.len(), 2);
     let native = String::from_utf8(prepared.mapped.model.bytes)
         .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
