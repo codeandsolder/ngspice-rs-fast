@@ -87,6 +87,7 @@ pub(super) fn parse_prefix(
                     text: written.to_owned(),
                     span,
                     verbatim,
+                    scalar_alternative: None,
                     root: root.node,
                 },
                 consumed,
