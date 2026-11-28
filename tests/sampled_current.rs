@@ -6,7 +6,7 @@ use ngspice_rs::{
     devices::{AnalysisMode, Circuit, LoadRequest, ModelContext},
     maths::{SparseMatrix, Vector},
     netlist::{Parser, source::parse_deck_text},
-    primitives::{AnalysisKind, Complex, SpiceResult},
+    primitives::{AnalysisKind, Complex, SpiceError, SpiceResult},
 };
 
 fn circuit(text: &str) -> SpiceResult<Circuit> {
@@ -22,9 +22,19 @@ fn run(c: &mut Circuit, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> 
         .run(c, &AnalysisContext::default())
 }
 
+fn observed(plot: &Plot, name: &str, point: usize) -> SpiceResult<Complex> {
+    plot.value(name, point)
+        .ok_or_else(|| SpiceError::circuit(format!("missing observation {name} at point {point}")))
+}
+
+fn number(text: &str) -> SpiceResult<f64> {
+    text.parse()
+        .map_err(|error| SpiceError::circuit(format!("invalid reference number {text}: {error}")))
+}
+
 fn close(got: Complex, want: Complex) {
     assert!(
-        (got - want).magnitude() <= 2e-8 + 1e-8 * want.magnitude(),
+        (got - want).magnitude() <= 1e-8_f64.mul_add(want.magnitude(), 2e-8),
         "{got:?} != {want:?}"
     );
 }
@@ -37,23 +47,23 @@ fn dc_ac_and_instantaneous_probe_are_independent() -> SpiceResult<()> {
         "phase selection\nv1 s 0 dc 2 ac 1\n{NETWORK}.end\n"
     ))?;
     let op = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
-    close(op.value("v(p)", 0).unwrap(), Complex::real(40. / 23.));
+    close(observed(&op, "v(p)", 0)?, Complex::real(40. / 23.));
     for name in ["v(b)", "v(live)", "i(c1)", "i(vc1#port)"] {
-        close(op.value(name, 0).unwrap(), Complex::real(2. / 23.));
+        close(observed(&op, name, 0)?, Complex::real(2. / 23.));
     }
     let dc = run(&mut c, AnalysisKind::DcSweep, &["v1", "1", "2", ".5"])?;
     for (point, v) in [1., 1.5, 2.].into_iter().enumerate() {
-        close(dc.value("v(b)", point).unwrap(), Complex::real(v / 23.));
+        close(observed(&dc, "v(b)", point)?, Complex::real(v / 23.));
     }
     // Independently measured LTspice 24.0.12 port currents, issue #274.
     for (frequency, physical) in [
         (
             "100",
-            Complex::new(0.04349123838977926, 0.001425166557324791),
+            Complex::new(0.043_491_238_389_779_26, 0.001_425_166_557_324_791),
         ),
         (
             "10000",
-            Complex::new(0.1080018567925942, 0.07832699946699417),
+            Complex::new(0.108_001_856_792_594_2, 0.078_326_999_466_994_17),
         ),
     ] {
         let ac = run(
@@ -61,12 +71,12 @@ fn dc_ac_and_instantaneous_probe_are_independent() -> SpiceResult<()> {
             AnalysisKind::Ac,
             &["lin", "1", frequency, frequency],
         )?;
-        close(ac.value("v(b)", 0).unwrap(), Complex::real(0.));
+        close(observed(&ac, "v(b)", 0)?, Complex::real(0.));
         for name in ["v(live)", "i(c1)", "i(vc1#port)"] {
-            close(ac.value(name, 0).unwrap(), physical);
+            close(observed(&ac, name, 0)?, physical);
         }
         // The sampled current's bias value still multiplies the live voltage tangent.
-        close(ac.value("v(mixed)", 0).unwrap(), Complex::real(2. / 23.));
+        close(observed(&ac, "v(mixed)", 0)?, Complex::real(2. / 23.));
     }
     Ok(())
 }
@@ -88,18 +98,18 @@ fn feedback_converges_to_present_physical_current_for_both_companion_methods() -
         assert!(plot.point_count() > 50);
         let mut changed = false;
         for point in 1..plot.point_count() {
-            let held = plot.value("v(b)", point).unwrap();
-            let live = plot.value("v(live)", point).unwrap();
-            let port = plot.value("i(vc1#port)", point).unwrap();
-            let previous = plot.value("i(vc1#port)", point - 1).unwrap();
+            let held = observed(&plot, "v(b)", point)?;
+            let live = observed(&plot, "v(live)", point)?;
+            let port = observed(&plot, "i(vc1#port)", point)?;
+            let previous = observed(&plot, "i(vc1#port)", point - 1)?;
             assert!(
-                (held - port).magnitude() <= 2e-6 * port.magnitude() + 2e-12,
+                (held - port).magnitude() <= 2e-6_f64.mul_add(port.magnitude(), 2e-12),
                 "{method} point {point}: {held:?} != {port:?}"
             );
             close(live, port);
             close(
-                plot.value("v(s)", point).unwrap(),
-                plot.value("v(drive)", point).unwrap() - Complex::real(0.5) * held,
+                observed(&plot, "v(s)", point)?,
+                observed(&plot, "v(drive)", point)? - Complex::real(0.5) * held,
             );
             changed |= (held - previous).magnitude() > 1e-5;
         }
@@ -125,7 +135,7 @@ fn feedback_endpoint_matches_independent_ltspice_witness() -> SpiceResult<()> {
         let fields: Vec<_> = evidence
             .lines()
             .find(|line| line.split('\t').next() == Some(witness))
-            .unwrap()
+            .ok_or_else(|| SpiceError::circuit(format!("missing witness {witness}")))?
             .split('\t')
             .collect();
         let mut c = circuit(&format!(
@@ -153,8 +163,8 @@ fn feedback_endpoint_matches_independent_ltspice_witness() -> SpiceResult<()> {
             ("v(p)", 6, 5e-5),
             ("i(c1)", 7, 2e-5),
         ] {
-            let expected: f64 = fields[field].parse().unwrap();
-            let actual = plot.value(name, last).unwrap();
+            let expected: f64 = number(fields[field])?;
+            let actual = observed(&plot, name, last)?;
             assert!(
                 (actual - Complex::real(expected)).magnitude() <= absolute,
                 "{witness} {name}: {actual:?} != {expected:e}"
@@ -173,17 +183,28 @@ fn transient_load_samples_only_its_input_iterate_and_has_no_control_tangent() ->
         .devices()
         .iter()
         .position(|d| d.name().starts_with("b__sampled_current_"))
-        .unwrap();
-    let control = c.devices().iter().position(|d| d.name() == "v1").unwrap();
+        .ok_or_else(|| SpiceError::circuit("missing sampled device"))?;
+    let control = c
+        .devices()
+        .iter()
+        .position(|d| d.name() == "v1")
+        .ok_or_else(|| SpiceError::circuit("missing control device"))?;
     let row = c
         .unknowns()
         .node_row(c.devices()[sample].constitutive_nodes()[0])
-        .unwrap();
-    let control_row = c.branch_rows(control).unwrap().start;
+        .ok_or_else(|| SpiceError::circuit("missing sample node row"))?;
+    let control_row = c
+        .branch_rows(control)
+        .ok_or_else(|| SpiceError::circuit("missing control branch row"))?
+        .start;
     let n = c.unknown_count();
     let history = c.state_history()?;
     let accepted = history.clone();
-    assert!(c.state_rows(sample).unwrap().is_empty());
+    assert!(
+        c.state_rows(sample)
+            .ok_or_else(|| SpiceError::circuit("missing sample state rows"))?
+            .is_empty()
+    );
     let load = |mode, current| -> SpiceResult<(SparseMatrix, Vector)> {
         let mut x = vec![0.; n];
         x[control_row] = current;
@@ -228,17 +249,17 @@ fn lexical_macro_expansion_and_removed_networks() -> SpiceResult<()> {
     )?;
     let op = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
     for name in ["v(b1)", "v(live1)"] {
-        close(op.value(name, 0).unwrap(), Complex::real(0.2));
+        close(observed(&op, name, 0)?, Complex::real(0.2));
     }
     for name in ["v(b2)", "v(live2)"] {
-        close(op.value(name, 0).unwrap(), Complex::real(0.));
+        close(observed(&op, name, 0)?, Complex::real(0.));
     }
     let ac = run(&mut c, AnalysisKind::Ac, &["lin", "1", "1000", "1000"])?;
     for name in ["v(b1)", "v(b2)", "v(live2)"] {
-        close(ac.value(name, 0).unwrap(), Complex::real(0.));
+        close(observed(&ac, name, 0)?, Complex::real(0.));
     }
     close(
-        ac.value("v(live1)", 0).unwrap(),
+        observed(&ac, "v(live1)", 0)?,
         Complex::new(0.1, 4e-6 * std::f64::consts::TAU * 1000.),
     );
     Ok(())
@@ -286,29 +307,20 @@ fn selection_uses_actual_macro_target_before_sensing_aliases() -> SpiceResult<()
         .filter(|line| line.starts_with("v("))
     {
         let fields: Vec<_> = line.split('\t').collect();
-        let value = |index: usize| fields[index].parse::<f64>().unwrap();
-        close(op.value(fields[0], 0).unwrap(), Complex::real(value(1)));
+        let value = |index: usize| number(fields[index]);
+        close(observed(&op, fields[0], 0)?, Complex::real(value(1)?));
         close(
-            ac.value(fields[0], 0).unwrap(),
-            Complex::new(value(2), value(3)),
+            observed(&ac, fields[0], 0)?,
+            Complex::new(value(2)?, value(3)?),
         );
     }
-    close(
-        op.value("v(src)", 0).unwrap(),
-        op.value("v(srclive)", 0).unwrap(),
-    );
-    close(
-        op.value("v(forced)", 0).unwrap(),
-        op.value("v(src)", 0).unwrap(),
-    );
-    close(op.value("v(repeat)", 0).unwrap(), Complex::real(0.25));
-    close(ac.value("v(rlive)", 0).unwrap(), Complex::real(0.125));
-    close(
-        ac.value("v(src)", 0).unwrap(),
-        ac.value("v(srclive)", 0).unwrap(),
-    );
+    close(observed(&op, "v(src)", 0)?, observed(&op, "v(srclive)", 0)?);
+    close(observed(&op, "v(forced)", 0)?, observed(&op, "v(src)", 0)?);
+    close(observed(&op, "v(repeat)", 0)?, Complex::real(0.25));
+    close(observed(&ac, "v(rlive)", 0)?, Complex::real(0.125));
+    close(observed(&ac, "v(src)", 0)?, observed(&ac, "v(srclive)", 0)?);
     for name in ["v(repeat)", "v(forced)"] {
-        close(ac.value(name, 0).unwrap(), Complex::real(0.));
+        close(observed(&ac, name, 0)?, Complex::real(0.));
     }
     // The six observation-only targets, plus a forced sample of v1.
     // Repeated reads of r2 share a stateless sample coordinate.
@@ -328,17 +340,25 @@ fn physical_dae_and_taylor_use_the_exact_residual_not_the_ac_tangent() -> SpiceR
     let mut c =
         circuit("physical law\nv1 a 0 1\nr1 a 0 1\nb1 b 0 v=sampled_current(i(v1))\n.end\n")?;
     c.finalize()?;
-    let index = |name| c.devices().iter().position(|d| d.name() == name).unwrap();
+    let index = |name| {
+        c.devices()
+            .iter()
+            .position(|d| d.name() == name)
+            .ok_or_else(|| SpiceError::circuit(format!("missing device {name}")))
+    };
     let sample = c
         .devices()
         .iter()
         .find(|d| d.name().starts_with("b__sampled_current_"))
-        .unwrap();
+        .ok_or_else(|| SpiceError::circuit("missing sampled device"))?;
     let row = c
         .unknowns()
         .node_row(sample.constitutive_nodes()[0])
-        .unwrap();
-    let control = c.branch_rows(index("v1")).unwrap().start;
+        .ok_or_else(|| SpiceError::circuit("missing sample node row"))?;
+    let control = c
+        .branch_rows(index("v1")?)
+        .ok_or_else(|| SpiceError::circuit("missing control branch row"))?
+        .start;
     let run = c.prepare_run();
     let mut dae =
         run.prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
@@ -381,8 +401,8 @@ fn sampled_current_does_not_add_noise_or_change_small_signal_gain() -> SpiceResu
     }
     for name in ["onoise_spectrum", "inoise_spectrum"] {
         for point in 0..3 {
-            let baseline = spectra[0].value(name, point).unwrap();
-            let sample = spectra[1].value(name, point).unwrap();
+            let baseline = observed(&spectra[0], name, point)?;
+            let sample = observed(&spectra[1], name, point)?;
             assert!(baseline.magnitude() > 0.);
             assert!(
                 (sample - baseline).magnitude() <= 1e-12 * baseline.magnitude(),
@@ -402,12 +422,13 @@ fn absent_winding_control_is_distinct_from_sampled_zero_projection() -> SpiceRes
         (AnalysisKind::Ac, ["lin", "1", "1000", "1000"].as_slice()),
     ] {
         let plot = run(&mut c, kind, args)?;
-        close(plot.value("v(b)", 0).unwrap(), Complex::real(0.));
+        close(observed(&plot, "v(b)", 0)?, Complex::real(0.));
     }
     let error =
         circuit(&deck.replace("sampled_current(i(l1))", "branch_or_sampled_current(i(l1))"))
             .and_then(|mut c| c.finalize())
-            .unwrap_err();
+            .err()
+            .ok_or_else(|| SpiceError::circuit("accepted required absent winding"))?;
     assert!(
         error
             .to_string()
