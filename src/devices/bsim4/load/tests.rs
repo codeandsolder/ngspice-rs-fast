@@ -923,3 +923,148 @@ fn full_nonlinear_stamps_conserve_physical_rows_and_common_mode_with_aliases() {
         }
     }
 }
+
+#[test]
+fn channel_and_intrinsic_charge_share_physical_trajectory_and_partial_series() -> SpiceResult<()> {
+    use crate::maths::taylor::{Jet, differential::Differential};
+
+    fn at(jet: &Jet, t: f64) -> f64 {
+        jet.coefficients()
+            .iter()
+            .rev()
+            .fold(0., |sum: f64, coefficient| sum.mul_add(t, *coefficient))
+    }
+
+    fn assert_close(actual: f64, expected: f64, absolute: f64, context: &str) {
+        assert!(
+            actual.is_finite()
+                && expected.is_finite()
+                && (actual - expected).abs() <= absolute + 2e-6 * actual.abs().max(expected.abs()),
+            "{context}: {actual:e} vs {expected:e}"
+        );
+    }
+
+    for polarity in [-1, 1] {
+        for mobility in 0..=6 {
+            for cap in 0..=2 {
+                let fixture = PhysicalFixture::prepare(
+                    Model {
+                        r#type: polarity,
+                        typeGiven: true,
+                        mobMod: mobility,
+                        mobModGiven: true,
+                        capMod: cap,
+                        capModGiven: true,
+                        cvchargeMod: mobility % 2,
+                        cvchargeModGiven: true,
+                        xpart: [0., 0.5, 1.][mobility as usize % 3],
+                        xpartGiven: true,
+                        ..Model::default()
+                    },
+                    300.15,
+                );
+                for initial in [
+                    [0.35, 0.05, -0.3],
+                    [1.2, 0.1, -0.2],
+                    [1.4, 1.1, -0.3],
+                    [1.2, -0.3, -0.7],
+                ] {
+                    let rates = [0.002, -0.001, 0.0007];
+                    let variables = [0, 1, 2].map(|i| {
+                        Differential::<3>::variable(i, Jet::affine(8, initial[i], rates[i]))
+                            .unwrap()
+                    });
+                    let [vg, vd, vb] = variables;
+                    let mut instance = fixture.instance.clone();
+                    let e = super::channel::electrostatics_constitutive(
+                        &fixture.model,
+                        &mut instance,
+                        &fixture.size,
+                        fixture.temperature,
+                        vb.clone(),
+                        vg.clone(),
+                        vd.clone(),
+                    )?;
+                    let transport = super::channel::transport_constitutive(
+                        &fixture.model,
+                        &mut instance,
+                        &fixture.size,
+                        [vb, vg, vd.clone(), vd, Differential::constant(8, 0.)],
+                        &e,
+                    )?;
+                    let charge = super::charge::intrinsic_constitutive(
+                        &fixture.model,
+                        &mut instance,
+                        &fixture.size,
+                        true,
+                        &e,
+                        &transport,
+                    )?;
+                    let laws = [
+                        transport.unscaled_drain_current,
+                        charge.qgate,
+                        charge.qbulk,
+                        charge.qdrn,
+                    ];
+                    let scalar = |[vg, vd, vb]: [f64; 3]| -> SpiceResult<[f64; 4]> {
+                        let mut instance = fixture.instance.clone();
+                        let e = super::channel::electrostatics_constitutive(
+                            &fixture.model,
+                            &mut instance,
+                            &fixture.size,
+                            fixture.temperature,
+                            vb,
+                            vg,
+                            vd,
+                        )?;
+                        let tr = super::channel::transport_constitutive(
+                            &fixture.model,
+                            &mut instance,
+                            &fixture.size,
+                            [vb, vg, vd, vd, 0.],
+                            &e,
+                        )?;
+                        let q = super::charge::intrinsic_constitutive(
+                            &fixture.model,
+                            &mut instance,
+                            &fixture.size,
+                            true,
+                            &e,
+                            &tr,
+                        )?;
+                        Ok([tr.unscaled_drain_current, q.qgate, q.qbulk, q.qdrn])
+                    };
+                    for t in [0., 0.25, 0.5] {
+                        let sample = std::array::from_fn(|i| rates[i].mul_add(t, initial[i]));
+                        let values = scalar(sample)?;
+                        for (row, law) in laws.iter().enumerate() {
+                            let context = format!(
+                                "pol={polarity} mob={mobility} cap={cap} bias={sample:?} row={row}"
+                            );
+                            let absolute = if row == 0 { 1e-14 } else { 1e-23 };
+                            assert_close(at(&law.value, t), values[row], absolute, &context);
+                            for column in 0..3 {
+                                let h = 1e-4;
+                                let samples = [-h, h, -0.5 * h, 0.5 * h].map(|delta| {
+                                    let mut point = sample;
+                                    point[column] += delta;
+                                    scalar(point).unwrap()[row]
+                                });
+                                let (reference, error) = richardson(samples, h);
+                                let actual =
+                                    law.gradient[column].as_ref().map_or(0., |jet| at(jet, t));
+                                assert_close(
+                                    actual,
+                                    reference,
+                                    absolute + 0.1 * error,
+                                    &format!("{context} col={column}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

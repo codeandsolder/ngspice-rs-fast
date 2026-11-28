@@ -38,23 +38,25 @@
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
     DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model, SizeParam,
-    depletion_charge, exp, fabs, log, mode, smooth_drain, smooth_positive, state,
+    depletion_charge, fabs, mode, smooth_drain, smooth_positive, state,
 };
 use super::{
     bias::LoadBias,
     channel::{Electrostatics, Transport},
 };
 use crate::devices::bsim_physics::{
-    CapZeroBias, CapZeroParameters, ChargeChain, cap_zero, channel_inversion, charge_overdrive,
+    CapZeroBias, CapZeroParameters, cap_zero, channel_inversion, charge_overdrive,
     effective_overdrive, thermal_softplus,
 };
+use crate::maths::taylor::{Constitutive, Local};
 use crate::primitives::SpiceResult;
+use std::cmp::Ordering;
 
 /// Intrinsic terminal charges before extrinsic overlap and junction assembly.
-pub(super) struct IntrinsicCharges {
-    pub(super) qbulk: f64,
-    pub(super) qdrn: f64,
-    pub(super) qgate: f64,
+pub(super) struct IntrinsicCharges<S = f64> {
+    pub(super) qbulk: S,
+    pub(super) qdrn: S,
+    pub(super) qgate: S,
 }
 
 /// Evaluate the intrinsic C-V model and charge-deficit equilibrium.
@@ -67,440 +69,244 @@ pub(super) fn intrinsic(
     electrostatics: &Electrostatics,
     transport: &Transport,
 ) -> SpiceResult<IntrinsicCharges> {
-    let &LoadBias {
-        ChargeComputationNeeded,
-        ..
-    } = bias;
-    let &Electrostatics {
-        Phis,
-        Vbs,
-        Vbseff,
-        Vds,
-        Vgs_eff,
-        Vgst,
-        Vtm,
-        dPhis_dVb,
-        dVbseff_dVb,
-        dVgs_eff_dVg,
-        dVth_dVb,
-        dVth_dVd,
-        dn_dVb,
-        dn_dVd,
-        dsqrtPhis_dVb,
-        epssub,
-        n,
-        sqrtPhis,
-        ..
-    } = electrostatics;
-    let &Transport {
-        Abulk0_Q,
-        dAbulk0_Q_dVb,
-        ..
-    } = transport;
-    let mut Coxeff: f64;
-    let mut Vgsteff: f64;
-    let mut dVgsteff_dVb: f64;
-    let mut dVgsteff_dVd: f64;
-    let mut dVgsteff_dVg: f64;
-    let mut ceq: f64;
-    let mut geq: f64;
-    let mut Vfbeff: f64;
-    let mut dVfbeff_dVg: f64;
-    let mut dVfbeff_dVb: f64;
-    let mut V3: f64;
-    let mut qgate: f64 = 0.0;
-    let mut qbulk: f64 = 0.0;
-    let mut qdrn: f64 = 0.0;
-    let mut qsrc: f64;
-    let mut Vfb: f64;
-    let mut voffcv: f64;
-    let mut noff: f64;
-    let mut CoxWLcen: f64;
-    let mut QovCox: f64;
-    let mut LINK: f64;
-    let mut VgDP: f64;
-    let mut dVgDP_dVg: f64;
-    let mut Cox: f64;
-    let mut Tox: f64;
-    let mut Tcen: f64;
-    let mut dTcen_dVg: f64;
-    let mut dTcen_dVd: f64;
-    let mut dTcen_dVb: f64;
-    let mut Ccen: f64;
-    let mut dCoxeff_dVd: f64;
-    let mut dCoxeff_dVg: f64;
-    let mut dCoxeff_dVb: f64;
-    let mut VbseffCV: f64;
-    let mut dVbseffCV_dVb: f64;
-    let mut CoxWL: f64;
-    let mut T0: f64;
-    let mut dT0_dVg: f64;
-    let mut dT0_dVb: f64;
-    let mut T1: f64;
-    let mut T2: f64;
-    let mut T3: f64;
-    let mut tmp: f64;
-    let mut VdseffCV: f64;
-    let mut dVdseffCV_dVg: f64;
-    let mut dVdseffCV_dVd: f64;
-    let mut dVdseffCV_dVb: f64;
-    let mut VdsatCV: f64;
-    let mut AbulkCV: f64;
-    let mut dAbulkCV_dVb: f64;
-    let mut qcheq: f64;
-    let mut Cgg: f64;
-    let mut Cgd: f64;
-    let mut Cgb: f64;
-    let mut Csg: f64;
-    let mut Csd: f64;
-    let mut Csb: f64;
-    let mut Cbg: f64;
-    let mut Cbd: f64;
-    let mut Cbb: f64;
-    let mut Cgg1: f64;
-    let mut Cgb1: f64;
-    let mut Cgd1: f64;
-    let mut Cbg1: f64;
-    let mut Cbb1: f64;
-    let mut Cbd1: f64;
-    let mut Qac0: f64;
-    let mut Qsub0: f64;
-    let mut dQac0_dVg: f64;
-    let mut dQac0_dVb: f64;
-    let mut dQsub0_dVg: f64;
-    let mut dQsub0_dVd: f64;
-    let mut dQsub0_dVb: f64;
-    let ScalingFactor = 1.0e-9;
-    // C `goto finished` (only from the first branch below) skips the
-    // block between this if/else chain and the `finished:` label.
-    let mut goto_finished = false;
-    if (model.xpart < 0.0) || (ChargeComputationNeeded == 0) {
-        qbulk = 0.0;
-        qsrc = qbulk;
-        qdrn = qsrc;
-        qgate = qdrn;
-        here.cgdb = 0.0;
-        here.cgsb = here.cgdb;
-        here.cggb = here.cgsb;
-        here.cddb = 0.0;
-        here.cdsb = here.cddb;
-        here.cdgb = here.cdsb;
-        here.cbdb = 0.0;
-        here.cbsb = here.cbdb;
-        here.cbgb = here.cbsb;
-        here.csdb = 0.0;
-        here.cssb = here.csdb;
-        here.csgb = here.cssb;
-        here.cbbb = 0.0;
-        here.cdbb = here.cbbb;
-        here.csbb = here.cdbb;
-        here.cgbb = here.csbb;
-        here.cqbb = 0.0;
-        here.cqgb = here.cqbb;
-        here.cqsb = here.cqgb;
-        here.cqdb = here.cqsb;
-        here.gtau = 0.0;
-        goto_finished = true;
-    } else if model.capMod == 0 {
-        if Vbseff < 0.0 {
-            VbseffCV = Vbs;
-            dVbseffCV_dVb = 1.0;
-        } else {
-            VbseffCV = pParam.phi - Phis;
-            dVbseffCV_dVb = -dPhis_dVb * dVbseff_dVb;
+    let charges = intrinsic_constitutive(
+        model,
+        here,
+        pParam,
+        bias.ChargeComputationNeeded != 0,
+        electrostatics,
+        transport,
+    )?;
+    if model.xpart >= 0.
+        && bias.ChargeComputationNeeded != 0
+        && (here.trnqsMod != 0 || here.acnqsMod != 0)
+    {
+        let qcheq = -(charges.qbulk + charges.qgate);
+        here.qchqs = qcheq;
+        here.cqgb = -(here.cggb + here.cbgb);
+        here.cqdb = -(here.cgdb + here.cbdb);
+        here.cqsb = -(here.cgsb + here.cbsb);
+        here.cqbb = -(here.cqgb + here.cqdb + here.cqsb);
+        let coxwl = model.coxe * pParam.weffCV * here.nf * pParam.leffCV;
+        let rate = here.gcrg / coxwl;
+        here.gtau = rate * 1e-9;
+        if here.acnqsMod != 0 {
+            here.taunet = rate.recip();
         }
+        ckt.set_state0(state::QCHEQ, qcheq);
+        if ckt.mode() & mode::MODEINITTRAN != 0 {
+            ckt.set_state1(state::QCHEQ, ckt.state0(state::QCHEQ));
+        }
+        if here.trnqsMod != 0 {
+            ckt.integrate(0., state::QCHEQ)?;
+        }
+    }
+    Ok(charges)
+}
+
+/// Constitutive intrinsic terminal charges. The only history-dependent
+/// operation, the NQS equilibrium companion, belongs to the scalar host
+/// wrapper rather than the shared quasi-static value law.
+pub(super) fn intrinsic_constitutive<S: Constitutive>(
+    model: &Model,
+    here: &mut Instance,
+    p: &SizeParam,
+    compute: bool,
+    electro: &Electrostatics<S>,
+    transport: &Transport<S>,
+) -> SpiceResult<IntrinsicCharges<S>> {
+    let c = |x| Local::new(electro.Vgst.constant(x), [0.; 3]);
+    if model.xpart < 0. || !compute {
+        here.cgdb = 0.;
+        here.cgsb = 0.;
+        here.cggb = 0.;
+        here.cddb = 0.;
+        here.cdsb = 0.;
+        here.cdgb = 0.;
+        here.cbdb = 0.;
+        here.cbsb = 0.;
+        here.cbgb = 0.;
+        here.csdb = 0.;
+        here.cssb = 0.;
+        here.csgb = 0.;
+        here.cbbb = 0.;
+        here.cdbb = 0.;
+        here.csbb = 0.;
+        here.cgbb = 0.;
+        here.cqbb = 0.;
+        here.cqgb = 0.;
+        here.cqsb = 0.;
+        here.cqdb = 0.;
+        here.gtau = 0.;
+        return Ok(IntrinsicCharges {
+            qgate: c(0.).value,
+            qbulk: c(0.).value,
+            qdrn: c(0.).value,
+        });
+    }
+
+    // Reference C-V coordinate basis: oriented physical gate, drain and
+    // body voltages (the effective-body chain is included at the input).
+    let body_partial = electro.dVbseff_dVb;
+    let body = Local::new(electro.Vbseff.clone(), [0., 0., body_partial]);
+    let raw_body = Local::new(electro.Vbs.clone(), [0., 0., 1.]);
+    let surface = Local::new(
+        electro.Phis.clone(),
+        [0., 0., electro.dPhis_dVb * body_partial],
+    );
+    let root = Local::new(
+        electro.sqrtPhis.clone(),
+        [0., 0., electro.dsqrtPhis_dVb * body_partial],
+    );
+    let gate = Local::new(electro.Vgs_eff.clone(), [electro.dVgs_eff_dVg, 0., 0.]);
+    let drain = Local::new(electro.Vds.clone(), [0., 1., 0.]);
+    let bulk = Local::new(
+        transport.Abulk0_Q.clone(),
+        [0., 0., transport.dAbulk0_Q_dVb * body_partial],
+    )
+    .scale(p.abulkCVfactor);
+    let area = model.coxe * p.weffCV * p.leffCV * here.nf;
+    let body_cv = if body.compare(0.) == Some(Ordering::Less) {
+        if model.capMod == 0 { raw_body } else { body }
+    } else {
+        surface.scale(-1.).offset(p.phi)
+    };
+    let [qgate, qbulk, qdrn] = if model.capMod == 0 {
         let [gate, bulk, drain] = cap_zero(
             &CapZeroBias {
-                gate: Vgs_eff,
-                body_cv: VbseffCV,
-                surface: pParam.k1ox * sqrtPhis,
-                drain: Vds,
-                bulk_factor: Abulk0_Q * pParam.abulkCVfactor,
+                gate,
+                body_cv,
+                surface: root.scale(p.k1ox),
+                drain,
+                bulk_factor: bulk,
             },
             CapZeroParameters {
-                flatband: pParam.vfbcv,
-                phi: pParam.phi,
-                body_effect: pParam.k1ox,
-                oxide_area: model.coxe * pParam.weffCV * pParam.leffCV * here.nf,
+                flatband: p.vfbcv,
+                phi: p.phi,
+                body_effect: p.k1ox,
+                oxide_area: area,
                 partition: model.xpart,
             },
         )?;
-        let coordinates = [
-            [dVgs_eff_dVg, 0., 0.],
-            [0., 0., dVbseffCV_dVb],
-            [0., 0., pParam.k1ox * dsqrtPhis_dVb * dVbseff_dVb],
-            [0., 1., 0.],
-            [0., 0., pParam.abulkCVfactor * dAbulk0_Q_dVb * dVbseff_dVb],
-        ];
-        let [gg, gd, gb] = gate.project(&coordinates);
-        let [bg, bd, bb] = bulk.project(&coordinates);
-        let [dg, dd, db] = drain.project(&coordinates);
-        qgate = gate.value;
-        qbulk = bulk.value;
-        qdrn = drain.value;
-        here.cggb = gg;
-        here.cgdb = gd;
-        here.cgsb = -(gg + gd + gb);
-        here.cbgb = bg;
-        here.cbdb = bd;
-        here.cbsb = -(bg + bd + bb);
-        here.cdgb = dg;
-        here.cddb = dd;
-        here.cdsb = -(dg + dd + db);
+        [gate.value, bulk.value, drain.value]
     } else {
-        if Vbseff < 0.0 {
-            VbseffCV = Vbseff;
-            dVbseffCV_dVb = 1.0;
-        } else {
-            VbseffCV = pParam.phi - Phis;
-            dVbseffCV_dVb = -dPhis_dVb;
-        }
-        CoxWL = model.coxe * pParam.weffCV * pParam.leffCV * here.nf;
-        let (value, voltage_partial, factor_partial) = if model.cvchargeMod == 0 {
-            let (value, voltage_partial, factor_partial) =
-                thermal_softplus(&(Vgst - pParam.voffcv), &(n * pParam.noff), Vtm)?;
-            (value, voltage_partial, factor_partial * pParam.noff)
+        let vgst = Local::new(
+            electro.Vgst.clone(),
+            [
+                electro.dVgs_eff_dVg,
+                -electro.dVth_dVd,
+                -electro.dVth_dVb * body_partial,
+            ],
+        );
+        let slope = Local::new(
+            electro.n.clone(),
+            [0., electro.dn_dVd, electro.dn_dVb * body_partial],
+        );
+        let (overdrive, _, _) = if model.cvchargeMod == 0 {
+            thermal_softplus(&vgst.offset(-p.voffcv), &slope.scale(p.noff), electro.Vtm)?
         } else {
             effective_overdrive(
-                &Vgst,
-                &n,
-                Vtm,
-                pParam.mstarcv,
-                pParam.voffcbncv,
-                model.coxe / pParam.cdep0,
+                &vgst,
+                &slope,
+                electro.Vtm,
+                p.mstarcv,
+                p.voffcbncv,
+                model.coxe / p.cdep0,
             )?
         };
-        Vgsteff = value;
-        dVgsteff_dVg = voltage_partial * dVgs_eff_dVg;
-        dVgsteff_dVd = factor_partial.mul_add(dn_dVd, -voltage_partial * dVth_dVd);
-        dVgsteff_dVb = factor_partial.mul_add(dn_dVb, -voltage_partial * dVth_dVb);
-        if model.capMod == 1 {
-            Vfb = here.vfbzb;
-            V3 = Vfb - Vgs_eff + VbseffCV - DELTA_3;
-            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * Vfb.abs())?;
-            T1 = flatband_slope;
-            Vfbeff = Vfb - flatband_shift;
-            dVfbeff_dVg = T1 * dVgs_eff_dVg;
-            dVfbeff_dVb = -T1 * dVbseffCV_dVb;
-            Qac0 = -CoxWL * flatband_shift;
-            dQac0_dVg = CoxWL * dVfbeff_dVg;
-            dQac0_dVb = CoxWL * dVfbeff_dVb;
-            T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
-            let (charge, slope) = depletion_charge(pParam.k1ox, T3)?;
-            Qsub0 = CoxWL * charge;
-            T2 = CoxWL * slope;
-            dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg);
-            dQsub0_dVd = -T2 * dVgsteff_dVd;
-            dQsub0_dVb = -T2 * (dVfbeff_dVb + dVbseffCV_dVb + dVgsteff_dVb);
-            AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
-            dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
-            VdsatCV = Vgsteff / AbulkCV;
-            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4)?;
-            VdseffCV = smoothing.effective;
-            dVdseffCV_dVg = smoothing.saturation_partial * (1.0 / AbulkCV);
-            dVdseffCV_dVd = smoothing.drain_partial;
-            dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
-            let [inversion, bulk, source] =
-                channel_inversion(&Vgsteff, &VdseffCV, &AbulkCV, &CoxWL, model.xpart, 1e-20)?;
-            let chain = ChargeChain {
-                overdrive: [dVgsteff_dVg, dVgsteff_dVd, dVgsteff_dVb],
-                drain: [
-                    dVdseffCV_dVg * dVgsteff_dVg,
-                    dVdseffCV_dVg.mul_add(dVgsteff_dVd, dVdseffCV_dVd),
-                    dVdseffCV_dVg.mul_add(dVgsteff_dVb, dVdseffCV_dVb),
-                ],
-                bulk: [0., 0., dAbulkCV_dVb],
-                relative_oxide: [0.; 3],
-            };
-            let [ig, id, ib] = chain.apply(&inversion);
-            [Cbg1, Cbd1, Cbb1] = chain.apply(&bulk);
-            [Csg, Csd, Csb] = chain.apply(&source);
-            Cgg1 = ig - Cbg1;
-            Cgd1 = id - Cbd1;
-            Cgb1 = ib - Cbb1;
-            qgate = inversion.value - bulk.value;
-            qbulk = bulk.value;
-            qsrc = source.value;
-            qgate += Qac0 + Qsub0;
-            qbulk -= (Qac0 + Qsub0);
-            qdrn = -(qgate + qbulk + qsrc);
-            Cgg = dQac0_dVg + dQsub0_dVg + Cgg1;
-            Cgd = dQsub0_dVd + Cgd1;
-            Cgb = dQac0_dVb + dQsub0_dVb + Cgb1;
-            Cbg = Cbg1 - dQac0_dVg - dQsub0_dVg;
-            Cbd = Cbd1 - dQsub0_dVd;
-            Cbb = Cbb1 - dQac0_dVb - dQsub0_dVb;
-            Cgb *= dVbseff_dVb;
-            Cbb *= dVbseff_dVb;
-            Csb *= dVbseff_dVb;
-            here.cggb = Cgg;
-            here.cgsb = -(Cgg + Cgd + Cgb);
-            here.cgdb = Cgd;
-            here.cdgb = -(Cgg + Cbg + Csg);
-            here.cdsb = (Cgg + Cgd + Cgb + Cbg + Cbd + Cbb + Csg + Csd + Csb);
-            here.cddb = -(Cgd + Cbd + Csd);
-            here.cbgb = Cbg;
-            here.cbsb = -(Cbg + Cbd + Cbb);
-            here.cbdb = Cbd;
-        } else if model.capMod == 2 {
-            V3 = here.vfbzb - Vgs_eff + VbseffCV - DELTA_3;
-            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * here.vfbzb.abs())?;
-            T1 = flatband_slope;
-            Vfbeff = here.vfbzb - flatband_shift;
-            dVfbeff_dVg = T1 * dVgs_eff_dVg;
-            dVfbeff_dVb = -T1 * dVbseffCV_dVb;
-            Cox = here.coxp;
-            Tox = 1.0e8 * here.toxp;
-            T0 = (Vgs_eff - VbseffCV - here.vfbzb) / Tox;
-            dT0_dVg = dVgs_eff_dVg / Tox;
-            dT0_dVb = -dVbseffCV_dVb / Tox;
-            tmp = T0 * pParam.acde;
-            if (-EXP_THRESHOLD < tmp) && (tmp < EXP_THRESHOLD) {
-                Tcen = pParam.ldeb * exp(tmp);
-                dTcen_dVg = pParam.acde * Tcen;
-                dTcen_dVb = dTcen_dVg * dT0_dVb;
-                dTcen_dVg *= dT0_dVg;
-            } else if tmp <= -EXP_THRESHOLD {
-                Tcen = pParam.ldeb * MIN_EXP;
-                dTcen_dVb = 0.0;
-                dTcen_dVg = dTcen_dVb;
+        let flatband_argument = gate
+            .clone()
+            .scale(-1.)
+            .add(&body_cv)
+            .offset(here.vfbzb - DELTA_3);
+        let (flatband_shift, _) = smooth_positive(flatband_argument, DELTA_3 * here.vfbzb.abs())?;
+        let flatband = flatband_shift.clone().scale(-1.).offset(here.vfbzb);
+        let effective_area = if model.capMod == 1 {
+            c(area)
+        } else {
+            let field = gate
+                .clone()
+                .add(&body_cv.clone().scale(-1.))
+                .offset(-here.vfbzb)
+                .scale(p.acde / (1e8 * here.toxp));
+            let centroid = if field.compare(-EXP_THRESHOLD) != Some(Ordering::Greater) {
+                c(p.ldeb * MIN_EXP)
+            } else if field.compare(EXP_THRESHOLD) != Some(Ordering::Less) {
+                c(p.ldeb * MAX_EXP)
             } else {
-                Tcen = pParam.ldeb * MAX_EXP;
-                dTcen_dVb = 0.0;
-                dTcen_dVg = dTcen_dVb;
-            }
-            LINK = 1.0e-3 * here.toxp;
-            let centroid = smooth_drain(pParam.ldeb, Tcen, LINK)?;
-            Tcen = centroid.effective;
-            T1 = centroid.drain_partial;
-            dTcen_dVg *= T1;
-            dTcen_dVb *= T1;
-            Ccen = epssub / Tcen;
-            T2 = Cox / (Cox + Ccen);
-            Coxeff = T2 * Ccen;
-            T3 = -Ccen / Tcen;
-            dCoxeff_dVg = T2 * T2 * T3;
-            dCoxeff_dVb = dCoxeff_dVg * dTcen_dVb;
-            dCoxeff_dVg *= dTcen_dVg;
-            CoxWLcen = CoxWL * Coxeff / model.coxe;
-            Qac0 = -CoxWLcen * flatband_shift;
-            QovCox = Qac0 / Coxeff;
-            dQac0_dVg = CoxWLcen * dVfbeff_dVg + QovCox * dCoxeff_dVg;
-            dQac0_dVb = CoxWLcen * dVfbeff_dVb + QovCox * dCoxeff_dVb;
-            T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
-            let (charge, slope) = depletion_charge(pParam.k1ox, T3)?;
-            Qsub0 = CoxWLcen * charge;
-            T2 = CoxWLcen * slope;
-            QovCox = Qsub0 / Coxeff;
-            dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg) + QovCox * dCoxeff_dVg;
-            dQsub0_dVd = -T2 * dVgsteff_dVd;
-            dQsub0_dVb = -T2 * (dVfbeff_dVb + dVbseffCV_dVb + dVgsteff_dVb) + QovCox * dCoxeff_dVb;
-            (VgDP, dVgDP_dVg) =
-                charge_overdrive(Vgsteff, pParam.k1ox, pParam.moin, Vtm, pParam.sqrtPhi)?;
-            Tox += Tox;
-            T0 = (Vgsteff + here.vtfbphi2) / Tox;
-            tmp = exp(model.bdos * 0.7 * log(T0));
-            T1 = 1.0 + tmp;
-            T2 = model.bdos * 0.7 * tmp / (T0 * Tox);
-            Tcen = model.ados * 1.9e-9 / T1;
-            dTcen_dVg = -Tcen * T2 / T1;
-            dTcen_dVd = dTcen_dVg * dVgsteff_dVd;
-            dTcen_dVb = dTcen_dVg * dVgsteff_dVb;
-            dTcen_dVg *= dVgsteff_dVg;
-            Ccen = epssub / Tcen;
-            T0 = Cox / (Cox + Ccen);
-            Coxeff = T0 * Ccen;
-            T1 = -Ccen / Tcen;
-            dCoxeff_dVg = T0 * T0 * T1;
-            dCoxeff_dVd = dCoxeff_dVg * dTcen_dVd;
-            dCoxeff_dVb = dCoxeff_dVg * dTcen_dVb;
-            dCoxeff_dVg *= dTcen_dVg;
-            CoxWLcen = CoxWL * Coxeff / model.coxe;
-            AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
-            dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
-            VdsatCV = VgDP / AbulkCV;
-            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4)?;
-            VdseffCV = smoothing.effective;
-            dVdseffCV_dVg = smoothing.saturation_partial * (dVgDP_dVg / AbulkCV);
-            dVdseffCV_dVd = smoothing.drain_partial;
-            dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
-            let [inversion, bulk, source] =
-                channel_inversion(&VgDP, &VdseffCV, &AbulkCV, &CoxWLcen, model.xpart, 1e-20)?;
-            let chain = ChargeChain {
-                overdrive: [dVgsteff_dVg, dVgsteff_dVd, dVgsteff_dVb]
-                    .map(|slope| slope * dVgDP_dVg),
-                drain: [
-                    dVdseffCV_dVg * dVgsteff_dVg,
-                    dVdseffCV_dVg.mul_add(dVgsteff_dVd, dVdseffCV_dVd),
-                    dVdseffCV_dVg.mul_add(dVgsteff_dVb, dVdseffCV_dVb),
-                ],
-                bulk: [0., 0., dAbulkCV_dVb],
-                relative_oxide: [dCoxeff_dVg, dCoxeff_dVd, dCoxeff_dVb].map(|slope| slope / Coxeff),
+                field.exp().scale(p.ldeb)
             };
-            [Cgg1, Cgd1, Cgb1] = chain.apply(&inversion);
-            [Cbg1, Cbd1, Cbb1] = chain.apply(&bulk);
-            [Csg, Csd, Csb] = chain.apply(&source);
-            qgate = inversion.value;
-            qbulk = bulk.value;
-            qsrc = source.value;
-            qgate += Qac0 + Qsub0 - qbulk;
-            qbulk -= (Qac0 + Qsub0);
-            qdrn = -(qgate + qbulk + qsrc);
-            Cbg = Cbg1 - dQac0_dVg - dQsub0_dVg;
-            Cbd = Cbd1 - dQsub0_dVd;
-            Cbb = Cbb1 - dQac0_dVb - dQsub0_dVb;
-            Cgg = Cgg1 - Cbg;
-            Cgd = Cgd1 - Cbd;
-            Cgb = Cgb1 - Cbb;
-            Cgb *= dVbseff_dVb;
-            Cbb *= dVbseff_dVb;
-            Csb *= dVbseff_dVb;
-            here.cggb = Cgg;
-            here.cgsb = -(Cgg + Cgd + Cgb);
-            here.cgdb = Cgd;
-            here.cdgb = -(Cgg + Cbg + Csg);
-            here.cdsb = (Cgg + Cgd + Cgb + Cbg + Cbd + Cbb + Csg + Csd + Csb);
-            here.cddb = -(Cgd + Cbd + Csd);
-            here.cbgb = Cbg;
-            here.cbsb = -(Cbg + Cbd + Cbb);
-            here.cbdb = Cbd;
-        }
-    }
-    if !goto_finished {
-        here.csgb = -here.cggb - here.cdgb - here.cbgb;
-        here.csdb = -here.cgdb - here.cddb - here.cbdb;
-        here.cssb = -here.cgsb - here.cdsb - here.cbsb;
-        here.cgbb = -here.cgdb - here.cggb - here.cgsb;
-        here.cdbb = -here.cddb - here.cdgb - here.cdsb;
-        here.cbbb = -here.cbgb - here.cbdb - here.cbsb;
-        here.csbb = -here.cgbb - here.cdbb - here.cbbb;
-        here.qgate = qgate;
-        here.qbulk = qbulk;
-        here.qdrn = qdrn;
-        here.qsrc = -(qgate + qbulk + qdrn);
-        if ((here.trnqsMod) != 0) || ((here.acnqsMod) != 0) {
-            qcheq = -(qbulk + qgate);
-            here.qchqs = qcheq;
-            here.cqgb = -(here.cggb + here.cbgb);
-            here.cqdb = -(here.cgdb + here.cbdb);
-            here.cqsb = -(here.cgsb + here.cbsb);
-            here.cqbb = -(here.cqgb + here.cqdb + here.cqsb);
-            CoxWL = model.coxe * pParam.weffCV * here.nf * pParam.leffCV;
-            T1 = here.gcrg / CoxWL;
-            here.gtau = T1 * ScalingFactor;
-            if here.acnqsMod != 0 {
-                here.taunet = 1.0 / T1;
-            }
-            ckt.set_state0(state::QCHEQ, qcheq);
-            if (ckt.mode() & mode::MODEINITTRAN) != 0 {
-                ckt.set_state1(state::QCHEQ, ckt.state0(state::QCHEQ));
-            }
-            if here.trnqsMod != 0 {
-                (geq, ceq) = ckt.integrate(0.0, state::QCHEQ)?;
-            }
-        }
-    }
-    Ok(IntrinsicCharges { qbulk, qdrn, qgate })
+            let centroid = smooth_drain(c(p.ldeb), centroid, 1e-3 * here.toxp)?.effective;
+            let oxide = c(electro.epssub * here.coxp)
+                .divide(&centroid.scale(here.coxp).offset(electro.epssub))?;
+            oxide.scale(area / model.coxe)
+        };
+        let accumulation = effective_area.clone().multiply(&flatband_shift).scale(-1.);
+        let depletion_argument = gate
+            .add(&flatband.scale(-1.))
+            .add(&body_cv.scale(-1.))
+            .add(&overdrive.clone().scale(-1.));
+        let (depletion, _) = depletion_charge(p.k1ox, depletion_argument)?;
+        let depletion = effective_area.clone().multiply(&depletion);
+        let (inversion_overdrive, inversion_area) = if model.capMod == 1 {
+            (overdrive, effective_area)
+        } else {
+            let field = overdrive
+                .clone()
+                .offset(here.vtfbphi2)
+                .scale(1. / (2e8 * here.toxp));
+            let power = field.ln()?.scale(model.bdos * 0.7).exp();
+            let centroid = c(model.ados * 1.9e-9).divide(&power.offset(1.))?;
+            let oxide = c(electro.epssub * here.coxp)
+                .divide(&centroid.scale(here.coxp).offset(electro.epssub))?;
+            let (adjusted, _) =
+                charge_overdrive(overdrive, p.k1ox, p.moin, electro.Vtm, p.sqrtPhi)?;
+            (adjusted, oxide.scale(area / model.coxe))
+        };
+        let saturation = inversion_overdrive.clone().divide(&bulk)?;
+        let effective = smooth_drain(saturation, drain, DELTA_4)?.effective;
+        let [inversion, bulk, source] = channel_inversion(
+            &inversion_overdrive,
+            &effective,
+            &bulk,
+            &inversion_area,
+            model.xpart,
+            1e-20,
+        )?;
+        let accumulated = accumulation.add(&depletion);
+        let qbulk = bulk.value.add(&accumulated.scale(-1.));
+        let qgate = inversion.value.clone().add(&qbulk.clone().scale(-1.));
+        let qdrn = inversion.value.add(&source.value).scale(-1.);
+        [qgate, qbulk, qdrn]
+    };
+    let [gg, gd, gb] = qgate.partials;
+    let [bg, bd, bb] = qbulk.partials;
+    let [dg, dd, db] = qdrn.partials;
+    here.cggb = gg;
+    here.cgdb = gd;
+    here.cgsb = -(gg + gd + gb);
+    here.cbgb = bg;
+    here.cbdb = bd;
+    here.cbsb = -(bg + bd + bb);
+    here.cdgb = dg;
+    here.cddb = dd;
+    here.cdsb = -(dg + dd + db);
+    here.csgb = -here.cggb - here.cdgb - here.cbgb;
+    here.csdb = -here.cgdb - here.cddb - here.cbdb;
+    here.cssb = -here.cgsb - here.cdsb - here.cbsb;
+    here.cgbb = -here.cgdb - here.cggb - here.cgsb;
+    here.cdbb = -here.cddb - here.cdgb - here.cdsb;
+    here.cbbb = -here.cbgb - here.cbdb - here.cbsb;
+    here.csbb = -here.cgbb - here.cdbb - here.cbbb;
+    here.qgate = qgate.primal();
+    here.qbulk = qbulk.primal();
+    here.qdrn = qdrn.primal();
+    here.qsrc = -(here.qgate + here.qbulk + here.qdrn);
+    Ok(IntrinsicCharges {
+        qgate: qgate.value,
+        qbulk: qbulk.value,
+        qdrn: qdrn.value,
+    })
 }
 
 /// Charge companion RHS current contributions.

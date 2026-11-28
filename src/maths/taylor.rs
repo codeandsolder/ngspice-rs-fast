@@ -5,7 +5,9 @@
 //! use coefficient recurrences, not differences of nearly equal samples.
 
 mod arithmetic;
+mod local;
 pub(crate) use arithmetic::{BranchComparison, ObservedDifferential};
+pub(crate) use local::Local;
 pub mod differential;
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
