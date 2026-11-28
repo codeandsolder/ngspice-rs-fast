@@ -8,7 +8,9 @@ use model_compact_intrinsic::{
     PreparedLegacyBsimModel, prepare_legacy_bsim_model,
 };
 use model_kernel_api::Artifact;
-use model_kernel_bsim::{INSTANCE_PARAMETERS, Instance, LegacyBsimKernel, legacy_bsim_artifact};
+use model_kernel_bsim::{
+    INSTANCE_PARAMETERS, Instance, LegacyBsimKernel, SeriesNodes, legacy_bsim_artifact,
+};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -228,36 +230,26 @@ impl InstanceInput {
         }
     }
 
-    fn shape(&self, compiled: &Compiled, instance: &DeviceInstance) -> SpiceResult<[bool; 2]> {
-        let bound = BoundParameters::bind(
-            compiled.physical.variant(),
-            ParameterScope::Instance,
-            INSTANCE_PARAMETERS[..GMIN]
-                .iter()
-                .copied()
-                .zip(self.slots[..GMIN].iter().copied().map(ParameterValue::Real)),
+    fn shape(&self, compiled: &Compiled, instance: &DeviceInstance) -> SpiceResult<SeriesNodes> {
+        let input = self.reference();
+        SeriesNodes::resolve(
+            &compiled.physical,
+            [input.drain_squares, input.source_squares],
         )
-        .map_err(|error| SpiceError::parse(instance.location.clone(), error.to_string()))?;
-        // Use the producer's exact topology decision. Invalid local geometry
-        // is never placed inside the declaration-scoped artifact cache.
-        let prepared = compiled
-            .physical
-            .prepare_instance(&bound)
-            .map_err(|error| SpiceError::parse(instance.location.clone(), error.to_string()))?;
-        Ok([
-            prepared.drain.series_conductance > 0.,
-            prepared.source.series_conductance > 0.,
-        ])
+        .map_err(|error| SpiceError::parse(instance.location.clone(), error.to_string()))
     }
 }
 
 fn artifact_for(
     model: &ResolvedModel<'_>,
     compiled: &Compiled,
-    input: &InstanceInput,
     instance: &DeviceInstance,
-    [drain_series, source_series]: [bool; 2],
+    shape: SeriesNodes,
 ) -> SpiceResult<Arc<Artifact<LegacyBsimKernel>>> {
+    let SeriesNodes {
+        drain: drain_series,
+        source: source_series,
+    } = shape;
     let cached = model.prepare(
         PreparationKey::LegacyBsimTopology {
             drain_series,
@@ -270,12 +262,8 @@ fn artifact_for(
             let digest = hash.finalize();
             let mut fingerprint = [0; 16];
             fingerprint.copy_from_slice(&digest[..16]);
-            legacy_bsim_artifact(
-                Arc::clone(&compiled.physical),
-                input.reference(),
-                fingerprint,
-            )
-            .map_err(|error| SpiceError::parse(instance.location.clone(), error.to_string()))
+            legacy_bsim_artifact(Arc::clone(&compiled.physical), shape, fingerprint)
+                .map_err(|error| SpiceError::parse(instance.location.clone(), error.to_string()))
         },
     )?;
     Ok(Arc::clone(cached.as_ref()))
@@ -299,8 +287,11 @@ pub(super) fn instantiate(
         input.apply(compiled.physical.variant(), field)?;
     }
     let shape = input.shape(&compiled, instance)?;
-    let artifact = artifact_for(model, &compiled, &input, instance, shape)?;
-    let [drain_series, source_series] = shape;
+    let artifact = artifact_for(model, &compiled, instance, shape)?;
+    let SeriesNodes {
+        drain: drain_series,
+        source: source_series,
+    } = shape;
     let source = SourceBinding {
         model_name: model.card().name.clone(),
         designator: 'm',

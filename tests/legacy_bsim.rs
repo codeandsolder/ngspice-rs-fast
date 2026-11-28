@@ -367,3 +367,55 @@ fn transient_currents_match_independent_forward_equivalent() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[test]
+fn physical_noise_matches_independent_native_dc_measurements() {
+    use ngspice_rs::analysis::RunConfig;
+    let reference = include_str!("fixtures/legacy_bsim/noise-dc.tsv");
+    let model = MODEL.replace("rsh=52", "rsh=0");
+    let temperature = 300.15;
+    let thermal = 4. * 1.380_648_52e-23 * temperature;
+    let cox = 3.453e-13_f64 / (0.024e-4);
+    let area = 8.3e-6 * 17.6e-6;
+    for row in reference.lines().filter(|line| !line.starts_with('#')) {
+        let [level, polarity, direction, id, gm] =
+            row.split('\t').collect::<Vec<_>>().try_into().unwrap();
+        let id = id.parse::<Real>().unwrap();
+        let gm = gm.parse::<Real>().unwrap();
+        let sign = if polarity == "n" { 1. } else { -1. };
+        let (vd, vg, vb) = if direction == "f" {
+            (0.8, 2., -0.2)
+        } else {
+            (-0.6, 1.5, -1.)
+        };
+        let family = if level == "4" { FAMILY1 } else { FAMILY2 };
+        // A unit transresistance CCVS observes the ideal drain voltage
+        // source current: each physical drain-source generator sees
+        // exactly 1 V/A transfer. No native noise state indices are used.
+        let source = format!(
+            "physical legacy BSIM noise\nvd d 0 {}\nvg g 0 {} ac 1\nvb b 0 {}\nm1 d g 0 b mm {GEOMETRY}\n.model mm {polarity}mos(level={level} {model} {family})\nh1 out 0 vd 1\n.options gmin=1e-15 reltol=1e-9 vntol=1e-10 abstol=1e-14\n.noise v(out) vg lin 3 1k 3k 1\n.end\n",
+            sign * vd,
+            sign * vg,
+            sign * vb
+        );
+        let netlist = parse(&source);
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let plots = plan.run_plots(&mut circuit, &config.context()).unwrap();
+        let spectrum = &plots[0];
+        let channel = thermal * (2. / 3.) * gm.abs();
+        for index in 0..3 {
+            let frequency = spectrum.value("frequency", index).unwrap().re;
+            let flicker = 2e-25 * 2. * (id.abs() / 2.).powf(1.2) / (frequency * area * cox.powi(2));
+            let out = spectrum.value("onoise_spectrum", index).unwrap().re;
+            close(
+                "noise output PSD",
+                out.powi(2),
+                channel + flicker,
+                3e-6,
+                1e-35,
+            );
+        }
+    }
+}

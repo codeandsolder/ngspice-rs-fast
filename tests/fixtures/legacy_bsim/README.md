@@ -18,3 +18,7 @@ b1acld.c/b2acld.c consume cdgb/cddb/cdsb without a matching permutation.
 Both direct and transformed native DC currents agree. Physical AC must
 agree with the transformed forward model, not the erroneous native
 reverse-mode AC matrix. No reference data is modified by the Rust solver.
+
+Transient witnesses use the same forward-equivalent model and gate ramps.
+The generator interpolates independently simulated terminal currents at six
+specified times away from the ramp corners, using a maximum step of 0.5 ns.

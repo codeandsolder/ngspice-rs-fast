@@ -235,7 +235,7 @@ fn unported_mos_levels_name_their_c_directory() {
     expect_not_ported("m1 d g 0 0 mm\n.model mm nmos(level=68)", "hisim2/");
     for level in [4, 5] {
         let netlist = deck(&format!(
-            "m1 d g 0 0 mm\n.model mm nmos(level={level} tox=.024)"
+            "m1 d g 0 0 mm\n.model mm nmos(level={level} tox=.024 vdd=5 phi=.75)"
         ));
         let circuit = Circuit::from_netlist(&netlist).unwrap();
         assert_eq!(circuit.device("m1").unwrap().model_name(), Some("mm"));

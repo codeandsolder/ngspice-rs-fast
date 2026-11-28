@@ -95,3 +95,25 @@ with tempfile.TemporaryDirectory(prefix="legacy-bsim-tran-") as directory:
             current = left[column] + fraction*(right[column]-left[column])
             rows.append(f"{time:.17e}\t{name}\t{current:.17e}")
 (out / "tran-forward-equivalent.tsv").write_text("\n".join(rows)+"\n")
+
+# Independent physical noise laws use measured DC current and gate slope.
+rows=['# ngspice 47 KLU: level, polarity, orientation, drain A, dId/dVg S']
+for level,polarity,direction in itertools.product((4,5),('n','p'),('f','r')):
+    sign=1 if polarity=='n' else -1
+    d=sign*(.8 if direction=='f' else -.6)
+    g=sign*(2 if direction=='f' else 1.5)
+    bulk=sign*(-.2 if direction=='f' else -1.)
+    # Direct DC is reliable in both orientations. Measure source current
+    # at three independent gate biases, not C's cached gm/noise state slot.
+    noise_model=base.replace('rsh=52', 'rsh=0')
+    deck=f'noise physical witness\nvd d 0 {d}\nvg g 0 {g}\nvb b 0 {bulk}\nm1 d g 0 b mm {geometry}\n.model mm {polarity}mos(level={level} {noise_model} {family[level]})\n.options gmin=1e-15 reltol=1e-10 abstol=1e-15 vntol=1e-11\n.control\nset numdgt=17\n'
+    for v in [g,g-1e-5,g+1e-5]:
+        deck+=f'alter vg {v:.17e}\nop\nprint i(vd)\n'
+    deck+='quit\n.endc\n.end\n'
+    with tempfile.TemporaryDirectory(prefix='legacy-bsim-noise-') as td:
+        path=Path(td)/'noise.cir';path.write_text(deck)
+        result=subprocess.run([args.ngspice,'-b',str(path)],cwd=td,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,check=True)
+    values=[float(x) for x in re.findall(r'^i\(vd\)\s*=\s*(\S+)',result.stdout,re.M)]
+    assert len(values)==3,result.stdout
+    rows.append(f'{level}\t{polarity}\t{direction}\t{-values[0]:.17e}\t{-(values[2]-values[1])/2e-5:.17e}')
+(out / "noise-dc.tsv").write_text('\n'.join(rows)+'\n')

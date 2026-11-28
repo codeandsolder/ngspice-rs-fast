@@ -37,6 +37,11 @@ temperature and gmin are prepared at a context boundary, never during a
 Newton evaluation. A candidate that changes the descriptor's topology must
 re-elaborate instead of reusing numerical rows or accepted state.
 
+Legacy Berkeley BSIM1 and BSIM2 are selected by model levels 4 and 5. Their
+separate typed constitutive models, series-node resolution and numerical trial
+policies come from the shared producer; source OFF and initial differential
+voltages are applied at the circuit boundary.
+
 Public terminal observations exclude hidden equations, while numerical
 coordinate bindings include them. ABI 4 independently declares ownership of
 cold-start initialization, limiting, and additional static convergence.
