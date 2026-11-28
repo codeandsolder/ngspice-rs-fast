@@ -1350,7 +1350,8 @@ impl RunConfig {
 
 /// Whether `apply` can accept `name` (with an effect or as a no-op).
 fn accepted(name: &str) -> bool {
-    PRINT_FLAGS.contains(&name)
+    model_normalize_ngspice::ltspice::output_options::is_projected(name)
+        || PRINT_FLAGS.contains(&name)
         || IGNORED_BY_C.iter().any(|(ignored, _)| *ignored == name)
         || matches!(
             name,
