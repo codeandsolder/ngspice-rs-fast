@@ -314,17 +314,7 @@ impl ModelBackend {
                     ]
                 }
             }
-            'q' => {
-                const {
-                    &[
-                        BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2]),
-                        BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal NPN", &[1])
-                            .for_family(ModelFamily::GummelPoonLegacyNpn),
-                        BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal PNP", &[1])
-                            .for_family(ModelFamily::GummelPoonLegacyPnp),
-                    ]
-                }
-            }
+            'q' => Self::bipolar_catalog(),
             'm' => {
                 const {
                     &[
@@ -378,26 +368,40 @@ impl ModelBackend {
             'o' => const { &[BackendSpec::new(Self::Ltra, "Lossy line", &[1])] },
             'y' => const { &[BackendSpec::new(Self::Txl, "TXL lossy line", &[1])] },
             'p' => const { &[BackendSpec::new(Self::Cpl, "Coupled line", &[1])] },
-            'a' => {
-                const {
-                    &[
-                        BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
-                        BackendSpec::new(Self::FrequencyTransfer, "Tabulated AC transfer", &[1])
-                            .for_family(ModelFamily::FrequencyTransfer),
-                        BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
-                            .for_family(ModelFamily::LogicEvent),
-                        BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
-                            .for_family(ModelFamily::LogicVoltage),
-                        BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
-                            .for_family(ModelFamily::TimedSwitch),
-                        BackendSpec::new(Self::PSwitch, "Continuous cubic switch", &[1])
-                            .for_family(ModelFamily::PSwitch),
-                        BackendSpec::new(Self::ASwitch, "Continuous analog switch", &[1])
-                            .for_family(ModelFamily::ASwitch),
-                    ]
-                }
-            }
+            'a' => Self::code_model_catalog(),
             _ => &[],
+        }
+    }
+
+    const fn bipolar_catalog() -> &'static [BackendSpec] {
+        const {
+            &[
+                BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2]),
+                BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal NPN", &[1])
+                    .for_family(ModelFamily::GummelPoonLegacyNpn),
+                BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal PNP", &[1])
+                    .for_family(ModelFamily::GummelPoonLegacyPnp),
+            ]
+        }
+    }
+
+    const fn code_model_catalog() -> &'static [BackendSpec] {
+        const {
+            &[
+                BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
+                BackendSpec::new(Self::FrequencyTransfer, "Tabulated AC transfer", &[1])
+                    .for_family(ModelFamily::FrequencyTransfer),
+                BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
+                    .for_family(ModelFamily::LogicEvent),
+                BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
+                    .for_family(ModelFamily::LogicVoltage),
+                BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
+                    .for_family(ModelFamily::TimedSwitch),
+                BackendSpec::new(Self::PSwitch, "Continuous cubic switch", &[1])
+                    .for_family(ModelFamily::PSwitch),
+                BackendSpec::new(Self::ASwitch, "Continuous analog switch", &[1])
+                    .for_family(ModelFamily::ASwitch),
+            ]
         }
     }
 
@@ -1103,47 +1107,63 @@ impl ModelContext {
     /// Exact identity of every immutable load setting. Ordinary floating
     /// equality does not distinguish signed zero, including swept values.
     pub(super) fn same_preparation(&self, other: &Self) -> bool {
-        if self.spice3_noise != other.spice3_noise || self.noise_analysis != other.noise_analysis {
-            return false;
-        }
-        let bits = |context: &Self| {
-            [
-                context.temperature,
-                context.nominal_temperature,
-                context.gmin,
-                context.reltol,
-                context.frequency,
-                context.pivot.absolute,
-                context.pivot.relative,
-                context.source_factor,
-            ]
-            .map(Real::to_bits)
+        // Exhaustive destructuring makes every new context field an explicit
+        // cache-key decision instead of silently reusing stale preparation.
+        let key = |context: &Self| {
+            let Self {
+                analysis_kind,
+                bias_analysis,
+                spice3_noise,
+                temperature,
+                nominal_temperature,
+                resistor_overrides,
+                instance_overrides,
+                gmin,
+                configured_gmin,
+                shunts,
+                geometry_scale,
+                reltol,
+                frequency,
+                pivot,
+                source_factor,
+                noise_analysis,
+            } = *context;
+            (
+                analysis_kind,
+                bias_analysis,
+                spice3_noise,
+                noise_analysis,
+                [
+                    temperature,
+                    nominal_temperature,
+                    gmin,
+                    configured_gmin,
+                    geometry_scale,
+                    reltol,
+                    frequency,
+                    pivot.absolute,
+                    pivot.relative,
+                    source_factor,
+                    shunts.capacitance,
+                ]
+                .map(Real::to_bits),
+                shunts.resistance.map(Real::to_bits),
+                resistor_overrides.map(|slot| {
+                    slot.map(|value| (value.topology(), value.device(), value.supplied().to_bits()))
+                }),
+                instance_overrides.map(|slot| {
+                    slot.map(|value| {
+                        (
+                            value.topology(),
+                            value.device(),
+                            value.parameter(),
+                            value.value().to_bits(),
+                        )
+                    })
+                }),
+            )
         };
-        bits(self) == bits(other)
-            && self.resistor_overrides.map(|slot| {
-                slot.map(|value| (value.topology(), value.device(), value.supplied().to_bits()))
-            }) == other.resistor_overrides.map(|slot| {
-                slot.map(|value| (value.topology(), value.device(), value.supplied().to_bits()))
-            })
-            && self.instance_overrides.map(|slot| {
-                slot.map(|value| {
-                    (
-                        value.topology(),
-                        value.device(),
-                        value.parameter(),
-                        value.value().to_bits(),
-                    )
-                })
-            }) == other.instance_overrides.map(|slot| {
-                slot.map(|value| {
-                    (
-                        value.topology(),
-                        value.device(),
-                        value.parameter(),
-                        value.value().to_bits(),
-                    )
-                })
-            })
+        key(self) == key(other)
     }
 
     pub(crate) fn validate(&self, location: &SourceLoc) -> SpiceResult<()> {

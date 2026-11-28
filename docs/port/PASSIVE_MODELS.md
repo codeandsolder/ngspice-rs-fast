@@ -291,8 +291,19 @@ copies: capacitor charge multiplies by m; inductor flux is S(I/m), with
 total branch current I. These are native prepared-model extensions, not a
 claim that PSpice accepts these instance keywords. Nonlinear mutual
 inductance is rejected until a coupled energy law is available.
-Source-specific non-UIC initial bias semantics require a separate producer
-policy; the native instance IC alone does not impose a DC clamp.
+Source-prepared non-UIC initialization binds the same typed physical bias
+policy as scalar C/L (#279). A polynomial device already owns a branch row:
+during the selected equilibrium, its capacitor equation becomes either
+`v = Vtarget` or `i = G(v - Vtarget)`; its inductor equation becomes
+`i = Itarget + Gv`. The branch current is still the signed terminal current.
+Ordinary DC sweeps without a selected constraint, AC perturbations, and
+transient physical equations use the original storage law. UIC evaluates the
+integrated polynomial at the supplied coordinate (including explicit zero);
+an omitted capacitor coordinate retains the native differential node hint
+unless the producer specifies a different default. An exact-history policy
+can also seed S(x) independently of a finite bias constraint without UIC.
+Candidate and temperature replacement retain the bound policy. A native
+instance IC alone does not impose a DC clamp.
 
 
 ## Explicit physical passive networks
@@ -301,6 +312,33 @@ The native normalized C/L grammar accepts explicit per-copy series resistance an
 
 For source-prepared bias, `pn_bias_op`, `pn_bias_dc`, `pn_bias_ac` and `pn_bias_tran` specify the per-copy constraint conductance; presence is significant (zero is a hard constraint). Analysis-dependent damping may be placed across the series inductance, storage or terminal nodes using `pn_gseries_{dc,ac,tran}`, `pn_gstorage_{dc,ac,tran}` or `pn_gterminal_{dc,ac,tran}` and their `_gmin` variants. The latter multiply configured junction gmin rather than continuation conductance. The corresponding `pn_gseries_noise`, `pn_gstorage_noise` and `pn_gterminal_noise` flags select physical thermal noise. The enclosing analysis selects damping even during UIC, independently of bias constraints.
 
+An independent terminal bias uses `pn_terminal_bias_{op,dc,ac,tran}` instead of `pn_bias_*`. It specifies an aggregate, not per-copy, conductance and uses aggregate inductor `ic` current. During the selected bias solve the primary capacitor is open, or the primary winding carries its prescribed current; the alternate terminal constraint replaces the ordinary shunt laws. Outside that phase the original physical network is restored. `pn_exact_ic=1` separately selects exact prescribed primary storage at non-UIC transient startup. `pn_parallel_ic` independently sets the initial voltage of the external parallel capacitance, when present. Without these selectors, ordinary native startup history is unchanged. The reported initial bias point and the physical right-limit storage state need not coincide, including with derivative-constrained systems.
+
 Reporting and controlled-device references are independent of electrical loading. With explicit reporting, `pn_report_{dc,ac,tran}` selects the primary (0) or external terminal (1) current; omitted selectors default to terminal. The optional `_g` term multiplies external differential voltage, and `_rparallel_factor` multiplies the actual aggregate external parallel conductance before multiplying that voltage. These signed terms are projections of solved physical rows, never injected currents. `pn_control` selects the physical control current (0 primary, 1 terminal). The generated ideal port-current probe is not an independent excitation. An intrinsic branch current remains separately available as `i(<name>#intrinsic)` when a reported projection replaces its ordinary output name; the physical port probe is `i(v<name>#port)`.
 
+An explicitly prepared storage network with resolved `m=0` has no electrical objects, not even a port probe or a parasitic resistor. Its original current and otherwise unconnected written terminal voltages are zero output projections; surviving circuit terminals retain their physical solution. Behavioral current reads of the removed occurrence resolve to zero, while a true controlling-branch reference or mutual coupling cannot bind to it. This zero projection is a native observation law, not a physical voltage or winding constraint; source adapters must distinguish references that require a physical coordinate from display-only observations. Source parameter candidates re-elaborate the entire storage network when any original setter changes, including across zero multiplicity; an in-place native primitive override cannot represent those changes. Incremental additions that would connect a previously compiled observation-only voltage require complete source re-elaboration.
+
 Source-language omission rules, source-dependent parasitic placement, and reporting/control choices belong to preprocessing, not to the native solver. The independent synthetic fixtures in `tests/fixtures/passive_network` cover the observed distinctions without embedding a vendor-specific compatibility mode.
+
+### Signed physical coefficients
+
+Explicit native networks accept finite signed primary and auxiliary storage,
+series and shunt resistance, and analysis-dependent conductance. Parallel-copy
+scaling is algebraic: C times m, L and R divided by m, conductance times m.
+Zero multiplicity removes electrical objects. Nonzero coefficients may not
+underflow to zero or overflow; a resistor must have a finite reciprocal.
+A signed constitutive equation is not a claim of passivity: a coupled
+inductive system with negative self inductance is rejected by the existing
+positive-semidefinite requirement. Classical literal/model validation
+remains separate from the signed physical kernel.
+
+Thermal-generator law is independent of the electrical coefficient.
+`pn_rparallel_noise_abs=1` selects magnitude of the signed external
+parallel conductance in its thermal generator. Other explicit network
+losses require nonnegative thermal conductance; a negative generator is
+diagnosed when noise is requested, not when electrical analysis is performed.
+`pn_noiseless=1` removes all network noise generators without removing
+any electrical stamps. Both are occurrence-bound Boolean selectors.
+The voltage-source output-impedance thermal generator continues to use
+conductance magnitude. Ordinary resistor noise retains its own reference
+signed-density arithmetic.

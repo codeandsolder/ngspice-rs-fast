@@ -45,12 +45,12 @@ impl PassiveBias {
             } => {
                 voltage.is_finite()
                     && conductance
-                        .is_none_or(|g| g.is_finite() && g > 0. && (g * voltage).is_finite())
+                        .is_none_or(|g| g.is_finite() && g != 0. && (g * voltage).is_finite())
             }
             Self::Current {
                 current,
                 conductance,
-            } => current.is_finite() && conductance.is_finite() && conductance >= 0.,
+            } => current.is_finite() && conductance.is_finite(),
         }
     }
 
@@ -66,13 +66,15 @@ impl PassiveBias {
 }
 
 /// Immutable occurrence-specific constraints for the enclosing analysis.
-/// Storage IC is read only by the ordinary UIC state initialization.
+/// The storage IC is independent of the selected bias equation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PassiveInitialization {
     kind: StorageKind,
     storage_ic: Option<Real>,
     bias: BTreeMap<AnalysisKind, PassiveBias>,
     hard_branch: bool,
+    exact_history: bool,
+    terminal_bias: bool,
 }
 
 impl PassiveInitialization {
@@ -110,7 +112,65 @@ impl PassiveInitialization {
             storage_ic,
             bias,
             hard_branch,
+            exact_history: false,
+            terminal_bias: false,
         })
+    }
+
+    /// Select a bias network across the external terminal pair, independently
+    /// of the physical series path and shunts. Bias conductances are aggregate.
+    #[must_use = "the returned policy selects terminal rather than storage bias"]
+    pub const fn with_terminal_bias(mut self) -> Self {
+        self.terminal_bias = true;
+        self
+    }
+
+    /// Prescribe the storage history at transient startup even without UIC.
+    ///
+    /// # Errors
+    /// No explicit initial storage coordinate was supplied.
+    pub fn with_exact_history(mut self) -> SpiceResult<Self> {
+        if self.storage_ic.is_none() {
+            return Err(SpiceError::circuit(
+                "exact startup history requires a storage IC",
+            ));
+        }
+        self.exact_history = true;
+        Ok(self)
+    }
+
+    pub(super) const fn exact_initial(&self) -> Option<Real> {
+        if self.exact_history {
+            self.storage_ic
+        } else {
+            None
+        }
+    }
+
+    pub(super) const fn terminal_bias(&self) -> bool {
+        self.terminal_bias
+    }
+
+    /// For an external bias, the main capacitor is open during bias and
+    /// the inductor carries the prescribed winding current. All terminal
+    /// conductance belongs to the separate terminal equation.
+    pub(super) fn primary_policy(&self) -> Self {
+        let mut primary = self.clone();
+        primary.terminal_bias = false;
+        if self.terminal_bias {
+            primary.hard_branch = false;
+            match self.kind {
+                StorageKind::Capacitor => primary.bias.clear(),
+                StorageKind::Inductor => {
+                    for constraint in primary.bias.values_mut() {
+                        if let PassiveBias::Current { conductance, .. } = constraint {
+                            *conductance = 0.;
+                        }
+                    }
+                }
+            }
+        }
+        primary
     }
 
     pub(super) fn check_kind(&self, kind: StorageKind) -> SpiceResult<()> {
@@ -138,7 +198,7 @@ impl PassiveInitialization {
         self.hard_branch
     }
 
-    fn active(&self, context: &StampContext<'_>) -> Option<PassiveBias> {
+    pub(super) fn active(&self, context: &StampContext<'_>) -> Option<PassiveBias> {
         if !context.mode.is_bias() {
             return None;
         }
@@ -177,30 +237,61 @@ impl PassiveInitialization {
         Ok(())
     }
 
-    /// Replace only the inductor's branch equation during bias. Its
-    /// terminal KCL current and physical flux state are unchanged.
-    pub(super) fn stamp_inductor(
+    /// Replace a storage device's owned branch equation during bias.
+    /// KCL always retains the physical terminal current. The ordinary
+    /// constitutive equation is restored outside the selected bias.
+    pub(super) fn stamp_owned_branch(
         &self,
         terminals: [NodeId; 2],
         row: usize,
         context: &mut StampContext<'_>,
     ) -> SpiceResult<bool> {
-        let Some(PassiveBias::Current {
-            current,
-            conductance,
-        }) = self.active(context)
-        else {
+        let Some(constraint) = self.active(context) else {
             return Ok(false);
+        };
+        let (voltage, current, rhs) = match constraint {
+            PassiveBias::Voltage {
+                voltage,
+                conductance: None,
+            } => (1., 0., voltage),
+            PassiveBias::Voltage {
+                voltage,
+                conductance: Some(g),
+            } => (-g, 1., -g * voltage),
+            PassiveBias::Current {
+                current,
+                conductance,
+            } => (-conductance, 1., current),
         };
         for (node, sign) in [(terminals[0], 1.), (terminals[1], -1.)] {
             if let Some(node_row) = context.unknowns.node_row(node) {
                 context.matrix.add(node_row, row, sign)?;
-                context.matrix.add(row, node_row, -sign * conductance)?;
+                if voltage != 0. {
+                    context.matrix.add(row, node_row, sign * voltage)?;
+                }
             }
         }
-        context.matrix.add(row, row, 1.)?;
-        context.rhs.add_to(row, current)?;
+        if current != 0. {
+            context.matrix.add(row, row, current)?;
+        }
+        context.rhs.add_to(row, rhs)?;
         Ok(true)
+    }
+
+    pub(super) fn stamp_terminal(
+        &self,
+        terminals: [NodeId; 2],
+        context: &mut StampContext<'_>,
+    ) -> SpiceResult<()> {
+        match self.kind {
+            StorageKind::Capacitor => self.stamp_capacitor(terminals, context),
+            StorageKind::Inductor => {
+                if let Some(PassiveBias::Current { conductance, .. }) = self.active(context) {
+                    crate::devices::rlc::stamp_conductance(terminals, conductance, context)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// The voltage-source branch does not persist electrically after bias.
@@ -279,11 +370,12 @@ impl NodeInitialization {
         }
         let mut bias = BTreeMap::new();
         for (analysis, voltage, conductance) in constraints {
-            if !(PassiveBias::Voltage {
-                voltage,
-                conductance: Some(conductance),
-            })
-            .validate()
+            if conductance <= 0.
+                || !(PassiveBias::Voltage {
+                    voltage,
+                    conductance: Some(conductance),
+                })
+                .validate()
             {
                 return Err(SpiceError::parse(
                     location,

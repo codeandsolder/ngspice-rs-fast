@@ -176,8 +176,12 @@ pub(super) fn instantiate(
     {
         return crate::devices::behavioural::rlc::instantiate(instance, nodes);
     }
-    if crate::devices::behavioural::dynamic::is_generated(instance) {
-        return crate::devices::behavioural::rlc::instantiate(instance, nodes);
+    if let Some(operator) = crate::devices::behavioural::dynamic::generated_operator(instance) {
+        use crate::devices::behavioural::{dynamic::GeneratedOperator, rlc, sampled};
+        return match operator {
+            GeneratedOperator::Derivative => rlc::instantiate(instance, nodes),
+            GeneratedOperator::SampledCurrent => sampled::instantiate(instance, nodes),
+        };
     }
     if matches!(instance.designator, 'b' | 'a') {
         return crate::devices::behavioural::instantiate(instance, nodes);
@@ -290,6 +294,12 @@ fn instantiate_passive(
             "ic" if kind != PassiveKind::Resistor => ic = Some(scalar_number(p)?),
             _ => return Err(unsupported_parameter(instance, p)),
         }
+    }
+    if kind != PassiveKind::Resistor && value < 0. {
+        return Err(SpiceError::parse(
+            instance.location.clone(),
+            "literal passive storage must be nonnegative",
+        ));
     }
     nodes.transaction(|nodes| {
         let terminals = [

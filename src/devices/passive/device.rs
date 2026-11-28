@@ -303,7 +303,7 @@ impl Device for ModelPassive {
         sources: &mut Vec<NoiseSource>,
     ) -> SpiceResult<DeviceNoise<'_>> {
         self.parameters.effective_value(context.model_context)?;
-        Ok(if self.parameters.kind == PassiveKind::Resistor {
+        if self.parameters.kind == PassiveKind::Resistor {
             let conductance = self
                 .parameters
                 .resistor_conductance(context.model_context, false)?;
@@ -339,8 +339,8 @@ impl Device for ModelPassive {
                 None => evaluate(&self.parameters.resistor_noise_parameters()),
             }
         } else {
-            DeviceNoise::Noiseless
-        })
+            Ok(DeviceNoise::Noiseless)
+        }
     }
     fn inductance(&self, context: &ModelContext) -> Option<SpiceResult<InductanceValue>> {
         (self.parameters.kind == PassiveKind::Inductor).then(|| {
@@ -348,6 +348,7 @@ impl Device for ModelPassive {
                 effective: self.parameters.effective_value(context)?,
                 coupling_base: self.parameters.coupling_value(context)?,
                 initial: self.initial_condition().unwrap_or(0.),
+                exact_startup: self.exact_startup_storage(),
             })
         })
     }

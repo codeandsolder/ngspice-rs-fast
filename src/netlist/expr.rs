@@ -10,20 +10,16 @@
 //!
 //! # Accepted syntax
 //!
-//! ```text
-//! sum     := [sign] term { ('+' | '-') term }
-//! term    := factor { ('*' | '/') factor }          (left associative)
-//! factor  := atom { ('^' | '**') atom }             (left associative, as in C)
-//! atom    := number | '-' number | identifier | call | '(' sum ')'
-//! call    := function '(' sum { ',' sum } ')'
-//!          | name '(' [ sum { ',' sum } ] ')'     (user `.func`, see below)
-//! ```
+//! Precedence (lowest first): conditional, logical OR, logical AND,
+//! comparisons, addition/subtraction, multiplication/division/remainder/
+//! integer division, power, then atomic logical negation. The conditional
+//! accumulator follows native numparam rather than behavioural precedence.
 //!
 //! A call to a name outside the [`Function`] allowlist is an
 //! [`ExprKind::UserCall`]; whether a `.func` defines it is decided during
 //! evaluation ([`crate::netlist::eval::FunctionScope`]).
 //!
-//! Precedence, tightest first: `^`/`**`, then `*` `/`, then `+` `-`. A sign at
+//! A sign at
 //! the start of an expression, group or argument binds like C's
 //! additive-level operator (`-2^2` is `-(2^2)`, `-a*b+1` is `(-(a*b))+1`).
 //! After a binary operator C accepts only `-` directly before a numeric
@@ -31,6 +27,8 @@
 //! rejects the other C-erroring forms (`2*+3`, `2*-a`, `2*-(3)`).
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
+
+pub use model_normalize_ngspice::native_scalar::{BinaryOp, Function, UnaryOp};
 
 /// A half-open source span.
 ///
@@ -79,6 +77,27 @@ impl SourceSpan {
     }
 }
 
+/// A macro body interpreted in the language of its eventual use site.
+///
+/// A valid definition may be accepted in just one phase: numparam and
+/// behavioural syntax have different operators and precedence. Diagnostics
+/// for the other phase are retained until a call selects that phase.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionBody {
+    /// Original text without the enclosing delimiters.
+    pub text: String,
+    /// Whether the definition uses braces or single quotes.
+    pub braced: bool,
+    /// Whether the delimiters are single quotes.
+    pub quoted: bool,
+    /// Physical and logical span of the original text.
+    pub span: SourceSpan,
+    /// Native scalar interpretation.
+    pub scalar: SpiceResult<Expr>,
+    /// Native behavioural interpretation.
+    pub behavioural: SpiceResult<crate::netlist::bexpr::BExpr>,
+}
+
 /// A parsed expression together with the text it was written as.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParameterExpression {
@@ -96,6 +115,10 @@ pub struct ParameterExpression {
     pub quoted: bool,
     /// Span of [`text`](Self::text), excluding enclosing delimiters.
     pub span: SourceSpan,
+    /// Retained native behavioural interpretation of a potentially dynamic
+    /// passive value. Other scalar sites never need this alternative.
+    pub behavioural_alternative:
+        Option<Box<SpiceResult<crate::netlist::bexpr::BehaviouralExpression>>>,
     /// The syntax tree. `root.span` excludes surrounding whitespace.
     pub root: Expr,
 }
@@ -155,6 +178,15 @@ impl Expr {
                 child(lhs)?;
                 child(rhs)?;
             }
+            ExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => {
+                child(condition)?;
+                child(then)?;
+                child(otherwise)?;
+            }
             ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
                 for argument in arguments {
                     child(argument)?;
@@ -179,6 +211,15 @@ impl Expr {
                 ExprKind::Binary { lhs, rhs, .. } => {
                     pending.push(rhs);
                     pending.push(lhs);
+                }
+                ExprKind::Ternary {
+                    condition,
+                    then,
+                    otherwise,
+                } => {
+                    pending.push(otherwise);
+                    pending.push(then);
+                    pending.push(condition);
                 }
                 ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
                     pending.extend(arguments.iter().rev());
@@ -220,6 +261,15 @@ pub enum ExprKind {
         /// Right operand.
         rhs: Box<Expr>,
     },
+    /// A conditional expression, selecting only one branch.
+    Ternary {
+        /// Condition (nonzero is true).
+        condition: Box<Expr>,
+        /// True branch.
+        then: Box<Expr>,
+        /// False branch.
+        otherwise: Box<Expr>,
+    },
     /// An allowlisted function call; `arguments.len() == function.arity()`.
     Call {
         /// The function.
@@ -241,32 +291,6 @@ pub enum ExprKind {
         /// Arguments in source order.
         arguments: Vec<Expr>,
     },
-}
-
-/// Prefix signs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnaryOp {
-    /// `+x`
-    Plus,
-    /// `-x`
-    Minus,
-}
-
-/// Binary arithmetic operators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryOp {
-    /// `+`
-    Add,
-    /// `-`
-    Sub,
-    /// `*`
-    Mul,
-    /// `/`
-    Div,
-    /// `^` or `**` (both spellings are one operator in C). Left associative:
-    /// `2^3^2` is `(2^3)^2 = 64` in C. C's default `^` is `pow(fabs(x), y)`
-    /// (xpressn.c `operate()`), so an evaluator must not use plain `powf`.
-    Pow,
 }
 
 /// Maximum parenthesis/call nesting accepted by the parser; deeper input is a
@@ -316,84 +340,7 @@ impl TreeBudget {
     }
 }
 
-macro_rules! functions {
-    ($($variant:ident => $name:literal / $arity:literal,)*) => {
-        /// The allowlisted numparam functions (a subset of `fmathS` in
-        /// `xpressn.c`). Statistical calls are realized separately from
-        /// ordinary deterministic math functions.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum Function {
-            $(
-                #[doc = concat!("`", $name, "`")]
-                $variant,
-            )*
-        }
-
-        impl Function {
-            /// Every allowlisted function, in `fmathS` order.
-            pub const ALL: &'static [Function] = &[$(Self::$variant,)*];
-
-            /// Looks a function up by (case-insensitive) name.
-            #[must_use = "the lookup result identifies the supported intrinsic function"]
-            pub fn from_name(name: &str) -> Option<Self> {
-                match name.to_ascii_lowercase().as_str() {
-                    $($name => Some(Self::$variant),)*
-                    _ => None,
-                }
-            }
-
-            /// Canonical lowercase name.
-            #[must_use = "the name is the canonical intrinsic function spelling"]
-            pub const fn name(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $name,)*
-                }
-            }
-
-            /// Required argument count: 2 for `pow`/`pwr`/`max`/`min`, else 1.
-            #[must_use = "the returned arity determines the required argument count"]
-            pub const fn arity(self) -> usize {
-                match self {
-                    $(Self::$variant => $arity,)*
-                }
-            }
-        }
-    };
-}
-
-functions! {
-    Sqr => "sqr" / 1,
-    Sqrt => "sqrt" / 1,
-    Sin => "sin" / 1,
-    Cos => "cos" / 1,
-    Exp => "exp" / 1,
-    Ln => "ln" / 1,
-    Arctan => "arctan" / 1,
-    Abs => "abs" / 1,
-    Pow => "pow" / 2,
-    Pwr => "pwr" / 2,
-    Max => "max" / 2,
-    Min => "min" / 2,
-    Int => "int" / 1,
-    Log => "log" / 1,
-    Log10 => "log10" / 1,
-    Sinh => "sinh" / 1,
-    Cosh => "cosh" / 1,
-    Tanh => "tanh" / 1,
-    Sgn => "sgn" / 1,
-    Ceil => "ceil" / 1,
-    Floor => "floor" / 1,
-    Asin => "asin" / 1,
-    Acos => "acos" / 1,
-    Atan => "atan" / 1,
-    Asinh => "asinh" / 1,
-    Acosh => "acosh" / 1,
-    Atanh => "atanh" / 1,
-    Tan => "tan" / 1,
-    Nint => "nint" / 1,
-}
-
 /// C `fmathS` names outside the allowlist. A call to one parses as
 /// [`ExprKind::UserCall`] and is rejected as not yet ported during evaluation
 /// unless a `.func` of that name is in scope.
-pub const EXCLUDED_FUNCTIONS: &[&str] = &["ternary_fcn", "vec", "var"];
+pub const EXCLUDED_FUNCTIONS: &[&str] = &["vec", "var"];

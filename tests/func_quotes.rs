@@ -392,8 +392,10 @@ fn function_errors_are_explicit() {
     // A self reference through a function is a self reference.
     let e = scope_error(".func f(x) {x*k}\n.param k={f(1)}").to_string();
     assert!(e.contains("undefined parameter 'k'"), "{e}");
-    // Excluded numparam built-ins without a .func are not yet ported.
-    let n = deck("r1 a 0 {ternary_fcn(1,2,3)}");
+    // The intrinsic conditional selects the true branch without evaluating the other.
+    assert_eq!(probe("", "ternary_fcn(1,2,sqrt(-1))"), 2.0);
+    // String-valued numparam built-ins remain unsupported.
+    let n = deck("r1 a 0 {vec(1)}");
     let e = literalize(&n).unwrap_err();
     assert!(e.is_not_yet_ported(), "{e}");
     assert!(e.to_string().contains("f.cir:2:9"), "{e}");
@@ -611,4 +613,34 @@ fn writer_round_trips_functions_and_quotes() {
     let quoted = deck(".param a='1'");
     let braced = deck(".param a={1}");
     assert!(!semantic_eq(&quoted, &braced));
+}
+
+#[test]
+fn conditional_macros_bind_arguments_only_when_selected() {
+    let body = ".func select(c,a,b) {ternary_fcn(c>0.5,a,b)}\n.func outer(x) {select(x,1/0,7)}";
+    assert_eq!(probe(body, "outer(0)"), 7.0);
+    assert_eq!(probe(body, "select(1,3,sqrt(-1))"), 3.0);
+    let error = scope_error(&format!("{body}\n.param p=outer(1)"));
+    assert!(error.to_string().contains("division by zero"), "{error}");
+    // A reused argument is still a single scalar realization, even when
+    // its first use is reached through a nested function.
+    assert_eq!(
+        probe(
+            ".func twice(x) {x-x}\n.func sample() {aunif(5,1)}",
+            "twice(sample())"
+        ),
+        0.0
+    );
+}
+
+#[test]
+fn static_and_behavioural_interpretations_are_separately_positioned() {
+    let n = deck(".func f(x) {x*-sin(x)}\nb1 y 0 v=f(1)");
+    let function = &n.functions[0];
+    assert!(function.body.scalar.is_err());
+    assert!(function.body.behavioural.is_ok());
+    assert!(literalize(&n).is_ok());
+    let invalid = deck(".func f(x) {x*-sin(x)}\n.param a=f(1)");
+    let error = ParamScope::for_netlist(&invalid).unwrap_err();
+    assert!(error.to_string().contains("f.cir:2:"), "{error}");
 }

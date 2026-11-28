@@ -378,6 +378,8 @@ pub struct MutualTerm {
     /// The coupled inductor's `ic=` (C `INDinitCond`, zero when absent),
     /// which `INDload` uses for the mutual flux of a `uic` first step.
     pub initial: Real,
+    /// Optional exact non-UIC startup current of the coupled winding.
+    pub exact_startup: Option<Real>,
 }
 
 /// The inductance of an inductor, as mutual coupling sees it
@@ -392,6 +394,8 @@ pub struct InductanceValue {
     pub coupling_base: Real,
     /// The `ic=` initial current (C `INDinitCond`, zero when absent).
     pub initial: Real,
+    /// Exact startup current, if prescribed independently of bias.
+    pub exact_startup: Option<Real>,
 }
 
 /// What a K (mutual inductance) device couples: every pair of the named
@@ -1080,6 +1084,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Prescribed storage coordinate independent of the solved startup bias.
+    fn exact_startup_storage(&self) -> Option<Real> {
+        self.passive_initialization()
+            .and_then(crate::devices::passive_bias::PassiveInitialization::exact_initial)
+    }
+
     /// True when bias equations need physical nodal continuation rather
     /// than perturbing a numerical pivot diagonal.
     fn has_passive_bias(&self) -> bool {
@@ -1097,7 +1107,7 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// Whether real loads require the enclosing analysis selected by the
     /// analysis plan, independently of numerical regularization.
     fn requires_analysis_context(&self) -> bool {
-        self.has_passive_bias()
+        self.has_passive_bias() || self.exact_startup_storage().is_some()
     }
 
     /// How many device-local coordinates the device adds to the MNA
@@ -1779,6 +1789,20 @@ pub trait Device: fmt::Debug + std::any::Any {
         }
     }
 
+    /// Stage an effective recipe before the candidate's physical preparation.
+    /// Ordinary devices validate immediately; prepared kernels validate the
+    /// final combined recipe once at the candidate boundary.
+    /// # Errors
+    /// Invalid parameter or structural change.
+    fn stage_bound_parameter(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+        value: Real,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Box<dyn Device>> {
+        self.with_bound_parameter(key, value, context)
+    }
+
     /// Whether typed instance setters preserve the selected model declaration.
     /// Model-backed devices opt in only when no setter can change model
     /// selection (including binning). The candidate validator still checks
@@ -1787,13 +1811,13 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
-    /// Whether this device needs context preparation, independently of batching.
+    /// Whether this native device needs context preparation independently of batching.
+    /// Prepared artifact lanes use the separate run-instance contract.
     fn needs_context_preparation(&self) -> bool {
-        self.prepared_batch_key().is_some()
+        false
     }
 
-    /// Reprepare immutable context-dependent data at a context transition.
-    /// Ordinary native devices need no replacement.
+    /// Reprepare immutable context-dependent native data at a context transition.
     /// # Errors
     /// Invalid effective physical parameters.
     fn reprepare_context(
@@ -1801,6 +1825,29 @@ pub trait Device: fmt::Debug + std::any::Any {
         _context: &crate::devices::ModelContext,
     ) -> SpiceResult<Option<Box<dyn Device>>> {
         Ok(None)
+    }
+
+    /// Construct a run-local prepared recipe. A previous candidate may lend
+    /// immutable singleton data; grouped physical lanes are bound by its plan.
+    /// # Errors
+    /// Invalid context or unsupported prepared device.
+    fn prepared_run_instance(
+        &self,
+        _context: &crate::devices::ModelContext,
+        _previous: Option<&dyn Device>,
+    ) -> SpiceResult<Box<dyn Device>> {
+        Err(SpiceError::circuit(
+            "device has no prepared run implementation",
+        ))
+    }
+
+    /// Validate and activate an independent singleton's prepared data.
+    /// # Errors
+    /// Invalid physical parameters or unsupported prepared device.
+    fn activate_prepared_scalar(&self) -> SpiceResult<()> {
+        Err(SpiceError::circuit(
+            "device has no prepared scalar implementation",
+        ))
     }
 
     /// The canonical (lowercase, alias-folded) keyword of a settable real

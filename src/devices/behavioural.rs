@@ -39,6 +39,7 @@
 pub(super) mod dynamic;
 pub mod program;
 pub mod rlc;
+pub(super) mod sampled;
 pub mod xspice;
 
 use crate::maths::{SparseMatrix, Vector};

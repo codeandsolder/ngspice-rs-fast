@@ -5,8 +5,12 @@
 //! resolved separately; the winding, storage and terminal identities are
 //! intentionally distinct.
 
+mod absent;
+mod bias;
 mod damping;
+pub(super) use absent::AbsentStorage;
 mod report;
+use bias::TerminalBias;
 use damping::DampingShunt;
 pub use damping::{AnalysisDamping, ConductanceLaw};
 pub(super) use report::CurrentReportSpec;
@@ -14,11 +18,14 @@ pub use report::{CurrentReference, CurrentReporting, CurrentReportingLaw};
 
 use crate::devices::{
     Capacitor, Circuit, Device, IndependentSource, Inductor, Resistor, ResistorNoise, StorageKind,
+    ThermalConductance,
     elaboration::{ElaborationSize, reserve},
     passive_bias::PassiveInitialization,
     rlc::REACTIVE_STATE_COUNT,
     sources::{SourceExcitation, SourceInputs},
 };
+use std::sync::Arc;
+
 use crate::primitives::{Complex, NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 /// Resolved physical coefficients of one parallel copy of a storage network.
@@ -123,7 +130,6 @@ impl Element {
             Self::Damping(_) => return Err(SpiceError::circuit("unexpected scalar damping")),
         };
         if !original.is_finite()
-            || original < 0.
             || !value.is_finite()
             || (original != 0. && value == 0.)
             || matches!(scaled, Self::Resistance(r) if r == 0. || !(1. / r).is_finite())
@@ -152,7 +158,10 @@ pub struct PreparedPassiveNetwork {
     edges: Vec<Edge>,
     nodes: usize,
     temperature: Option<Real>,
+    noiseless: bool,
+    parallel_noise_magnitude: bool,
     initialization: Option<PassiveInitialization>,
+    parallel_initialization: Option<PassiveInitialization>,
     reporting: Option<CurrentReporting>,
     control: Option<CurrentReference>,
     primary_probe: bool,
@@ -264,11 +273,38 @@ impl PreparedPassiveNetwork {
             edges,
             nodes,
             temperature: input.temperature,
+            noiseless: false,
+            parallel_noise_magnitude: false,
             initialization,
+            parallel_initialization: None,
             reporting: None,
             control: None,
             primary_probe: false,
         }))
+    }
+
+    /// Prescribe independent initial voltage of the external parallel capacitance.
+    /// A zero capacitance removes that storage, including its initial voltage.
+    ///
+    /// # Errors
+    /// The voltage is nonfinite.
+    pub fn with_parallel_initial_voltage(mut self, voltage: Real) -> SpiceResult<Self> {
+        let policy = PassiveInitialization::new(StorageKind::Capacitor, Some(voltage), [])?
+            .with_exact_history()?;
+        if self
+            .edges
+            .iter()
+            .any(|edge| edge.role == Role::ParallelCapacitance)
+        {
+            self.parallel_initialization = Some(policy);
+        }
+        Ok(self)
+    }
+
+    fn terminal_bias(&self) -> Option<&PassiveInitialization> {
+        self.initialization
+            .as_ref()
+            .filter(|policy| policy.terminal_bias() && policy.has_constraints())
     }
 
     fn validate(
@@ -276,7 +312,6 @@ impl PreparedPassiveNetwork {
         initialization: Option<&PassiveInitialization>,
     ) -> SpiceResult<()> {
         if !input.multiplicity.is_finite()
-            || input.multiplicity < 0.
             || input
                 .temperature
                 .is_some_and(|t| !t.is_finite() || t <= -273.15)
@@ -287,7 +322,7 @@ impl PreparedPassiveNetwork {
                 input.parallel_capacitance,
             ]
             .iter()
-            .any(|v| !v.is_finite() || *v < 0.)
+            .any(|v| !v.is_finite())
             || [
                 input.series_inductance_shunt,
                 input.storage_shunt,
@@ -295,7 +330,7 @@ impl PreparedPassiveNetwork {
             ]
             .into_iter()
             .flatten()
-            .any(|r| !r.is_finite() || r <= 0. || !(1. / r).is_finite())
+            .any(|r| !r.is_finite() || r == 0. || !(1. / r).is_finite())
         {
             return Err(SpiceError::circuit("invalid passive network coefficients"));
         }
@@ -303,6 +338,29 @@ impl PreparedPassiveNetwork {
             policy.check_kind(input.kind)?;
         }
         Ok(())
+    }
+
+    /// Select thermal generator policy independently of electrical stamping.
+    #[must_use = "the returned network carries the selected thermal noise policy"]
+    pub const fn with_noise_policy(mut self, noiseless: bool, parallel_magnitude: bool) -> Self {
+        self.noiseless = noiseless;
+        self.parallel_noise_magnitude = parallel_magnitude;
+        self
+    }
+
+    fn resistor_noise(&self, role: Role, noisy: bool) -> ResistorNoise {
+        ResistorNoise {
+            noisy: noisy && !self.noiseless,
+            temperature: self.temperature,
+            thermal_conductance: if role == Role::ParallelResistance
+                && self.parallel_noise_magnitude
+            {
+                ThermalConductance::Magnitude
+            } else {
+                ThermalConductance::Nonnegative
+            },
+            ..Default::default()
+        }
     }
 
     /// Install an explicit current-reporting policy without changing the
@@ -364,7 +422,10 @@ impl PreparedPassiveNetwork {
 
     pub(super) fn size(&self) -> ElaborationSize {
         ElaborationSize::new(
-            self.edges.len() + 1 + usize::from(self.primary_probe),
+            self.edges.len()
+                + 1
+                + usize::from(self.primary_probe)
+                + usize::from(self.terminal_bias().is_some()),
             self.nodes - 1 + usize::from(self.primary_probe),
             self.edges
                 .iter()
@@ -393,11 +454,7 @@ impl PreparedPassiveNetwork {
             )?);
         }
         let mut devices: Vec<Box<dyn Device>> = Vec::new();
-        reserve(
-            &mut devices,
-            self.edges.len() + 1 + usize::from(self.primary_probe),
-            None,
-        )?;
+        reserve(&mut devices, self.size().devices, None)?;
         let primary = if self.primary_probe {
             format!("v{}#primary", binding.primary)
         } else {
@@ -416,6 +473,14 @@ impl PreparedPassiveNetwork {
             [positive, alias],
             report,
         )?));
+        let terminal_bias = self.terminal_bias().map(|policy| Arc::new(policy.clone()));
+        if let Some(policy) = &terminal_bias {
+            devices.push(Box::new(TerminalBias {
+                name: format!("{}#terminal_bias", binding.primary),
+                terminals: [alias, negative],
+                policy: Arc::clone(policy),
+            }));
+        }
         for edge in &self.edges {
             let name = edge.role.name(&binding.primary);
             let mut terminals = edge.nodes.map(|index| ids[index]);
@@ -428,18 +493,31 @@ impl PreparedPassiveNetwork {
                 )?));
                 terminals[0] = sense;
             }
+            // The alternate terminal bias replaces shunt paths; the ordinary
+            // series chain remains connected, with the primary storage open
+            // (C) or carrying its prescribed winding current (L).
+            let excluded = terminal_bias
+                .as_ref()
+                .filter(|_| edge.role != Role::SeriesResistance)
+                .cloned();
             let mut device: Box<dyn Device> = match edge.element {
-                Element::Resistance(r) => Box::new(Resistor::new(name, terminals, r)?.with_noise(
-                    ResistorNoise {
-                        temperature: self.temperature,
-                        ..Default::default()
-                    },
+                Element::Resistance(r) if excluded.is_some() => Box::new(DampingShunt::resistive(
+                    name,
+                    terminals,
+                    r,
+                    self.resistor_noise(edge.role, true),
+                    excluded,
                 )),
+                Element::Resistance(r) => Box::new(
+                    Resistor::new(name, terminals, r)?
+                        .with_noise(self.resistor_noise(edge.role, true)),
+                ),
                 Element::Damping(damping) => Box::new(DampingShunt {
                     name,
                     terminals,
                     damping,
-                    temperature: self.temperature,
+                    noise: self.resistor_noise(edge.role, damping.noisy),
+                    excluded_bias: excluded,
                 }),
                 Element::Storage(StorageKind::Capacitor, c) => {
                     Box::new(Capacitor::new(name, terminals, c, None)?)
@@ -450,6 +528,10 @@ impl PreparedPassiveNetwork {
             };
             if edge.role == Role::Primary
                 && let Some(policy) = &self.initialization
+            {
+                device.bind_passive_initialization(policy.primary_policy())?;
+            } else if edge.role == Role::ParallelCapacitance
+                && let Some(policy) = &self.parallel_initialization
             {
                 device.bind_passive_initialization(policy.clone())?;
             }
@@ -517,8 +599,7 @@ impl PreparedVoltageNetwork {
     /// Resolve voltage excitation and physical output coefficients.
     ///
     /// # Errors
-    /// Invalid excitation, nonfinite coefficients or temperature, negative
-    /// capacitance, or a nonzero resistance with nonfinite reciprocal.
+    /// Invalid excitation, nonfinite coefficients or temperature, or a nonzero resistance with nonfinite reciprocal.
     pub fn prepare(
         coefficients: VoltageNetworkCoefficients,
         inputs: SourceInputs,
@@ -527,9 +608,7 @@ impl PreparedVoltageNetwork {
             || (coefficients.series_resistance != 0.
                 && !(1. / coefficients.series_resistance).is_finite())
             || !coefficients.parallel_capacitance.is_finite()
-            || coefficients.parallel_capacitance < 0.
             || !coefficients.series_shunt_capacitance.is_finite()
-            || coefficients.series_shunt_capacitance < 0.
             || coefficients
                 .temperature
                 .is_some_and(|t| !t.is_finite() || t <= -273.15)
@@ -632,7 +711,7 @@ impl PreparedVoltageNetwork {
                 Resistor::new(Role::SeriesResistance.name(name), [source, output], series)?
                     .with_noise(ResistorNoise {
                         temperature: self.coefficients.temperature,
-                        absolute_thermal_conductance: true,
+                        thermal_conductance: ThermalConductance::Magnitude,
                         ..Default::default()
                     }),
             ));
@@ -666,6 +745,28 @@ pub(super) enum NetworkPlan {
 }
 
 impl NetworkPlan {
+    /// Detect a resolved zero-copy prepared network before dynamic expansion.
+    pub(super) fn is_removed(instance: &crate::netlist::ast::DeviceInstance) -> SpiceResult<bool> {
+        if !matches!(instance.designator, 'c' | 'l')
+            || !instance
+                .parameters
+                .iter()
+                .any(|p| crate::netlist::network_parameter(instance.designator, &p.name))
+        {
+            return Ok(false);
+        }
+        let Some(m) = instance.parameters.iter().rfind(|p| p.name == "m") else {
+            return Ok(false);
+        };
+        if super::factory::scalar_number(m)? != 0. {
+            return Ok(false);
+        }
+        Ok(matches!(
+            Self::prepare(instance)?,
+            Some(Self::Storage(None))
+        ))
+    }
+
     pub(super) fn prepare(
         instance: &crate::netlist::ast::DeviceInstance,
     ) -> SpiceResult<Option<Self>> {
@@ -785,8 +886,19 @@ impl NetworkPlan {
         let initialization = Self::initialization(kind, initial, multiplicity, values)?;
         let Some(mut network) = PreparedPassiveNetwork::prepare(&coefficients, initialization)?
         else {
+            report::parse(values, 0.)?;
+            report::parse_control(values)?;
             return Ok(Self::Storage(None));
         };
+        let flag = |key| match get(key).unwrap_or(0.) {
+            0. => Ok(false),
+            1. => Ok(true),
+            _ => Err(SpiceError::circuit(format!("{key} must be 0 or 1"))),
+        };
+        network = network.with_noise_policy(flag("pn_noiseless")?, flag("pn_rparallel_noise_abs")?);
+        if let Some(voltage) = get("pn_parallel_ic") {
+            network = network.with_parallel_initial_voltage(voltage)?;
+        }
         let conductance = network
             .edges
             .iter()
@@ -838,27 +950,51 @@ impl NetworkPlan {
     ) -> SpiceResult<Option<PassiveInitialization>> {
         use super::passive_bias::PassiveBias;
         use crate::primitives::AnalysisKind;
-        let initial = initial.map(|value| match kind {
-            StorageKind::Capacitor => value,
-            StorageKind::Inductor => value * multiplicity,
-        });
         let mut constraints = Vec::new();
-        for (analysis, key) in [
-            (AnalysisKind::OperatingPoint, "pn_bias_op"),
-            (AnalysisKind::DcSweep, "pn_bias_dc"),
-            (AnalysisKind::Ac, "pn_bias_ac"),
-            (AnalysisKind::Transient, "pn_bias_tran"),
+        let terminal = ["op", "dc", "ac", "tran"]
+            .into_iter()
+            .any(|phase| coefficients.contains_key(format!("pn_terminal_bias_{phase}").as_str()));
+        // Terminal bias uses aggregate physical coordinates. Ordinary
+        // storage IC and local bias continue to use per-copy winding current.
+        let initial = initial.map(|value| {
+            if kind == StorageKind::Inductor && !terminal {
+                value * multiplicity
+            } else {
+                value
+            }
+        });
+        let exact = match coefficients.get("pn_exact_ic").copied().unwrap_or(0.) {
+            0. => false,
+            1. => true,
+            _ => {
+                return Err(SpiceError::circuit(
+                    "exact startup history selector must be 0 or 1",
+                ));
+            }
+        };
+        for (analysis, phase) in [
+            (AnalysisKind::OperatingPoint, "op"),
+            (AnalysisKind::DcSweep, "dc"),
+            (AnalysisKind::Ac, "ac"),
+            (AnalysisKind::Transient, "tran"),
         ] {
-            let Some(&g) = coefficients.get(key) else {
+            let storage = coefficients.get(format!("pn_bias_{phase}").as_str());
+            let external = coefficients.get(format!("pn_terminal_bias_{phase}").as_str());
+            if terminal && storage.is_some() {
+                return Err(SpiceError::circuit(
+                    "cannot mix storage and terminal bias equations",
+                ));
+            }
+            let Some(&g) = storage.or(external) else {
                 continue;
             };
             let target = initial.ok_or_else(|| {
                 SpiceError::circuit("physical bias requires an explicit storage IC")
             })?;
-            if !g.is_finite() || g < 0. {
+            if !g.is_finite() {
                 return Err(SpiceError::circuit("invalid physical bias conductance"));
             }
-            let conductance = g * multiplicity;
+            let conductance = if terminal { g } else { g * multiplicity };
             let bias = match kind {
                 StorageKind::Capacitor => PassiveBias::Voltage {
                     voltage: target,
@@ -873,11 +1009,17 @@ impl NetworkPlan {
                 constraints.push((analysis, bias));
             }
         }
-        if initial.is_none() && constraints.is_empty() {
-            Ok(None)
-        } else {
-            PassiveInitialization::new(kind, initial, constraints).map(Some)
+        if initial.is_none() && constraints.is_empty() && !exact {
+            return Ok(None);
         }
+        let mut policy = PassiveInitialization::new(kind, initial, constraints)?;
+        if terminal {
+            policy = policy.with_terminal_bias();
+        }
+        if exact {
+            policy = policy.with_exact_history()?;
+        }
+        Ok(Some(policy))
     }
 
     pub(super) fn size(&self) -> ElaborationSize {
@@ -893,6 +1035,11 @@ impl NetworkPlan {
         instance: &crate::netlist::ast::DeviceInstance,
         nodes: &mut NodeAppend<'_>,
     ) -> SpiceResult<Vec<Box<dyn Device>>> {
+        if matches!(self, Self::Storage(None)) {
+            return Err(SpiceError::circuit(
+                "absent storage reached physical expansion",
+            ));
+        }
         let terminals = nodes.intern_array::<2>(&instance.nodes)?;
         let name = &instance.name;
         match self {
@@ -904,7 +1051,9 @@ impl NetworkPlan {
                 },
                 terminals,
             ),
-            Self::Storage(None) => Ok(Vec::new()),
+            Self::Storage(None) => Err(SpiceError::circuit(
+                "absent storage reached physical expansion",
+            )),
             Self::Voltage(network) => network.build(
                 nodes,
                 &VoltageNetworkBinding {
@@ -926,24 +1075,35 @@ pub(crate) enum ReportPhase {
     Transient,
 }
 
-/// Bound projection of one reported current, independent of the solver.
+/// Bound output projection, independent of the solver's unknown layout.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CurrentOutputLaw {
-    row: usize,
-    voltage_rows: [Option<usize>; 2],
-    conductance: Real,
+pub(crate) enum OutputProjection {
+    /// An observation-only value with no physical MNA coordinate.
+    Zero,
+    /// A physical current and its phase-specific voltage contribution.
+    Current {
+        row: usize,
+        voltage_rows: [Option<usize>; 2],
+        conductance: Real,
+    },
 }
 
-impl CurrentOutputLaw {
+impl OutputProjection {
     pub(crate) fn evaluate(self, mut value: impl FnMut(usize) -> Complex) -> Complex {
-        let current = value(self.row);
-        if self.conductance == 0. {
+        let Self::Current {
+            row,
+            voltage_rows,
+            conductance,
+        } = self
+        else {
+            return Complex::ZERO;
+        };
+        let current = value(row);
+        if conductance == 0. {
             return current;
         }
-        let [p, n] = self
-            .voltage_rows
-            .map(|row| row.map_or(Complex::ZERO, &mut value));
-        current + (p - n) * Complex::real(self.conductance)
+        let [p, n] = voltage_rows.map(|row| row.map_or(Complex::ZERO, &mut value));
+        current + (p - n) * Complex::real(conductance)
     }
 }
 
@@ -986,7 +1146,7 @@ impl BoundCurrentReport {
         })
     }
 
-    pub(crate) fn law(&self, phase: ReportPhase) -> SpiceResult<CurrentOutputLaw> {
+    pub(crate) fn law(&self, phase: ReportPhase) -> SpiceResult<OutputProjection> {
         let law = match phase {
             ReportPhase::Steady => self.reporting.steady,
             ReportPhase::SmallSignal => self.reporting.small_signal,
@@ -998,7 +1158,7 @@ impl BoundCurrentReport {
                 .primary_row
                 .ok_or_else(|| SpiceError::circuit("unbound primary current"))?,
         };
-        Ok(CurrentOutputLaw {
+        Ok(OutputProjection::Current {
             row,
             voltage_rows: self.voltage_rows,
             conductance: law.voltage_conductance,

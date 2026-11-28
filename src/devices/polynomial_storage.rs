@@ -9,13 +9,14 @@ use crate::devices::{
     linear::LinearContext,
     noise::{DeviceNoise, NoiseContext, NoiseSource},
     nonlinear::charge::ChargeBranch,
+    passive_bias::{self, PassiveInitialization},
     physical_dae::TaylorContext,
     schema::{
         ScalarDomain as D, ScalarParameter, ScalarSchema, ScalarUnit as U, ScalarValues,
         temperature_kelvin,
     },
     setup::MatrixSetup,
-    traits::{AnalysisMode, ChargeContext, MnaUnknowns, VoltageStorageHistory},
+    traits::{AnalysisMode, ChargeContext, MnaUnknowns, StorageKind, VoltageStorageHistory},
 };
 use crate::maths::{SparseMatrix, Vector, taylor::Jet};
 use crate::netlist::ast::DeviceInstance;
@@ -90,6 +91,13 @@ enum Kind {
 }
 
 impl Kind {
+    const fn storage_kind(self) -> StorageKind {
+        match self {
+            Self::Capacitor => StorageKind::Capacitor,
+            Self::Inductor => StorageKind::Inductor,
+        }
+    }
+
     const fn model_schema(self) -> &'static ScalarSchema<'static> {
         match self {
             Self::Capacitor => &CAP_MODEL,
@@ -221,6 +229,7 @@ struct PolynomialDevice {
     terminals: [NodeId; 2],
     recipe: Recipe,
     prepared: Prepared,
+    bias: Option<Box<PassiveInitialization>>,
 }
 
 impl PolynomialDevice {
@@ -234,7 +243,7 @@ impl PolynomialDevice {
     }
 
     fn initial(&self) -> Option<Real> {
-        self.recipe.setting("ic")
+        passive_bias::initial_value(self.bias.as_deref(), self.recipe.setting("ic"))
     }
 
     fn with_recipe(&self, recipe: Recipe, context: &ModelContext) -> SpiceResult<Self> {
@@ -243,6 +252,7 @@ impl PolynomialDevice {
             model_name: self.model_name.clone(),
             terminals: self.terminals,
             prepared: recipe.prepare(context)?,
+            bias: self.bias.clone(),
             recipe,
         })
     }
@@ -313,6 +323,14 @@ impl Rows {
 }
 
 impl Device for PolynomialDevice {
+    fn bind_passive_initialization(&mut self, policy: PassiveInitialization) -> SpiceResult<()> {
+        passive_bias::bind(&mut self.bias, self.recipe.kind.storage_kind(), policy)
+    }
+
+    fn passive_initialization(&self) -> Option<&PassiveInitialization> {
+        self.bias.as_deref()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -459,12 +477,23 @@ impl Device for PolynomialDevice {
         let coordinate = rows.coordinate(context.solution)?;
         let x = if context.states.initial_conditions() {
             self.initial().unwrap_or(coordinate)
+        } else if context.mode.is_bias()
+            && context.bias_analysis == Some(crate::primitives::AnalysisKind::Transient)
+        {
+            self.exact_startup_storage().unwrap_or(coordinate)
         } else {
             coordinate
         };
         let point = self.prepared.at(x)?;
         let storage = ChargeBranch::new(0, point.stored, point.differential);
-        rows.static_stamp(context.matrix)?;
+        let constrained = if let Some(bias) = &self.bias {
+            bias.stamp_owned_branch(self.terminals, rows.branch, context)?
+        } else {
+            false
+        };
+        if !constrained {
+            rows.static_stamp(context.matrix)?;
+        }
         if let AnalysisMode::Transient { dt, .. } = context.mode {
             let integration = context
                 .integration
@@ -493,6 +522,12 @@ impl Device for PolynomialDevice {
     }
 
     fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        // With no integration the owned branch equation is linear (whether
+        // physical DC or an analysis-selected bias constraint). Only the
+        // nonlinear storage companion requires a device Newton check.
+        let Some(integration) = context.integration else {
+            return Ok(false);
+        };
         let rows = self.rows(context.unknowns, context.branch)?;
         let x = rows.coordinate(context.solution)?;
         let point = self.prepared.at(x)?;
@@ -509,18 +544,13 @@ impl Device for PolynomialDevice {
             Kind::Capacitor => context.abstol,
             Kind::Inductor => context.vntol,
         };
-        let (expected, rounding) = if let Some(integration) = context.integration {
-            let storage = ChargeBranch::new(0, point.stored, 1.);
-            let companion =
-                storage.companion(integration, |age, slot| context.accepted(age, slot))?;
-            let roundoff = (8. * Real::EPSILON * companion.conductance.abs()).mul_add(
-                point.stored.abs(),
-                8. * Real::EPSILON * companion.current.abs(),
-            );
-            (companion.derivative, roundoff)
-        } else {
-            (0., 0.)
-        };
+        let storage = ChargeBranch::new(0, point.stored, 1.);
+        let companion = storage.companion(integration, |age, slot| context.accepted(age, slot))?;
+        let expected = companion.derivative;
+        let rounding = (8. * Real::EPSILON * companion.conductance.abs()).mul_add(
+            point.stored.abs(),
+            8. * Real::EPSILON * companion.current.abs(),
+        );
         Ok((actual - expected).abs()
             > context
                 .reltol
@@ -605,5 +635,6 @@ pub(super) fn instantiate(
         terminals: nodes.intern_array(&instance.nodes)?,
         recipe,
         prepared,
+        bias: None,
     }))
 }
