@@ -308,3 +308,26 @@ Reporting and controlled-device references are independent of electrical loading
 An explicitly prepared storage network with resolved `m=0` has no electrical objects, not even a port probe or a parasitic resistor. Its original current and otherwise unconnected written terminal voltages are zero output projections; surviving circuit terminals retain their physical solution. Behavioral current reads of the removed occurrence resolve to zero, while a true controlling-branch reference or mutual coupling cannot bind to it. This zero projection is a native observation law, not a physical voltage or winding constraint; source adapters must distinguish references that require a physical coordinate from display-only observations. Source parameter candidates re-elaborate the entire storage network when any original setter changes, including across zero multiplicity; an in-place native primitive override cannot represent those changes. Incremental additions that would connect a previously compiled observation-only voltage require complete source re-elaboration.
 
 Source-language omission rules, source-dependent parasitic placement, and reporting/control choices belong to preprocessing, not to the native solver. The independent synthetic fixtures in `tests/fixtures/passive_network` cover the observed distinctions without embedding a vendor-specific compatibility mode.
+
+### Signed physical coefficients
+
+Explicit native networks accept finite signed primary and auxiliary storage,
+series and shunt resistance, and analysis-dependent conductance. Parallel-copy
+scaling is algebraic: C times m, L and R divided by m, conductance times m.
+Zero multiplicity removes electrical objects. Nonzero coefficients may not
+underflow to zero or overflow; a resistor must have a finite reciprocal.
+A signed constitutive equation is not a claim of passivity: a coupled
+inductive system with negative self inductance is rejected by the existing
+positive-semidefinite requirement. Classical literal/model validation
+remains separate from the signed physical kernel.
+
+Thermal-generator law is independent of the electrical coefficient.
+`pn_rparallel_noise_abs=1` selects magnitude of the signed external
+parallel conductance in its thermal generator. Other explicit network
+losses require nonnegative thermal conductance; a negative generator is
+diagnosed when noise is requested, not when electrical analysis is performed.
+`pn_noiseless=1` removes all network noise generators without removing
+any electrical stamps. Both are occurrence-bound Boolean selectors.
+The voltage-source output-impedance thermal generator continues to use
+conductance magnitude. Ordinary resistor noise retains its own reference
+signed-density arithmetic.
