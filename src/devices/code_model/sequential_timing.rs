@@ -82,14 +82,17 @@ impl TimingSpec {
             } => (kind.arity() - 1, trigger, asynchronous),
             // Transparent latches capture the final data at the closing
             // edge. Setup/hold are relative to that edge, not the opening.
-            Operation::Enabled(active) => (
+            Operation::Enabled {
+                active,
+                asynchronous,
+            } => (
                 1,
                 if active == Logic::One {
                     Edge::Falling
                 } else {
                     Edge::Rising
                 },
-                None,
+                asynchronous,
             ),
             _ => {
                 return Err(SpiceError::circuit(

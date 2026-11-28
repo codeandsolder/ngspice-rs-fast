@@ -157,8 +157,10 @@ impl SourceModel {
             Self::LogicEvent => match name {
                 "operation" | "ic" | "strength" | "timing_violation" => Some(Integer),
                 "delay" | "low" | "high" => Some(Real),
-                "delay_paths" | "timing_setup" | "timing_hold" | "timing_clock_min"
-                | "timing_async_min" | "timing_recovery" => Some(RealVector),
+                "delay_paths" | "delay_gate" | "delay_preset" | "delay_clear" | "timing_setup"
+                | "timing_hold" | "timing_clock_min" | "timing_async_min" | "timing_recovery" => {
+                    Some(RealVector)
+                }
                 "inertial" => Some(Boolean),
                 "inverted" => Some(BooleanVector),
                 "rx_ic" | "async_policy" => Some(IntegerVector),
@@ -300,7 +302,7 @@ fn validate_value(
 }
 
 use super::sequential_timing::TimingSpec;
-use super::source_logic::{AsyncPolicy, LogicKernel, Operation};
+use super::source_logic::{AsyncPolicy, CausalPaths, LogicKernel, Operation};
 use super::{
     Adc, AnalogOutputConfig, AnalogOutputDevice, ConductanceConfig, DacConfig, DelayMode, Delays,
     Logic, OutputPort, Strength,
@@ -317,6 +319,7 @@ use std::collections::BTreeMap;
 struct LogicMaterial {
     operation: Real,
     delays: Delays,
+    causal: CausalPaths,
     inertial: bool,
     initial: Logic,
     strength: Strength,
@@ -333,6 +336,7 @@ impl Default for LogicMaterial {
         Self {
             operation: 0.,
             delays: Delays::ZERO,
+            causal: CausalPaths::default(),
             inertial: true,
             initial: Logic::Zero,
             strength: Strength::Strong,
@@ -389,12 +393,32 @@ impl LogicMaterial {
                         let delay = numeric_scalar(parameter)?;
                         Delays::new(delay, delay)?
                     } else {
-                        let paths: [Real; 6] =
-                            numeric_vector(parameter)?.try_into().map_err(|_| {
-                                SpiceError::circuit("delay_paths requires six directional values")
-                            })?;
-                        Delays::paths(paths)?
+                        match numeric_vector(parameter)?.as_slice() {
+                            [rise, fall] => Delays::new(*rise, *fall)?,
+                            [rise, fall, lz, hz, zl, zh] => {
+                                Delays::paths([*rise, *fall, *lz, *hz, *zl, *zh])?
+                            }
+                            _ => {
+                                return Err(SpiceError::circuit(
+                                    "delay_paths requires two or six directional values",
+                                ));
+                            }
+                        }
                     };
+                }
+                "delay_gate" | "delay_preset" | "delay_clear" => {
+                    let [rise, fall]: [Real; 2] =
+                        numeric_vector(parameter)?.try_into().map_err(|_| {
+                            SpiceError::circuit(
+                                "causal propagation path requires two directional values",
+                            )
+                        })?;
+                    let target = match parameter.name.as_str() {
+                        "delay_gate" => &mut material.causal.gate,
+                        "delay_preset" => &mut material.causal.preset,
+                        _ => &mut material.causal.clear,
+                    };
+                    *target = Some(Delays::new(rise, fall)?);
                 }
                 "inertial" => material.inertial = binary(numeric_scalar(parameter)?)?,
                 "ic" => material.initial = three_logic(numeric_scalar(parameter)?)?,
@@ -495,6 +519,7 @@ impl LogicMaterial {
             }
         }
         let operation = Operation::from_value(self.operation, inputs, self.asynchronous)?;
+        self.causal.validate(operation)?;
         let timing = self.timing.bind(operation, inputs)?;
         let kernel = LogicKernel {
             operation,
@@ -502,6 +527,7 @@ impl LogicMaterial {
             inputs,
             initial: self.initial,
             delays: self.delays,
+            causal: self.causal,
             mode: if self.inertial {
                 DelayMode::Inertial
             } else {

@@ -163,7 +163,10 @@ pub(super) enum Operation {
         trigger: Edge,
         asynchronous: Option<AsyncPolicy>,
     },
-    Enabled(Logic),
+    Enabled {
+        active: Logic,
+        asynchronous: Option<AsyncPolicy>,
+    },
     TriState(Logic),
 }
 
@@ -194,8 +197,14 @@ impl Operation {
             12. => clocked(ClockedKind::Data, Edge::Falling),
             13. => clocked(ClockedKind::Toggle, Edge::Rising),
             14. => clocked(ClockedKind::Toggle, Edge::Falling),
-            15. => Self::Enabled(Logic::One),
-            16. => Self::Enabled(Logic::Zero),
+            15. => Self::Enabled {
+                active: Logic::One,
+                asynchronous,
+            },
+            16. => Self::Enabled {
+                active: Logic::Zero,
+                asynchronous,
+            },
             17. => clocked(ClockedKind::Sr, Edge::Both),
             18. => clocked(ClockedKind::Jk, Edge::Both),
             19. => clocked(ClockedKind::Data, Edge::Both),
@@ -211,17 +220,38 @@ impl Operation {
         let valid = match operation {
             Self::Gate(GateKind::Buffer | GateKind::Inverter) => inputs == 1,
             Self::Gate(_) => inputs > 0,
-            Self::Sr(_) | Self::Enabled(_) | Self::TriState(_) => inputs == 2,
+            Self::Sr(_) | Self::TriState(_) => inputs == 2,
+            Self::Enabled { .. } => inputs == 2 + if asynchronous.is_some() { 2 } else { 0 },
             Self::Clocked { kind, .. } => {
                 inputs == kind.arity() + if asynchronous.is_some() { 2 } else { 0 }
             }
         };
-        if !valid || (asynchronous.is_some() && !matches!(operation, Self::Clocked { .. })) {
+        if !valid
+            || (asynchronous.is_some()
+                && !matches!(operation, Self::Clocked { .. } | Self::Enabled { .. }))
+        {
             return Err(SpiceError::circuit(
                 "invalid native logic input arity or asynchronous policy",
             ));
         }
         Ok(operation)
+    }
+
+    pub(super) const fn has_gate_path(self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
+    pub(super) const fn has_async_paths(self) -> bool {
+        matches!(
+            self,
+            Self::Clocked {
+                asynchronous: Some(_),
+                ..
+            } | Self::Enabled {
+                asynchronous: Some(_),
+                ..
+            }
+        )
     }
 
     fn desired(
@@ -230,27 +260,56 @@ impl Operation {
         state: &mut LogicState,
         initial: bool,
         strength: Strength,
-    ) -> SpiceResult<Drive> {
-        let drive = |logic| Drive { logic, strength };
+    ) -> SpiceResult<(Drive, Causes)> {
         let prior = state.requested.logic;
+        let mut causes = Causes::PRIMARY;
         let logic = match (self, inputs) {
             (Self::Gate(kind), _) => kind.evaluate(inputs),
             (Self::Sr(policy), [set, reset]) => policy.next(set.logic, reset.logic, prior),
-            (Self::Enabled(active), [data, enable]) => consensus(
-                possible(enable.logic)
-                    .iter()
-                    .map(|&bit| if bit == active { data.logic } else { prior }),
-            ),
+            (
+                Self::Enabled {
+                    active,
+                    asynchronous,
+                },
+                [data, enable, controls @ ..],
+            ) => {
+                let previous_gate = std::mem::replace(&mut state.clock, enable.logic);
+                let previous_data = std::mem::replace(&mut state.data, data.logic);
+                let transparent = |data: Logic, gate: Logic| {
+                    consensus(
+                        possible(gate)
+                            .iter()
+                            .map(|&bit| if bit == active { data } else { prior }),
+                    )
+                };
+                let normal = transparent(data.logic, enable.logic);
+                if previous_gate != enable.logic {
+                    // Evaluate each change in isolation. If either is
+                    // sufficient, retain its cause; if both are required,
+                    // retain both. This also handles ambiguous enable edges.
+                    let gate_alone = transparent(previous_data, enable.logic);
+                    let data_alone = transparent(data.logic, previous_gate);
+                    causes.gate = gate_alone != prior;
+                    causes.primary = data_alone != prior;
+                    if normal != prior && !causes.gate && !causes.primary {
+                        causes.gate = true;
+                        causes.primary = previous_data != data.logic;
+                    }
+                    if !causes.gate && !causes.primary {
+                        causes.gate = true;
+                    }
+                }
+                apply_async(asynchronous, controls, normal, prior, state, &mut causes)?
+            }
             (Self::TriState(active), [data, enable]) => {
                 if enable.logic == Logic::Unknown {
                     // A conditional connection cannot be expressed as a
-                    // single exact Drive; retain uncertainty, not a
-                    // falsely disconnected output.
+                    // single exact Drive; retain uncertainty.
                     Logic::Unknown
                 } else if enable.logic == active {
                     data.logic
                 } else {
-                    return Ok(Drive::default());
+                    return Ok((Drive::default(), causes));
                 }
             }
             (
@@ -277,17 +336,114 @@ impl Operation {
                         kind.capture(synchronous, prior)?,
                     )
                 };
-                match (asynchronous, controls) {
-                    (Some(policy), [preset, clear]) => {
-                        policy.resolve(preset.logic, clear.logic, normal)
-                    }
-                    (None, []) => normal,
-                    _ => return Err(SpiceError::circuit("invalid asynchronous logic inputs")),
-                }
+                apply_async(asynchronous, controls, normal, prior, state, &mut causes)?
             }
             _ => return Err(SpiceError::circuit("invalid logic input dimensions")),
         };
-        Ok(drive(logic))
+        Ok((Drive { logic, strength }, causes))
+    }
+}
+
+/// A simultaneous group can have more than one causally relevant path.
+/// For the deterministic contract, the latest selected path wins.
+#[derive(Clone, Copy, Debug, Default)]
+struct Causes {
+    primary: bool,
+    gate: bool,
+    preset: bool,
+    clear: bool,
+}
+
+impl Causes {
+    const PRIMARY: Self = Self {
+        primary: true,
+        gate: false,
+        preset: false,
+        clear: false,
+    };
+}
+
+fn apply_async(
+    policy: Option<AsyncPolicy>,
+    controls: &[Drive],
+    normal: Logic,
+    prior: Logic,
+    state: &mut LogicState,
+    causes: &mut Causes,
+) -> SpiceResult<Logic> {
+    match (policy, controls) {
+        (None, []) => Ok(normal),
+        (Some(policy), [preset, clear]) => {
+            let new = [preset.logic, clear.logic];
+            let old = std::mem::replace(&mut state.asynchronous, new);
+            let result = policy.resolve(new[0], new[1], normal);
+            if result != prior {
+                let no_async_change = policy.resolve(old[0], old[1], normal);
+                let no_normal_change = policy.resolve(new[0], new[1], prior);
+                let preset_alone = policy.resolve(new[0], old[1], normal);
+                let clear_alone = policy.resolve(old[0], new[1], normal);
+                let changed = [new[0] != old[0], new[1] != old[1]];
+                let known_asserted = new[0] == policy.preset || new[1] == policy.clear;
+                let normal_caused =
+                    normal != prior && !known_asserted && no_normal_change != result;
+                causes.primary &= normal_caused;
+                causes.gate &= normal_caused;
+                causes.preset =
+                    changed[0] && (preset_alone != no_async_change || no_async_change != result);
+                causes.clear =
+                    changed[1] && (clear_alone != no_async_change || no_async_change != result);
+                // Simultaneous controls may reach the same result as a
+                // normal capture. A known asserted control dominates that
+                // capture, even if its counterfactual happens to agree.
+                if known_asserted && !causes.preset && !causes.clear {
+                    causes.preset = new[0] == policy.preset;
+                    causes.clear = new[1] == policy.clear;
+                }
+                if !causes.primary && !causes.gate && !causes.preset && !causes.clear {
+                    causes.primary = true;
+                }
+            }
+            Ok(result)
+        }
+        _ => Err(SpiceError::circuit("invalid asynchronous logic inputs")),
+    }
+}
+
+/// Complete directional propagation tables for additional causal inputs.
+/// Missing tables inherit the explicit primary path.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct CausalPaths {
+    pub(super) gate: Option<Delays>,
+    pub(super) preset: Option<Delays>,
+    pub(super) clear: Option<Delays>,
+}
+
+impl CausalPaths {
+    pub(super) fn validate(self, operation: Operation) -> SpiceResult<()> {
+        if self.gate.is_some() && !operation.has_gate_path() {
+            return Err(SpiceError::circuit(
+                "gate propagation path requires transparent storage",
+            ));
+        }
+        if (self.preset.is_some() || self.clear.is_some()) && !operation.has_async_paths() {
+            return Err(SpiceError::circuit(
+                "asynchronous propagation paths require preset/clear ports",
+            ));
+        }
+        Ok(())
+    }
+
+    fn delay(self, primary: Delays, causes: Causes, from: Drive, to: Drive) -> Real {
+        [
+            (causes.primary, primary),
+            (causes.gate, self.gate.unwrap_or(primary)),
+            (causes.preset, self.preset.unwrap_or(primary)),
+            (causes.clear, self.clear.unwrap_or(primary)),
+        ]
+        .into_iter()
+        .filter(|(active, _)| *active)
+        .map(|(_, path)| path.transition(from, to))
+        .fold(0., Real::max)
     }
 }
 
@@ -297,6 +453,7 @@ pub(super) struct LogicKernel {
     pub(super) inputs: usize,
     pub(super) initial: Logic,
     pub(super) delays: Delays,
+    pub(super) causal: CausalPaths,
     pub(super) mode: DelayMode,
     pub(super) strength: Strength,
     /// Input inversion at digital terminals, after net resolution.
@@ -310,6 +467,8 @@ pub(super) struct LogicState {
     requested: Drive,
     deadline: Option<Real>,
     clock: Logic,
+    data: Logic,
+    asynchronous: [Logic; 2],
     timing: Option<TimingState>,
     diagnostics: Vec<ModelDiagnostic>,
 }
@@ -333,6 +492,8 @@ impl CodeModel for LogicKernel {
             },
             deadline: None,
             clock: Logic::Unknown,
+            data: Logic::Unknown,
+            asynchronous: [Logic::Unknown; 2],
             timing: self.timing.as_ref().map(TimingContract::initial_state),
             diagnostics: Vec::new(),
         }
@@ -392,13 +553,13 @@ impl CodeModel for LogicKernel {
             (None, None) => false,
             _ => return Err(SpiceError::circuit("sequential timing state mismatch")),
         };
-        let mut desired = self
-            .operation
-            .desired(inputs, state, context.initial, self.strength)?;
+        let (mut desired, causes) =
+            self.operation
+                .desired(inputs, state, context.initial, self.strength)?;
         if unknown {
             desired.logic = Logic::Unknown;
         }
-        let transition = |from, to| self.delays.transition(from, to);
+        let transition = |from, to| self.causal.delay(self.delays, causes, from, to);
         let delay = if context.initial {
             state.committed = desired;
             state.requested = desired;
@@ -470,6 +631,7 @@ mod tests {
                 mode: DelayMode::Transport,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                causal: CausalPaths::default(),
                 timing: None,
             },
             &[data, enable],
@@ -548,6 +710,7 @@ mod tests {
                 mode: DelayMode::Inertial,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                causal: CausalPaths::default(),
                 timing: None,
             },
             &inputs,
@@ -582,6 +745,104 @@ mod tests {
     }
 
     #[test]
+    fn causal_paths_match_independent_ngspice_clock_and_latch() -> SpiceResult<()> {
+        let unit = 2_f64.powi(-20);
+        for mode in [DelayMode::Transport, DelayMode::Inertial] {
+            let mut network = Network::default();
+            let inputs: Vec<_> = (0..4).map(|_| network.add_net()).collect();
+            let outputs = [network.add_net(), network.add_net()];
+            let sources = inputs
+                .iter()
+                .map(|&net| network.add_source(net))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            for (index, operation, primary) in [(0, 11., [3., 4.]), (1, 15., [7., 8.])] {
+                let operation = Operation::from_value(
+                    operation,
+                    4,
+                    Some(AsyncPolicy {
+                        preset: Logic::One,
+                        clear: Logic::One,
+                        both: Logic::Unknown,
+                    }),
+                )?;
+                network.add_model(
+                    LogicKernel {
+                        operation,
+                        inputs: 4,
+                        initial: Logic::Zero,
+                        delays: Delays::new(primary[0] * unit, primary[1] * unit)?,
+                        causal: CausalPaths {
+                            gate: if index == 1 {
+                                Some(Delays::new(5. * unit, 6. * unit)?)
+                            } else {
+                                None
+                            },
+                            preset: Some(Delays::new(10. * unit, 11. * unit)?),
+                            clear: Some(Delays::new(9. * unit, 10. * unit)?),
+                        },
+                        mode,
+                        strength: Strength::Strong,
+                        invert: Vec::new(),
+                        timing: None,
+                    },
+                    &inputs,
+                    &outputs[index..=index],
+                )?;
+            }
+            let mut engine = Engine::new(network, Limits::default())?;
+            let mut trial = engine.trial();
+            let bit = |field: &str| {
+                if field == "1s" {
+                    Logic::One
+                } else {
+                    Logic::Zero
+                }
+            };
+            for row in include_str!("../../../tests/fixtures/native-logic/causal.txt").lines() {
+                let fields: Vec<_> = row.split_whitespace().collect();
+                let time = fields[0].parse::<Real>().unwrap();
+                for (&source, field) in sources.iter().zip(&fields[1..]) {
+                    trial.schedule(source, time, Drive::strong(bit(field)))?;
+                }
+            }
+            let mut reference = [Vec::new(), Vec::new()];
+            for row in include_str!("../../../tests/fixtures/native-logic/causal.csv")
+                .lines()
+                .skip(1)
+            {
+                let fields: Vec<_> = row.split(',').collect();
+                let time = fields[0].parse::<Real>().unwrap();
+                trial.advance_to(time)?;
+                for (index, &output) in outputs.iter().enumerate() {
+                    let expected = bit(fields[5 + index]);
+                    assert_eq!(
+                        trial.value(output),
+                        Some(Drive::strong(expected)),
+                        "{row}, output {index}, {mode:?}"
+                    );
+                    if reference[index]
+                        .last()
+                        .is_none_or(|&(_, prior)| prior != expected)
+                    {
+                        reference[index].push((time, expected));
+                    }
+                }
+            }
+            for (index, &output) in outputs.iter().enumerate() {
+                let actual: Vec<_> = trial
+                    .changes()
+                    .iter()
+                    .filter(|change| change.net == output)
+                    .map(|change| (change.time, change.drive.logic))
+                    .collect();
+                assert_eq!(actual, reference[index], "output {index}, {mode:?}");
+            }
+            trial.commit()?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn timing_warning_is_committed_once_without_poisoning_output() -> SpiceResult<()> {
         use super::super::sequential_timing::TimingSpec;
         let mut network = Network::default();
@@ -604,6 +865,7 @@ mod tests {
                 mode: DelayMode::Inertial,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                causal: CausalPaths::default(),
                 timing: spec.bind(operation, 2)?,
             },
             &[data, clock],
@@ -658,6 +920,7 @@ mod tests {
                 mode: DelayMode::Inertial,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                causal: CausalPaths::default(),
                 timing: spec.bind(operation, 2)?,
             },
             &[data, clock],
@@ -714,6 +977,7 @@ mod tests {
                     mode,
                     strength: Strength::Strong,
                     invert: Vec::new(),
+                    causal: CausalPaths::default(),
                     timing: None,
                 },
                 &[input],
@@ -761,6 +1025,7 @@ mod tests {
                 mode: DelayMode::Inertial,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                causal: CausalPaths::default(),
                 timing: None,
             },
             &[input],
@@ -810,6 +1075,7 @@ mod tests {
                 mode: DelayMode::Inertial,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                causal: CausalPaths::default(),
                 timing: None,
             },
             &[data, clock],

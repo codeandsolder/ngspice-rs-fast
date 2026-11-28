@@ -77,3 +77,19 @@ independent resistances. Ordinary R/C devices supply input loading,
 leakage and storage; supply currents follow Kirchhoff's laws. Accepted
 strength-only transitions are electrical breakpoints when their conductance
 differs. No DAC approximation or implicit pull resistor is used.
+
+## Causal propagation paths
+
+`delay_paths=[LH HL]` is the binary two-path form; the six-entry form also
+binds the four impedance paths. Clocked storage interprets the primary
+pair as clock-to-output; transparent storage interprets it as data-to-output.
+`delay_gate=[LH HL]` selects gate-to-output, and `delay_preset` and
+`delay_clear` select the respective asynchronous control paths. Omitted
+causal paths inherit the primary pair; explicit zero does not inherit.
+Transparent latches also accept `async_policy` and the trailing preset/clear
+ports. The native model selects the cause of the requested output change
+before applying inertial/transport scheduling, so unrelated input evaluations
+cannot replace an outstanding causal deadline. Simultaneous ambiguous causes
+select the latest participating path in this deterministic contract, with
+known active asynchronous controls dominating a normal capture. It does not
+assert a particular source vendor's simultaneous-event policy.
