@@ -362,7 +362,7 @@ pub(super) fn charge(
     ckt: &mut dyn LoadCkt,
     bias: JunctionBias,
 ) -> SpiceResult<()> {
-    let (source_charge, source_capacitance) = depletion(
+    let (_, source_capacitance) = depletion(
         bias.source,
         [
             JunctionCapacitance {
@@ -381,10 +381,10 @@ pub(super) fn charge(
                 grading: model.SbulkJctGateSideGradingCoeff,
             },
         ],
+        |charge| ckt.set_state0(state::QBS, *charge),
     )?;
-    ckt.set_state0(state::QBS, source_charge);
     here.capbs = source_capacitance;
-    let (drain_charge, drain_capacitance) = depletion(
+    let (_, drain_capacitance) = depletion(
         bias.drain,
         [
             JunctionCapacitance {
@@ -403,8 +403,8 @@ pub(super) fn charge(
                 grading: model.DbulkJctGateSideGradingCoeff,
             },
         ],
+        |charge| ckt.set_state0(state::QBD, *charge),
     )?;
-    ckt.set_state0(state::QBD, drain_charge);
     here.capbd = drain_capacitance;
     Ok(())
 }

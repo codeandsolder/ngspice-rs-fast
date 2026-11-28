@@ -610,8 +610,8 @@ impl ChargeModel<'_> {
         // quirk is reproduced.
         let source = junction_parts(t, m, p.source_area, p.source_perimeter, p.weff);
         let drain = junction_parts(t, m, p.drain_area, p.drain_perimeter, p.weff);
-        let (qbs, capbs) = depletion(vbs, source)?;
-        let (qbd, capbd) = depletion(vbs - vds, drain)?;
+        let (qbs, capbs) = depletion(vbs, source, |_| {})?;
+        let (qbd, capbd) = depletion(vbs - vds, drain, |_| {})?;
 
         let result = ChargeEvaluation {
             qgate,
