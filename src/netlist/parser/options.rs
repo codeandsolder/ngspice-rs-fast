@@ -12,13 +12,15 @@ use winnow::token::any;
 
 use super::grammar::{Failure, Input, ParsedCard, Result, keyword};
 use super::syntax::{canonical_node, equals, malformed, name};
-use crate::netlist::ast::{GlobalCard, GlobalNode, OptionCard, OptionSetting, PositionedValue};
+use crate::netlist::ast::{
+    GlobalCard, GlobalNode, OptionCard, OptionCardKind, OptionSetting, PositionedValue,
+};
 use crate::netlist::expr::ParameterExpression;
 use crate::netlist::token::{Token, TokenKind};
 use crate::primitives::{SpiceError, SpiceResult};
 
 pub(super) fn options_or_global(input: &mut Input<'_>) -> Result<ParsedCard> {
-    alt((options, global)).parse_next(input)
+    alt((options, temperature, global)).parse_next(input)
 }
 
 fn options(input: &mut Input<'_>) -> Result<ParsedCard> {
@@ -35,7 +37,41 @@ fn options(input: &mut Input<'_>) -> Result<ParsedCard> {
             ))));
         }
         Ok(ParsedCard::Options(OptionCard {
+            kind: OptionCardKind::Options,
             settings,
+            location: input.state.card.location.clone(),
+        }))
+    })
+    .parse_next(input)
+}
+
+/// The C front end evaluates numparam substitutions before interpreting the
+/// scalar Celsius value. Unlike .option, its literal syntax is decimal, not
+/// an engineering-suffix SPICE number.
+fn temperature(input: &mut Input<'_>) -> Result<ParsedCard> {
+    let directive = keyword(".temp").parse_next(input)?;
+    cut_err(|input: &mut Input<'_>| {
+        let (value, expression) = option_value(input)?;
+        if !input.input.is_empty() {
+            return Err(malformed(
+                input,
+                "expected one scalar .temp value; temperature lists require a sweep",
+            ));
+        }
+        if expression.is_none() && !value.text.parse::<f64>().is_ok_and(f64::is_finite) {
+            return Err(ErrMode::Cut(Failure(SpiceError::parse(
+                value.location.clone(),
+                ".temp requires a finite decimal Celsius value or parameter expression",
+            ))));
+        }
+        Ok(ParsedCard::Options(OptionCard {
+            kind: OptionCardKind::Temperature,
+            settings: vec![OptionSetting {
+                name: "temp".to_owned(),
+                value: Some(value),
+                expression,
+                location: directive.location.clone(),
+            }],
             location: input.state.card.location.clone(),
         }))
     })
@@ -191,6 +227,7 @@ pub(super) fn frontend_setting(input: &mut Input<'_>) -> Result<ParsedCard> {
             }
         }
         Ok(ParsedCard::Options(OptionCard {
+            kind: OptionCardKind::Options,
             settings,
             location: input.state.card.location.clone(),
         }))

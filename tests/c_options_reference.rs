@@ -308,3 +308,30 @@ fn expression_option_values_match_c() {
     let c_plain = run_c("expr-plain", base, "op");
     assert!(points_match(&rust, &c_plain, &["i(v1)"]).is_err());
 }
+
+#[test]
+#[ignore = "requires NGSPICE_BIN; scalar temperature, nominal temperature and device overrides against live C"]
+fn scalar_temperature_directives_match_c() {
+    let base = "scalar temperature\nv1 a 0 .6\nv2 b 0 .6\nv3 c 0 .6\nd1 a 0 dm\nd2 b 0 dm temp=35\nd3 c 0 dm dtemp=10\n.model dm d(is=1e-14 n=1)\n.options tnom=20";
+    let currents = ["i(v1)", "i(v2)", "i(v3)"];
+    for directives in [
+        ".temp -30",
+        ".temp 27",
+        ".temp 75",
+        ".temp -30\n.options temp=75",
+        ".options temp=75\n.temp -30",
+        ".temp 75\n.temp -30",
+        ".param tt=-30\n.temp {tt}",
+        ".param tt=75\n.temp 'tt'",
+        ".subckt thermal x params: tt=75\n.temp {tt}\nr1 x 0 1k\n.ends\nx1 0 thermal tt=-30",
+    ] {
+        let cards = format!("{base}\n{directives}");
+        let rust = run_rust(&cards, "op");
+        let c = run_c("scalar-temp", &cards, "op");
+        points_match(&rust, &c, &currents).unwrap_or_else(|error| panic!("{directives}: {error}"));
+    }
+    let cold = run_rust(&format!("{base}\n.temp -30"), "op");
+    let hot = run_rust(&format!("{base}\n.temp 75"), "op");
+    assert!((cold.value("i(v1)", 0).unwrap().re - hot.value("i(v1)", 0).unwrap().re).abs() > 1e-6);
+    assert_eq!(cold.value("i(v2)", 0), hot.value("i(v2)", 0));
+}
