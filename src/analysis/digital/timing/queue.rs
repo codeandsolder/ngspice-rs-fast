@@ -144,8 +144,7 @@ impl<T: Clone> SymbolicQueue<T> {
                 continue;
             }
             let mut groups = vec![(first, vec![pivot_index])];
-            for index in pivot_index + 1..self.events.len() {
-                let event = &self.events[index];
+            for (index, event) in self.events.iter().enumerate().skip(pivot_index + 1) {
                 let mut next = Vec::new();
                 for (guard, members) in groups {
                     for (relation, join) in [
