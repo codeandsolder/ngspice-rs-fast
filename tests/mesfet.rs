@@ -1197,7 +1197,7 @@ fn statz_control_jump_is_not_a_classical_charge_path() {
     // The high-index branch selects the physical solver, but observes an
     // unrelated smooth voltage so the error must be the Statz path itself.
     let result = FIXTURE.run_all(
-        "vd d 0 0.3\nvg g 0 PWL(0 -0.7 5u -0.7 5u -0.5 20u -0.5)\nz1 d g 0 zm\n.model zm nmf(cgs=20p cgd=5p)\nvr r 0 PWL(0 0 20u 1)\nb1 out 0 v=1u*ddt(v(r))\nr1 out 0 1k\n.tran 1u 20u 0 1u uic"
+        "vd d 0 0.3\nvg g 0 PWL(0 -0.7 10u -0.5) r=0\nz1 d g 0 zm\n.model zm nmf(cgs=20p cgd=5p)\nvr r 0 PWL(0 0 20u 1)\nb1 out 0 v=1u*ddt(v(r))\nr1 out 0 1k\n.tran 1u 20u 0 1u uic"
     );
     let error = result
         .expect_err("an undefined Statz impulse path must not be silently selected")
