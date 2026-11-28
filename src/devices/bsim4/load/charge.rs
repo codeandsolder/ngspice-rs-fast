@@ -50,6 +50,7 @@ use super::{
 };
 use crate::devices::bsim_physics::{
     CapZeroBias, CapZeroParameters, ChargeChain, cap_zero, channel_inversion, charge_overdrive,
+    effective_overdrive, thermal_softplus,
 };
 use crate::primitives::SpiceResult;
 
@@ -105,8 +106,6 @@ pub(super) fn intrinsic(
     let mut dVgsteff_dVb: f64;
     let mut dVgsteff_dVd: f64;
     let mut dVgsteff_dVg: f64;
-    let mut VgstNVt: f64;
-    let mut ExpVgst: f64;
     let mut ceq: f64;
     let mut geq: f64;
     let mut Vfbeff: f64;
@@ -120,8 +119,6 @@ pub(super) fn intrinsic(
     let mut Vfb: f64;
     let mut voffcv: f64;
     let mut noff: f64;
-    let mut dnoff_dVd: f64;
-    let mut dnoff_dVb: f64;
     let mut CoxWLcen: f64;
     let mut QovCox: f64;
     let mut LINK: f64;
@@ -146,16 +143,6 @@ pub(super) fn intrinsic(
     let mut T1: f64;
     let mut T2: f64;
     let mut T3: f64;
-    let mut T4: f64;
-    let mut T5: f64;
-    let mut T9: f64;
-    let mut dT9_dVg: f64;
-    let mut dT9_dVd: f64;
-    let mut dT9_dVb: f64;
-    let mut T10: f64;
-    let mut dT10_dVg: f64;
-    let mut dT10_dVb: f64;
-    let mut dT10_dVd: f64;
     let mut tmp: f64;
     let mut VdseffCV: f64;
     let mut dVdseffCV_dVg: f64;
@@ -273,88 +260,24 @@ pub(super) fn intrinsic(
             dVbseffCV_dVb = -dPhis_dVb;
         }
         CoxWL = model.coxe * pParam.weffCV * pParam.leffCV * here.nf;
-        if model.cvchargeMod == 0 {
-            noff = n * pParam.noff;
-            dnoff_dVd = pParam.noff * dn_dVd;
-            dnoff_dVb = pParam.noff * dn_dVb;
-            T0 = Vtm * noff;
-            voffcv = pParam.voffcv;
-            VgstNVt = (Vgst - voffcv) / T0;
-            if VgstNVt > EXP_THRESHOLD {
-                Vgsteff = Vgst - voffcv;
-                dVgsteff_dVg = dVgs_eff_dVg;
-                dVgsteff_dVd = -dVth_dVd;
-                dVgsteff_dVb = -dVth_dVb;
-            } else if VgstNVt < -EXP_THRESHOLD {
-                Vgsteff = T0 * MIN_EXP.ln_1p();
-                dVgsteff_dVg = 0.0;
-                dVgsteff_dVd = Vgsteff / noff;
-                dVgsteff_dVb = dVgsteff_dVd * dnoff_dVb;
-                dVgsteff_dVd *= dnoff_dVd;
-            } else {
-                ExpVgst = exp(VgstNVt);
-                Vgsteff = T0 * ExpVgst.ln_1p();
-                dVgsteff_dVg = ExpVgst / (1.0 + ExpVgst);
-                dVgsteff_dVd = -dVgsteff_dVg * (dVth_dVd + (Vgst - voffcv) / noff * dnoff_dVd)
-                    + Vgsteff / noff * dnoff_dVd;
-                dVgsteff_dVb = -dVgsteff_dVg * (dVth_dVb + (Vgst - voffcv) / noff * dnoff_dVb)
-                    + Vgsteff / noff * dnoff_dVb;
-                dVgsteff_dVg *= dVgs_eff_dVg;
-            }
+        let (value, voltage_partial, factor_partial) = if model.cvchargeMod == 0 {
+            let (value, voltage_partial, factor_partial) =
+                thermal_softplus(&(Vgst - pParam.voffcv), &(n * pParam.noff), Vtm)?;
+            (value, voltage_partial, factor_partial * pParam.noff)
         } else {
-            T0 = n * Vtm;
-            T1 = pParam.mstarcv * Vgst;
-            T2 = T1 / T0;
-            if T2 > EXP_THRESHOLD {
-                T10 = T1;
-                dT10_dVg = pParam.mstarcv * dVgs_eff_dVg;
-                dT10_dVd = -dVth_dVd * pParam.mstarcv;
-                dT10_dVb = -dVth_dVb * pParam.mstarcv;
-            } else if T2 < -EXP_THRESHOLD {
-                T10 = Vtm * MIN_EXP.ln_1p();
-                dT10_dVg = 0.0;
-                dT10_dVd = T10 * dn_dVd;
-                dT10_dVb = T10 * dn_dVb;
-                T10 *= n;
-            } else {
-                ExpVgst = exp(T2);
-                T3 = Vtm * ExpVgst.ln_1p();
-                T10 = n * T3;
-                dT10_dVg = pParam.mstarcv * ExpVgst / (1.0 + ExpVgst);
-                dT10_dVb = T3 * dn_dVb - dT10_dVg * (dVth_dVb + Vgst * dn_dVb / n);
-                dT10_dVd = T3 * dn_dVd - dT10_dVg * (dVth_dVd + Vgst * dn_dVd / n);
-                dT10_dVg *= dVgs_eff_dVg;
-            }
-            T1 = pParam.voffcbncv - (1.0 - pParam.mstarcv) * Vgst;
-            T2 = T1 / T0;
-            if T2 < -EXP_THRESHOLD {
-                T3 = model.coxe * MIN_EXP / pParam.cdep0;
-                T9 = pParam.mstarcv + T3 * n;
-                dT9_dVg = 0.0;
-                dT9_dVd = dn_dVd * T3;
-                dT9_dVb = dn_dVb * T3;
-            } else if T2 > EXP_THRESHOLD {
-                T3 = model.coxe * MAX_EXP / pParam.cdep0;
-                T9 = pParam.mstarcv + T3 * n;
-                dT9_dVg = 0.0;
-                dT9_dVd = dn_dVd * T3;
-                dT9_dVb = dn_dVb * T3;
-            } else {
-                ExpVgst = exp(T2);
-                T3 = model.coxe / pParam.cdep0;
-                T4 = T3 * ExpVgst;
-                T5 = T1 * T4 / T0;
-                T9 = pParam.mstarcv + n * T4;
-                dT9_dVg = T3 * (pParam.mstarcv - 1.0) * ExpVgst / Vtm;
-                dT9_dVb = T4 * dn_dVb - dT9_dVg * dVth_dVb - T5 * dn_dVb;
-                dT9_dVd = T4 * dn_dVd - dT9_dVg * dVth_dVd - T5 * dn_dVd;
-                dT9_dVg *= dVgs_eff_dVg;
-            }
-            Vgsteff = T10 / T9;
-            dVgsteff_dVg = (-Vgsteff).mul_add(dT9_dVg, dT10_dVg) / T9;
-            dVgsteff_dVd = (-Vgsteff).mul_add(dT9_dVd, dT10_dVd) / T9;
-            dVgsteff_dVb = (-Vgsteff).mul_add(dT9_dVb, dT10_dVb) / T9;
-        }
+            effective_overdrive(
+                &Vgst,
+                &n,
+                Vtm,
+                pParam.mstarcv,
+                pParam.voffcbncv,
+                model.coxe / pParam.cdep0,
+            )?
+        };
+        Vgsteff = value;
+        dVgsteff_dVg = voltage_partial * dVgs_eff_dVg;
+        dVgsteff_dVd = factor_partial.mul_add(dn_dVd, -voltage_partial * dVth_dVd);
+        dVgsteff_dVb = factor_partial.mul_add(dn_dVb, -voltage_partial * dVth_dVb);
         if model.capMod == 1 {
             Vfb = here.vfbzb;
             V3 = Vfb - Vgs_eff + VbseffCV - DELTA_3;

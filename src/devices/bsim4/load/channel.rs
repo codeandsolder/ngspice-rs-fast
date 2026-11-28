@@ -42,7 +42,9 @@ use super::{
     Model, SaturationRoot, SizeParam, exp, log, smooth_drain, smooth_positive, sqrt,
 };
 
-use crate::devices::bsim_physics::{poly_depletion, rational_floor, reciprocal_floor};
+use crate::devices::bsim_physics::{
+    effective_overdrive, poly_depletion, rational_floor, reciprocal_floor,
+};
 use crate::primitives::SpiceResult;
 
 /// Body potential, threshold, effective gate bias and their independent derivatives.
@@ -116,7 +118,6 @@ pub(super) fn electrostatics(
     let mut vgd_eff: f64;
     let mut dvgs_eff_dvg: f64;
     let mut dvgd_eff_dvg: f64;
-    let mut ExpVgst: f64;
     let mut Vdb: f64;
     let mut Vds: f64;
     let mut Vgs: f64;
@@ -153,14 +154,7 @@ pub(super) fn electrostatics(
     let mut T5: f64;
     let mut dT5_dVb: f64;
     let mut T9: f64;
-    let mut dT9_dVg: f64;
-    let mut dT9_dVd: f64;
-    let mut dT9_dVb: f64;
     let mut T10: f64;
-    let mut dT10_dVg: f64;
-    let mut dT10_dVb: f64;
-    let mut dT10_dVd: f64;
-    let mut T11: f64;
     let mut Lpe_Vb: f64;
     let mut dDITS_Sft_dVb: f64;
     let mut dDITS_Sft_dVd: f64;
@@ -367,59 +361,19 @@ pub(super) fn electrostatics(
     here.dvgs_eff_dvg = dvgs_eff_dvg;
     here.dvgd_eff_dvg = dvgd_eff_dvg;
     Vgst = Vgs_eff - Vth;
-    T0 = n * Vtm;
-    T1 = pParam.mstar * Vgst;
-    T2 = T1 / T0;
-    if T2 > EXP_THRESHOLD {
-        T10 = T1;
-        dT10_dVg = pParam.mstar * dVgs_eff_dVg;
-        dT10_dVd = -dVth_dVd * pParam.mstar;
-        dT10_dVb = -dVth_dVb * pParam.mstar;
-    } else if T2 < -EXP_THRESHOLD {
-        T10 = Vtm * MIN_EXP.ln_1p();
-        dT10_dVg = 0.0;
-        dT10_dVd = T10 * dn_dVd;
-        dT10_dVb = T10 * dn_dVb;
-        T10 *= n;
-    } else {
-        ExpVgst = exp(T2);
-        T3 = Vtm * ExpVgst.ln_1p();
-        T10 = n * T3;
-        dT10_dVg = pParam.mstar * ExpVgst / (1.0 + ExpVgst);
-        dT10_dVb = T3 * dn_dVb - dT10_dVg * (dVth_dVb + Vgst * dn_dVb / n);
-        dT10_dVd = T3 * dn_dVd - dT10_dVg * (dVth_dVd + Vgst * dn_dVd / n);
-        dT10_dVg *= dVgs_eff_dVg;
-    }
-    T1 = pParam.voffcbn - (1.0 - pParam.mstar) * Vgst;
-    T2 = T1 / T0;
-    if T2 < -EXP_THRESHOLD {
-        T3 = model.coxe * MIN_EXP / pParam.cdep0;
-        T9 = pParam.mstar + T3 * n;
-        dT9_dVg = 0.0;
-        dT9_dVd = dn_dVd * T3;
-        dT9_dVb = dn_dVb * T3;
-    } else if T2 > EXP_THRESHOLD {
-        T3 = model.coxe * MAX_EXP / pParam.cdep0;
-        T9 = pParam.mstar + T3 * n;
-        dT9_dVg = 0.0;
-        dT9_dVd = dn_dVd * T3;
-        dT9_dVb = dn_dVb * T3;
-    } else {
-        ExpVgst = exp(T2);
-        T3 = model.coxe / pParam.cdep0;
-        T4 = T3 * ExpVgst;
-        T5 = T1 * T4 / T0;
-        T9 = pParam.mstar + n * T4;
-        dT9_dVg = T3 * (pParam.mstar - 1.0) * ExpVgst / Vtm;
-        dT9_dVb = T4 * dn_dVb - dT9_dVg * dVth_dVb - T5 * dn_dVb;
-        dT9_dVd = T4 * dn_dVd - dT9_dVg * dVth_dVd - T5 * dn_dVd;
-        dT9_dVg *= dVgs_eff_dVg;
-    }
-    Vgsteff = T10 / T9;
+    let (value, voltage_partial, factor_partial) = effective_overdrive(
+        &Vgst,
+        &n,
+        Vtm,
+        pParam.mstar,
+        pParam.voffcbn,
+        model.coxe / pParam.cdep0,
+    )?;
+    Vgsteff = value;
     here.Vgsteff = Vgsteff;
-    dVgsteff_dVg = (-Vgsteff).mul_add(dT9_dVg, dT10_dVg) / T9;
-    dVgsteff_dVd = (-Vgsteff).mul_add(dT9_dVd, dT10_dVd) / T9;
-    dVgsteff_dVb = (-Vgsteff).mul_add(dT9_dVb, dT10_dVb) / T9;
+    dVgsteff_dVg = voltage_partial * dVgs_eff_dVg;
+    dVgsteff_dVd = factor_partial.mul_add(dn_dVd, -voltage_partial * dVth_dVd);
+    dVgsteff_dVb = factor_partial.mul_add(dn_dVb, -voltage_partial * dVth_dVb);
     Ok(Electrostatics {
         Leff,
         Lpe_Vb,

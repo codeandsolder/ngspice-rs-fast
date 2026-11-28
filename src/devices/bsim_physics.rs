@@ -6,6 +6,109 @@ use std::cmp::Ordering;
 use crate::maths::taylor::Constitutive;
 use crate::primitives::{Real, SpiceResult};
 
+const EXP_LIMIT: Real = 34.;
+const MIN_EXP: Real = 1.713_908_431e-15;
+const MAX_EXP: Real = 5.834_617_425e14;
+
+/// The clipped thermal softplus and its independent voltage and slope-factor
+/// partials. The upper asymptote is linear; the lower one is proportional
+/// to the thermal slope factor. Preserve the reference clipping constants.
+pub(super) fn thermal_softplus<S: Constitutive>(
+    voltage: &S,
+    factor: &S,
+    thermal: Real,
+) -> SpiceResult<(S, S, S)> {
+    let argument = voltage.clone().divide(&factor.clone().scale(thermal))?;
+    if argument.compare(EXP_LIMIT) == Some(Ordering::Greater) {
+        return Ok((voltage.clone(), voltage.constant(1.), voltage.constant(0.)));
+    }
+    if argument.compare(-EXP_LIMIT) == Some(Ordering::Less) {
+        let slope = thermal * MIN_EXP.ln_1p();
+        return Ok((
+            factor.clone().scale(slope),
+            voltage.constant(0.),
+            voltage.constant(slope),
+        ));
+    }
+    // For z > 0, evaluate the linear asymptote plus its small tail.
+    // This also avoids cancellation of the n-partial in automatic differentiation.
+    if argument.primal() > 0. {
+        let inverse = argument.clone().scale(-1.).exp();
+        let divisor = inverse.clone().offset(1.);
+        let tail = inverse.clone().divide(&divisor)?;
+        let sigmoid = voltage.constant(1.).divide(&divisor)?;
+        let logarithm = inverse.ln_1p()?;
+        let entropy = argument.mul_add(&tail, &logarithm);
+        let value = factor
+            .clone()
+            .multiply(&logarithm.scale(thermal))
+            .add(voltage);
+        Ok((value, sigmoid, entropy.scale(thermal)))
+    } else {
+        let exponential = argument.clone().exp();
+        let sigmoid = exponential
+            .clone()
+            .divide(&exponential.clone().offset(1.))?;
+        let logarithm = exponential.ln_1p()?;
+        let entropy = argument.scale(-1.).mul_add(&sigmoid, &logarithm);
+        Ok((
+            factor.clone().multiply(&logarithm.scale(thermal)),
+            sigmoid,
+            entropy.scale(thermal),
+        ))
+    }
+}
+
+/// BSIM4 effective overdrive, shared between intrinsic DC and the
+/// cvchargeMod=1 charge law. Returns value, partial in Vgst and partial in n.
+pub(super) fn effective_overdrive<S: Constitutive>(
+    voltage: &S,
+    factor: &S,
+    thermal: Real,
+    mstar: Real,
+    offset: Real,
+    oxide_ratio: Real,
+) -> SpiceResult<(S, S, S)> {
+    let (numerator, numerator_voltage, numerator_factor) =
+        thermal_softplus(&voltage.clone().scale(mstar), factor, thermal)?;
+    let argument = voltage
+        .clone()
+        .scale(mstar - 1.)
+        .offset(offset)
+        .divide(&factor.clone().scale(thermal))?;
+    let (exponential, exp_slope) = if argument.compare(-EXP_LIMIT) == Some(Ordering::Less) {
+        (voltage.constant(MIN_EXP), voltage.constant(0.))
+    } else if argument.compare(EXP_LIMIT) == Some(Ordering::Greater) {
+        (voltage.constant(MAX_EXP), voltage.constant(0.))
+    } else {
+        let value = argument.clone().exp();
+        (value.clone(), value)
+    };
+    let denominator_voltage = exp_slope
+        .clone()
+        .scale(oxide_ratio * (mstar - 1.) / thermal);
+    let denominator_factor = argument
+        .scale(-1.)
+        .mul_add(&exp_slope, &exponential)
+        .scale(oxide_ratio);
+    let denominator = factor
+        .clone()
+        .multiply(&exponential.scale(oxide_ratio))
+        .offset(mstar);
+    let value = numerator.divide(&denominator)?;
+    let voltage_partial = value
+        .clone()
+        .scale(-1.)
+        .mul_add(&denominator_voltage, &numerator_voltage.scale(mstar))
+        .divide(&denominator)?;
+    let factor_partial = value
+        .clone()
+        .scale(-1.)
+        .mul_add(&denominator_factor, &numerator_factor)
+        .divide(&denominator)?;
+    Ok((value, voltage_partial, factor_partial))
+}
+
 /// Bias-dependent overlap charge and capacitance. The two rationalized
 /// square-root offsets are essential in the small-charge/large-bias tails.
 pub(super) fn overlap<S: Constitutive>(
@@ -861,6 +964,66 @@ mod tests {
         for (&actual, &expected) in gradient.coefficients().iter().zip(cap.value.coefficients()) {
             close(actual, expected, 2e-26);
         }
+    }
+
+    #[test]
+    fn thermal_overdrive_matches_reference_and_local_partials() -> SpiceResult<()> {
+        type Local = Differential<2>;
+        const THERMAL: Real = 0.03125;
+        const FACTOR: Real = 1.5;
+        let scale = THERMAL * FACTOR;
+        for argument in [-60., -34., -25., -1., 0., 1., 25., 34., 60.] {
+            for direction in [-1., 1.] {
+                let voltage = scale * argument;
+                let rates = [direction * 0.015, 0.001];
+                let input = Local::variable(0, Jet::affine(ORDER, voltage, rates[0]))?;
+                let factor = Local::variable(1, Jet::affine(ORDER, FACTOR, rates[1]))?;
+                for (value, voltage_partial, factor_partial) in [
+                    thermal_softplus(&input, &factor, THERMAL)?,
+                    effective_overdrive(&input, &factor, THERMAL, 0.6, -0.02, 1.7)?,
+                ] {
+                    for (coordinate, partial) in
+                        [voltage_partial, factor_partial].iter().enumerate()
+                    {
+                        for (degree, &expected) in partial.value.coefficients().iter().enumerate() {
+                            let actual = value.gradient[coordinate]
+                                .as_ref()
+                                .map_or(0., |g| g.coefficients()[degree]);
+                            close(actual, expected, 3e-15);
+                        }
+                    }
+                }
+                let (soft, _, _) = thermal_softplus(&input, &factor, THERMAL)?;
+                let (effective, _, _) =
+                    effective_overdrive(&input, &factor, THERMAL, 0.6, -0.02, 1.7)?;
+                let reference = |v: Real, n: Real| {
+                    let z = v / (THERMAL * n);
+                    if z > 34. {
+                        v
+                    } else if z < -34. {
+                        THERMAL * n * MIN_EXP.ln_1p()
+                    } else {
+                        THERMAL * n * z.exp().ln_1p()
+                    }
+                };
+                for time in [0.001, 0.025] {
+                    let v = rates[0].mul_add(time, voltage);
+                    let n = rates[1].mul_add(time, FACTOR);
+                    close(value_at(&soft.value, time), reference(v, n), 1e-27);
+                    let z = (-0.4_f64).mul_add(v, -0.02) / (n * THERMAL);
+                    let exponential = if z < -34. {
+                        MIN_EXP
+                    } else if z > 34. {
+                        MAX_EXP
+                    } else {
+                        z.exp()
+                    };
+                    let expected = reference(0.6 * v, n) / (1.7 * n).mul_add(exponential, 0.6);
+                    close(value_at(&effective.value, time), expected, 1e-27);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn cap_zero_reference(point: [Real; 5], p: CapZeroParameters) -> [Real; 3] {
