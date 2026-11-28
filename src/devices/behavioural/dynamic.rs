@@ -216,7 +216,7 @@ pub(in crate::devices) fn expand<'a>(
     existing: &[crate::devices::ElaboratedDevice],
     capacity: usize,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
-    absent_terminals: &BTreeSet<String>,
+    absent: &crate::devices::passive_network::AbsentStorage,
 ) -> SpiceResult<ExpandedInstances<'a>> {
     let count = dynamic_count(instances);
     let CurrentTargets {
