@@ -20,10 +20,6 @@
     reason = "reference scratch variables may be assigned on different branches"
 )]
 #![expect(
-    clippy::assign_op_pattern,
-    reason = "retain C expression grouping and operand order"
-)]
-#![expect(
     clippy::float_cmp,
     reason = "C branch predicates compare floating point exactly"
 )]
