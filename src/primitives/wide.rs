@@ -6,7 +6,7 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct Wide {
+pub struct Wide {
     pub(crate) hi: Real,
     lo: Real,
 }
