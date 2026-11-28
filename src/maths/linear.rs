@@ -984,11 +984,7 @@ fn refine_retained_rhs(
     let mut residual = Vector::zeros(order);
     let mut stalled = 0;
     for _ in 0..MAX_RECOVERED_RHS_CORRECTIONS {
-        let _quality = original.evaluate_with_correction(
-            rhs.as_slice(),
-            current.as_slice(),
-            residual.as_mut_slice(),
-        )?;
+        original.correction_into(rhs.as_slice(), current.as_slice(), residual.as_mut_slice())?;
         let mut next = solve(&residual)?;
         let relative = update_coordinates(&mut next, &current);
         if !next.is_finite() || !relative.is_finite() {
