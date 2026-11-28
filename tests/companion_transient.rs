@@ -594,12 +594,24 @@ impl Device for Probe {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal(self.terminals, 1e-3, false)
     }
+    fn accept_validator(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptValidation> {
+        Some(self)
+    }
+    fn accept_notifier(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptNotification> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptValidation for Probe {
     fn validate_accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
         if context.time.is_some_and(|t| t > self.fail_after) {
             return Err(SpiceError::circuit("probe refused"));
         }
         Ok(())
     }
+}
+
+impl ngspice_rs::devices::DeviceAcceptNotification for Probe {
     fn accept(&self, context: &AcceptContext<'_>) {
         self.log
             .borrow_mut()
@@ -763,4 +775,49 @@ fn nonlinear_trials_iterate_to_convergence_and_non_convergence_shrinks_the_step(
     .unwrap();
     let error = error_text(run(&mut c, &["0.1m", "4m"]));
     assert!(error.contains("timestep too small"), "{error}");
+}
+
+#[test]
+#[ignore = "opt-in accepted and rejected transient lifecycle workload"]
+fn benchmark_transient_lifecycle_workloads() {
+    use std::{fmt::Write as _, hint::black_box, time::Instant};
+    for (name, inert, lines, nonlinear) in [
+        ("inert", 1024, 0, false),
+        ("sparse_active", 1024, 2, true),
+        ("delay_dense", 0, 24, false),
+        ("nonlinear", 64, 0, true),
+    ] {
+        let mut deck =
+            String::from("v1 in 0 pulse(0 1 0 2n 2n 100n 200n)\nr1 in out 1k\nc1 out 0 1p\n");
+        for i in 0..inert {
+            writeln!(deck, "ri{i} in 0 1meg").unwrap();
+        }
+        if nonlinear {
+            deck.push_str("d1 out 0 dm\n.model dm d(is=1e-14 n=1)\nb1 out 0 i=1u*v(out)*v(out)\n");
+        }
+        for i in 0..lines {
+            writeln!(deck, "t{i} in 0 l{i} 0 z0=50 td=8n\nrl{i} l{i} 0 50").unwrap();
+        }
+        let mut c = circuit(&deck);
+        let start = Instant::now();
+        let (plot, stats) = run(&mut c, &["2n", "1u", "0", "2n"]).unwrap();
+        let elapsed = start.elapsed();
+        let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+        for row in 0..plot.point_count() {
+            for name in ["time", "v(out)"] {
+                let value = plot.value(name, row).unwrap().re;
+                assert!(value.is_finite());
+                digest = (digest ^ value.to_bits()).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        assert_eq!(plot.point_count(), stats.accepted + 1);
+        black_box(&plot);
+        println!(
+            "{name} devices={} accepted={} rejected={} digest={digest:016x} elapsed_ns={}",
+            c.devices().len(),
+            stats.accepted,
+            stats.rejected,
+            elapsed.as_nanos()
+        );
+    }
 }

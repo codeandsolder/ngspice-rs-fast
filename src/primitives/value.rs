@@ -626,6 +626,31 @@ pub fn parse_spice_number(input: &str) -> Option<Real> {
     }
 }
 
+// Numparam and ASCII rawfiles both emit 16 significant decimal digits.
+const SPICE_FRACTION_DIGITS: usize = 15;
+
+/// The numeric result of numparam's decimal write/read boundary, without
+/// allocating or normalizing an intermediate literal. The generated decimal
+/// has no suffix or other SPICE-specific syntax, so the binary64 parser can
+/// consume it directly. Nonfinite inputs are rejected just as literal parsing
+/// rejects them; finite inputs may round to infinity at the upper boundary.
+#[must_use = "the returned value preserves numparam decimal rounding"]
+pub(crate) fn round_numparam_literal(value: Real) -> Option<Real> {
+    use std::io::Write as _;
+
+    if !value.is_finite() {
+        return None;
+    }
+    // Sign, leading digit, point, 15 fraction digits, e, exponent sign and
+    // at most three exponent digits cover the entire finite binary64 range.
+    let mut buffer = [0_u8; 24];
+    let capacity = buffer.len();
+    let mut remaining = buffer.as_mut_slice();
+    write!(remaining, "{value:.SPICE_FRACTION_DIGITS$e}").ok()?;
+    let len = capacity - remaining.len();
+    std::str::from_utf8(&buffer[..len]).ok()?.parse().ok()
+}
+
 /// Formats a real the way ngspice writes ASCII rawfiles: `%-.15e`, always with a
 /// signed two-digit exponent.
 ///
@@ -633,7 +658,7 @@ pub fn parse_spice_number(input: &str) -> Option<Real> {
 /// `-2.500000000000000e-03`, matching `src/frontend/rawfile.c`.
 #[must_use = "the returned text is the reference-compatible decimal representation"]
 pub fn format_spice_number(value: Real) -> String {
-    let text = format!("{value:.15e}");
+    let text = format!("{value:.SPICE_FRACTION_DIGITS$e}");
     let Some((mantissa, exponent)) = text.split_once('e') else {
         // `NaN`, `inf` and `-inf` have no exponent part.
         return text;
@@ -653,8 +678,85 @@ mod tests {
     use super::{
         Complex, Real, almost_equal_ulps, approx_eq, complex_schur, exact_product_sum,
         format_spice_number, parse_numparam_number_prefix, parse_spice_number,
-        parse_spice_number_prefix, real_schur, scale_power,
+        parse_spice_number_prefix, real_schur, round_numparam_literal, scale_power,
     };
+
+    #[test]
+    fn numparam_numeric_rounding_matches_literal_and_c_oracle() {
+        let check = |value: Real| {
+            let expected = parse_spice_number(&format_spice_number(value)).map(Real::to_bits);
+            let actual = round_numparam_literal(value).map(Real::to_bits);
+            assert_eq!(actual, expected, "input bits {:016x}", value.to_bits());
+            actual
+        };
+        for value in [
+            0.0,
+            -0.0,
+            Real::MAX,
+            -Real::MAX,
+            Real::MIN_POSITIVE,
+            Real::MIN_POSITIVE.next_down(),
+            Real::from_bits(1),
+            Real::from_bits(2),
+            Real::INFINITY,
+            Real::NEG_INFINITY,
+            Real::NAN,
+            2_147_483_647.5,
+            -2_147_483_648.5,
+            1.0_f64.next_up(),
+            1.0_f64.next_down(),
+            0.125,
+            0.000_030_517_578_125,
+        ] {
+            check(value);
+        }
+        // Exact binary fractions that fall halfway between two 16-digit
+        // decimals. C rounds down to the even last digit in the first case
+        // and up in the second, for both signs.
+        for (input, expected) in [
+            (0x3ff0_0010_0000_0000, 0x3ff0_000f_ffff_fffe),
+            (0x3ff0_0030_0000_0000, 0x3ff0_0030_0000_0002),
+            (0xbff0_0010_0000_0000, 0xbff0_000f_ffff_fffe),
+            (0xbff0_0030_0000_0000, 0xbff0_0030_0000_0002),
+        ] {
+            assert_eq!(check(Real::from_bits(input)), Some(expected));
+        }
+        // Decimal rounding may move a value across a later integer setter's
+        // rounding boundary. Preserve the decimal read-back before that step.
+        for value in [2_147_483_647.5_f64, -2_147_483_648.5_f64, 0.5_f64, -0.5_f64] {
+            for input in [value.next_down(), value, value.next_up()] {
+                let expected = parse_spice_number(&format_spice_number(input))
+                    .and_then(crate::primitives::c_integer);
+                assert_eq!(
+                    round_numparam_literal(input).and_then(crate::primitives::c_integer),
+                    expected
+                );
+            }
+        }
+        for exponent in -323..=308 {
+            let power: Real = format!("1e{exponent}").parse().unwrap();
+            for value in [power.next_down(), power, power.next_up()] {
+                check(value);
+                check(-value);
+            }
+        }
+        // Independent C-locale snprintf("%.15e") / strtod oracle, generated
+        // for the same xorshift64 sequence (nearest-even rounding).
+        let mut bits = 0x1234_5678_9abc_def0_u64;
+        let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+        let mut count = 0;
+        for _ in 0..100_000 {
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            if let Some(rounded) = check(Real::from_bits(bits)) {
+                digest = (digest ^ rounded).wrapping_mul(1_099_511_628_211);
+                count += 1;
+            }
+        }
+        assert_eq!(count, 99_949);
+        assert_eq!(digest, 0x29ef_5948_92db_bd6f_u64);
+    }
 
     #[test]
     fn scaled_division_recovers_product_cancellation_below_one_ulp() {

@@ -402,6 +402,38 @@ fn parameter_fit_gradient_benchmark() {
 }
 
 #[test]
+#[ignore = "manual repeated candidate gradient throughput benchmark"]
+fn benchmark_repeated_candidate_gradients() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let plan = physical_gradient_fixture();
+    let mut candidate = plan.session().unwrap();
+    let request = requests(AnalysisKind::OperatingPoint, None);
+    let start = Instant::now();
+    for index in 0..1_000_u32 {
+        let resistance = f64::from(index) + 1_000.123_456_789_012;
+        candidate
+            .update(
+                &[resistance, 2.123_456_789_012_345, 4.],
+                &mut EvalBudget::default(),
+            )
+            .unwrap();
+        let derivatives = evaluate(&candidate, &request, EvalLimits::default()).unwrap();
+        assert!(
+            derivatives
+                .iter()
+                .all(|value| matches!(value.status, DerivativeStatus::Defined(_)))
+        );
+        black_box(derivatives);
+    }
+    eprintln!(
+        "candidate-gradients count=1000 elapsed={:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
 fn compiled_law_dependency_does_not_report_a_false_zero_gradient() {
     let plan = CircuitParameterPlan::new(
         deck(".param gain=1000 unused=4\n.func law(x) {gain*(1+v(in))}\nv1 in 0 2\nr1 in out {law(1)}\nr2 out 0 1k"),

@@ -103,9 +103,18 @@ perturbed load, reads:
   that difference quotient (about `-3e10` on `sens_ac_mutual`), and from the
   next frequency on the coupling has collapsed to `M`.
 
-`DeviceSensitivity::reset_ac_load` builds a stand-in (`ResetStamps` or a
-family's own) that stamps exactly the C load's elements in C's order from the
-reset records and the current ones. Two fields escape the reset: MOS
+`DeviceSensitivity::ac_load` explicitly selects ordinary small-signal assembly
+for a reconstructed device, or an AC-only stamp (`ResetStamps` or a family's
+own `AcSensitivityStamp`). Neither specialized reset stamps nor passive AC
+stamps are DC devices. The reset stamps reproduce the C load's elements in
+their original order, with all addends validated before a stamp group is
+written. Fixed-size stamp lists and borrowed iterators do not allocate temporary
+vectors or copy device metadata. Families with ordinary DC reconstruction
+and two-snapshot historical AC replay share the reconstruction protocol:
+`ResetAcDevice` defines only the family-specific ordered AC assembly,
+while `ResetDevicePair` owns the reset and current snapshots. Frequency,
+thermal defaults and record identities retain their original semantics.
+Two fields escape the reset: MOS
 `capbd`/`capbs` are instance fields written only by `MODEINITSMSIG` or
 transient loads, so they hold whatever an earlier `.op`, `.ac`, `.tran`,
 `.pz`, `.disto` or `.noise` of the deck left (measured: a `.op` before the
@@ -248,10 +257,13 @@ allocates a second matrix merely to discover that no block is poisoned.
 The device hook is `Device::sensitivity(&ModelContext) ->
 SpiceResult<Box<dyn DeviceSensitivity>>`; its default is an explicit
 `NotYetPorted`, so a device whose C parameters are not reproduced is refused,
-never left out of the list. The analysis stamps the stand-in devices a
-description returns through `Circuit::load_device` (DC) and
-`Circuit::assemble_small_signal_device` (AC); the diode stand-in is the
-port's own `Diode` built from C's records.
+never left out of the list. The description provides a separate `dc_load`
+returning `DcSensitivityLoad` (original or replacement device) and `ac_load`
+returning `AcSensitivityLoad` (ordinary small-signal device or AC-only stamp).
+The analysis loads them through `Circuit::load_device` and
+`Circuit::assemble_sensitivity_ac` respectively. The parameter walker is
+generic over the load type, so the two assembly protocols cannot be mixed.
+The DC diode replacement is the port's own `Diode` built from C's records.
 
 ### BSIM4 (`bsim4/`, levels 14/54)
 

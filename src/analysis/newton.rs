@@ -542,6 +542,14 @@ impl CircuitNewton<'_, '_> {
     }
 }
 
+#[derive(Default)]
+struct IterateBuffers {
+    current: Vector,
+    next: Vector,
+    correction: Vector,
+    linear: crate::maths::NiWorkspace,
+}
+
 /// One ordinary Newton driver's disposable load slots. The matrix/RHS stay
 /// owned by the solve across loads; only the trial returned at convergence
 /// escapes to acceptance. This storage is also reused across DC continuation
@@ -550,6 +558,7 @@ struct LoadStorage<T> {
     matrix: Option<SparseMatrix>,
     rhs: Option<Vector>,
     spare_trial: Option<T>,
+    buffers: IterateBuffers,
     correction: Correction,
     late_recovery: bool,
     retain_linearization: bool,
@@ -561,6 +570,7 @@ impl<T> Default for LoadStorage<T> {
             matrix: None,
             rhs: None,
             spare_trial: None,
+            buffers: IterateBuffers::default(),
             correction: Correction::Absolute,
             late_recovery: false,
             retain_linearization: false,
@@ -619,15 +629,26 @@ impl<T> LoadStorage<T> {
     }
 }
 
-/// Persistent numerical scratch for a single circuit/analysis driver. A
-/// changed matrix pattern is recognized before reusing any bound stamps;
+/// Persistent numerical scratch for a single circuit/analysis driver.
+///
+/// A changed matrix pattern is recognized before reusing any bound stamps;
 /// state reuse is checked independently against accepted history revision.
 #[derive(Default)]
-pub(super) struct CircuitNewtonWorkspace {
+pub struct CircuitNewtonWorkspace {
     load: LoadStorage<TrialState>,
 }
 
 impl CircuitNewtonWorkspace {
+    /// Reclaim a consumed iterate's storage for the next Newton solve.
+    pub fn recycle_current(&mut self, current: Vector) {
+        self.load.buffers.current = current;
+    }
+
+    /// Reclaim a consumed next-iterate buffer for the next Newton solve.
+    pub fn recycle_next(&mut self, next: Vector) {
+        self.load.buffers.next = next;
+    }
+
     fn load_for(&mut self, bias: bool, options: &NewtonOptions) -> &mut LoadStorage<TrialState> {
         self.load.configure_recovery(bias, options);
         &mut self.load
@@ -747,7 +768,8 @@ fn iterate<T, F: Fn(&T) -> bool>(
     release_previous: impl Fn(&mut T),
 ) -> Result<NewtonSolution<T>, NewtonFailure> {
     let mut progress = Progress::default();
-    iterate_inner(
+    let mut buffers = std::mem::take(&mut storage.buffers);
+    let result = iterate_inner(
         initial,
         branch_rows,
         limited_rows,
@@ -758,8 +780,10 @@ fn iterate<T, F: Fn(&T) -> bool>(
         device_test,
         release_previous,
         &mut progress,
-    )
-    .map_err(|error| NewtonFailure {
+        &mut buffers,
+    );
+    storage.buffers = buffers;
+    result.map_err(|error| NewtonFailure {
         error,
         iterations: progress.iterations,
         last_iterate: progress.last_iterate,
@@ -821,6 +845,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     mut device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
     release_previous: impl Fn(&mut T),
     progress: &mut Progress,
+    buffers: &mut IterateBuffers,
 ) -> SpiceResult<NewtonSolution<T>> {
     validate_iteration_input(
         initial,
@@ -830,10 +855,10 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         options,
     )?;
     let n = initial.len();
-    let mut guess = initial.clone();
+    buffers.current.copy_values_from(initial);
+    buffers.linear.begin_solve();
     let mut phase = phases.first;
     let mut previous = phases.previous;
-    let mut ordering = None;
     let mut reorder = phases.initial_transient;
     let mut ipass = false;
     // Each solve begins in ordinary absolute coordinates. A cancellation-
@@ -843,26 +868,15 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     loop {
         // NIiter increments before checking the CKTload return code.
         let iterno = storage.begin_iteration(progress);
-        let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
+        let mut trial = load(&buffers.current, phase, previous.as_ref(), storage)?;
         let flagged = (phases.nonconvergent)(&trial);
         let linearization = storage.linearization();
         let (matrix, rhs) = storage.checked_system(n)?;
         if phase == IterationPhase::Junction {
             reorder = true;
         }
-        let mut next = match linearised_solve(
-            matrix,
-            rhs,
-            &guess,
-            &mut ordering,
-            reorder,
-            options,
-            linearization,
-        )? {
-            crate::maths::NiStep::Solved(next) => {
-                reorder = false;
-                next
-            }
+        match linearised_solve(matrix, rhs, buffers, reorder, options, linearization)? {
+            crate::maths::NiStep::Solved => reorder = false,
             crate::maths::NiStep::ZeroPivot => {
                 // E_SINGULAR from SMPluFac: NISHOULDREORDER and `continue`,
                 // reloading at the same iterate.
@@ -871,31 +885,30 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                 storage.spare_trial = previous.replace(trial);
                 continue;
             }
-        };
-        if phases.damped {
-            damp(
-                &mut next,
-                &guess,
-                branch_rows,
-                limited_rows,
-                options.voltage_step,
-            );
         }
-        reconstruct_storage(matrix, rhs, &mut next, phases.private_storage)?;
-        check_iteration_result(progress, &guess, &next, options)?;
+        let IterateBuffers {
+            current: guess,
+            next,
+            ..
+        } = buffers;
+        if phases.damped {
+            damp(next, guess, branch_rows, limited_rows, options.voltage_step);
+        }
+        reconstruct_storage(matrix, rhs, next, phases.private_storage)?;
+        check_iteration_result(progress, guess, next, options)?;
         let mut noncon = if flagged || iterno == 1 {
             true
         } else {
-            !converged(&next, &guess, branch_rows, phases.coordinate_kinds, options)
-                || device_test(&next, &guess, &trial)?
+            !converged(next, guess, branch_rows, phases.coordinate_kinds, options)
+                || device_test(next, guess, &trial)?
         };
         (storage.correction, noncon) =
             linearization
                 .correction
-                .after_solve(noncon, phase, &guess, &next, || {
+                .after_solve(noncon, phase, guess, next, || {
                     phases.coordinate_kinds.is_some()
                         && options.diag_gmin == 0.
-                        && correction_risk(matrix, rhs, &next, options)
+                        && correction_risk(matrix, rhs, next, options)
                 });
         if phase == IterationPhase::Float {
             if phases.nodesets {
@@ -915,9 +928,9 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                     storage.spare_trial = previous.take();
                 }
                 return Ok(NewtonSolution {
-                    values: guess,
+                    values: std::mem::take(guess),
                     trial,
-                    next,
+                    next: std::mem::take(next),
                     iterations: iterno,
                 });
             }
@@ -932,7 +945,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         );
         release_previous(&mut trial);
         storage.spare_trial = previous.replace(trial);
-        guess = next;
+        std::mem::swap(guess, next);
     }
 }
 // Eight inexpensive absolute passes cover the normal short bias solves;
@@ -1021,7 +1034,7 @@ fn damp(
 }
 fn check_iteration_result(
     progress: &mut Progress,
-    guess: &Vector,
+    guess: &mut Vector,
     next: &Vector,
     options: &NewtonOptions,
 ) -> SpiceResult<()> {
@@ -1029,7 +1042,7 @@ fn check_iteration_result(
         return Err(failure("nonfinite Newton iterate"));
     }
     if progress.iterations > options.max_iterations {
-        progress.last_iterate = Some(guess.clone());
+        progress.last_iterate = Some(std::mem::take(guess));
         return Err(failure(format!(
             "Newton iteration limit ({}) reached",
             options.max_iterations
@@ -1069,32 +1082,45 @@ fn reconstruct_storage(
 fn linearised_solve(
     matrix: &mut SparseMatrix,
     rhs: &mut Vector,
-    guess: &Vector,
-    ordering: &mut Option<crate::maths::SparseSymbolic>,
+    buffers: &mut IterateBuffers,
     reorder: bool,
     options: &NewtonOptions,
     linearization: Linearization,
 ) -> SpiceResult<crate::maths::NiStep> {
+    let IterateBuffers {
+        current: guess,
+        next,
+        correction,
+        linear: workspace,
+    } = buffers;
     // A validated zero-dimensional MNA system has exactly one solution.
     // Keep ordinary load, phase, convergence and trial handling intact;
     // the numerical factorization interface still requires a nonempty matrix.
     if guess.is_empty() {
-        return Ok(crate::maths::NiStep::Solved(Vector::zeros(0)));
+        next.copy_values_from(guess);
+        return Ok(crate::maths::NiStep::Solved);
     }
     let capturing = linearization.correction.capturing();
-    let correction = if capturing {
-        Some(matrix.original_correction(rhs, guess)?)
+    let solve_rhs = if capturing {
+        matrix.original_correction_into(rhs, guess, correction)?;
+        correction
     } else {
-        None
+        rhs
     };
-    let solve_rhs = correction.as_ref().unwrap_or(rhs);
-    let mut step = if linearization.retain {
-        crate::maths::linear::solve_ni_recorded(matrix, solve_rhs, ordering, reorder)?
+    let step = if linearization.retain {
+        crate::maths::linear::solve_ni_recorded(matrix, solve_rhs, workspace, next, reorder)?
     } else {
-        crate::maths::solve_ni(matrix, solve_rhs, ordering, reorder, options.diag_gmin)?
+        crate::maths::solve_ni(
+            matrix,
+            solve_rhs,
+            workspace,
+            next,
+            reorder,
+            options.diag_gmin,
+        )?
     };
-    if capturing && let crate::maths::NiStep::Solved(delta) = &mut step {
-        for (new, old) in delta.as_mut_slice().iter_mut().zip(guess.as_slice()) {
+    if capturing && matches!(step, crate::maths::NiStep::Solved) {
+        for (new, old) in next.as_mut_slice().iter_mut().zip(guess.as_slice()) {
             *new += old;
         }
     }
@@ -1191,6 +1217,77 @@ mod tests {
         assert_eq!(matrix.rows(), b.unknown_count());
         assert_eq!(rhs.len(), b.unknown_count());
         assert!(rhs.as_slice().iter().all(|&value| value == 0.));
+    }
+
+    #[test]
+    fn iterate_buffers_swap_reuse_and_preserve_retry_ownership() {
+        let options = NewtonOptions {
+            max_iterations: 8,
+            ..NewtonOptions::default()
+        };
+        let mut storage = LoadStorage::default();
+        let initial = Vector::zeros(2);
+        let mut addresses = Vec::new();
+        let mut run = |initial: &Vector, storage: &mut LoadStorage<()>, drift| {
+            let pattern =
+                std::sync::Arc::new(crate::maths::Pattern::new(2, [(0, 0), (1, 1)]).unwrap());
+            let mut matrix = SparseMatrix::bound(pattern).unwrap();
+            matrix.set(0, 0, 1.).unwrap();
+            matrix.set(1, 1, 1.).unwrap();
+            let phases = Phases {
+                coordinate_kinds: None,
+                private_storage: &[],
+                first: IterationPhase::Junction,
+                previous: None,
+                nonconvergent: |_: &()| false,
+                damped: false,
+                initial_transient: false,
+                nodesets: false,
+            };
+            iterate(
+                initial,
+                &[false; 2],
+                None,
+                &options,
+                phases,
+                storage,
+                |guess, _, _, storage| {
+                    addresses.push(guess.as_slice().as_ptr());
+                    let value = if drift {
+                        guess.get(0).unwrap() + 1.
+                    } else {
+                        2.
+                    };
+                    let mut rhs = storage.rhs.take().unwrap_or_else(|| Vector::zeros(2));
+                    rhs.set(0, value)?;
+                    rhs.set(1, -value)?;
+                    storage.loaded(matrix.clone(), rhs);
+                    Ok(())
+                },
+                |_, _, _| Ok(false),
+                |_: &mut ()| {},
+            )
+        };
+        let first = run(&initial, &mut storage, false).unwrap();
+        let expected = [
+            first.values.as_slice().as_ptr(),
+            first.next.as_slice().as_ptr(),
+        ];
+        assert_ne!(expected[0], expected[1]);
+        assert_eq!(first.values.as_slice(), &[2., -2.]);
+        assert_eq!(first.next, first.values);
+        // Recycle both consumed outputs just as the caller does after use.
+        storage.buffers.current = first.values;
+        storage.buffers.next = first.next;
+        let failed = run(&initial, &mut storage, true).unwrap_err();
+        assert_eq!(failed.iterations, options.max_iterations + 1);
+        let last = failed.last_iterate.unwrap();
+        assert_eq!(last.as_slice(), &[8., -8.]);
+        assert!(expected.contains(&last.as_slice().as_ptr()));
+        storage.buffers.current = last;
+        let recovered = run(&initial, &mut storage, false).unwrap();
+        assert_eq!(recovered.values.as_slice(), &[2., -2.]);
+        assert!(addresses.iter().all(|address| expected.contains(address)));
     }
 
     #[test]

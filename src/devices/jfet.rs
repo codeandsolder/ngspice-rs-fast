@@ -64,8 +64,8 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter, SensitivityRecord,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, junction_temperature_defaults, reconstructed_loads,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -1321,49 +1321,18 @@ impl SensitivityKernel for JfetSensitivity<'_> {
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        if !model.given("tnom") {
-            model.store("tnom", self.nominal_kelvin)?;
-        }
-        if !instance.given("dtemp") {
-            instance.store("dtemp", 0.)?;
-        }
-        if !instance.given("temp") {
-            let dtemp = instance.value("dtemp")?;
-            instance.store("temp", self.circuit_kelvin + dtemp)?;
-        }
-        Ok(())
+        junction_temperature_defaults(model, instance, self.nominal_kelvin, self.circuit_kelvin)
     }
 
-    fn load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "a JFET's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(self.jfet(current)?)))
-    }
-
-    /// `JFETacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
-    /// `ggd` are the `CKTstate0` values `jfetload.c` stored at zero junction
-    /// voltages with the reset records, the charge slots `qgs`/`qgd` (written
-    /// only by a small-signal or transient load) are zero, and the series
-    /// conductances and `m` come from `current`.
-    fn reset_ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(ResetJfet {
-            state: self.jfet(reset.state)?,
-            current: self.jfet(current)?,
-        })))
-    }
+    reconstructed_loads!(
+        reset,
+        /// `JFETacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
+        /// `ggd` are the `CKTstate0` values `jfetload.c` stored at zero junction
+        /// voltages with the reset records, the charge slots `qgs`/`qgd` (written
+        /// only by a small-signal or transient load) are zero, and the series
+        /// conductances and `m` come from `current`.
+        jfet
+    );
 }
 
 impl JfetSensitivity<'_> {
@@ -1417,50 +1386,25 @@ impl JfetSensitivity<'_> {
     }
 }
 
-/// A JFET's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
-#[derive(Debug)]
-struct ResetJfet {
-    /// Built from the reset load's records: the junction conductances.
-    state: Jfet,
-    /// Built from the current records: series conductances and `m`.
-    current: Jfet,
-}
-
-impl Device for ResetJfet {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'j'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl ResetAcDevice for Jfet {
     /// `jfetacld.c`'s real stamps; its `xgs`/`xgd` imaginary parts are zero.
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        _omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let model = context.model_context;
-        let state = &self.state;
         let op = state.operating(model)?;
         let [vgs, vgd] = state.normalized([0.; 3]);
         let e = state.evaluate(&op, vgs, vgd, model.gmin)?;
-        let current = self.current.operating(model)?;
+        let current_op = current.operating(model)?;
         ac_conductances(
             context,
-            &self.current.terminals,
-            self.current.inner,
-            self.current.instance.m,
-            [current.gdpr, current.gspr],
+            &current.terminals,
+            current.inner,
+            current.instance.m,
+            [current_op.gdpr, current_op.gspr],
             [e.load.gm, e.load.gds, e.load.ggs, e.load.ggd],
         )
     }

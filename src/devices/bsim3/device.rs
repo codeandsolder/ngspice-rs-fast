@@ -482,116 +482,8 @@ impl Device for Bsim3 {
         vec![slot::QB, slot::QG, slot::QD]
     }
 
-    /// `BSIM3convTest` (`b3cvtest.c`) on the last load's state, reading
-    /// `CKTrhsOld` (the iterate that load used) as C does. `NIiter` runs it
-    /// in `MODEINITFIX` too, where an `off` instance is not tested.
-    fn convergence_test(
-        &self,
-        context: &crate::devices::ConvergenceContext<'_>,
-    ) -> SpiceResult<bool> {
-        let at = |k: usize| context.states.get(k).copied().unwrap_or(0.);
-        let rhs_old = |node: NodeId| {
-            context
-                .unknowns
-                .node_row(node)
-                .and_then(|row| context.previous.get(row))
-                .unwrap_or(0.)
-        };
-        let [d, g, s, b] = [0, 1, 2, 3].map(|k| self.terminals[k]);
-        let dp = self.primes[0].unwrap_or(d);
-        let sp = self.primes[1].unwrap_or(s);
-        let pol = self.polarity;
-        let vbs = pol * (rhs_old(b) - rhs_old(sp));
-        let vgs = pol * (rhs_old(g) - rhs_old(sp));
-        let vds = pol * (rhs_old(dp) - rhs_old(sp));
-        let vbd = vbs - vds;
-        let vgd = vgs - vds;
-        let vgdo = at(slot::VGS) - at(slot::VDS);
-        let delvbs = vbs - at(slot::VBS);
-        let delvbd = vbd - at(slot::VBD);
-        let delvgs = vgs - at(slot::VGS);
-        let delvds = vds - at(slot::VDS);
-        let delvgd = vgd - vgdo;
-        let (gbd, gbs, gm, gds, gmbs) = (
-            at(slot::GBD),
-            at(slot::GBS),
-            at(slot::GM),
-            at(slot::GDS),
-            at(slot::GMBS),
-        );
-        let (gbbs, gbgs, gbds, csub) = (
-            at(slot::GBBS),
-            at(slot::GBGS),
-            at(slot::GBDS),
-            at(slot::CSUB),
-        );
-        let forward = at(slot::MODE) >= 0.;
-        let mut cd = at(slot::CD) - at(slot::CBD);
-        let cdhat = if forward {
-            cd += csub;
-            f64::mul_add(
-                gds + gbds,
-                delvds,
-                f64::mul_add(
-                    gm + gbgs,
-                    delvgs,
-                    f64::mul_add(gmbs + gbbs, delvbs, f64::mul_add(gbd, -delvbd, cd)),
-                ),
-            )
-        } else {
-            f64::mul_add(
-                gds,
-                -delvds,
-                f64::mul_add(gm, delvgd, f64::mul_add(gmbs - gbd, delvbd, cd)),
-            )
-        };
-        let fix = context.phase == crate::devices::IterationPhase::Fix;
-        if !self.off || !fix {
-            let max = |a: Real, b: Real| if a > b { a } else { b };
-            let tol = context
-                .reltol
-                .mul_add(max(cdhat.abs(), cd.abs()), context.abstol);
-            if (cdhat - cd).abs() >= tol {
-                return Ok(true);
-            }
-            let (cbs, cbd) = (at(slot::CBS), at(slot::CBD));
-            let cbhat = if forward {
-                f64::mul_add(
-                    gbds,
-                    -delvds,
-                    f64::mul_add(
-                        gbgs,
-                        -delvgs,
-                        f64::mul_add(
-                            gbs - gbbs,
-                            delvbs,
-                            f64::mul_add(gbd, delvbd, cbs + cbd - csub),
-                        ),
-                    ),
-                )
-            } else {
-                f64::mul_add(
-                    gbds,
-                    delvds,
-                    f64::mul_add(
-                        gbgs,
-                        -delvgd,
-                        f64::mul_add(
-                            gbd - gbbs,
-                            delvbd,
-                            f64::mul_add(gbs, delvbs, cbs + cbd - csub),
-                        ),
-                    ),
-                )
-            };
-            let tol = context
-                .reltol
-                .mul_add(max(cbhat.abs(), (cbs + cbd - csub).abs()), context.abstol);
-            if (cbhat - (cbs + cbd - csub)).abs() > tol {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
@@ -1063,6 +955,120 @@ impl Device for Bsim3 {
             model: Some(&self.model_name),
             total: true,
         })
+    }
+}
+
+impl crate::devices::DeviceConvergence for Bsim3 {
+    /// `BSIM3convTest` (`b3cvtest.c`) on the last load's state, reading
+    /// `CKTrhsOld` (the iterate that load used) as C does. `NIiter` runs it
+    /// in `MODEINITFIX` too, where an `off` instance is not tested.
+    fn convergence_test(
+        &self,
+        context: &crate::devices::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        let at = |k: usize| context.states.get(k).copied().unwrap_or(0.);
+        let rhs_old = |node: NodeId| {
+            context
+                .unknowns
+                .node_row(node)
+                .and_then(|row| context.previous.get(row))
+                .unwrap_or(0.)
+        };
+        let [d, g, s, b] = [0, 1, 2, 3].map(|k| self.terminals[k]);
+        let dp = self.primes[0].unwrap_or(d);
+        let sp = self.primes[1].unwrap_or(s);
+        let pol = self.polarity;
+        let vbs = pol * (rhs_old(b) - rhs_old(sp));
+        let vgs = pol * (rhs_old(g) - rhs_old(sp));
+        let vds = pol * (rhs_old(dp) - rhs_old(sp));
+        let vbd = vbs - vds;
+        let vgd = vgs - vds;
+        let vgdo = at(slot::VGS) - at(slot::VDS);
+        let delvbs = vbs - at(slot::VBS);
+        let delvbd = vbd - at(slot::VBD);
+        let delvgs = vgs - at(slot::VGS);
+        let delvds = vds - at(slot::VDS);
+        let delvgd = vgd - vgdo;
+        let (gbd, gbs, gm, gds, gmbs) = (
+            at(slot::GBD),
+            at(slot::GBS),
+            at(slot::GM),
+            at(slot::GDS),
+            at(slot::GMBS),
+        );
+        let (gbbs, gbgs, gbds, csub) = (
+            at(slot::GBBS),
+            at(slot::GBGS),
+            at(slot::GBDS),
+            at(slot::CSUB),
+        );
+        let forward = at(slot::MODE) >= 0.;
+        let mut cd = at(slot::CD) - at(slot::CBD);
+        let cdhat = if forward {
+            cd += csub;
+            f64::mul_add(
+                gds + gbds,
+                delvds,
+                f64::mul_add(
+                    gm + gbgs,
+                    delvgs,
+                    f64::mul_add(gmbs + gbbs, delvbs, f64::mul_add(gbd, -delvbd, cd)),
+                ),
+            )
+        } else {
+            f64::mul_add(
+                gds,
+                -delvds,
+                f64::mul_add(gm, delvgd, f64::mul_add(gmbs - gbd, delvbd, cd)),
+            )
+        };
+        let fix = context.phase == crate::devices::IterationPhase::Fix;
+        if !self.off || !fix {
+            let max = |a: Real, b: Real| if a > b { a } else { b };
+            let tol = context
+                .reltol
+                .mul_add(max(cdhat.abs(), cd.abs()), context.abstol);
+            if (cdhat - cd).abs() >= tol {
+                return Ok(true);
+            }
+            let (cbs, cbd) = (at(slot::CBS), at(slot::CBD));
+            let cbhat = if forward {
+                f64::mul_add(
+                    gbds,
+                    -delvds,
+                    f64::mul_add(
+                        gbgs,
+                        -delvgs,
+                        f64::mul_add(
+                            gbs - gbbs,
+                            delvbs,
+                            f64::mul_add(gbd, delvbd, cbs + cbd - csub),
+                        ),
+                    ),
+                )
+            } else {
+                f64::mul_add(
+                    gbds,
+                    delvds,
+                    f64::mul_add(
+                        gbgs,
+                        -delvgd,
+                        f64::mul_add(
+                            gbd - gbbs,
+                            delvbd,
+                            f64::mul_add(gbs, delvbs, cbs + cbd - csub),
+                        ),
+                    ),
+                )
+            };
+            let tol = context
+                .reltol
+                .mul_add(max(cbhat.abs(), (cbs + cbd - csub).abs()), context.abstol);
+            if (cbhat - (cbs + cbd - csub)).abs() > tol {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

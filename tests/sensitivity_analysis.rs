@@ -550,7 +550,9 @@ fn unsupported_cases_fail_explicitly() {
 
 #[test]
 fn replay_rejects_foreign_and_swapped_records_without_mutating() {
-    use ngspice_rs::devices::sensitivity::{ParameterScope, RecordPair, SensitivityMode};
+    use ngspice_rs::devices::sensitivity::{
+        AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair,
+    };
     use ngspice_rs::devices::{Circuit, ModelContext};
     let netlist = Parser::new()
         .parse_deck(&parse_deck_text(
@@ -616,13 +618,51 @@ fn replay_rejects_foreign_and_swapped_records_without_mutating() {
             .ask(ParameterScope::Instance, "resistance", foreign)
             .is_err()
     );
+    assert!(resistor.dc_load(correct, swapped).is_err());
+    assert!(resistor.setup_elements(foreign).is_err());
+    assert!(matches!(
+        resistor.dc_load(correct, correct),
+        Ok(DcSensitivityLoad::Replacement(_))
+    ));
+    let reset = AcReset {
+        state: correct,
+        omega: 1.,
+        small_signal: None,
+        transient: None,
+    };
+    assert!(matches!(
+        resistor.ac_load(correct, reset, correct),
+        Ok(AcSensitivityLoad::Device(_))
+    ));
+    assert!(resistor.ac_load(correct, reset, swapped).is_err());
+    assert!(resistor.ac_load(foreign, reset, correct).is_err());
     assert!(
         resistor
-            .load(correct, swapped, SensitivityMode::Dc)
+            .ac_load(
+                correct,
+                AcReset {
+                    state: foreign,
+                    ..reset
+                },
+                correct
+            )
             .is_err()
     );
-    assert!(resistor.setup_elements(foreign).is_err());
-    assert!(resistor.load(correct, correct, SensitivityMode::Dc).is_ok());
+    assert!(matches!(
+        capacitor.dc_load(foreign, foreign),
+        Ok(DcSensitivityLoad::Original)
+    ));
+    assert!(matches!(
+        capacitor.ac_load(
+            foreign,
+            AcReset {
+                state: foreign,
+                ..reset
+            },
+            foreign
+        ),
+        Ok(AcSensitivityLoad::Stamp(_))
+    ));
 }
 
 /// The JFET2 DELTA=0 derivative can be computed independently by implicit

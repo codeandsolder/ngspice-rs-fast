@@ -469,107 +469,8 @@ impl Device for Passive {
         self.expression.validate_dc_inputs(context)
     }
 
-    fn convergence_test(
-        &self,
-        context: &crate::devices::ConvergenceContext<'_>,
-    ) -> SpiceResult<bool> {
-        let rows = self.rows(context.unknowns, context.branch)?;
-        let branch = if self.law == Law::Derivative {
-            rows[1]
-        } else {
-            rows[0]
-        };
-        self.with_bound(
-            BoundInput {
-                solution: context.solution,
-                unknowns: context.unknowns,
-                controls: context.controls,
-                branch,
-                time: context.time,
-                model: context.model_context,
-            },
-            |bound, equations| {
-                let [p, n, current, rate] = bound.values;
-                let voltage = p - n;
-                let coefficient = bound.factor * bound.expression.evaluation.value;
-                let disagree = |actual: Real, expected: Real, absolute: Real| {
-                    !actual.is_finite()
-                        || !expected.is_finite()
-                        || (actual - expected).abs()
-                            > context
-                                .reltol
-                                .mul_add(actual.abs().max(expected.abs()), absolute)
-                };
-                let derivative = |quantity: Real| -> SpiceResult<(Real, Real)> {
-                    if let Some(integration) = context.integration {
-                        let accepted = |age, slot| {
-                            context.accepted(age, slot).ok_or_else(|| {
-                                SpiceError::circuit("missing constitutive convergence history")
-                            })
-                        };
-                        let mut history = crate::maths::integrator::ChargeHistory::new(quantity);
-                        for age in 1..=integration.charge_history_len() {
-                            history.push(accepted(age, 0)?)?;
-                        }
-                        let previous = integration
-                            .needs_previous_derivative()
-                            .then(|| accepted(1, 1))
-                            .transpose()?;
-                        let companion = integration.integrate(&history, previous, 1.)?;
-                        // The linear evolution stamp contains the rounded history
-                        // source and present-charge coefficient. Their cancellation
-                        // can amplify one ulp of stored charge into a large rate
-                        // error at small dt. Test against that arithmetic's
-                        // backward-error floor, not a fictitious exact derivative.
-                        let rounding = (4. * Real::EPSILON * companion.conductance.abs())
-                            .mul_add(quantity.abs(), 4. * Real::EPSILON * companion.current.abs());
-                        Ok((companion.derivative, rounding))
-                    } else {
-                        Ok((0., 0.))
-                    }
-                };
-                let dynamic = || -> SpiceResult<(Real, Real)> {
-                    let storage = equations
-                        .into_iter()
-                        .flatten()
-                        .find_map(|equation| equation.storage)
-                        .ok_or_else(|| SpiceError::circuit("missing constitutive storage"))?;
-                    derivative(storage.value)
-                };
-                Ok(match self.law {
-                    Law::Resistance => disagree(voltage, coefficient * current, context.vntol),
-                    Law::Charge | Law::Derivative => {
-                        let mut scale = coefficient.abs().max(rate.abs());
-                        for (_, value, derivative) in bound.derivatives(
-                            equations[0]
-                                .ok_or_else(|| {
-                                    SpiceError::circuit("missing explicit storage relation")
-                                })?
-                                .static_part,
-                        ) {
-                            scale += (value * derivative).abs();
-                        }
-                        let rounding = 4. * Real::EPSILON * scale;
-                        let (actual, absolute) = if self.law == Law::Charge {
-                            (current, context.abstol)
-                        } else {
-                            (voltage, context.vntol)
-                        };
-                        let (expected, rate_rounding) = dynamic()?;
-                        disagree(rate, coefficient, rounding)
-                            || disagree(actual, -expected, absolute + rate_rounding)
-                    }
-                    Law::Capacitance => {
-                        disagree(current, coefficient * rate, context.abstol)
-                            || disagree(current, -coefficient * dynamic()?.0, context.abstol)
-                    }
-                    Law::Inductance => {
-                        disagree(voltage, coefficient * rate, context.vntol)
-                            || disagree(voltage, -coefficient * dynamic()?.0, context.vntol)
-                    }
-                })
-            },
-        )
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
 
     fn setup_matrix(&self, setup: &mut MatrixSetup<'_>) -> SpiceResult<bool> {
@@ -906,6 +807,111 @@ impl Device for Passive {
             model: None,
             total: true,
         })
+    }
+}
+
+impl crate::devices::DeviceConvergence for Passive {
+    fn convergence_test(
+        &self,
+        context: &crate::devices::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        let rows = self.rows(context.unknowns, context.branch)?;
+        let branch = if self.law == Law::Derivative {
+            rows[1]
+        } else {
+            rows[0]
+        };
+        self.with_bound(
+            BoundInput {
+                solution: context.solution,
+                unknowns: context.unknowns,
+                controls: context.controls,
+                branch,
+                time: context.time,
+                model: context.model_context,
+            },
+            |bound, equations| {
+                let [p, n, current, rate] = bound.values;
+                let voltage = p - n;
+                let coefficient = bound.factor * bound.expression.evaluation.value;
+                let disagree = |actual: Real, expected: Real, absolute: Real| {
+                    !actual.is_finite()
+                        || !expected.is_finite()
+                        || (actual - expected).abs()
+                            > context
+                                .reltol
+                                .mul_add(actual.abs().max(expected.abs()), absolute)
+                };
+                let derivative = |quantity: Real| -> SpiceResult<(Real, Real)> {
+                    if let Some(integration) = context.integration {
+                        let accepted = |age, slot| {
+                            context.accepted(age, slot).ok_or_else(|| {
+                                SpiceError::circuit("missing constitutive convergence history")
+                            })
+                        };
+                        let mut history = crate::maths::integrator::ChargeHistory::new(quantity);
+                        for age in 1..=integration.charge_history_len() {
+                            history.push(accepted(age, 0)?)?;
+                        }
+                        let previous = integration
+                            .needs_previous_derivative()
+                            .then(|| accepted(1, 1))
+                            .transpose()?;
+                        let companion = integration.integrate(&history, previous, 1.)?;
+                        // The linear evolution stamp contains the rounded history
+                        // source and present-charge coefficient. Their cancellation
+                        // can amplify one ulp of stored charge into a large rate
+                        // error at small dt. Test against that arithmetic's
+                        // backward-error floor, not a fictitious exact derivative.
+                        let rounding = (4. * Real::EPSILON * companion.conductance.abs())
+                            .mul_add(quantity.abs(), 4. * Real::EPSILON * companion.current.abs());
+                        Ok((companion.derivative, rounding))
+                    } else {
+                        Ok((0., 0.))
+                    }
+                };
+                let dynamic = || -> SpiceResult<(Real, Real)> {
+                    let storage = equations
+                        .into_iter()
+                        .flatten()
+                        .find_map(|equation| equation.storage)
+                        .ok_or_else(|| SpiceError::circuit("missing constitutive storage"))?;
+                    derivative(storage.value)
+                };
+                Ok(match self.law {
+                    Law::Resistance => disagree(voltage, coefficient * current, context.vntol),
+                    Law::Charge | Law::Derivative => {
+                        let mut scale = coefficient.abs().max(rate.abs());
+                        for (_, value, derivative) in bound.derivatives(
+                            equations[0]
+                                .ok_or_else(|| {
+                                    SpiceError::circuit("missing explicit storage relation")
+                                })?
+                                .static_part,
+                        ) {
+                            scale += (value * derivative).abs();
+                        }
+                        let rounding = 4. * Real::EPSILON * scale;
+                        let (actual, absolute) = if self.law == Law::Charge {
+                            (current, context.abstol)
+                        } else {
+                            (voltage, context.vntol)
+                        };
+                        let (expected, rate_rounding) = dynamic()?;
+                        disagree(rate, coefficient, rounding)
+                            || disagree(actual, -expected, absolute + rate_rounding)
+                    }
+                    Law::Capacitance => {
+                        disagree(current, coefficient * rate, context.abstol)
+                            || disagree(current, -coefficient * dynamic()?.0, context.abstol)
+                    }
+                    Law::Inductance => {
+                        disagree(voltage, coefficient * rate, context.vntol)
+                            || disagree(voltage, -coefficient * dynamic()?.0, context.vntol)
+                    }
+                })
+            },
+        )
     }
 }
 

@@ -362,6 +362,7 @@ fn real_sparse_rhs_fill_crossover() {
             .collect();
         let mut work = SolveBatchWorkspace::default();
         let mut scalar_work = Vec::new();
+        let mut expected = Vector::default();
         let mut out = Vec::new();
         println!(
             "workload={name},factor_entries={}",
@@ -374,12 +375,8 @@ fn real_sparse_rhs_fill_crossover() {
                     .unwrap();
                 for (input, output) in rhs.chunks_exact(size).zip(out.chunks_exact(size)) {
                     let input = Vector::from(input.to_vec());
-                    let expected = if transposed {
-                        lu.solve_transposed_with_workspace(&input, &mut scalar_work)
-                    } else {
-                        lu.solve_with_workspace(&input, &mut scalar_work)
-                    }
-                    .unwrap();
+                    lu.solve_into(&input, &mut scalar_work, &mut expected, transposed)
+                        .unwrap();
                     assert_eq!(output, expected.as_slice());
                 }
                 let mut times = [Duration::ZERO; 5];

@@ -173,6 +173,12 @@ impl ngspice_rs::devices::Device for Cubic {
             .unwrap_or(0.);
         context.nodal(self.nodes, 3. * v * v, false)
     }
+    fn accept_notifier(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptNotification> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptNotification for Cubic {
     fn accept(&self, _: &ngspice_rs::devices::AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
     }
@@ -222,6 +228,12 @@ impl ngspice_rs::devices::Device for Rejecting {
     ) -> SpiceResult<()> {
         context.nodal(self.nodes, 1e-3, false)
     }
+    fn accept_notifier(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptNotification> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptNotification for Rejecting {
     fn accept(&self, _: &ngspice_rs::devices::AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
     }

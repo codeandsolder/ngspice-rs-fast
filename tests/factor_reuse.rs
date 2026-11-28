@@ -5,7 +5,7 @@
 //! a changed value, a changed `diag_gmin`, a requested reorder and a complex
 //! (AC) factorization in the shared frame.
 use ngspice_rs::maths::complex::ComplexMatrix;
-use ngspice_rs::maths::{NiStep, Pattern, SparseMatrix, Vector, solve_ni};
+use ngspice_rs::maths::{NiStep, NiWorkspace, Pattern, SparseMatrix, Vector, solve_ni};
 use ngspice_rs::primitives::Complex;
 use std::sync::Arc;
 
@@ -32,8 +32,18 @@ fn rhs() -> Vector {
 }
 
 fn solve(pattern: &Arc<Pattern>, values: &[f64; 7], reorder: bool, gmin: f64) -> Vec<f64> {
-    match solve_ni(&bound(pattern, values), &rhs(), &mut None, reorder, gmin).unwrap() {
-        NiStep::Solved(x) => x.as_slice().to_vec(),
+    let mut x = Vector::default();
+    match solve_ni(
+        &bound(pattern, values),
+        &rhs(),
+        &mut NiWorkspace::default(),
+        &mut x,
+        reorder,
+        gmin,
+    )
+    .unwrap()
+    {
+        NiStep::Solved => x.as_slice().to_vec(),
         NiStep::ZeroPivot => panic!("zero pivot"),
     }
 }
@@ -131,7 +141,9 @@ fn a_complex_factorization_in_the_shared_frame_invalidates_the_factors() {
 
 #[test]
 fn measured_cache_work_distinguishes_order_refactor_exact_hit_and_retained_pivots() {
-    use ngspice_rs::maths::{FactorWork, PatternTelemetry, solve_last_factors};
+    use ngspice_rs::maths::{
+        FactorWork, PatternTelemetry, RetainedSolveWorkspace, solve_last_factors_into,
+    };
 
     let p = pattern();
     assert_eq!(p.factor_telemetry(), PatternTelemetry::default());
@@ -174,9 +186,13 @@ fn measured_cache_work_distinguishes_order_refactor_exact_hit_and_retained_pivot
     assert_eq!(after_order.work.rhs_solves, 4);
     assert_eq!(after_order.storage, Some(storage));
 
-    let retained = solve_last_factors(&p, &rhs()).unwrap().unwrap();
+    let mut retained = Vector::default();
+    let mut scratch = RetainedSolveWorkspace::default();
+    assert!(solve_last_factors_into(&p, &rhs(), &mut scratch, &mut retained, false).unwrap());
     assert_eq!(bits(retained.as_slice()), bits(&reordered));
-    assert!(solve_last_factors(&p, &Vector::zeros(1)).is_err());
+    assert!(
+        solve_last_factors_into(&p, &Vector::zeros(1), &mut scratch, &mut retained, false).is_err()
+    );
     let after_retained = p.factor_telemetry();
     assert_eq!(after_retained.work.rhs_solves, 5);
     assert_eq!(after_retained.work.rhs_failures, 1);
@@ -205,13 +221,13 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     let rhs = Vector::from_slice(&[2., 1.]);
     let initial = two_by_two(&p, [4., 1., 1., 5.]);
     let changed = two_by_two(&p, [0., 2., 1., 0.]);
-    let mut old = None;
+    let mut old = NiWorkspace::default();
     assert!(matches!(
-        solve_ni(&initial, &rhs, &mut old, true, 0.).unwrap(),
-        NiStep::Solved(_)
+        solve_ni(&initial, &rhs, &mut old, &mut Vector::default(), true, 0.).unwrap(),
+        NiStep::Solved
     ));
     assert!(matches!(
-        solve_ni(&changed, &rhs, &mut old, false, 0.).unwrap(),
+        solve_ni(&changed, &rhs, &mut old, &mut Vector::default(), false, 0.).unwrap(),
         NiStep::ZeroPivot
     ));
     let failed = p.factor_telemetry();
@@ -221,7 +237,8 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     assert_eq!(failed.work.rhs_solves, 1);
     assert!(failed.storage.is_none());
 
-    let NiStep::Solved(x) = solve_ni(&changed, &rhs, &mut old, true, 0.).unwrap() else {
+    let mut x = Vector::default();
+    let NiStep::Solved = solve_ni(&changed, &rhs, &mut old, &mut x, true, 0.).unwrap() else {
         panic!("threshold reorder did not recover the nonsingular matrix");
     };
     assert_eq!(x.as_slice(), [1., 1.]);
@@ -233,14 +250,14 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     assert_eq!(changed.nnz(), 2);
 
     let singular = two_by_two(&p, [0.; 4]);
-    assert!(solve_ni(&singular, &rhs, &mut old, true, 0.).is_err());
+    assert!(solve_ni(&singular, &rhs, &mut old, &mut Vector::default(), true, 0.).is_err());
     let failed = p.factor_telemetry();
     assert_eq!(failed.work.factor.successful_factors, 2);
     assert_eq!(failed.work.factor.singular_failures, 1);
     assert!(failed.storage.is_none());
 
     let nonfinite = two_by_two(&p, [f64::NAN, 1., 1., 1.]);
-    assert!(solve_ni(&nonfinite, &rhs, &mut old, true, 0.).is_err());
+    assert!(solve_ni(&nonfinite, &rhs, &mut old, &mut Vector::default(), true, 0.).is_err());
     let rejected = p.factor_telemetry();
     assert_eq!(rejected.work.factor.assembly_rejections, 1);
     assert_eq!(rejected.work.factor.successful_factors, 2);
@@ -250,21 +267,23 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     // A tiny raw pivot alone is not: it may only make a particular
     // RHS solution unrepresentable.
     let overflow = two_by_two(&p, [f64::MAX, f64::MAX, f64::MAX, -f64::MAX]);
-    assert!(solve_ni(&overflow, &rhs, &mut old, true, 0.).is_err());
+    assert!(solve_ni(&overflow, &rhs, &mut old, &mut Vector::default(), true, 0.).is_err());
     let nonfinite = p.factor_telemetry();
     assert_eq!(nonfinite.work.factor.nonfinite_failures, 1);
     assert_eq!(nonfinite.work.factor.successful_factors, 2);
     assert!(nonfinite.storage.is_none());
 
     let tiny = two_by_two(&p, [f64::from_bits(1), 0., 0., 1.]);
-    assert!(solve_ni(&tiny, &rhs, &mut old, true, 0.).is_err());
+    assert!(solve_ni(&tiny, &rhs, &mut old, &mut Vector::default(), true, 0.).is_err());
     let valid_factors = p.factor_telemetry();
     assert_eq!(valid_factors.work.factor.nonfinite_failures, 1);
     assert_eq!(valid_factors.work.factor.successful_factors, 3);
     assert_eq!(valid_factors.work.rhs_failures, 1);
     assert!(valid_factors.storage.is_some());
     let representable = Vector::from_slice(&[f64::from_bits(1), 1.]);
-    let NiStep::Solved(x) = solve_ni(&tiny, &representable, &mut old, false, 0.).unwrap() else {
+    let mut x = Vector::default();
+    let NiStep::Solved = solve_ni(&tiny, &representable, &mut old, &mut x, false, 0.).unwrap()
+    else {
         panic!("valid small-pivot factors failed to solve a representable RHS");
     };
     assert_eq!(x.as_slice(), &[1., 1.]);
@@ -335,7 +354,15 @@ fn missing_translated_unknown_never_publishes_partial_factor_storage() {
     for _ in 0..2 {
         let error = SparseLu::new(&matrix, None).unwrap_err();
         assert!(error.to_string().contains("no matrix entries"));
-        let error = solve_ni(&matrix, &rhs, &mut None, false, 0.).unwrap_err();
+        let error = solve_ni(
+            &matrix,
+            &rhs,
+            &mut NiWorkspace::default(),
+            &mut Vector::default(),
+            false,
+            0.,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("no matrix entries"));
         let telemetry = pattern.factor_telemetry();
         assert_eq!(telemetry.storage, None);
@@ -370,4 +397,59 @@ fn shared_cache_telemetry_is_transactional_across_concurrent_solves() {
     );
     assert_eq!(after.work.rhs_solves - start.work.rhs_solves, 64);
     assert_eq!(after.storage, start.storage);
+}
+
+#[test]
+fn warmed_solution_and_numeric_workspace_reuse_across_rhs_and_refactors() {
+    for bound_system in [false, true] {
+        let p = pattern();
+        let mut matrix = if bound_system {
+            bound(&p, &A)
+        } else {
+            let mut matrix = SparseMatrix::new(3, 3);
+            for (&(row, col), &value) in POSITIONS.iter().zip(&A) {
+                matrix.set(row, col, value).unwrap();
+            }
+            matrix
+        };
+        let mut workspace = NiWorkspace::default();
+        let mut output = Vector::default();
+        let source = rhs();
+        for _ in 0..2 {
+            assert!(matches!(
+                solve_ni(&matrix, &source, &mut workspace, &mut output, false, 0.).unwrap(),
+                NiStep::Solved
+            ));
+        }
+        let address = output.as_slice().as_ptr();
+        for (i, coefficient) in [A[0], B[0], B[0], A[0]].into_iter().enumerate() {
+            matrix.set(0, 0, coefficient).unwrap();
+            let mut values = A;
+            values[0] = coefficient;
+            let source = Vector::from_slice(&[1., -2., 0.5]);
+            assert!(matches!(
+                solve_ni(&matrix, &source, &mut workspace, &mut output, i == 3, 0.).unwrap(),
+                NiStep::Solved
+            ));
+            assert_eq!(output.as_slice().as_ptr(), address);
+            assert!(residual(&values, 0., output.as_slice()) < 1e-14);
+        }
+        assert!(
+            solve_ni(
+                &matrix,
+                &Vector::zeros(2),
+                &mut workspace,
+                &mut output,
+                false,
+                0.
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            solve_ni(&matrix, &source, &mut workspace, &mut output, false, 0.).unwrap(),
+            NiStep::Solved
+        ));
+        assert_eq!(output.as_slice().as_ptr(), address);
+        assert!(residual(&A, 0., output.as_slice()) < 1e-14);
+    }
 }

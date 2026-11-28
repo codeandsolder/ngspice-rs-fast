@@ -30,6 +30,8 @@ use petgraph::graphmap::UnGraphMap;
 use crate::maths::dense::Vector;
 use crate::maths::linear::SparseLu;
 
+mod symbolic;
+
 /// One `(row, column, value)` entry.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Triplet {
@@ -89,9 +91,6 @@ pub(super) struct OrderingState {
     pub(super) frame: Option<crate::maths::linear::CachedFrame>,
     pub(super) ac_reorder: bool,
     pub(super) work: crate::maths::PatternWork,
-    /// Reused real factor/triangular-solve scratch, owned by the circuit
-    /// transaction rather than by an immutable factor snapshot.
-    pub(super) solve_workspace: Vec<Real>,
 }
 
 impl Default for OrderingState {
@@ -100,7 +99,6 @@ impl Default for OrderingState {
             frame: None,
             ac_reorder: true,
             work: crate::maths::PatternWork::default(),
-            solve_workspace: Vec::new(),
         }
     }
 }
@@ -174,64 +172,7 @@ impl Pattern {
     /// # Errors
     /// Unsupported dimensions, coordinates, compact handle count or allocation.
     pub fn new(n: usize, positions: impl IntoIterator<Item = (usize, usize)>) -> SpiceResult<Self> {
-        pattern_rows(n)?;
-        let mut seen = std::collections::HashSet::new();
-        let mut unique = Vec::new();
-        for (row, col) in positions {
-            let position = compact_position(n, row, col)?;
-            if insert_position(&mut seen, position)? {
-                push_compact(&mut unique, position)?;
-            }
-        }
-        Self::index(n, unique)
-    }
-
-    fn index(n: usize, positions: Vec<(u32, u32)>) -> SpiceResult<Self> {
-        let len = compact_count(positions.len())?;
-        let rows = pattern_rows(n)?;
-        let mut row_start = crate::primitives::filled_vec(rows, 0_u32, "sparse pattern")?;
-        for &(row, _) in &positions {
-            row_start[row as usize + 1] += 1;
-        }
-        for row in 0..n {
-            row_start[row + 1] += row_start[row];
-        }
-        let row_ids = if positions.windows(2).all(|pair| pair[0] < pair[1]) {
-            // Already row-major and unique: element handles are the index.
-            let mut order = Vec::new();
-            reserve(&mut order, positions.len())?;
-            order.extend(0..len);
-            order
-        } else {
-            // Bucket handles by row in linear time, then sort only within
-            // rows. The original positions and handle numbering never move.
-            let mut order =
-                crate::primitives::filled_vec(positions.len(), 0_u32, "sparse pattern")?;
-            for (id, &(row, _)) in (0..len).zip(&positions) {
-                let cursor = &mut row_start[row as usize];
-                order[*cursor as usize] = id;
-                *cursor += 1;
-            }
-            // Each write cursor is now the following row's start. Recover
-            // the prefix offsets in place rather than allocate another n-vector.
-            row_start.copy_within(..n, 1);
-            row_start[0] = 0;
-            for bounds in row_start.windows(2) {
-                order[bounds[0] as usize..bounds[1] as usize]
-                    .sort_unstable_by_key(|&id| positions[id as usize].1);
-            }
-            order
-        };
-        let mut row_cols = Vec::new();
-        reserve(&mut row_cols, row_ids.len())?;
-        row_cols.extend(row_ids.iter().map(|&id| positions[id as usize].1));
-        Ok(Self::with_index(PatternIndex {
-            n,
-            positions,
-            row_start,
-            row_cols,
-            row_ids,
-        }))
+        Ok(Self::with_index(symbolic::build(n, positions, None)?))
     }
 
     fn with_index(index: PatternIndex) -> Self {
@@ -301,15 +242,8 @@ impl Pattern {
     /// # Errors
     /// Invalid coordinates, unsupported compact handle count or allocation.
     pub fn extended(&self, extra: impl IntoIterator<Item = (usize, usize)>) -> SpiceResult<Self> {
-        let mut positions = copy_entries(&self.index.positions)?;
-        let mut appended = std::collections::HashSet::new();
-        for (row, col) in extra {
-            let position = compact_position(self.index.n, row, col)?;
-            if self.find(row, col).is_none() && insert_position(&mut appended, position)? {
-                push_compact(&mut positions, position)?;
-            }
-        }
-        let mut extended = Self::index(self.index.n, positions)?;
+        let mut extended =
+            Self::with_index(symbolic::build(self.index.n, extra, Some(&self.index))?);
         extended.namespace = Arc::clone(&self.namespace);
         Ok(extended)
     }
@@ -359,20 +293,12 @@ impl Pattern {
         if row >= self.index.n {
             return None;
         }
-        let (start, end) = self.row_bounds(row);
-        let col = u32::try_from(col).ok()?;
-        self.index.row_cols[start..end]
-            .binary_search(&col)
-            .ok()
-            .map(|offset| ElementId(self.index.row_ids[start + offset]))
+        self.index.find(row, u32::try_from(col).ok()?)
     }
 
     /// Index interval of one row within the row-major handle array.
     fn row_bounds(&self, row: usize) -> (usize, usize) {
-        (
-            self.index.row_start[row] as usize,
-            self.index.row_start[row + 1] as usize,
-        )
+        self.index.row_bounds(row)
     }
 
     /// Validated element handles and coordinates in row-major order.
@@ -399,23 +325,6 @@ fn pattern_rows(n: usize) -> SpiceResult<usize> {
     std::alloc::Layout::array::<u32>(rows)
         .map_err(|error| pattern_error(format!("row offset capacity: {error}")))?;
     Ok(rows)
-}
-
-fn insert_position(
-    seen: &mut std::collections::HashSet<(u32, u32)>,
-    position: (u32, u32),
-) -> SpiceResult<bool> {
-    // A duplicate does not require storage; on the usual path there is just
-    // one hash lookup, as in the original infallible builder.
-    if seen.len() == seen.capacity() {
-        if seen.contains(&position) {
-            return Ok(false);
-        }
-        seen.try_reserve(1).map_err(|error| {
-            pattern_error(format!("cannot reserve sparse position index: {error}"))
-        })?;
-    }
-    Ok(seen.insert(position))
 }
 
 fn reserve<T>(values: &mut Vec<T>, additional: usize) -> SpiceResult<()> {
@@ -1376,11 +1285,12 @@ impl SparseMatrix {
     /// Compute b - A*x from individual original stamps. Sorting by equation
     /// uses sparse storage rather than an exact accumulator per unknown.
     /// The already rounded matrix remains the numerical Jacobian.
-    pub(crate) fn original_correction(
+    pub(crate) fn original_correction_into(
         &mut self,
         rhs: &mut Vector,
         solution: &Vector,
-    ) -> SpiceResult<Vector> {
+        correction: &mut Vector,
+    ) -> SpiceResult<()> {
         let entries = self
             .original
             .as_mut()
@@ -1400,8 +1310,9 @@ impl SparseMatrix {
         entries.sort_unstable_by_key(|t| t.row);
         let mut matrix = entries.iter().peekable();
         let mut sources = sources.iter().peekable();
-        let mut correction = Vector::zeros(self.rows);
-        for (row, value) in correction.as_mut_slice().iter_mut().enumerate() {
+        let correction = correction.overwrite_storage();
+        correction.resize(self.rows, 0.);
+        for (row, value) in correction.iter_mut().enumerate() {
             let mut sum = crate::primitives::ExactSum::new();
             let mut has_entry = false;
             while let Some(t) = matrix.next_if(|t| t.row == row) {
@@ -1419,7 +1330,7 @@ impl SparseMatrix {
             }
             *value = sum.rounded_sum();
         }
-        Ok(correction)
+        Ok(())
     }
 
     /// The stored contributions. For a bound matrix: the folded nonzero
@@ -1675,18 +1586,19 @@ mod tests {
             assert_eq!(a.get(0, 0), 0.);
             assert_eq!(b.get(0), Some(0.));
             let x = Vector::from_slice(&[2., 3., 5.]);
-            assert_eq!(
-                a.original_correction(&mut b, &x).unwrap().as_slice(),
-                &[-7., -3., 2.]
-            );
+            let mut correction = Vector::default();
+            a.original_correction_into(&mut b, &x, &mut correction)
+                .unwrap();
+            assert_eq!(correction.as_slice(), &[-7., -3., 2.]);
+            let address = correction.as_slice().as_ptr();
             a.clear();
             b.clear();
             a.add(0, 0, 1.).unwrap();
             b.add_to(0, 2.).unwrap();
-            assert_eq!(
-                a.original_correction(&mut b, &x).unwrap().as_slice(),
-                &[0., -3., -5.]
-            );
+            a.original_correction_into(&mut b, &x, &mut correction)
+                .unwrap();
+            assert_eq!(correction.as_slice(), &[0., -3., -5.]);
+            assert_eq!(correction.as_slice().as_ptr(), address);
         }
     }
 
@@ -1810,7 +1722,6 @@ mod tests {
                 .spawn(|| {
                     pattern.with_ordering(|state| {
                         state.ac_reorder = false;
-                        state.solve_workspace.push(42.);
                         state.work.factor.successful_factors = 9;
                         panic!("interrupted ordering transaction");
                     })
@@ -1820,7 +1731,6 @@ mod tests {
         });
         pattern.with_ordering(|state| {
             assert!(state.ac_reorder);
-            assert!(state.solve_workspace.is_empty());
             assert_eq!(state.work, crate::maths::PatternWork::default());
             state.ac_reorder = false;
         });

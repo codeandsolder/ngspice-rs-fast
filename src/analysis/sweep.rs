@@ -933,12 +933,28 @@ struct SweepSolver<'a> {
 }
 
 impl SweepSolver<'_> {
+    /// A sweep consumes only the accepted iterate and its trial. Recover
+    /// the unused next iterate before handing the point to its accept hooks.
     fn solve(
         &self,
         point: &PointContext<'_>,
         previous: &Vector,
         history: &crate::devices::StateHistory,
         first: bool,
+        workspace: &mut crate::analysis::newton::CircuitNewtonWorkspace,
+    ) -> SpiceResult<(Vector, crate::devices::TrialState)> {
+        let solution = self.solve_newton(point, previous, history, first, workspace)?;
+        workspace.recycle_next(solution.next);
+        Ok((solution.values, solution.trial))
+    }
+
+    fn solve_newton(
+        &self,
+        point: &PointContext<'_>,
+        previous: &Vector,
+        history: &crate::devices::StateHistory,
+        first: bool,
+        workspace: &mut crate::analysis::newton::CircuitNewtonWorkspace,
     ) -> SpiceResult<crate::analysis::newton::NewtonSolution<crate::devices::TrialState>> {
         use crate::analysis::bias::{DcOutcome, solve_dc_from};
         use crate::analysis::newton::PhasePolicy;
@@ -953,6 +969,7 @@ impl SweepSolver<'_> {
                 history,
                 PhasePolicy::Predicted,
                 self.nodes,
+                workspace,
             ) {
                 Ok(solved) => return Ok(solved.solution),
                 Err(failure)
@@ -979,6 +996,7 @@ impl SweepSolver<'_> {
             history,
             phase,
             self.nodes,
+            workspace,
         )?
         .solution)
     }
@@ -1070,6 +1088,7 @@ fn run_fixed(
         true,
     )?;
     let mut previous = Vector::zeros(circuit.unknown_count());
+    let mut workspace = crate::analysis::newton::CircuitNewtonWorkspace::default();
     // dctrcurv.c rotates the state vectors before every point, so a point's
     // CKTstate1 is the previous point's state (the first point's own state is
     // copied in after it). Only devices with discrete state (switches) read it.
@@ -1095,9 +1114,8 @@ fn run_fixed(
             let model = point_context.model;
             let overrides = point_context.source_values();
             // dctrcurv.c runs NIiter at every point, linear circuits included.
-            let solution = solver.solve(&point_context, &previous, &history, first)?;
-            let x = solution.values;
-            let trial = solution.trial;
+            let (x, trial) =
+                solver.solve(&point_context, &previous, &history, first, &mut workspace)?;
             let first_point = std::mem::replace(&mut first, false);
             // Only a solved point is accepted; a failure above returns before
             // any accept hook runs for it. A nonlinear point's state becomes the
@@ -1142,7 +1160,7 @@ fn run_fixed(
                 result.check_point(&point)?;
                 sink.point(&point)?;
             }
-            previous = x;
+            workspace.recycle_current(std::mem::replace(&mut previous, x));
         }
     }
     sink.end()

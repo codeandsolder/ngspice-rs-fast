@@ -50,7 +50,7 @@
 //!
 //! # Timestep control
 //!
-//! [`Device::timestep_limit`] follows `swtrunc.c`: while really off with the
+//! [`crate::devices::DeviceTimestepControl::timestep_limit`] follows `swtrunc.c`: while really off with the
 //! control rising towards `VT + VH`, or (any other state) falling towards
 //! `VT - VH`, the next step is limited to
 //! `(0.75 (ref - c) +/- 0.05) / (c - c_accepted) * dt`. C's `cswtrunc.c` uses
@@ -1069,43 +1069,12 @@ impl Device for Switch {
         )
     }
 
-    fn convergence_test(
-        &self,
-        context: &crate::devices::traits::ConvergenceContext<'_>,
-    ) -> SpiceResult<bool> {
-        let Some(law) = self.model.ltspice else {
-            return Ok(false);
-        };
-        let (voltage, control) = self.ltspice_bias(|node| context.voltage(node));
-        let closed = self.ltspice_closed(law, Some(context.states), control)?;
-        let (prior_v, prior_c) = self.ltspice_bias(|node| {
-            context
-                .unknowns
-                .node_row(node)
-                .and_then(|row| context.previous.get(row))
-                .unwrap_or(0.)
-        });
-        let prior_closed = self.ltspice_closed(law, Some(context.states), prior_c)?;
-        let point =
-            self.ltspice_point(law, voltage, control, closed, context.model_context.gmin)?;
-        let prior = self.ltspice_point(
-            law,
-            prior_v,
-            prior_c,
-            prior_closed,
-            context.model_context.gmin,
-        )?;
-        let predicted = prior.jacobian.control.mul_add(
-            control - prior_c,
-            prior
-                .jacobian
-                .voltage
-                .mul_add(voltage - prior_v, prior.current),
-        );
-        let tol = context
-            .reltol
-            .mul_add(point.current.abs().max(predicted.abs()), context.abstol);
-        Ok((predicted - point.current).abs() > tol)
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        if self.model.ltspice.is_some() {
+            Some(self)
+        } else {
+            None
+        }
     }
 
     fn assemble_nonlinear_taylor(
@@ -1316,6 +1285,66 @@ impl Device for Switch {
         })
     }
 
+    fn timestep_control(&self) -> Option<&dyn crate::devices::DeviceTimestepControl> {
+        if self.discrete() && self.kind != SwitchKind::Current {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
+    /// Pole-zero load: C `swpzload.c`/`cswpzld.c` (the `MODEINITSMSIG` state, as AC) equals the AC load with `s` for `j omega`.
+    fn assemble_pole_zero(
+        &self,
+        context: &mut crate::devices::linear::LinearContext<'_>,
+        bias: &crate::maths::Vector,
+    ) -> crate::primitives::SpiceResult<()> {
+        self.assemble_small_signal(context, bias)
+    }
+}
+
+impl crate::devices::DeviceConvergence for Switch {
+    fn convergence_test(
+        &self,
+        context: &crate::devices::traits::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        let Some(law) = self.model.ltspice else {
+            return Ok(false);
+        };
+        let (voltage, control) = self.ltspice_bias(|node| context.voltage(node));
+        let closed = self.ltspice_closed(law, Some(context.states), control)?;
+        let (prior_v, prior_c) = self.ltspice_bias(|node| {
+            context
+                .unknowns
+                .node_row(node)
+                .and_then(|row| context.previous.get(row))
+                .unwrap_or(0.)
+        });
+        let prior_closed = self.ltspice_closed(law, Some(context.states), prior_c)?;
+        let point =
+            self.ltspice_point(law, voltage, control, closed, context.model_context.gmin)?;
+        let prior = self.ltspice_point(
+            law,
+            prior_v,
+            prior_c,
+            prior_closed,
+            context.model_context.gmin,
+        )?;
+        let predicted = prior.jacobian.control.mul_add(
+            control - prior_c,
+            prior
+                .jacobian
+                .voltage
+                .mul_add(voltage - prior_v, prior.current),
+        );
+        let tol = context
+            .reltol
+            .mul_add(point.current.abs().max(predicted.abs()), context.abstol);
+        Ok((predicted - point.current).abs() > tol)
+    }
+}
+
+impl crate::devices::DeviceTimestepControl for Switch {
     fn timestep_limit(&self, context: &TruncationContext<'_>) -> SpiceResult<Option<Real>> {
         if !self.discrete() || self.kind == SwitchKind::Current {
             // cswtrunc.c reads a control slot CSWload never writes.
@@ -1356,20 +1385,12 @@ impl Device for Switch {
         };
         Ok(Some(max_change / change * context.dt))
     }
-
-    /// Pole-zero load: C `swpzload.c`/`cswpzld.c` (the `MODEINITSMSIG` state, as AC) equals the AC load with `s` for `j omega`.
-    fn assemble_pole_zero(
-        &self,
-        context: &mut crate::devices::linear::LinearContext<'_>,
-        bias: &crate::maths::Vector,
-    ) -> crate::primitives::SpiceResult<()> {
-        self.assemble_small_signal(context, bias)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Switch, SwitchKind, SwitchModel, SwitchState};
+    use crate::devices::DeviceTimestepControl as _;
     use crate::devices::state::IterationPhase;
     use crate::primitives::NodeId;
 
@@ -1500,7 +1521,7 @@ mod tests {
 
     #[test]
     fn truncation_decodes_the_state_before_selecting_a_threshold() {
-        use crate::devices::{Device, TruncationContext};
+        use crate::devices::TruncationContext;
         let s = switch(SwitchKind::Voltage, 1., 0.5, false);
         let context = |trial| TruncationContext {
             trial,

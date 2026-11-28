@@ -83,7 +83,7 @@ the run with an error; no partial plot is returned.
   coordinates do not. These options resolve per transient, and request
   `newtrunc=0` disables the deck flag. No predictor state is kept when off.
   Devices without charge storage add their own bound through
-  `Device::timestep_limit` (S switches: `swtrunc.c`, see
+  `DeviceTimestepControl::timestep_limit` (S switches: `swtrunc.c`, see
   [SWITCHES.md](SWITCHES.md#timestep-control)).
 * **Order policy.** Order 1 (backward Euler) for the first step and the first
   step after every breakpoint; after an accepted order-1 step the order-2
@@ -103,9 +103,13 @@ the run with an error; no partial plot is returned.
   SIN/EXP/SFFM/AM request none. Devices add entries through the same
   `CKTsetBreak` rules when they accept a point (transmission lines, see
   [Device-driven breakpoints](#device-driven-breakpoints-and-delay-history-adr-84)).
-  The pending table uses an ordered index with logarithmic predecessor/
-  successor lookup and front removal (#126), rather than scanning and
-  shifting an entire vector. A successor within the merge distance takes
+  The pending table stores up to 32 entries inline, with bounded scans
+  and shifts. Larger tables promote once to an ordered index with
+  logarithmic predecessor/successor lookup and front removal. An indexed
+  update retains the search cursor through insertion, coalescing and
+  successor replacement; a timestep reads the front once between mutations.
+  See [the breakpoint and arrival performance record](performance-baselines/2026-11-28-breakpoint-arrivals.md).
+  A successor within the merge distance takes
   priority over a predecessor, including an equal predecessor; duplicate
   entries retain insertion order and the original signed-zero bits. The
   two-entry clear appends the final-time sentinel even when an already

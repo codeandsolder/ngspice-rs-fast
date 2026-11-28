@@ -93,7 +93,8 @@ impl RetainedOriginal {
         rhs: &Vector,
         transpose: bool,
         work: &mut PatternWork,
-    ) -> SpiceResult<Vector> {
+        out: &mut Vector,
+    ) -> SpiceResult<()> {
         if self.wide.is_none() {
             let mut sparse = assemble_wide(order, &self.stamps)?;
             let factor = order_fresh("retained two-word sparse LU", &mut sparse, self.pivot, None);
@@ -105,7 +106,7 @@ impl RetainedOriginal {
             .wide
             .as_deref()
             .ok_or_else(|| numerical("retained sparse recovery", "missing promoted factors"))?;
-        solve_checked(sparse, &self.stamps, rhs, transpose, work)
+        solve_checked(sparse, &self.stamps, rhs, transpose, work, out)
     }
 }
 
@@ -170,7 +171,8 @@ fn solve_checked(
     rhs: &Vector,
     transpose: bool,
     work: &mut PatternWork,
-) -> SpiceResult<Vector> {
+    out: &mut Vector,
+) -> SpiceResult<()> {
     let factors = sparse.factors()?;
     let entries = operator_entries(stamps)?;
     let original = OriginalResidual::real(rhs.len(), &entries, transpose)?;
@@ -181,24 +183,23 @@ fn solve_checked(
         .map(Wide::from_real)
         .collect();
     let mut workspace = Vec::new();
-    let mut solve = |rhs: &[Wide]| {
-        let result = if transpose {
-            factors.solve_transposed(rhs, &mut workspace)
-        } else {
-            factors.solve(rhs, &mut workspace)
-        };
+    let mut solve = |rhs: &[Wide], output: &mut Vec<Wide>| {
+        let result = factors.solve_into(rhs, &mut workspace, output, transpose);
         work.record_rhs(&result);
         result
     };
-    let mut current = solve(&wide_rhs)?;
+    let mut current = Vec::new();
+    solve(&wide_rhs, &mut current)?;
     let mut residual = vec![Wide::ZERO; rhs.len()];
+    let mut delta = Vec::new();
     for _ in 0..8 {
         original.wide_correction(rhs.as_slice(), &current, &mut residual)?;
-        let delta = solve(&residual)?;
+        solve(&residual, &mut delta)?;
         if relative_update(&mut current, &delta) <= f64::EPSILON.sqrt() {
-            return Ok(Vector::from(
-                current.iter().map(|value| value.hi).collect::<Vec<_>>(),
-            ));
+            let storage = out.overwrite_storage();
+            storage.clear();
+            storage.extend(current.iter().map(|value| value.hi));
+            return Ok(());
         }
     }
     Err(numerical(

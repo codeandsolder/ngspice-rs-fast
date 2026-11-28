@@ -1735,63 +1735,8 @@ impl<L: MosLevel> Device for Mosfet<L> {
         )?;
         Ok(())
     }
-    /// `MOS1convTest` (`mos1conv.c`, equal to `mos3conv.c`): the drain and
-    /// bulk currents predicted linearly from the last load at the new
-    /// iterate (`CKTrhs`) against their loaded values, in C's arithmetic.
-    fn convergence_test(
-        &self,
-        context: &crate::devices::ConvergenceContext<'_>,
-    ) -> SpiceResult<bool> {
-        let at = |k: usize| context.states.get(k).copied().unwrap_or(0.);
-        let pol = self.model.common().pol;
-        let [dp, g, sp, b] = self.inner.map(|n| context.voltage(n));
-        let vbs = pol * (b - sp);
-        let vgs = pol * (g - sp);
-        let vds = pol * (dp - sp);
-        let vbd = vbs - vds;
-        let vgd = vgs - vds;
-        let vgdo = at(slot::VGS) - at(slot::VDS);
-        let delvbs = vbs - at(slot::VBS);
-        let delvbd = vbd - at(slot::VBD);
-        let delvgs = vgs - at(slot::VGS);
-        let delvds = vds - at(slot::VDS);
-        let delvgd = vgd - vgdo;
-        let (cd, gbd, gmbs, gm, gds) = (
-            at(slot::CD),
-            at(slot::GBD),
-            at(slot::GMBS),
-            at(slot::GM),
-            at(slot::GDS),
-        );
-        let (cbs, cbd, gbs) = (at(slot::CBS), at(slot::CBD), at(slot::GBS));
-        let cdhat = if at(slot::MODE) >= 0. {
-            f64::mul_add(
-                gds,
-                delvds,
-                f64::mul_add(
-                    gm,
-                    delvgs,
-                    f64::mul_add(gmbs, delvbs, f64::mul_add(gbd, -delvbd, cd)),
-                ),
-            )
-        } else {
-            f64::mul_add(
-                gds,
-                delvds,
-                f64::mul_add(gm, -delvgd, f64::mul_add(gbd - gmbs, -delvbd, cd)),
-            )
-        };
-        let cbhat = f64::mul_add(gbs, delvbs, f64::mul_add(gbd, delvbd, cbs + cbd));
-        let tol = context
-            .reltol
-            .mul_add(cdhat.abs().max(cd.abs()), context.abstol);
-        if (cdhat - cd).abs() >= tol {
-            return Ok(true);
-        }
-        let tol = context
-            .reltol
-            .mul_add(cbhat.abs().max((cbs + cbd).abs()), context.abstol);
-        Ok((cbhat - (cbs + cbd)).abs() > tol)
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
 
     /// `mos1acld.c` (`mos3acld.c` with the effective width): the
@@ -1985,6 +1930,67 @@ impl<L: MosLevel> Device for Mosfet<L> {
             model: Some(&self.model_name),
             total: true,
         })
+    }
+}
+
+impl<L: MosLevel> crate::devices::DeviceConvergence for Mosfet<L> {
+    /// `MOS1convTest` (`mos1conv.c`, equal to `mos3conv.c`): the drain and
+    /// bulk currents predicted linearly from the last load at the new
+    /// iterate (`CKTrhs`) against their loaded values, in C's arithmetic.
+    fn convergence_test(
+        &self,
+        context: &crate::devices::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        let at = |k: usize| context.states.get(k).copied().unwrap_or(0.);
+        let pol = self.model.common().pol;
+        let [dp, g, sp, b] = self.inner.map(|n| context.voltage(n));
+        let vbs = pol * (b - sp);
+        let vgs = pol * (g - sp);
+        let vds = pol * (dp - sp);
+        let vbd = vbs - vds;
+        let vgd = vgs - vds;
+        let vgdo = at(slot::VGS) - at(slot::VDS);
+        let delvbs = vbs - at(slot::VBS);
+        let delvbd = vbd - at(slot::VBD);
+        let delvgs = vgs - at(slot::VGS);
+        let delvds = vds - at(slot::VDS);
+        let delvgd = vgd - vgdo;
+        let (cd, gbd, gmbs, gm, gds) = (
+            at(slot::CD),
+            at(slot::GBD),
+            at(slot::GMBS),
+            at(slot::GM),
+            at(slot::GDS),
+        );
+        let (cbs, cbd, gbs) = (at(slot::CBS), at(slot::CBD), at(slot::GBS));
+        let cdhat = if at(slot::MODE) >= 0. {
+            f64::mul_add(
+                gds,
+                delvds,
+                f64::mul_add(
+                    gm,
+                    delvgs,
+                    f64::mul_add(gmbs, delvbs, f64::mul_add(gbd, -delvbd, cd)),
+                ),
+            )
+        } else {
+            f64::mul_add(
+                gds,
+                delvds,
+                f64::mul_add(gm, -delvgd, f64::mul_add(gbd - gmbs, -delvbd, cd)),
+            )
+        };
+        let cbhat = f64::mul_add(gbs, delvbs, f64::mul_add(gbd, delvbd, cbs + cbd));
+        let tol = context
+            .reltol
+            .mul_add(cdhat.abs().max(cd.abs()), context.abstol);
+        if (cdhat - cd).abs() >= tol {
+            return Ok(true);
+        }
+        let tol = context
+            .reltol
+            .mul_add(cbhat.abs().max((cbs + cbd).abs()), context.abstol);
+        Ok((cbhat - (cbs + cbd)).abs() > tol)
     }
 }
 

@@ -52,12 +52,24 @@ impl Device for Accumulator {
         assert!(context.branch(self.branches).is_err());
         Ok(())
     }
+    fn accept_validator(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptValidation> {
+        Some(self)
+    }
+    fn accept_notifier(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptNotification> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptValidation for Accumulator {
     fn validate_accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
         if self.name == "x2" && context.time == Some(99.0) {
             return Err(SpiceError::circuit("accept refused"));
         }
         Ok(())
     }
+}
+
+impl ngspice_rs::devices::DeviceAcceptNotification for Accumulator {
     fn accept(&self, context: &AcceptContext<'_>) {
         self.log
             .borrow_mut()

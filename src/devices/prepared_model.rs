@@ -834,91 +834,20 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         Ok(())
     }
 
-    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
-        let Some(workspace) = &self.trial_workspace else {
-            return Ok(false);
-        };
-        let width = self.terminals.len();
-        let offset = self.charge_state_count();
-        let previous = context
-            .states
-            .get(offset..offset + width)
-            .ok_or_else(|| SpiceError::circuit("missing prepared trial coordinates"))?;
-        if context
-            .states
-            .get(offset + width)
-            .is_none_or(|value| value.to_bits() != 1_f64.to_bits())
-        {
-            return Ok(true);
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        if self.trial_workspace.is_some() {
+            Some(self)
+        } else {
+            None
         }
-        if self.artifact.descriptor().trial.convergence != TrialPolicy::Kernel {
-            return Ok(false);
-        }
-        let mut workspace = workspace.borrow_mut();
-        let TrialWorkspace {
-            proposed,
-            previous: previous_buffer,
-            candidate: candidate_buffer,
-            tolerances,
-            ..
-        } = &mut *workspace;
-        self.read_coordinates(proposed, |node| context.voltage(node));
-        let mut old = previous_buffer.point();
-        let mut candidate = candidate_buffer.point();
-        self.evaluate_point(previous, &mut old)?;
-        self.evaluate_point(proposed, &mut candidate)?;
-        // The ABI row kinds distinguish residual dimensions. Only electrical
-        // rows have an engine-supplied absolute current tolerance today.
-        // For non-electrical family equations use relative comparison, not
-        // a dimensionally incorrect ampere/volt tolerance.
-        for (absolute, equation) in tolerances
-            .iter_mut()
-            .zip(&self.artifact.descriptor().equations)
-        {
-            *absolute = if equation.kind == EquationKind::Electrical {
-                context.abstol
-            } else {
-                0.
-            };
-        }
-        let input = ConvergenceInput {
-            previous: TrialSample {
-                coordinates: previous,
-                residual: old.current,
-                jacobian: old.conductance,
-            },
-            candidate: TrialSample {
-                coordinates: proposed,
-                residual: candidate.current,
-                jacobian: candidate.conductance,
-            },
-            candidate_outcome: TrialOutcome::Exact,
-            relative_tolerance: context.reltol,
-            absolute_tolerances: tolerances,
-        };
-        let outcome = self.with_physical(
-            |data| self.artifact.check_trial_convergence(data, input),
-            |lane| lane.convergence(input),
-        )?;
-        Ok(outcome == Convergence::Retry)
     }
 
-    fn validate_accept(
-        &self,
-        context: &crate::devices::traits::AcceptContext<'_>,
-    ) -> SpiceResult<()> {
-        if self.trial_workspace.is_some()
-            && let Some(states) = context.states
-            && states
-                .get(self.charge_state_count() + self.terminals.len())
-                .is_none_or(|value| value.to_bits() != 1_f64.to_bits())
-        {
-            return Err(SpiceError::circuit(format!(
-                "{}: initialized or limited prepared trial cannot be accepted",
-                self.name
-            )));
+    fn accept_validator(&self) -> Option<&dyn crate::devices::DeviceAcceptValidation> {
+        if self.trial_workspace.is_some() {
+            Some(self)
+        } else {
+            None
         }
-        Ok(())
     }
 
     fn truncation_slots(&self) -> Vec<usize> {
@@ -1261,6 +1190,97 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+impl<K: Kernel> crate::devices::DeviceConvergence for PreparedDevice<K> {
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        let Some(workspace) = &self.trial_workspace else {
+            return Ok(false);
+        };
+        let width = self.terminals.len();
+        let offset = self.charge_state_count();
+        let previous = context
+            .states
+            .get(offset..offset + width)
+            .ok_or_else(|| SpiceError::circuit("missing prepared trial coordinates"))?;
+        if context
+            .states
+            .get(offset + width)
+            .is_none_or(|value| value.to_bits() != 1_f64.to_bits())
+        {
+            return Ok(true);
+        }
+        if self.artifact.descriptor().trial.convergence != TrialPolicy::Kernel {
+            return Ok(false);
+        }
+        let mut workspace = workspace.borrow_mut();
+        let TrialWorkspace {
+            proposed,
+            previous: previous_buffer,
+            candidate: candidate_buffer,
+            tolerances,
+            ..
+        } = &mut *workspace;
+        self.read_coordinates(proposed, |node| context.voltage(node));
+        let mut old = previous_buffer.point();
+        let mut candidate = candidate_buffer.point();
+        self.evaluate_point(previous, &mut old)?;
+        self.evaluate_point(proposed, &mut candidate)?;
+        // The ABI row kinds distinguish residual dimensions. Only electrical
+        // rows have an engine-supplied absolute current tolerance today.
+        // For non-electrical family equations use relative comparison, not
+        // a dimensionally incorrect ampere/volt tolerance.
+        for (absolute, equation) in tolerances
+            .iter_mut()
+            .zip(&self.artifact.descriptor().equations)
+        {
+            *absolute = if equation.kind == EquationKind::Electrical {
+                context.abstol
+            } else {
+                0.
+            };
+        }
+        let input = ConvergenceInput {
+            previous: TrialSample {
+                coordinates: previous,
+                residual: old.current,
+                jacobian: old.conductance,
+            },
+            candidate: TrialSample {
+                coordinates: proposed,
+                residual: candidate.current,
+                jacobian: candidate.conductance,
+            },
+            candidate_outcome: TrialOutcome::Exact,
+            relative_tolerance: context.reltol,
+            absolute_tolerances: tolerances,
+        };
+        let outcome = self.with_physical(
+            |data| self.artifact.check_trial_convergence(data, input),
+            |lane| lane.convergence(input),
+        )?;
+        Ok(outcome == Convergence::Retry)
+    }
+}
+
+impl<K: Kernel> crate::devices::DeviceAcceptValidation for PreparedDevice<K> {
+    fn validate_accept(
+        &self,
+        context: &crate::devices::traits::AcceptContext<'_>,
+    ) -> SpiceResult<()> {
+        if self.trial_workspace.is_some()
+            && let Some(states) = context.states
+            && states
+                .get(self.charge_state_count() + self.terminals.len())
+                .is_none_or(|value| value.to_bits() != 1_f64.to_bits())
+        {
+            return Err(SpiceError::circuit(format!(
+                "{}: initialized or limited prepared trial cannot be accepted",
+                self.name
+            )));
         }
         Ok(())
     }

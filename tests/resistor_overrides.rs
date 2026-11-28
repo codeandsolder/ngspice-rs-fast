@@ -429,11 +429,8 @@ impl ngspice_rs::devices::Device for PreparationProbe {
         context.states.set(0, self.value)?;
         context.stamp(self.nodes[0], self.nodes[0], self.value)
     }
-    fn convergence_test(
-        &self,
-        context: &ngspice_rs::devices::traits::ConvergenceContext<'_>,
-    ) -> ngspice_rs::primitives::SpiceResult<bool> {
-        Ok(context.states[0].to_bits() != self.value.to_bits())
+    fn convergence_hook(&self) -> Option<&dyn ngspice_rs::devices::DeviceConvergence> {
+        (self.value > 10.).then_some(self)
     }
     fn assemble_linear(
         &self,
@@ -447,6 +444,15 @@ impl ngspice_rs::devices::Device for PreparationProbe {
         _: &ModelContext,
     ) -> ngspice_rs::primitives::SpiceResult<Option<f64>> {
         Ok((keyword == "value").then_some(self.value))
+    }
+}
+
+impl ngspice_rs::devices::DeviceConvergence for PreparationProbe {
+    fn convergence_test(
+        &self,
+        context: &ngspice_rs::devices::traits::ConvergenceContext<'_>,
+    ) -> ngspice_rs::primitives::SpiceResult<bool> {
+        Ok(context.states[0].to_bits() != self.value.to_bits())
     }
 }
 
@@ -749,5 +755,57 @@ fn prepared_context_load_benchmark() {
             hot[1] * 1000.,
             cold[1] / hot[1]
         );
+    }
+}
+
+#[test]
+fn replacement_can_add_and_remove_convergence_capability() {
+    use ngspice_rs::devices::ConvergenceRequest;
+    for (initial, override_value) in [(1., 2.), (20., -195.)] {
+        let mut circuit = Circuit::new();
+        let node = circuit.add_node("a").unwrap();
+        circuit
+            .add_device(Box::new(PreparationProbe {
+                nodes: [node, NodeId::GROUND],
+                value: initial,
+                preparations: Default::default(),
+            }))
+            .unwrap();
+        circuit.finalize().unwrap();
+        let base = ModelContext::default();
+        let replacement = base
+            .with_instance_override(
+                circuit
+                    .instance_override("rprobe", "x", override_value, &base)
+                    .unwrap(),
+            )
+            .unwrap();
+        let run = circuit.prepare_run();
+        let history = circuit.state_history().unwrap();
+        let trial = history.trial();
+        let zero = Vector::zeros(1);
+        for (model, expected) in [
+            (base, initial > 10.),
+            (replacement, initial < 10.),
+            (base, initial > 10.),
+            (replacement, initial < 10.),
+        ] {
+            assert_eq!(
+                run.convergence_test(&ConvergenceRequest {
+                    solution: &zero,
+                    previous: &zero,
+                    history: &history,
+                    trial: &trial,
+                    model_context: &model,
+                    time: 0.,
+                    integration: None,
+                    reltol: 1e-3,
+                    abstol: 1e-12,
+                    vntol: 1e-6,
+                })
+                .unwrap(),
+                expected
+            );
+        }
     }
 }

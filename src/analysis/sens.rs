@@ -23,7 +23,7 @@
 //!    is ordered from scratch (`CKTsetup` + `NIacIter`) and `x` solved. The
 //!    fresh state and the DC load at all-zero node voltages before `NIacIter`
 //!    linearize every device at that reset state, not at the operating point
-//!    ([`DeviceSensitivity::reset_ac_load`]); each K stamps its own
+//!    ([`DeviceSensitivity::ac_load`]); each K stamps its own
 //!    `MUTacLoad` from its record ([`DeviceSensitivity::coupled_inductors`]).
 //! 3. For every parameter, in C's `sgen` order, the one device is loaded with
 //!    its current records, the result negated, the parameter set to
@@ -46,12 +46,12 @@ use crate::analysis::results::{PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
 use crate::devices::linear::LinearSystem;
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
-    SensitivityMode, SensitivityRecord,
+    AcReset, AcSensitivityLoad, DcSensitivityLoad, DeviceSensitivity, ParameterScope, RecordPair,
+    SensitivityFamily, SensitivityRecord,
 };
 use crate::devices::{AnalysisMode, Circuit, Device, IterationPhase, LoadRequest, TrialState};
 use crate::maths::complex::ComplexMatrix;
-use crate::maths::linear::solve_last_factors_transposed;
+use crate::maths::linear::{RetainedSolveWorkspace, solve_last_factors_into};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
@@ -1235,10 +1235,10 @@ fn real_stamps(matrix: &SparseMatrix) -> impl Iterator<Item = Stamp> + '_ {
 }
 
 /// The device a sensitivity load stamps.
-fn stand_in<'d>(circuit: &'d Circuit, index: usize, load: &'d SensitivityLoad) -> &'d dyn Device {
+fn stand_in<'d>(circuit: &'d Circuit, index: usize, load: &'d DcSensitivityLoad) -> &'d dyn Device {
     match load {
-        SensitivityLoad::Original => &*circuit.devices()[index],
-        SensitivityLoad::Replacement(device) => &**device,
+        DcSensitivityLoad::Original => &*circuit.devices()[index],
+        DcSensitivityLoad::Replacement(device) => &**device,
     }
 }
 
@@ -1445,7 +1445,7 @@ impl DcState<'_> {
     fn load(
         &self,
         index: usize,
-        load: &SensitivityLoad,
+        load: &DcSensitivityLoad,
         matrix: &mut SparseMatrix,
         rhs: &mut Vector,
     ) -> SpiceResult<()> {
@@ -1474,8 +1474,8 @@ impl DcState<'_> {
         mut assembly: BaseAssembly<'_>,
         scratch: &mut DcAssembly,
         index: usize,
-        base: &SensitivityLoad,
-        perturbed: &SensitivityLoad,
+        base: &DcSensitivityLoad,
+        perturbed: &DcSensitivityLoad,
     ) -> SpiceResult<()> {
         scratch.matrix.clear();
         scratch.rhs.clear();
@@ -1542,13 +1542,13 @@ impl AcState<'_> {
     fn assemble(
         &self,
         index: usize,
-        load: &SensitivityLoad,
+        load: &AcSensitivityLoad,
         system: &mut LinearSystem,
     ) -> SpiceResult<()> {
         system.clear();
-        self.circuit.assemble_small_signal_device(
+        self.circuit.assemble_sensitivity_ac(
             index,
-            stand_in(self.circuit, index, load),
+            load,
             &self.model,
             self.bias,
             Some(self.state),
@@ -1577,8 +1577,8 @@ impl AcState<'_> {
         mut assembly: BaseAssembly<'_>,
         scratch: &mut AcAssembly,
         index: usize,
-        base: &SensitivityLoad,
-        perturbed: &SensitivityLoad,
+        base: &AcSensitivityLoad,
+        perturbed: &AcSensitivityLoad,
     ) -> SpiceResult<()> {
         self.assemble(index, base, &mut scratch.system)?;
         scratch.system.ac_rhs_into(&mut scratch.rhs);
@@ -1665,6 +1665,8 @@ pub(super) fn run(
         &circuit.prepare_run(),
         &model,
         &settings,
+        None,
+        &mut crate::analysis::newton::CircuitNewtonWorkspace::default(),
     )?;
 
     let mut plot = workspace.plot(ac);
@@ -1805,8 +1807,8 @@ impl AcSweep<'_> {
         setup: RecordPair<'_>,
         current: RecordPair<'_>,
         omega: Real,
-    ) -> SpiceResult<SensitivityLoad> {
-        member.sensitivity.reset_ac_load(
+    ) -> SpiceResult<AcSensitivityLoad> {
+        member.sensitivity.ac_load(
             setup,
             self.earlier
                 .reset(circuit, member, reset, omega, self.bias)?,
@@ -1826,9 +1828,9 @@ impl AcSweep<'_> {
         for (slot, member) in walk.members.iter().enumerate() {
             let pair = reset.view(member, slot);
             let load = self.load(walk.circuit, member, pair, pair, pair, omega)?;
-            walk.circuit.assemble_small_signal_device(
+            walk.circuit.assemble_sensitivity_ac(
                 member.index,
-                stand_in(walk.circuit, member.index, &load),
+                &load,
                 &self.model,
                 &self.zeros,
                 Some(&self.state),
@@ -2025,6 +2027,26 @@ fn run_ac(
     Ok(())
 }
 
+fn dc_adjoint(
+    pattern: &std::sync::Arc<crate::maths::Pattern>,
+    rhs: &Vector,
+) -> SpiceResult<Vector> {
+    let mut adjoint = Vector::default();
+    if !solve_last_factors_into(
+        pattern,
+        rhs,
+        &mut RetainedSolveWorkspace::default(),
+        &mut adjoint,
+        true,
+    )? {
+        return Err(SpiceError::Numerical {
+            context: ".sens".to_owned(),
+            message: "the operating point left no factored circuit matrix".to_owned(),
+        });
+    }
+    Ok(adjoint)
+}
+
 fn run_dc(
     walk: &mut ParameterWalk<'_>,
     solved: crate::analysis::newton::NewtonSolution<TrialState>,
@@ -2078,12 +2100,7 @@ fn run_dc(
         trial,
         circuit,
     };
-    let adjoint = solve_last_factors_transposed(&at.pattern, &probe.dual(n))?.ok_or_else(|| {
-        SpiceError::Numerical {
-            context: ".sens".to_owned(),
-            message: "the operating point left no factored circuit matrix".to_owned(),
-        }
-    })?;
+    let adjoint = dc_adjoint(&at.pattern, &probe.dual(n))?;
     let mut point = Vec::with_capacity(plot.variables().len());
     let mut scratch = DcAssembly::new(n);
     let mut resolution = walk
@@ -2092,9 +2109,7 @@ fn run_dc(
         .map(|resolution| resolution.row(probe, &at.solution));
     if walk.physical {
         let responses = walk.sweep_physical(
-            |_, member, setup, current| {
-                member.sensitivity.load(setup, current, SensitivityMode::Dc)
-            },
+            |_, member, setup, current| member.sensitivity.dc_load(setup, current),
             |assembly, index, base, perturbed, _, label| {
                 at.residual(assembly, &mut scratch, index, base, perturbed)
                     .map_err(|error| perturbation_error(label, &error))?;
@@ -2113,9 +2128,7 @@ fn run_dc(
         }
     } else {
         let walked = walk.sweep(
-            |_, member, setup, current| {
-                member.sensitivity.load(setup, current, SensitivityMode::Dc)
-            },
+            |_, member, setup, current| member.sensitivity.dc_load(setup, current),
             |assembly, index, base, perturbed, delta, label| {
                 if let Some((floor, row)) = &mut resolution {
                     row.push(Complex::real(*floor / delta.abs()));
@@ -2180,22 +2193,10 @@ impl ParameterWalk<'_> {
     /// adjoint projection are used as the historical walk; only the numeric
     /// parameter policy changes. Unrepresentable/nonsmooth local variations
     /// emit NaN without silently switching to C's finite record transition.
-    fn sweep_physical(
+    fn sweep_physical<L>(
         &mut self,
-        load: impl Fn(
-            usize,
-            &Member<'_>,
-            RecordPair<'_>,
-            RecordPair<'_>,
-        ) -> SpiceResult<SensitivityLoad>,
-        mut measure: impl FnMut(
-            BaseAssembly<'_>,
-            usize,
-            &SensitivityLoad,
-            &SensitivityLoad,
-            Real,
-            &str,
-        ) -> SpiceResult<Complex>,
+        load: impl Fn(usize, &Member<'_>, RecordPair<'_>, RecordPair<'_>) -> SpiceResult<L>,
+        mut measure: impl FnMut(BaseAssembly<'_>, usize, &L, &L, Real, &str) -> SpiceResult<Complex>,
     ) -> SpiceResult<Vec<(Complex, Real)>> {
         let mut response = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
@@ -2274,22 +2275,10 @@ impl ParameterWalk<'_> {
 impl ParameterWalk<'_> {
     /// C `sens_sens` parameter lifecycle. The callback sees an already numbered
     /// perturbation and the two device loads, independent of DC/AC assembly.
-    fn sweep(
+    fn sweep<L>(
         &mut self,
-        load: impl Fn(
-            usize,
-            &Member<'_>,
-            RecordPair<'_>,
-            RecordPair<'_>,
-        ) -> SpiceResult<SensitivityLoad>,
-        mut measure: impl FnMut(
-            BaseAssembly<'_>,
-            usize,
-            &SensitivityLoad,
-            &SensitivityLoad,
-            Real,
-            &str,
-        ) -> SpiceResult<()>,
+        load: impl Fn(usize, &Member<'_>, RecordPair<'_>, RecordPair<'_>) -> SpiceResult<L>,
+        mut measure: impl FnMut(BaseAssembly<'_>, usize, &L, &L, Real, &str) -> SpiceResult<()>,
     ) -> SpiceResult<()> {
         // A device that refuses `.sens` outright keeps its own error class; only a
         // numerical failure is labelled with the parameter that caused it.

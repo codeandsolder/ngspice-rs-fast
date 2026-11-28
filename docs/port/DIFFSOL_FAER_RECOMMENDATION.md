@@ -157,7 +157,7 @@ an explicitly designed adapter error channel.
   (`NonLinearOpJacobian` / `LinearOp`) rather than assuming discovery works.
 - **Acceptance and discontinuities:** use `set_stop_time` at source breakpoints;
   inspect step stop reasons, update/restart integration history as required,
-  and call `Device::accept` only for accepted points. Never interpolate across
+  and call `DeviceAcceptNotification::accept` only for accepted points. Never interpolate across
   discontinuities or commit state during rejected trials.
 - **Output and limits:** distinguish requested plot samples from adaptive
   internal steps. Bound work/progress and final-time handling, honor requested
