@@ -27,7 +27,7 @@ use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use crate::devices::bsim_physics::{
     ChargeChain, JunctionCapacitance, channel_inversion, charge_overdrive, depletion,
-    depletion_charge, overlap, smooth_drain, smooth_positive,
+    depletion_charge, overlap, smooth_drain, smooth_positive, thermal_softplus,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -211,34 +211,11 @@ impl ChargeModel<'_> {
         let noff = cv.n * p.binned.noff;
         let dnoff_dvd = p.binned.noff * cv.d_n_dvd;
         let dnoff_dvb = p.binned.noff * cv.d_n_dvb;
-        let t0 = cv.vtm * noff;
-        let voffcv = p.binned.voffcv;
-        let vgst_nvt = (cv.vgst - voffcv) / t0;
-        let (vgsteff, dvgsteff_dvg, dvgsteff_dvd, dvgsteff_dvb) = if vgst_nvt > EXP_THRESHOLD {
-            (
-                cv.vgst - voffcv,
-                cv.d_vgs_eff_dvg,
-                -cv.d_vth_dvd,
-                -cv.d_vth_dvb,
-            )
-        } else if vgst_nvt < -EXP_THRESHOLD {
-            let vgsteff = t0 * MIN_EXP.ln_1p();
-            let dvd = vgsteff / noff;
-            (vgsteff, 0.0, dvd * dnoff_dvd, dvd * dnoff_dvb)
-        } else {
-            let exp_vgst = vgst_nvt.exp();
-            let vgsteff = t0 * exp_vgst.ln_1p();
-            let dvg = exp_vgst / (1.0 + exp_vgst);
-            let dvd = (vgsteff / noff).mul_add(
-                dnoff_dvd,
-                -dvg * ((cv.vgst - voffcv) / noff).mul_add(dnoff_dvd, cv.d_vth_dvd),
-            );
-            let dvb = (vgsteff / noff).mul_add(
-                dnoff_dvb,
-                -dvg * ((cv.vgst - voffcv) / noff).mul_add(dnoff_dvb, cv.d_vth_dvb),
-            );
-            (vgsteff, dvg * cv.d_vgs_eff_dvg, dvd, dvb)
-        };
+        let (vgsteff, voltage_partial, factor_partial) =
+            thermal_softplus(&(cv.vgst - p.binned.voffcv), &noff, cv.vtm)?;
+        let dvgsteff_dvg = voltage_partial * cv.d_vgs_eff_dvg;
+        let dvgsteff_dvd = factor_partial.mul_add(dnoff_dvd, -voltage_partial * cv.d_vth_dvd);
+        let dvgsteff_dvb = factor_partial.mul_add(dnoff_dvb, -voltage_partial * cv.d_vth_dvb);
 
         // ---- capMod == 3, the charge-thickness model (CTM).
         let vfbzb = p.vfbzb;
