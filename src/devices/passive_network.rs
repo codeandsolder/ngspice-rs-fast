@@ -5,7 +5,9 @@
 //! resolved separately; the winding, storage and terminal identities are
 //! intentionally distinct.
 
+mod absent;
 mod damping;
+pub(super) use absent::AbsentStorage;
 mod report;
 use damping::DampingShunt;
 pub use damping::{AnalysisDamping, ConductanceLaw};
@@ -666,6 +668,28 @@ pub(super) enum NetworkPlan {
 }
 
 impl NetworkPlan {
+    /// Detect a resolved zero-copy prepared network before dynamic expansion.
+    pub(super) fn is_removed(instance: &crate::netlist::ast::DeviceInstance) -> SpiceResult<bool> {
+        if !matches!(instance.designator, 'c' | 'l')
+            || !instance
+                .parameters
+                .iter()
+                .any(|p| crate::netlist::network_parameter(instance.designator, &p.name))
+        {
+            return Ok(false);
+        }
+        let Some(m) = instance.parameters.iter().rfind(|p| p.name == "m") else {
+            return Ok(false);
+        };
+        if super::factory::scalar_number(m)? != 0. {
+            return Ok(false);
+        }
+        Ok(matches!(
+            Self::prepare(instance)?,
+            Some(Self::Storage(None))
+        ))
+    }
+
     pub(super) fn prepare(
         instance: &crate::netlist::ast::DeviceInstance,
     ) -> SpiceResult<Option<Self>> {
@@ -785,6 +809,8 @@ impl NetworkPlan {
         let initialization = Self::initialization(kind, initial, multiplicity, values)?;
         let Some(mut network) = PreparedPassiveNetwork::prepare(&coefficients, initialization)?
         else {
+            report::parse(values, 0.)?;
+            report::parse_control(values)?;
             return Ok(Self::Storage(None));
         };
         let conductance = network
@@ -893,6 +919,11 @@ impl NetworkPlan {
         instance: &crate::netlist::ast::DeviceInstance,
         nodes: &mut NodeAppend<'_>,
     ) -> SpiceResult<Vec<Box<dyn Device>>> {
+        if matches!(self, Self::Storage(None)) {
+            return Err(SpiceError::circuit(
+                "absent storage reached physical expansion",
+            ));
+        }
         let terminals = nodes.intern_array::<2>(&instance.nodes)?;
         let name = &instance.name;
         match self {
@@ -904,7 +935,9 @@ impl NetworkPlan {
                 },
                 terminals,
             ),
-            Self::Storage(None) => Ok(Vec::new()),
+            Self::Storage(None) => Err(SpiceError::circuit(
+                "absent storage reached physical expansion",
+            )),
             Self::Voltage(network) => network.build(
                 nodes,
                 &VoltageNetworkBinding {
@@ -929,14 +962,20 @@ pub(crate) enum ReportPhase {
 /// Bound projection of one reported current, independent of the solver.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CurrentOutputLaw {
-    row: usize,
+    row: Option<usize>,
     voltage_rows: [Option<usize>; 2],
     conductance: Real,
 }
 
 impl CurrentOutputLaw {
+    pub(crate) const ZERO: Self = Self {
+        row: None,
+        voltage_rows: [None; 2],
+        conductance: 0.,
+    };
+
     pub(crate) fn evaluate(self, mut value: impl FnMut(usize) -> Complex) -> Complex {
-        let current = value(self.row);
+        let current = self.row.map_or(Complex::ZERO, &mut value);
         if self.conductance == 0. {
             return current;
         }
@@ -999,7 +1038,7 @@ impl BoundCurrentReport {
                 .ok_or_else(|| SpiceError::circuit("unbound primary current"))?,
         };
         Ok(CurrentOutputLaw {
-            row,
+            row: Some(row),
             voltage_rows: self.voltage_rows,
             conductance: law.voltage_conductance,
         })

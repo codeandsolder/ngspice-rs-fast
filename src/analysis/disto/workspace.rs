@@ -240,7 +240,7 @@ impl<'a> Workspace<'a> {
         let n = circuit.unknown_count();
         let width = n
             .checked_add(1)
-            .and_then(|width| width.checked_add(circuit.reported_currents().len()))
+            .and_then(|width| width.checked_add(circuit.projected_output_count()))
             .ok_or_else(|| SpiceError::circuit("distortion output dimension overflow"))?;
         let intermodulation = inputs.second.is_some();
         if plots.len() != if intermodulation { 3 } else { 2 }

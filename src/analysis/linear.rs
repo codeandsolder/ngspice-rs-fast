@@ -111,6 +111,14 @@ pub(super) fn plot(
         plot.push_variable(var(format!("i({})", report.original), "current"));
         reports.push(report.law(phase)?);
     }
+    for name in circuit.absent_storage_voltage_nodes() {
+        plot.push_variable(var(format!("v({name})"), "voltage"));
+        reports.push(CurrentOutputLaw::ZERO);
+    }
+    for name in circuit.absent_storage_currents() {
+        plot.push_variable(var(format!("i({name})"), "current"));
+        reports.push(CurrentOutputLaw::ZERO);
+    }
     for observation in circuit.observations() {
         plot.push_variable(Variable::new(observation.name(), observation.unit()));
     }
