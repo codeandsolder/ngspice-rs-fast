@@ -472,3 +472,158 @@ W1 p2 0 Vsen mi
     }
     Ok(())
 }
+
+#[test]
+fn continuous_physical_taylor_preserves_all_laws_and_one_sided_joins() -> SpiceResult<()> {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    use ngspice_rs::maths::Vector;
+    for (model, logarithmic, cubic, bounded) in [
+        ("pswitch", true, true, true),
+        ("pswitch", false, false, true),
+        ("aswitch", true, false, true),
+        ("aswitch", false, false, true),
+        ("aswitch", true, false, false),
+        ("aswitch", false, false, false),
+    ] {
+        for (off, on) in [(2., 4.), (4., 2.)] {
+            let input = if model == "pswitch" { "gd" } else { "vd" };
+            let parameters = if model == "pswitch" {
+                "r_cntl_in=200".to_owned()
+            } else {
+                format!("limit={bounded}")
+            };
+            let cards = format!(
+                "A1 %{input}(c z) %gd(p n) m\n.model m {model}(cntl_off={off} cntl_on={on} r_on=10 r_off=1k log={logarithmic} {parameters})"
+            );
+            let netlist = parse(&cards)?;
+            let config = RunConfig::from_netlist(&netlist)?;
+            let c = config.circuit(&netlist)?;
+            let rows = ["c", "z", "p", "n"]
+                .map(|name| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap());
+            let [cp, cn, p, n] = rows;
+            let prepared = c.prepare_run();
+            let dae = prepared.prepare_physical_dae(
+                &config.context().model_context(),
+                TransientTiming::new(1e-6, 1e-3)?,
+            )?;
+            let width = on - off;
+            // Include the bounded joins and the unbounded floor. The
+            // reference below is independent of the engine's local germs.
+            let floor = if logarithmic {
+                (1e-12_f64).ln() / (0.01_f64).ln()
+            } else {
+                (1e-9 - 1000.) / (10. - 1000.)
+            };
+            let mut fractions = vec![-0.2, 0., 0.3, 0.8, 1., 1.2];
+            if !bounded {
+                fractions.extend([floor - 0.01, floor + 0.01]);
+            }
+            for fraction in fractions {
+                let mut state = vec![Vector::zeros(c.unknown_count()); 9];
+                state[0].set(cp, fraction.mul_add(width, off) + 0.25)?;
+                state[0].set(cn, 0.25)?;
+                state[0].set(p, -1.5)?;
+                state[0].set(n, 0.5)?;
+                // Slow normalized control variation avoids crossing a join
+                // inside either tested Taylor germ.
+                let rate = if !bounded && !logarithmic && (fraction - floor).abs() < 0.02 {
+                    1e-5
+                } else {
+                    0.02
+                };
+                state[1].set(cp, rate * width + 0.04)?;
+                state[1].set(cn, 0.04)?;
+                state[1].set(p, 0.03)?;
+                state[1].set(n, -0.01)?;
+                for (limit, tau) in [(Limit::Left, -0.1_f64), (Limit::Right, 0.1_f64)] {
+                    let result = dae.evaluate_taylor(&state, 0., 1e-6, limit)?;
+                    let series = |values: &[Vector], row| {
+                        values.iter().rev().fold(0_f64, |sum, value| {
+                            sum.mul_add(tau, value.get(row).unwrap())
+                        })
+                    };
+                    let gradient = |row, col| {
+                        result
+                            .conductance
+                            .iter()
+                            .rev()
+                            .fold(0_f64, |sum, matrix| sum.mul_add(tau, matrix.get(row, col)))
+                    };
+                    let t = rate.mul_add(tau, fraction);
+                    let x = if bounded { t.clamp(0., 1.) } else { t };
+                    let flat = bounded && (t < 0. || t > 1.);
+                    let (g, dg) = if logarithmic {
+                        let (exponent, slope) = if cubic {
+                            (x * x * (3. - 2. * x), 6. * x * (1. - x))
+                        } else {
+                            (x, 1.)
+                        };
+                        let r = 1000. * 0.01_f64.powf(exponent);
+                        if !bounded && r <= 1e-9 {
+                            (1e9, 0.)
+                        } else {
+                            (
+                                r.recip(),
+                                if flat {
+                                    0.
+                                } else {
+                                    -0.01_f64.ln() * slope / r / width
+                                },
+                            )
+                        }
+                    } else {
+                        let r = (-990_f64).mul_add(x, 1000.);
+                        if !bounded && r <= 1e-9 {
+                            (1e9, 0.)
+                        } else {
+                            (r.recip(), if flat { 0. } else { 990. / width / r / r })
+                        }
+                    };
+                    let v = 0.04_f64.mul_add(tau, -2.);
+                    let expected = v * g;
+                    close(
+                        "output current",
+                        series(&result.residual, p),
+                        expected,
+                        1e-9,
+                        1e-11,
+                    );
+                    close(
+                        "negative current",
+                        series(&result.residual, n),
+                        -expected,
+                        1e-9,
+                        1e-11,
+                    );
+                    close("output derivative", gradient(p, p), g, 1e-9, 1e-11);
+                    close("output reverse derivative", gradient(p, n), -g, 1e-9, 1e-11);
+                    close("control derivative", gradient(p, cp), v * dg, 1e-8, 1e-11);
+                    close(
+                        "control reverse derivative",
+                        gradient(p, cn),
+                        -v * dg,
+                        1e-8,
+                        1e-11,
+                    );
+                    let input_g = if model == "pswitch" { 0.005 } else { 0. };
+                    let control = width.mul_add(t, off);
+                    close(
+                        "input loading",
+                        series(&result.residual, cp),
+                        input_g * control,
+                        1e-10,
+                        1e-13,
+                    );
+                    close(
+                        "input loading derivative",
+                        gradient(cp, cn),
+                        -input_g,
+                        1e-10,
+                        1e-13,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
