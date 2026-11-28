@@ -1073,15 +1073,25 @@ pub trait Device: fmt::Debug + std::any::Any {
         ))
     }
 
+    /// Occurrence-bound physical passive startup policy, if installed.
+    fn passive_initialization(
+        &self,
+    ) -> Option<&crate::devices::passive_bias::PassiveInitialization> {
+        None
+    }
+
     /// True when bias equations need physical nodal continuation rather
     /// than perturbing a numerical pivot diagonal.
     fn has_passive_bias(&self) -> bool {
-        false
+        crate::devices::passive_bias::has_constraints(self.passive_initialization())
     }
 
     /// Whether an explicit physical initialization equation applies in this bias analysis.
-    fn has_active_passive_bias(&self, _analysis: crate::primitives::AnalysisKind) -> bool {
-        false
+    fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
+        crate::devices::passive_bias::has_active_constraints(
+            self.passive_initialization(),
+            analysis,
+        )
     }
 
     /// Whether real loads require the enclosing analysis selected by the
@@ -1769,6 +1779,20 @@ pub trait Device: fmt::Debug + std::any::Any {
         }
     }
 
+    /// Stage an effective recipe before the candidate's physical preparation.
+    /// Ordinary devices validate immediately; prepared kernels validate the
+    /// final combined recipe once at the candidate boundary.
+    /// # Errors
+    /// Invalid parameter or structural change.
+    fn stage_bound_parameter(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+        value: Real,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Box<dyn Device>> {
+        self.with_bound_parameter(key, value, context)
+    }
+
     /// Whether typed instance setters preserve the selected model declaration.
     /// Model-backed devices opt in only when no setter can change model
     /// selection (including binning). The candidate validator still checks
@@ -1777,13 +1801,13 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
-    /// Whether this device needs context preparation, independently of batching.
+    /// Whether this native device needs context preparation independently of batching.
+    /// Prepared artifact lanes use the separate run-instance contract.
     fn needs_context_preparation(&self) -> bool {
-        self.prepared_batch_key().is_some()
+        false
     }
 
-    /// Reprepare immutable context-dependent data at a context transition.
-    /// Ordinary native devices need no replacement.
+    /// Reprepare immutable context-dependent native data at a context transition.
     /// # Errors
     /// Invalid effective physical parameters.
     fn reprepare_context(
@@ -1791,6 +1815,29 @@ pub trait Device: fmt::Debug + std::any::Any {
         _context: &crate::devices::ModelContext,
     ) -> SpiceResult<Option<Box<dyn Device>>> {
         Ok(None)
+    }
+
+    /// Construct a run-local prepared recipe. A previous candidate may lend
+    /// immutable singleton data; grouped physical lanes are bound by its plan.
+    /// # Errors
+    /// Invalid context or unsupported prepared device.
+    fn prepared_run_instance(
+        &self,
+        _context: &crate::devices::ModelContext,
+        _previous: Option<&dyn Device>,
+    ) -> SpiceResult<Box<dyn Device>> {
+        Err(SpiceError::circuit(
+            "device has no prepared run implementation",
+        ))
+    }
+
+    /// Validate and activate an independent singleton's prepared data.
+    /// # Errors
+    /// Invalid physical parameters or unsupported prepared device.
+    fn activate_prepared_scalar(&self) -> SpiceResult<()> {
+        Err(SpiceError::circuit(
+            "device has no prepared scalar implementation",
+        ))
     }
 
     /// The canonical (lowercase, alias-folded) keyword of a settable real
