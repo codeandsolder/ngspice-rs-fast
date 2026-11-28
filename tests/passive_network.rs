@@ -428,6 +428,7 @@ fn voltage_network(
         VoltageNetworkCoefficients {
             series_resistance,
             parallel_capacitance,
+            series_shunt_capacitance: 0.,
             temperature: None,
         },
         SourceInputs {

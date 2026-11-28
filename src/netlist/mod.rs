@@ -61,10 +61,27 @@ pub const C_REFERENCE: &str =
 /// Explicit physical network setters shared by the normalized native grammar
 /// and writer. No source-dialect defaults are selected here.
 pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
+    if matches!(designator, 'c' | 'l' | 'v')
+        && matches!(
+            name,
+            "pn_control"
+                | "pn_report_dc"
+                | "pn_report_ac"
+                | "pn_report_tran"
+                | "pn_report_dc_g"
+                | "pn_report_ac_g"
+                | "pn_report_tran_g"
+        )
+    {
+        return true;
+    }
     match designator {
         'c' | 'l' => matches!(
             name,
-            "pn_rseries"
+            "pn_report_dc_rparallel_factor"
+                | "pn_report_ac_rparallel_factor"
+                | "pn_report_tran_rparallel_factor"
+                | "pn_rseries"
                 | "pn_lseries"
                 | "pn_rseries_shunt"
                 | "pn_rstorage_shunt"
@@ -89,7 +106,10 @@ pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
                 | "pn_gterminal_tran_gmin"
                 | "pn_gterminal_noise"
         ),
-        'v' => matches!(name, "pn_rseries" | "pn_cparallel" | "pn_temp"),
+        'v' => matches!(
+            name,
+            "pn_rseries" | "pn_cparallel" | "pn_cseries_shunt" | "pn_temp"
+        ),
         _ => false,
     }
 }

@@ -6,18 +6,21 @@
 //! intentionally distinct.
 
 mod damping;
+mod report;
 use damping::DampingShunt;
 pub use damping::{AnalysisDamping, ConductanceLaw};
+pub(super) use report::CurrentReportSpec;
+pub(crate) use report::{BoundCurrentReport, CurrentOutputLaw, ReportPhase};
+pub use report::{CurrentReference, CurrentReporting, CurrentReportingLaw};
 
 use crate::devices::{
     Capacitor, Circuit, Device, IndependentSource, Inductor, Resistor, ResistorNoise, StorageKind,
-    Waveform,
     elaboration::{ElaborationSize, reserve},
     passive_bias::PassiveInitialization,
     rlc::REACTIVE_STATE_COUNT,
     sources::{SourceExcitation, SourceInputs},
 };
-use crate::primitives::{Complex, NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 /// Resolved physical coefficients of one parallel copy of a storage network.
 ///
@@ -147,6 +150,9 @@ pub struct PreparedPassiveNetwork {
     nodes: usize,
     temperature: Option<Real>,
     initialization: Option<PassiveInitialization>,
+    reporting: Option<CurrentReporting>,
+    control: Option<CurrentReference>,
+    primary_probe: bool,
 }
 
 /// Stable names for the independently observable currents of a bound network.
@@ -174,33 +180,7 @@ impl PreparedPassiveNetwork {
         input: PassiveNetworkCoefficients,
         initialization: Option<PassiveInitialization>,
     ) -> SpiceResult<Option<Self>> {
-        if !input.multiplicity.is_finite()
-            || input.multiplicity < 0.
-            || input
-                .temperature
-                .is_some_and(|t| !t.is_finite() || t <= -273.15)
-            || [
-                input.value,
-                input.series_resistance,
-                input.series_inductance,
-                input.parallel_capacitance,
-            ]
-            .iter()
-            .any(|v| !v.is_finite() || *v < 0.)
-            || [
-                input.series_inductance_shunt,
-                input.storage_shunt,
-                input.parallel_resistance,
-            ]
-            .into_iter()
-            .flatten()
-            .any(|r| !r.is_finite() || r <= 0. || !(1. / r).is_finite())
-        {
-            return Err(SpiceError::circuit("invalid passive network coefficients"));
-        }
-        if let Some(policy) = &initialization {
-            policy.check_kind(input.kind)?;
-        }
+        Self::validate(input, initialization.as_ref())?;
         if input.multiplicity == 0. {
             return Ok(None);
         }
@@ -275,7 +255,72 @@ impl PreparedPassiveNetwork {
             nodes,
             temperature: input.temperature,
             initialization,
+            reporting: None,
+            control: None,
+            primary_probe: false,
         }))
+    }
+
+    fn validate(
+        input: PassiveNetworkCoefficients,
+        initialization: Option<&PassiveInitialization>,
+    ) -> SpiceResult<()> {
+        if !input.multiplicity.is_finite()
+            || input.multiplicity < 0.
+            || input
+                .temperature
+                .is_some_and(|t| !t.is_finite() || t <= -273.15)
+            || [
+                input.value,
+                input.series_resistance,
+                input.series_inductance,
+                input.parallel_capacitance,
+            ]
+            .iter()
+            .any(|v| !v.is_finite() || *v < 0.)
+            || [
+                input.series_inductance_shunt,
+                input.storage_shunt,
+                input.parallel_resistance,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|r| !r.is_finite() || r <= 0. || !(1. / r).is_finite())
+        {
+            return Err(SpiceError::circuit("invalid passive network coefficients"));
+        }
+        if let Some(policy) = initialization {
+            policy.check_kind(input.kind)?;
+        }
+        Ok(())
+    }
+
+    /// Install an explicit current-reporting policy without changing the
+    /// network's electrical equations.
+    ///
+    /// # Errors
+    /// Nonfinite reporting coefficients.
+    pub fn with_reporting(mut self, reporting: CurrentReporting) -> SpiceResult<Self> {
+        self.reporting = Some(reporting.validate()?);
+        self.update_primary_probe();
+        Ok(self)
+    }
+
+    /// Select the physical branch used by controlling-current references.
+    #[must_use]
+    pub fn with_current_control(mut self, reference: CurrentReference) -> Self {
+        self.control = Some(reference);
+        self.update_primary_probe();
+        self
+    }
+
+    fn update_primary_probe(&mut self) {
+        self.primary_probe = (self.reporting.is_some_and(CurrentReporting::needs_primary)
+            || self.control == Some(CurrentReference::Primary))
+            && self.edges.iter().any(|edge| {
+                edge.role == Role::Primary
+                    && matches!(edge.element, Element::Storage(StorageKind::Capacitor, _))
+            });
     }
 
     /// Atomically materialize the validated network and its separate current
@@ -309,8 +354,8 @@ impl PreparedPassiveNetwork {
 
     pub(super) fn size(&self) -> ElaborationSize {
         ElaborationSize::new(
-            self.edges.len() + 1,
-            self.nodes - 1,
+            self.edges.len() + 1 + usize::from(self.primary_probe),
+            self.nodes - 1 + usize::from(self.primary_probe),
             self.edges
                 .iter()
                 .map(|edge| edge.element.state_slots())
@@ -338,18 +383,41 @@ impl PreparedPassiveNetwork {
             )?);
         }
         let mut devices: Vec<Box<dyn Device>> = Vec::new();
-        reserve(&mut devices, self.edges.len() + 1, None)?;
-        devices.push(Box::new(IndependentSource::new(
+        reserve(
+            &mut devices,
+            self.edges.len() + 1 + usize::from(self.primary_probe),
+            None,
+        )?;
+        let primary = if self.primary_probe {
+            format!("v{}#primary", binding.primary)
+        } else {
+            binding.primary.clone()
+        };
+        let report =
+            (self.reporting.is_some() || self.control.is_some()).then(|| CurrentReportSpec {
+                original: binding.primary.clone(),
+                primary: primary.clone(),
+                terminals,
+                reporting: self.reporting,
+                control: self.control,
+            });
+        devices.push(Box::new(IndependentSource::current_probe(
             &binding.terminal_probe,
             [positive, alias],
-            true,
-            0.,
-            Complex::ZERO,
-            Waveform::Constant(0.),
+            report,
         )?));
         for edge in &self.edges {
             let name = edge.role.name(&binding.primary);
-            let terminals = edge.nodes.map(|index| ids[index]);
+            let mut terminals = edge.nodes.map(|index| ids[index]);
+            if self.primary_probe && edge.role == Role::Primary {
+                let sense = new_node(nodes, &binding.primary, self.nodes, NodeKind::ProbeAlias)?;
+                devices.push(Box::new(IndependentSource::current_probe(
+                    &primary,
+                    [terminals[0], sense],
+                    None,
+                )?));
+                terminals[0] = sense;
+            }
             let mut device: Box<dyn Device> = match edge.element {
                 Element::Resistance(r) => Box::new(Resistor::new(name, terminals, r)?.with_noise(
                     ResistorNoise {
@@ -408,6 +476,8 @@ pub struct VoltageNetworkCoefficients {
     pub series_resistance: Real,
     /// Capacitance across the output pair, before the terminal current probe.
     pub parallel_capacitance: Real,
+    /// Additional capacitance directly across the series resistance.
+    pub series_shunt_capacitance: Real,
     /// Resolved series-resistor noise temperature, in Celsius.
     pub temperature: Option<Real>,
 }
@@ -420,6 +490,8 @@ pub struct VoltageNetworkCoefficients {
 pub struct PreparedVoltageNetwork {
     coefficients: VoltageNetworkCoefficients,
     excitation: SourceExcitation,
+    reporting: Option<CurrentReporting>,
+    control: Option<CurrentReference>,
 }
 
 /// Identities for voltage forcing and external current reporting.
@@ -446,6 +518,8 @@ impl PreparedVoltageNetwork {
                 && !(1. / coefficients.series_resistance).is_finite())
             || !coefficients.parallel_capacitance.is_finite()
             || coefficients.parallel_capacitance < 0.
+            || !coefficients.series_shunt_capacitance.is_finite()
+            || coefficients.series_shunt_capacitance < 0.
             || coefficients
                 .temperature
                 .is_some_and(|t| !t.is_finite() || t <= -273.15)
@@ -457,7 +531,25 @@ impl PreparedVoltageNetwork {
         Ok(Self {
             coefficients,
             excitation: SourceExcitation::from_inputs(true, inputs)?,
+            reporting: None,
+            control: None,
         })
+    }
+
+    /// Install an explicit current-reporting law, preserving forcing identity.
+    ///
+    /// # Errors
+    /// Nonfinite reporting coefficients.
+    pub fn with_reporting(mut self, reporting: CurrentReporting) -> SpiceResult<Self> {
+        self.reporting = Some(reporting.validate()?);
+        Ok(self)
+    }
+
+    /// Select the physical branch used by controlling-current references.
+    #[must_use]
+    pub fn with_current_control(mut self, reference: CurrentReference) -> Self {
+        self.control = Some(reference);
+        self
     }
 
     /// Atomically bind the voltage source and its output impedance.
@@ -488,7 +580,8 @@ impl PreparedVoltageNetwork {
 
     pub(super) fn size(&self) -> ElaborationSize {
         let series = usize::from(self.coefficients.series_resistance != 0.);
-        let shunt = usize::from(self.coefficients.parallel_capacitance != 0.);
+        let shunt = usize::from(self.coefficients.parallel_capacitance != 0.)
+            + usize::from(series != 0 && self.coefficients.series_shunt_capacitance != 0.);
         ElaborationSize::new(2 + series + shunt, 1 + series, shunt * REACTIVE_STATE_COUNT)
     }
 
@@ -507,17 +600,22 @@ impl PreparedVoltageNetwork {
             new_node(nodes, name, 1, NodeKind::Internal)?
         };
         let mut devices: Vec<Box<dyn Device>> = Vec::new();
-        reserve(&mut devices, 4, None)?;
+        reserve(&mut devices, self.size().devices, None)?;
         devices.push(Box::new(
             self.excitation.clone().bind(name, [source, negative]),
         ));
-        devices.push(Box::new(IndependentSource::new(
+        let report =
+            (self.reporting.is_some() || self.control.is_some()).then(|| CurrentReportSpec {
+                original: name.clone(),
+                primary: name.clone(),
+                terminals: [positive, negative],
+                reporting: self.reporting,
+                control: self.control,
+            });
+        devices.push(Box::new(IndependentSource::current_probe(
             &binding.terminal_probe,
             [positive, output],
-            true,
-            0.,
-            Complex::ZERO,
-            Waveform::Constant(0.),
+            report,
         )?));
         if series != 0. {
             devices.push(Box::new(
@@ -528,6 +626,14 @@ impl PreparedVoltageNetwork {
                         ..Default::default()
                     }),
             ));
+        }
+        if series != 0. && self.coefficients.series_shunt_capacitance != 0. {
+            devices.push(Box::new(Capacitor::new(
+                format!("c{name}#series_shunt"),
+                [source, output],
+                self.coefficients.series_shunt_capacitance,
+                None,
+            )?));
         }
         if self.coefficients.parallel_capacitance != 0. {
             devices.push(Box::new(Capacitor::new(
@@ -546,7 +652,7 @@ impl PreparedVoltageNetwork {
 /// but contributes no devices or private nodes.
 pub(super) enum NetworkPlan {
     Storage(Option<PreparedPassiveNetwork>),
-    Voltage(PreparedVoltageNetwork),
+    Voltage(Box<PreparedVoltageNetwork>),
 }
 
 impl NetworkPlan {
@@ -590,15 +696,22 @@ impl NetworkPlan {
         let get = |key| values.get(key).copied();
         let zero = |key| get(key).unwrap_or(0.);
         if instance.designator == 'v' {
-            let network = PreparedVoltageNetwork::prepare(
+            let mut network = PreparedVoltageNetwork::prepare(
                 VoltageNetworkCoefficients {
                     series_resistance: zero("pn_rseries"),
                     parallel_capacitance: zero("pn_cparallel"),
+                    series_shunt_capacitance: zero("pn_cseries_shunt"),
                     temperature: get("pn_temp"),
                 },
                 super::factory::voltage_network_inputs(&ordinary)?,
             )?;
-            return Ok(Some(Self::Voltage(network)));
+            if let Some(reporting) = report::parse(&values, 0.)? {
+                network = network.with_reporting(reporting)?;
+            }
+            if let Some(control) = report::parse_control(&values)? {
+                network = network.with_current_control(control);
+            }
+            return Ok(Some(Self::Voltage(Box::new(network))));
         }
 
         Self::storage(&ordinary, &values).map(Some)
@@ -659,10 +772,25 @@ impl NetworkPlan {
             terminal_damping: Self::damping(values, "terminal")?,
         };
         let initialization = Self::initialization(kind, initial, multiplicity, values)?;
-        Ok(Self::Storage(PreparedPassiveNetwork::prepare(
-            coefficients,
-            initialization,
-        )?))
+        let Some(mut network) = PreparedPassiveNetwork::prepare(coefficients, initialization)?
+        else {
+            return Ok(Self::Storage(None));
+        };
+        let conductance = network
+            .edges
+            .iter()
+            .find_map(|edge| match (edge.role, edge.element) {
+                (Role::ParallelResistance, Element::Resistance(r)) => Some(1. / r),
+                _ => None,
+            })
+            .unwrap_or(0.);
+        if let Some(reporting) = report::parse(values, conductance)? {
+            network = network.with_reporting(reporting)?;
+        }
+        if let Some(control) = report::parse_control(values)? {
+            network = network.with_current_control(control);
+        }
+        Ok(Self::Storage(Some(network)))
     }
 
     fn damping(

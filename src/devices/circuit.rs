@@ -181,6 +181,8 @@ struct TopologyBindings {
     convergence_kinds: Vec<crate::devices::ConvergenceKind>,
     private_storage_rows: Vec<(usize, usize)>,
     regularization_nodes: Option<Vec<usize>>,
+    reported_currents: Vec<super::passive_network::BoundCurrentReport>,
+    current_controls: std::collections::BTreeMap<usize, usize>,
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
@@ -1601,10 +1603,15 @@ impl Circuit {
             // cccsset.c, ccvsset.c, cswsetup.c and asrcset.c call
             // CKTfndBranch for each controlling source, in order.
             for control in self.devices[index].controlling_sources() {
-                if let Some(target) = names.get(&control.name)
-                    && self.devices[index]
-                        .control_branch(self.devices[target].as_ref())
-                        .is_some()
+                if let Some(target) = names.get(&control.name).map(|target| {
+                    self.bindings
+                        .current_controls
+                        .get(&target)
+                        .copied()
+                        .unwrap_or(target)
+                }) && self.devices[index]
+                    .control_branch(self.devices[target].as_ref())
+                    .is_some()
                 {
                     allocate_branch(&mut self.bindings.unknowns, target)?;
                 }
@@ -2061,6 +2068,7 @@ impl Circuit {
                         control.name
                     )));
                 };
+                let index = self.current_control_target(index);
                 let target = &self.devices[index];
                 let Some(branch) = device.control_branch(target.as_ref()) else {
                     return Err(failure(format!(
@@ -2162,8 +2170,10 @@ impl Circuit {
                 previous_dc = dc;
             }
         }
+        self.bindings.current_controls = self.bind_current_controls(&names)?;
         let order = self.setup_order();
         self.rebuild_unknowns_in_order(&order, &names)?;
+        self.bindings.reported_currents = self.bind_reported_currents(&names)?;
         for node in self.nodes.nodes() {
             self.bindings.unknowns.checked_node_row(node.id)?;
         }
@@ -2189,6 +2199,117 @@ impl Circuit {
         self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
+    }
+
+    fn current_control_target(&self, original: usize) -> usize {
+        self.bindings
+            .current_controls
+            .get(&original)
+            .copied()
+            .unwrap_or(original)
+    }
+
+    fn bind_current_controls(
+        &self,
+        names: &DeviceNames,
+    ) -> SpiceResult<std::collections::BTreeMap<usize, usize>> {
+        use super::{IndependentSource, passive_network::CurrentReference};
+        let mut controls = std::collections::BTreeMap::new();
+        for (index, device) in self.devices.iter().enumerate() {
+            let Some(spec) = (device.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<IndependentSource>()
+                .and_then(IndependentSource::current_report)
+            else {
+                continue;
+            };
+            let Some(control) = spec.control else {
+                continue;
+            };
+            let original = names
+                .get(&spec.original)
+                .ok_or_else(|| SpiceError::circuit("unbound original current control"))?;
+            let target = match control {
+                CurrentReference::Terminal => index,
+                CurrentReference::Primary => names
+                    .get(&spec.primary)
+                    .ok_or_else(|| SpiceError::circuit("unbound primary current control"))?,
+            };
+            if controls.insert(original, target).is_some() {
+                return Err(SpiceError::circuit("duplicate physical current control"));
+            }
+        }
+        Ok(controls)
+    }
+
+    fn bind_reported_currents(
+        &self,
+        names: &DeviceNames,
+    ) -> SpiceResult<Vec<super::passive_network::BoundCurrentReport>> {
+        use super::{BranchQuantity, IndependentSource, passive_network::BoundCurrentReport};
+        let branch = |index: usize| {
+            let device = &self.devices[index];
+            self.bindings.branch_rows[index]
+                .clone()
+                .enumerate()
+                .find_map(|(local, row)| {
+                    (device.branch_quantity(local) == BranchQuantity::Current).then_some(row)
+                })
+        };
+        let mut reports = Vec::new();
+        for (index, device) in self.devices.iter().enumerate() {
+            let Some(spec) = (device.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<IndependentSource>()
+                .and_then(IndependentSource::current_report)
+            else {
+                continue;
+            };
+            if spec.reporting.is_none() {
+                continue;
+            }
+            let original = names
+                .get(&spec.original)
+                .ok_or_else(|| SpiceError::circuit("unbound original current report"))?;
+            let primary = names.get(&spec.primary).and_then(branch);
+            let terminal =
+                branch(index).ok_or_else(|| SpiceError::circuit("current probe has no branch"))?;
+            let voltage = spec
+                .terminals
+                .map(|node| self.bindings.unknowns.node_row(node));
+            let report = BoundCurrentReport::new(spec, original, terminal, primary, voltage)?;
+            if branch(original).is_some() && names.get(&report.intrinsic).is_some() {
+                return Err(SpiceError::circuit(format!(
+                    "reported-current name collision: {}",
+                    report.intrinsic
+                )));
+            }
+            reserve(&mut reports, 1, None)?;
+            reports.push(report);
+        }
+        reports.sort_unstable_by_key(|report| report.original_device);
+        if reports
+            .windows(2)
+            .any(|pair| pair[0].original_device == pair[1].original_device)
+        {
+            return Err(SpiceError::circuit(
+                "duplicate current report for one instance",
+            ));
+        }
+        Ok(reports)
+    }
+
+    pub(crate) fn reported_currents(&self) -> &[super::passive_network::BoundCurrentReport] {
+        &self.bindings.reported_currents
+    }
+
+    pub(crate) fn current_report(
+        &self,
+        device: usize,
+    ) -> Option<&super::passive_network::BoundCurrentReport> {
+        let reports = self.reported_currents();
+        reports
+            .binary_search_by_key(&device, |report| report.original_device)
+            .ok()
+            .map(|index| &reports[index])
     }
 
     /// Device ordinals in C's `CKTsetup`/`CKTload` order.
@@ -4609,28 +4730,14 @@ impl Circuit {
                     )?;
                 }
                 Some(ExpansionKind::Network(network)) => {
-                    let expanded = network.build(instance, nodes)?;
-                    for device in expanded {
-                        if !device.name().eq_ignore_ascii_case(&instance.name)
-                            && !seen.insert(device.name().to_ascii_lowercase())
-                        {
-                            return Err(SpiceError::circuit(format!(
-                                "duplicate network instance {}",
-                                device.name()
-                            )));
-                        }
-                        staged.push(ElaboratedDevice {
-                            device,
-                            origin: DeviceOrigin::default(),
-                        });
-                    }
-                    if let Some(first) = staged.get_mut(first_device) {
-                        first.origin.internal_nodes = nodes.nodes()[first_node..]
-                            .iter()
-                            .filter(|node| node.kind == NodeKind::Internal)
-                            .map(|node| node.id)
-                            .collect();
-                    }
+                    Self::stage_network(
+                        instance,
+                        nodes,
+                        &network,
+                        first_node,
+                        &mut seen,
+                        &mut staged,
+                    )?;
                 }
                 None => {
                     let device = crate::devices::factory::instantiate_with_models(
@@ -4672,6 +4779,40 @@ impl Circuit {
             )));
         }
         Ok(staged)
+    }
+
+    fn stage_network(
+        instance: &crate::netlist::ast::DeviceInstance,
+        nodes: &mut crate::primitives::NodeAppend<'_>,
+        network: &super::passive_network::NetworkPlan,
+        first_node: usize,
+        seen: &mut BTreeSet<String>,
+        staged: &mut Vec<ElaboratedDevice>,
+    ) -> SpiceResult<()> {
+        let first_device = staged.len();
+        let expanded = network.build(instance, nodes)?;
+        for device in expanded {
+            if !device.name().eq_ignore_ascii_case(&instance.name)
+                && !seen.insert(device.name().to_ascii_lowercase())
+            {
+                return Err(SpiceError::circuit(format!(
+                    "duplicate network instance {}",
+                    device.name()
+                )));
+            }
+            staged.push(ElaboratedDevice {
+                device,
+                origin: DeviceOrigin::default(),
+            });
+        }
+        if let Some(first) = staged.get_mut(first_device) {
+            first.origin.internal_nodes = nodes.nodes()[first_node..]
+                .iter()
+                .filter(|node| node.kind == NodeKind::Internal)
+                .map(|node| node.id)
+                .collect();
+        }
+        Ok(())
     }
 
     fn stage_single(

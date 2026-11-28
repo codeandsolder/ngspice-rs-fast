@@ -1052,18 +1052,20 @@ fn run_fixed(
     })?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
     let GridPair { inner, outer } = GridPair::new(grids);
-    let result = plot(
+    let output = plot(
         circuit,
         "dc1",
         "DC transfer characteristic",
         // C writes only the inner axis' scale; an outer axis has no vector.
         Some(axes[0].spec.target.scale()),
         false,
+        crate::devices::passive_network::ReportPhase::Steady,
     )?;
-    sink.begin(&result)?;
+    let result = &output.header;
+    sink.begin(result)?;
     let mut selected = crate::analysis::results::SelectedOutput::bind(
         sink,
-        &result,
+        &output,
         circuit.unknown_count(),
         true,
     )?;
@@ -1135,6 +1137,7 @@ fn run_fixed(
                 point.clear();
                 point.push(Complex::real(inner_value));
                 point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
+                output.append_reports(&mut point);
                 point.extend(observed);
                 result.check_point(&point)?;
                 sink.point(&point)?;

@@ -69,6 +69,7 @@ fn has_native_current(
 ) -> SpiceResult<bool> {
     Ok(match instance.designator {
         'v' | 'e' | 'h' | 'l' => true,
+        'c' if instance.parameters.iter().any(|p| p.name == "pn_control") => true,
         'r' | 'c' => expressions(instance).next().is_some(),
         'b' => instance
             .parameters

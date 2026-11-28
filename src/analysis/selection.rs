@@ -1339,8 +1339,16 @@ mod tests {
         let mut circuit = crate::devices::Circuit::from_netlist(&parsed.netlist).unwrap();
         circuit.finalize().unwrap();
         let start = Instant::now();
-        let plot =
-            crate::analysis::linear::plot(&circuit, "op1", "Operating Point", None, false).unwrap();
+        let plot = crate::analysis::linear::plot(
+            &circuit,
+            "op1",
+            "Operating Point",
+            None,
+            false,
+            crate::devices::passive_network::ReportPhase::Steady,
+        )
+        .unwrap()
+        .header;
         let setup = start.elapsed();
         let requests = write_requests(&parsed.output, AnalysisKind::OperatingPoint).unwrap();
         let names = requests.iter().map(|r| r.vector.name()).collect::<Vec<_>>();

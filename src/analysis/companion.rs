@@ -1264,15 +1264,22 @@ impl Driver<'_> {
             TransientRun::Ordinary | TransientRun::Seed => ("tran1", "Transient Analysis"),
             TransientRun::Shooting { .. } => ("pss1", "Periodic Steady State Analysis"),
         };
-        let plot = plot(self.circuit, name, title, Some(("time", "time")), false)?;
-        sink.begin(&plot)?;
+        let output = plot(
+            self.circuit,
+            name,
+            title,
+            Some(("time", "time")),
+            false,
+            crate::devices::passive_network::ReportPhase::Transient,
+        )?;
+        sink.begin(&output.header)?;
         let mut selected = crate::analysis::results::SelectedOutput::bind(
             sink,
-            &plot,
+            &output,
             self.circuit.unknown_count(),
             true,
         )?;
-        let mut point = Vec::with_capacity(plot.variable_count());
+        let mut point = Vec::with_capacity(output.header.variable_count());
         let mut accepted = match purpose {
             TransientRun::Shooting { seed, output, .. } => self.initialize_orbit(
                 seed,
@@ -1311,7 +1318,7 @@ impl Driver<'_> {
                 self.emit_accepted(
                     &accepted,
                     output_time,
-                    &plot,
+                    &output,
                     sink,
                     &mut selected,
                     &mut point,
@@ -1364,7 +1371,7 @@ impl Driver<'_> {
         &self,
         accepted: &AcceptedPoint,
         time: Real,
-        plot: &Plot,
+        output: &super::linear::LinearOutput,
         sink: &mut dyn PointSink,
         selected: &mut Option<crate::analysis::results::SelectedOutput>,
         point: &mut Vec<Complex>,
@@ -1388,7 +1395,7 @@ impl Driver<'_> {
             None => return Err(failure("missing accepted output observations")),
         };
         push(
-            plot,
+            output,
             sink,
             selected.as_mut(),
             point,
@@ -2457,7 +2464,7 @@ impl Driver<'_> {
 
 /// Deliver an accepted row to the consumer without copying it.
 fn push(
-    header: &Plot,
+    output: &super::linear::LinearOutput,
     sink: &mut dyn PointSink,
     selected: Option<&mut crate::analysis::results::SelectedOutput>,
     point: &mut Vec<Complex>,
@@ -2471,8 +2478,9 @@ fn push(
     point.clear();
     point.push(Complex::real(time));
     point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
+    output.append_reports(point);
     point.extend_from_slice(observed);
-    header.check_point(point)?;
+    output.header.check_point(point)?;
     sink.point(point)
 }
 

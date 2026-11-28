@@ -375,7 +375,8 @@ impl ObservationPlan {
                 .ok_or_else(|| SpiceError::circuit(format!("{name}: unknown device {instance}")))?;
             let device = circuit.devices()[index].as_ref();
             if name.starts_with("i(")
-                && (device.expression_current_branch().is_some()
+                && (circuit.current_report(index).is_some()
+                    || device.expression_current_branch().is_some()
                     || (device.branch_currents() == 1
                         && device.branch_quantity(0) == crate::devices::BranchQuantity::Current))
             {
