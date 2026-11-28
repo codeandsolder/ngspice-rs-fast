@@ -38,10 +38,24 @@ keeps its acceptance criteria and lands here.
    `bsim4v7/`.
 
 Explicit non-goals: BSIM-SOI (`bsim3soi_{fd,dd,pd}`, `bsimsoi`), HiSIM2/HiSIM-HV,
-BSIM1/BSIM2 (`bsim1/`, `bsim2/`), and the older `bsim3v0`/`bsim3v1`/`bsim3v32`
+and the older `bsim3v0`/`bsim3v1`/`bsim3v32`
 and `bsim4v5`/`bsim4v6`/`bsim4v7` variants. A `version=` string that selects one
 of those stays an explicit `NotYetPorted` naming its C directory - never a
 silently substituted model.
+
+## Prepared BSIM1 / BSIM2
+
+Levels 4 and 5 select the distinct Berkeley BSIM1 and BSIM2 kernel families.
+The solver binds their typed model and instance parameters, declaration-scoped
+artifacts, source-level OFF and IC settings, and explicit intrinsic drain/source
+rows. The shared producer owns current, charge, noise, and the family-specific
+ABI 4 trial policy. Changing series-node topology requires re-elaboration.
+
+The independent reference decks in tests/fixtures/legacy_bsim cover both
+polarities and orientations. For inverse-mode AC the C load and AC functions
+use inconsistent charge derivative slots; the reference therefore also
+contains a forward-equivalent circuit with drain/source-specific geometry
+and overlap parameters permuted. DC is checked against the direct C deck.
 
 ## Size, measured
 

@@ -189,7 +189,8 @@ pub(super) fn instantiate(
         },
         gmin_slot: Some(GMIN),
         model_ambient,
-        relative_temperature_slot: RELATIVE_TEMPERATURE,
+        relative_temperature_slot: Some(RELATIVE_TEMPERATURE),
+        start: None,
         absolute_temperature_slot: absolute.then_some(ABSOLUTE_TEMPERATURE),
     };
     nodes.transaction(|nodes| {

@@ -24,7 +24,7 @@ pub(super) fn model(input: &mut Input<'_>, base: &str) -> Result<ParameterAssign
             match base.to_ascii_lowercase().as_str() {
                 "d" => key == "d",
                 "npn" | "pnp" => matches!(key.as_str(), "npn" | "pnp"),
-                "nmos" | "pmos" => matches!(key.as_str(), "nmos" | "pmos"),
+                "nmos" | "pmos" => matches!(key.as_str(), "nmos" | "pmos" | "off"),
                 // SW_MOD_SW / CSW_CSW: "just says that this is a switch".
                 "sw" => key == "sw",
                 "ltspice_switch" => key == "oneway",
