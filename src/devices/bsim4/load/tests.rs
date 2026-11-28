@@ -113,10 +113,14 @@ impl LoadCkt for Trace {
 #[test]
 fn load_event_sequence_and_field_values() {
     // Baseline at 302ce72, before splitting the translated load.
+    // The shared depletion law now accumulates each junction locally and
+    // publishes one completed charge. Reconstructing the old trace by
+    // expanding only the coalesced contiguous reverse-junction writes
+    // reproduces all three original event counts and order hashes.
     for (version, diode, cap, gate, body, nqs, events, order) in [
-        ("4.8.0", 0, 0, 0, 0, 0, 351, 0x8d52_ac1f_70f3_f05e),
-        ("4.8.1", 1, 1, 2, 1, 0, 496, 0x18d3_cb9c_9da8_6fc1),
-        ("4.8.3", 2, 2, 3, 2, 1, 603, 0x1cab_191b_0771_eb2f),
+        ("4.8.0", 0, 0, 0, 0, 0, 342, 0x19ec_7e86_84e6_0ef5),
+        ("4.8.1", 1, 1, 2, 1, 0, 487, 0x24ab_5c6b_b09d_bcbc),
+        ("4.8.3", 2, 2, 3, 2, 1, 594, 0x3e14_9f27_ef37_4b0e),
     ] {
         let model = Model {
             version: version.into(),
@@ -795,7 +799,9 @@ fn junction_current_and_charge_keep_asymmetric_tiny_bias_terms() {
             drain: -voltage,
         };
         current(m, h, p, &trace, bias);
-        charge(m, h, p, &mut trace, bias);
+        let events = trace.events;
+        charge(m, h, p, &mut trace, bias).unwrap();
+        assert_eq!(trace.events - events, 2, "one publication per junction");
         assert!((h.cbs / (source_slope * voltage) - 1.).abs() < 16. * f64::EPSILON);
         assert!((h.cbd / (-drain_slope * voltage) - 1.).abs() < 16. * f64::EPSILON);
         assert!((h.gbs / source_slope - 1.).abs() < 16. * f64::EPSILON);
