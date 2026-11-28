@@ -275,13 +275,19 @@ both Rust and C reported a supply current near 0.9765625 mA for a 1 V source,
 a RESMIN-clamped 1 pΩ series resistor and a 1 kΩ load, rather than the analytic
 current of approximately 1 mA.
 
-The ordinary load tracks the peak magnitudes of individual matrix and RHS
-stamps. At nominal convergence, a roundoff envelope of eight binary64 epsilons
-multiplied by the maximum stamped coefficient times maximum solution magnitude
-(or peak RHS contribution, whichever is larger) selects a corrective reload
-if the envelope reaches the absolute current tolerance. This is a conservative
-heuristic, not a condition bound or a residual acceptance criterion. No
-original-stamp ledger or exact product sums are required on the ordinary path.
+The ordinary load tracks original matrix coefficient peaks per column and
+individual RHS stamp peaks. At nominal convergence, a roundoff envelope of
+eight binary64 epsilons multiplied by the largest coefficient times its own
+solution coordinate magnitude (or peak RHS contribution, whichever is larger)
+selects a corrective reload if the envelope reaches the absolute current
+tolerance. The column association is essential: a scaled auxiliary state can
+have a large Jacobian coefficient while the actual stamped current remains
+small. Combining that coefficient with an unrelated supply voltage previously
+forced extra nonlinear iterations at every BSIM4 NQS transient point and
+changed accepted charge history (#268). Original peaks retain evidence even
+when opposing stamps cancel inside a folded entry. This remains a heuristic,
+not a condition bound or a residual acceptance criterion. No original-stamp
+ledger or exact product sums are required on the ordinary path.
 
 The reload retains individual contributions (including repeated entries,
 row replacement and RHS overwrites) before binary64 assembly. It evaluates
