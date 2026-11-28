@@ -21,7 +21,7 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@f22d2e61394d5b0b79314d24d16523eed509d496 # main
     with:
       command: |
-        cargo test --workspace --locked
+        cargo test --workspace --locked --no-fail-fast
         cargo xtask golden verify
         cargo doc --workspace --no-deps --locked
         cargo build --workspace --locked --release
