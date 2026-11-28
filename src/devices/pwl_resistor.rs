@@ -23,6 +23,7 @@ struct Segment {
 struct Curve {
     axis: Axis,
     segments: Vec<Segment>,
+    boundaries: Box<[Real]>,
 }
 
 impl Curve {
@@ -65,13 +66,22 @@ impl Curve {
                 intercept,
             });
         }
-        Ok(Self { axis, segments })
+        let boundaries = segments
+            .iter()
+            .take(count - 1)
+            .map(|segment| segment.upper)
+            .collect();
+        Ok(Self {
+            axis,
+            segments,
+            boundaries,
+        })
     }
 
     fn segment(&self, x: Real) -> &Segment {
         // Binary search, with the final segment extrapolated to +infinity.
-        let index = self.segments.partition_point(|segment| x >= segment.upper);
-        &self.segments[index.min(self.segments.len() - 1)]
+        let index = self.boundaries.partition_point(|&boundary| x >= boundary);
+        &self.segments[index]
     }
 
     const fn coordinates(&self, voltage: Real, current: Real) -> (Real, Real) {
@@ -415,8 +425,8 @@ impl Device for PwlResistor {
         &self,
         context: &mut crate::devices::physical_dae::TaylorContext<'_>,
     ) -> SpiceResult<()> {
+        use crate::devices::physical_dae::{LocalGuard, Region};
         use crate::maths::taylor::Jet;
-        use std::cmp::Ordering;
         let branch = context
             .branch
             .ok_or_else(|| SpiceError::circuit("missing PWL Taylor branch"))?;
@@ -427,11 +437,15 @@ impl Device for PwlResistor {
             Axis::Current => context.variable(Some(branch))?,
         };
         independent.check()?;
-        let index = self
-            .curve
-            .segments
-            .partition_point(|segment| independent.compare(segment.upper) != Some(Ordering::Less));
-        let segment = &self.curve.segments[index.min(self.curve.segments.len() - 1)];
+        let guard = LocalGuard::interval(0, independent.clone(), &self.curve.boundaries);
+        let Region::Interval(index) = guard.region else {
+            return Err(SpiceError::circuit("invalid PWL segment guard"));
+        };
+        let segment = &self.curve.segments[index];
+        if let Some(trace) = &mut context.output.guards {
+            trace.extend(context.device, vec![guard])?;
+        }
+        context.candidate_state(0, independent.value())?;
         let (voltage, current) = self.curve.coefficients(segment);
         let row = Some(branch);
         for (node, sign) in [(p, 1.), (n, -1.)] {

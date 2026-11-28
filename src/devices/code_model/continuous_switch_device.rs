@@ -293,6 +293,35 @@ impl Device for ContinuousSwitch {
         self.assemble_small_signal(context, bias)
     }
 
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        use crate::devices::physical_dae::TaylorControl;
+        let coordinates =
+            self.mna_coordinates(context.unknowns, context.branch, context.controls)?;
+        let controls = [coordinates.output, coordinates.control]
+            .map(|rows| TaylorControl { rows, polarity: 1. });
+        let voltage = controls[0].input::<2>(0, context)?;
+        let control = controls[1].input::<2>(1, context)?;
+        let mut guards = Vec::new();
+        let conductance = self.material.taylor(control, &mut guards)?;
+        if let Some(trace) = &mut context.output.guards {
+            trace.extend(context.device, guards)?;
+        }
+        let current = voltage.multiply(&conductance);
+        context.local_law(coordinates.output, &current, &controls, 1., None)?;
+        // The sensing branch and physical P-switch input conductance are
+        // linear; reuse the exact same row incidence as scalar assembly.
+        let zero_output = Coordinates {
+            output: [None; 2],
+            ..coordinates
+        };
+        zero_output.entries(0., 0., self.material.control_g, |row, column, value| {
+            context.linear_static(Some(row), Some(column), value)
+        })
+    }
+
     fn assemble_nonlinear_charge(&self, _context: &mut ChargeContext<'_>) -> SpiceResult<()> {
         // No physical storage; the current-sensing branch is algebraic.
         Ok(())
