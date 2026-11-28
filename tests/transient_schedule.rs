@@ -1,3 +1,5 @@
+//! Numerical continuity and exact sampling across independent transient timing partitions.
+
 use std::path::Path;
 
 use ngspice_rs::analysis::{
