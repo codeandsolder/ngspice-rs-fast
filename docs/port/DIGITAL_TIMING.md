@@ -345,3 +345,15 @@ comparisons to the first or last satisfying binary64 observation.
 Intervals are merged only when adjacent on that lattice. Feasibility
 over real origins and exact projection onto representable observation
 times are distinct operations.
+
+Guarded transport traces retain posting order separately from physical
+arrival order. At a concrete observation, the newest posted request
+that has arrived determines the drive; an older late request cannot
+resurrect an obsolete value. The guard partition composes through exact
+conjunction, so two reconverging copies of an uncertainty do not
+generate independent alternatives. Projection of a trace considers the
+selected request delivered and every later-posted request undelivered;
+the initial drive requires all requests undelivered. An interval sweep
+produces the exact feasible drive set at every representable observation.
+The symbolic branches remain available to downstream model evaluation;
+the feasible drive set is an observation, not a substitute for them.

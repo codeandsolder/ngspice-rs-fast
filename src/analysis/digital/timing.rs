@@ -11,15 +11,17 @@ mod conditional;
 mod feasibility;
 pub(crate) use conditional::proven_order;
 pub use conditional::{
-    Conditional, GuardStatus, OrderCase, OrderPartition, TimingGuard, TimingRelation,
+    Conditional, GuardStatus, Guarded, OrderCase, OrderPartition, TimingGuard, TimingRelation,
 };
 pub use feasibility::ProjectedInterval;
 use std::sync::Arc;
 mod constraints;
 pub use constraints::{ApertureResult, Certainty, ConstraintResult};
 mod delivery;
+mod waveform;
 pub(super) use delivery::phase_between;
 pub use delivery::{Arrival, TimedInput, TimedOutput};
+pub use waveform::{DriveTrace, GuardedWaveform, ProjectedDriveChange, WaveformProjection};
 
 /// Identity of one uncertain delay variable. Reusing an identity expresses
 /// the same normalized uncertainty, not another independent random draw.

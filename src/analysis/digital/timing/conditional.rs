@@ -273,9 +273,17 @@ impl TimingGuard {
     /// # Errors
     /// Missing/invalid origin assignment or exhausted work budget.
     pub fn holds(&self, origins: &BTreeMap<Origin, Real>, mut budget: usize) -> SpiceResult<bool> {
+        self.holds_with_budget(origins, &mut budget)
+    }
+
+    pub(super) fn holds_with_budget(
+        &self,
+        origins: &BTreeMap<Origin, Real>,
+        budget: &mut usize,
+    ) -> SpiceResult<bool> {
         for comparison in &self.comparisons {
-            let lhs = exact_at(&comparison.lhs, origins, &mut budget)?;
-            let rhs = exact_at(&comparison.rhs, origins, &mut budget)?;
+            let lhs = exact_at(&comparison.lhs, origins, budget)?;
+            let rhs = exact_at(&comparison.rhs, origins, budget)?;
             if !comparison.relation.accepts(lhs.exact_cmp(&rhs)) {
                 return Ok(false);
             }
@@ -315,6 +323,142 @@ impl<T> Conditional<T> {
         self.payloads
             .get(index)
             .ok_or_else(|| SpiceError::circuit("missing conditional payload"))
+    }
+}
+
+/// A complete disjoint set of guarded payloads. Constructed from a
+/// verified order partition, or by composing such sets under conjunction.
+/// Unlike a set of independently possible values, a branch retains the
+/// same origin variables when it is combined with another signal.
+#[derive(Clone, Debug)]
+pub struct Guarded<T> {
+    branches: Vec<(TimingGuard, T)>,
+}
+
+impl<T> Guarded<T> {
+    /// An unconditional payload, without uncertain case selection.
+    pub fn unconditional(payload: T) -> Self {
+        Self {
+            branches: vec![(TimingGuard::default(), payload)],
+        }
+    }
+
+    /// Retain the guards of a verified order partition.
+    pub fn from_conditional(conditional: Conditional<T>) -> Self {
+        let Conditional {
+            partition,
+            payloads,
+        } = conditional;
+        let branches = partition
+            .cases
+            .iter()
+            .zip(payloads)
+            .map(|(case, payload)| (partition.guard(case), payload))
+            .collect();
+        Self { branches }
+    }
+
+    /// Inspect each mutually exclusive branch and its payload.
+    pub fn branches(&self) -> impl Iterator<Item = (&TimingGuard, &T)> {
+        self.branches
+            .iter()
+            .map(|(guard, payload)| (guard, payload))
+    }
+
+    /// Transform each payload without changing its guard.
+    ///
+    /// # Errors
+    /// Payload transformation failure.
+    pub fn try_map<U>(
+        &self,
+        mut transform: impl FnMut(&T) -> SpiceResult<U>,
+    ) -> SpiceResult<Guarded<U>> {
+        let branches = self
+            .branches
+            .iter()
+            .map(|(guard, payload)| Ok((guard.clone(), transform(payload)?)))
+            .collect::<SpiceResult<Vec<_>>>()?;
+        Ok(Guarded { branches })
+    }
+
+    /// Compose two complete partitions over the same shared-origin
+    /// domain. Infeasible conjunctions are removed by exact feasibility.
+    ///
+    /// # Errors
+    /// Exhausted budget or payload transformation failure.
+    pub fn zip<U, V>(
+        &self,
+        other: &Guarded<U>,
+        mut budget: usize,
+        mut transform: impl FnMut(&T, &U) -> SpiceResult<V>,
+    ) -> SpiceResult<Guarded<V>> {
+        let mut branches = Vec::new();
+        for (lhs, a) in &self.branches {
+            for (rhs, b) in &other.branches {
+                charge(&mut budget, 1)?;
+                let guard = lhs.clone().and(rhs.clone());
+                if guard.status_with_budget(&mut budget)? != GuardStatus::Impossible {
+                    branches.push((guard, transform(a, b)?));
+                }
+            }
+        }
+        if branches.is_empty() {
+            return Err(SpiceError::circuit("empty composed timing partition"));
+        }
+        Ok(Guarded { branches })
+    }
+
+    /// Expand each payload into a complete guarded partition, conjoining
+    /// its existing condition with the newly selected conditions.
+    ///
+    /// # Errors
+    /// Exhausted budget or payload transformation failure.
+    pub fn try_flat_map<U>(
+        &self,
+        mut budget: usize,
+        mut transform: impl FnMut(&T) -> SpiceResult<Guarded<U>>,
+    ) -> SpiceResult<Guarded<U>> {
+        let mut branches = Vec::new();
+        for (guard, payload) in &self.branches {
+            for (next, result) in transform(payload)?.branches {
+                charge(&mut budget, 1)?;
+                let guard = guard.clone().and(next);
+                if guard.status_with_budget(&mut budget)? != GuardStatus::Impossible {
+                    branches.push((guard, result));
+                }
+            }
+        }
+        if branches.is_empty() {
+            return Err(SpiceError::circuit("empty expanded timing partition"));
+        }
+        Ok(Guarded { branches })
+    }
+
+    /// Select the unique payload for a concrete joint origin assignment.
+    ///
+    /// # Errors
+    /// Missing origin, invalid realization, exhausted budget, or
+    /// inconsistent branch coverage.
+    pub fn realize(&self, origins: &BTreeMap<Origin, Real>, mut budget: usize) -> SpiceResult<&T> {
+        self.realize_with_budget(origins, &mut budget)
+    }
+
+    pub(super) fn realize_with_budget(
+        &self,
+        origins: &BTreeMap<Origin, Real>,
+        budget: &mut usize,
+    ) -> SpiceResult<&T> {
+        let mut selected = None;
+        for (guard, payload) in &self.branches {
+            charge(budget, 1)?;
+            if guard.holds_with_budget(origins, budget)? {
+                if selected.is_some() {
+                    return Err(SpiceError::circuit("overlapping realized timing branches"));
+                }
+                selected = Some(payload);
+            }
+        }
+        selected.ok_or_else(|| SpiceError::circuit("no realized timing branch"))
     }
 }
 
@@ -448,7 +592,7 @@ impl OrderPartition {
 
     fn guard(&self, case: &OrderCase) -> TimingGuard {
         let mut comparisons = Vec::new();
-        let mut previous = None;
+        let mut previous: Option<usize> = None;
         for group in &case.groups {
             if let Some((&first, rest)) = group.split_first() {
                 if let Some(prior) = previous {
@@ -561,7 +705,7 @@ enum Evaluation<'a> {
     Extremum(Extremum, usize),
 }
 
-fn exact_at(
+pub(super) fn exact_at(
     window: &TimingWindow,
     origins: &BTreeMap<Origin, Real>,
     budget: &mut usize,
