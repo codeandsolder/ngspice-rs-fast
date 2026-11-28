@@ -409,7 +409,7 @@ fn scalar_temperature_directive_has_frontend_precedence() {
 
 #[test]
 fn temperature_directives_follow_instantiated_scopes() {
-    let body = ".subckt outer a\n.subckt inner b params: tt=75\n.temp {tt}\nr1 b 0 1k\n.ends\nxinner a inner tt=-30\n.ends";
+    let body = ".subckt inner b params: tt=75\n.temp {tt}\nr1 b 0 1k\n.ends\n.subckt outer a\nxinner a inner tt=-30\n.ends";
     let unused = config(body).unwrap();
     assert_eq!(unused.context().temperature, 27.);
     let instantiated = config(&format!("{body}\n.temp 75\nxouter a outer")).unwrap();
