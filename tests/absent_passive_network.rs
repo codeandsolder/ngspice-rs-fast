@@ -230,18 +230,16 @@ fn empty_physical_circuit_and_live_shared_terminal() -> SpiceResult<()> {
     assert_eq!(empty.device_count(), 0);
     assert_eq!(empty.unknown_count(), 0);
     assert_eq!(empty.state_history()?.len(), 0);
-    let op = run(&mut empty, AnalysisKind::OperatingPoint, &[])?;
-    assert_zero(
-        &op,
-        &[
-            "v(live)",
-            "v(ghost)",
-            "v(orphan)",
-            "i(c1)",
-            "i(c2)",
-            "i(l1)",
-        ],
-    );
+    for (kind, args) in [
+        (AnalysisKind::OperatingPoint, vec![]),
+        (AnalysisKind::Ac, vec!["lin", "3", "100", "10000"]),
+        (AnalysisKind::Transient, vec!["100n", "3u", "0", "100n"]),
+    ] {
+        let plot = run(&mut empty, kind, &args)?;
+        assert!(plot.point_count() > 0);
+        assert_zero(&plot, ZERO);
+        assert_zero(&plot, &["v(live)"]);
+    }
 
     let mut shared = circuit(&format!(
         "{LIVE}{REMOVED}v2 ghost 0 2\nb1 out 0 v=v(ghost)+i(c1)\nr2 out 0 1k"

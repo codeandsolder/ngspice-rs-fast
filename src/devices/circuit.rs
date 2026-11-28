@@ -5551,6 +5551,7 @@ impl Circuit {
             .devices
             .iter()
             .map(|device| device.name().to_ascii_lowercase())
+            .chain(self.absent_storage.names.iter().cloned())
             .collect();
         let nodes: Vec<_> = self.physical_voltage_nodes().collect();
         let resistors = if shunts.resistance.is_some() {

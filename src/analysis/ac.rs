@@ -47,6 +47,9 @@ pub(super) fn run(
     let mut point = Vec::with_capacity(plot.variable_count());
     for f in grid.values() {
         let x = small_signal.at_frequency(context, f, |system| {
+            if shared.unknown_count() == 0 {
+                return Ok(Vec::new());
+            }
             ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
                 .factorize()?
                 .solve(&system.ac_rhs())
