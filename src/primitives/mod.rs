@@ -24,7 +24,7 @@ pub mod node;
 pub mod numeric;
 pub(crate) mod random;
 pub mod value;
-pub(crate) mod wide;
+mod wide;
 
 pub use error::{SourceLoc, SpiceError, SpiceResult};
 pub use node::{GROUND_ALIAS, GROUND_NAME, Node, NodeAppend, NodeId, NodeKind, NodeTable};
@@ -36,6 +36,14 @@ pub use value::{
     parse_numparam_number, parse_numparam_number_prefix, parse_spice_number,
     parse_spice_number_prefix,
 };
+
+/// Portable two-word real arithmetic for cancellation-sensitive calculations.
+/// Both words remain binary64, extending precision rather than exponent range.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Wide {
+    pub(crate) hi: Real,
+    lo: Real,
+}
 
 /// Bounded, exact accumulator of finite binary64 weighted products.
 /// Arithmetic is implemented in the private exact module.

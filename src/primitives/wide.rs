@@ -1,15 +1,9 @@
 //! Portable two-word real arithmetic for cancellation-sensitive calculations.
 //! Both words remain binary64; this extends precision, not exponent range.
 use super::{
-    ExactSum, Real,
+    ExactSum, Real, Wide,
     numeric::{scale_power, split_power},
 };
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Wide {
-    pub(crate) hi: Real,
-    lo: Real,
-}
 
 impl Wide {
     pub(crate) const ZERO: Self = Self { hi: 0., lo: 0. };

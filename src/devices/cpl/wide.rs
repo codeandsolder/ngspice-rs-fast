@@ -3,7 +3,7 @@
 //! Keeping the low word through eigenbasis and scattering composition
 //! prevents rounding-induced modal rotation or attenuation in exact null
 //! spaces. Only prepared terminal coefficients are rounded to binary64.
-pub(super) use crate::primitives::wide::Wide;
+pub(super) use crate::primitives::Wide;
 use crate::primitives::{Complex, Real, SpiceResult};
 
 use super::invalid;

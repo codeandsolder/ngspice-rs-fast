@@ -14,7 +14,7 @@ use crate::{
         sparse13::{Scalar, Sparse},
         telemetry::PatternWork,
     },
-    primitives::{ExactSum, SpiceResult, wide::Wide},
+    primitives::{ExactSum, SpiceResult, Wide},
 };
 
 impl Scalar for Wide {

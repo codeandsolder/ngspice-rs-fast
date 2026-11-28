@@ -658,10 +658,10 @@ impl<'a> OriginalResidual<'a, f64> {
     pub(super) fn wide_correction(
         &self,
         rhs: &[f64],
-        solution: &[crate::primitives::wide::Wide],
-        out: &mut [crate::primitives::wide::Wide],
+        solution: &[crate::primitives::Wide],
+        out: &mut [crate::primitives::Wide],
     ) -> SpiceResult<()> {
-        use crate::primitives::{ExactSum, wide::Wide};
+        use crate::primitives::{ExactSum, Wide};
         if rhs.len() != self.order
             || solution.len() != self.order
             || out.len() != self.order
