@@ -56,19 +56,7 @@ impl Arrival {
     /// Displayed uncertainty while the event may or may not have arrived.
     #[must_use = "the phase is the drive between arrival bounds"]
     pub fn phase(&self) -> Drive {
-        let logic = if self.from.strength == self.to.strength {
-            match (self.from.logic, self.to.logic) {
-                (Logic::Zero, Logic::One) => Logic::Rising,
-                (Logic::One, Logic::Zero) => Logic::Falling,
-                _ => Logic::Unknown,
-            }
-        } else {
-            Logic::Unknown
-        };
-        Drive {
-            logic,
-            strength: self.from.strength.max(self.to.strength),
-        }
+        phase_between(self.from, self.to)
     }
 
     /// Whether the physical transition may still be unresolved at time.
@@ -76,6 +64,26 @@ impl Arrival {
     pub fn active_at(&self, time: Real) -> bool {
         let bounds = self.window.bounds();
         bounds.minimum() <= time && time < bounds.maximum()
+    }
+}
+
+// A single uncertain transition between two stable drive values.
+pub(in crate::analysis::digital) fn phase_between(from: Drive, to: Drive) -> Drive {
+    if from == to {
+        return from;
+    }
+    let logic = if from.strength == to.strength {
+        match (from.logic, to.logic) {
+            (Logic::Zero, Logic::One) => Logic::Rising,
+            (Logic::One, Logic::Zero) => Logic::Falling,
+            _ => Logic::Unknown,
+        }
+    } else {
+        Logic::Unknown
+    };
+    Drive {
+        logic,
+        strength: from.strength.max(to.strength),
     }
 }
 

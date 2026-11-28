@@ -8,7 +8,10 @@
 use crate::primitives::{ExactSum, Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+mod constraints;
+pub use constraints::{ApertureResult, Certainty, ConstraintResult};
 mod delivery;
+pub(super) use delivery::phase_between;
 pub use delivery::{Arrival, TimedInput, TimedOutput};
 
 /// Identity of one uncertain delay variable. Reusing an identity expresses
@@ -231,9 +234,10 @@ impl TimingWindow {
                 "timing ambiguity below physical time resolution",
             ));
         }
-        let bounds = if bounds.is_exact() {
-            bounds
-        } else {
+        if bounds.is_exact() {
+            return Self::exact(bounds.minimum);
+        }
+        let bounds = {
             let add = |a: Real, b: Real, upper: bool| -> SpiceResult<Real> {
                 let mut sum = ExactSum::new();
                 sum.add_product(a, 1.);

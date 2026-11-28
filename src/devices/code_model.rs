@@ -16,7 +16,7 @@ mod window_gate;
 pub use window_gate::{WindowDelays, WindowGate, WindowGateState};
 
 /// Stable digital logic and directional timing ambiguity.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Logic {
     /// Logical zero.
     Zero,

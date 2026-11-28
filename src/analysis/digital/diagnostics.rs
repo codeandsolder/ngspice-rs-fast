@@ -9,6 +9,16 @@ use std::sync::Arc;
 pub enum DiagnosticDetail {
     /// A sequential timing constraint.
     Timing(ModelDiagnostic),
+    /// Two successive drive arrivals have overlapping absolute windows.
+    /// The relative interval factors out common upstream uncertainty.
+    CumulativeAmbiguity {
+        /// Earlier posted transition's absolute arrival bounds.
+        earlier: super::timing::Bounds,
+        /// Later posted transition's absolute arrival bounds.
+        later: super::timing::Bounds,
+        /// Later minus earlier, after causal cancellation.
+        separation: super::timing::Bounds,
+    },
     /// A voltage receiver encountered an uncovered region and applied
     /// its declared fallback policy.
     RangeGap {
@@ -43,7 +53,9 @@ impl EventDiagnostic {
     pub const fn timing(&self) -> Option<&ModelDiagnostic> {
         match &self.detail {
             DiagnosticDetail::Timing(timing) => Some(timing),
-            DiagnosticDetail::RangeGap { .. } => None,
+            DiagnosticDetail::RangeGap { .. } | DiagnosticDetail::CumulativeAmbiguity { .. } => {
+                None
+            }
         }
     }
 
@@ -51,6 +63,7 @@ impl EventDiagnostic {
         match &self.detail {
             DiagnosticDetail::Timing(timing) => timing.fatal,
             DiagnosticDetail::RangeGap { fatal, .. } => *fatal,
+            DiagnosticDetail::CumulativeAmbiguity { .. } => false,
         }
     }
 }
@@ -68,6 +81,22 @@ impl std::fmt::Display for EventDiagnostic {
                 detail.input + 1,
                 detail.elapsed,
                 detail.minimum
+            ),
+            DiagnosticDetail::CumulativeAmbiguity {
+                earlier,
+                later,
+                separation,
+            } => write!(
+                f,
+                "{}: cumulative timing ambiguity at t={:e}: [{:e},{:e}] and [{:e},{:e}], relative separation [{:e},{:e}]",
+                self.model,
+                self.time,
+                earlier.minimum(),
+                earlier.maximum(),
+                later.minimum(),
+                later.maximum(),
+                separation.minimum(),
+                separation.maximum()
             ),
             DiagnosticDetail::RangeGap {
                 fatal,

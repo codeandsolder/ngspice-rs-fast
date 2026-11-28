@@ -204,3 +204,19 @@ index and nearest tie behavior are explicit generic choices pending
 source-specific qualification. Converter input resistance and capacitance
 are ordinary physical elements; this receiver does not replace them with
 a digital approximation.
+
+## Cumulative arrival overlap
+
+A causal transport driver retains every active arrival and the most
+recent guaranteed delivery. Overlapping envelopes may expose an X phase;
+when the earlier transition completes the remaining envelope can recover
+its directional state. A later completion supersedes an earlier pending
+completion, preventing stale events from reviving an obsolete level.
+The latest causal transition remains available at fanout even while
+multiple arrival envelopes overlap. Accepted diagnostics report both
+absolute intervals and the relative separation after common-origin
+cancellation. Absolute overlap alone does not prove that the physical
+pulse order can reverse. The current causal transport contract requires
+consistent announced endpoint order; reversed earliest-boundary order
+and independent multi-driver waveform convergence need further
+qualification and are diagnosed instead of treated as exact transitions.

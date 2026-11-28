@@ -9,7 +9,8 @@ pub use diagnostics::{DiagnosticDetail, EventDiagnostic};
 use timing::{Arrival, TimedInput, TimedOutput, TimingWindow};
 
 use crate::devices::code_model::{
-    AutonomousAdvance, CodeModel, DelayMode, Drive, EventContext, ModelDiagnostic, Output,
+    AutonomousAdvance, CodeModel, DelayMode, Drive, EventContext, Logic, ModelDiagnostic, Output,
+    Strength,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -65,9 +66,16 @@ enum Event {
         driver: usize,
         drive: Drive,
         external: Option<u64>,
-        arrival: Option<(Arrival, bool)>,
+        arrival: Option<ArrivalDelivery>,
     },
     Wake(usize),
+}
+
+#[derive(Clone, Debug)]
+struct ArrivalDelivery {
+    arrival: Arrival,
+    start: Key,
+    complete: bool,
 }
 
 #[derive(Debug, Default)]
@@ -362,16 +370,149 @@ struct Group {
     delta: usize,
 }
 
+/// A driver waveform consists of a settled prefix and an ordered set
+/// of arrivals whose starts have been announced but whose ends have not
+/// yet become certain. A later completion supersedes any earlier event
+/// that could still have been pending. This is transport queue ordering,
+/// applied to each admissible realization rather than a guessed delay.
+#[derive(Clone, Debug)]
+struct DriverArrivals {
+    stable: Drive,
+    latest: Option<Arrival>,
+    active: BTreeMap<Key, Arrival>,
+    targets: BTreeMap<(Strength, Logic), usize>,
+    completed: Option<Key>,
+}
+
+impl DriverArrivals {
+    fn new(stable: Drive) -> Self {
+        Self {
+            stable,
+            latest: None,
+            active: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            completed: None,
+        }
+    }
+
+    fn envelope(&self) -> Drive {
+        match self.targets.len() {
+            0 => self.stable,
+            1 => {
+                let Some((&(strength, logic), _)) = self.targets.first_key_value() else {
+                    return self.stable;
+                };
+                timing::phase_between(self.stable, Drive { logic, strength })
+            }
+            _ => {
+                let strength = self
+                    .targets
+                    .last_key_value()
+                    .map_or(self.stable.strength, |(&(strength, _), _)| {
+                        strength.max(self.stable.strength)
+                    });
+                Drive {
+                    logic: Logic::Unknown,
+                    strength,
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, order: Key, drive: Drive) -> SpiceResult<()> {
+        self.stable = drive;
+        self.completed = Some(order);
+        while let Some((&first, _)) = self.active.first_key_value() {
+            if first > order {
+                break;
+            }
+            let (_, arrival) = self
+                .active
+                .pop_first()
+                .ok_or_else(|| SpiceError::circuit("missing active causal arrival"))?;
+            let key = (arrival.to().strength, arrival.to().logic);
+            let count = self
+                .targets
+                .get_mut(&key)
+                .ok_or_else(|| SpiceError::circuit("missing active causal drive count"))?;
+            *count -= 1;
+            if *count == 0 {
+                self.targets.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    fn start(&mut self, delivery: ArrivalDelivery) -> SpiceResult<Option<DiagnosticDetail>> {
+        let ArrivalDelivery {
+            arrival,
+            start,
+            complete,
+        } = delivery;
+        let prior = self.latest.as_ref().map_or(self.stable, Arrival::to);
+        if prior != arrival.from() {
+            return Err(SpiceError::circuit(
+                "causal driver transitions have inconsistent logical endpoints",
+            ));
+        }
+        let overlap = if let Some((_, previous)) = self.active.last_key_value()
+            && previous.window().bounds().maximum() > arrival.window().bounds().minimum()
+        {
+            let earlier = previous.window().bounds();
+            let later = arrival.window().bounds();
+            Some(DiagnosticDetail::CumulativeAmbiguity {
+                earlier,
+                later,
+                separation: arrival.window().relative_to(previous.window(), 100_000)?,
+            })
+        } else {
+            None
+        };
+        self.latest = Some(arrival.clone());
+        if complete {
+            self.finish(start, arrival.to())?;
+        } else {
+            *self
+                .targets
+                .entry((arrival.to().strength, arrival.to().logic))
+                .or_default() += 1;
+            self.active.insert(start, arrival);
+        }
+        Ok(overlap)
+    }
+
+    fn deliver(&mut self, delivery: ArrivalDelivery) -> SpiceResult<Option<DiagnosticDetail>> {
+        if !delivery.complete || delivery.arrival.window().bounds().is_exact() {
+            return self.start(delivery);
+        }
+        if self.completed.is_some_and(|order| delivery.start <= order) {
+            // A newer completion has made this delivery irrelevant.
+            return Ok(None);
+        }
+        if !self
+            .active
+            .get(&delivery.start)
+            .is_some_and(|a| a.same_transition(&delivery.arrival))
+        {
+            return Err(SpiceError::circuit(
+                "causal completion without matching start",
+            ));
+        }
+        self.finish(delivery.start, delivery.arrival.to())?;
+        Ok(None)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Arrivals {
-    drivers: Vec<Option<Arrival>>,
+    drivers: Vec<DriverArrivals>,
     nets: Vec<Option<Arrival>>,
 }
 
 impl Arrivals {
-    fn new(drivers: usize, nets: usize) -> Self {
+    fn new(drivers: impl IntoIterator<Item = Drive>, nets: usize) -> Self {
         Self {
-            drivers: vec![None; drivers],
+            drivers: drivers.into_iter().map(DriverArrivals::new).collect(),
             nets: vec![None; nets],
         }
     }
@@ -430,9 +571,12 @@ impl State {
             pending: vec![BTreeSet::new(); network.drivers.len()],
             wakeups: vec![None; network.models.len()],
             nets: vec![Drive::default(); network.nets.len()],
-            arrivals: network
-                .track_arrivals
-                .then(|| Arrivals::new(network.drivers.len(), network.nets.len())),
+            arrivals: network.track_arrivals.then(|| {
+                Arrivals::new(
+                    std::iter::repeat_n(Drive::default(), network.drivers.len()),
+                    network.nets.len(),
+                )
+            }),
             models: network
                 .models
                 .iter()
@@ -465,7 +609,7 @@ impl State {
 
     fn enable_arrivals(&mut self) {
         if self.arrivals.is_none() {
-            self.arrivals = Some(Arrivals::new(self.drivers.len(), self.nets.len()));
+            self.arrivals = Some(Arrivals::new(self.drivers.iter().copied(), self.nets.len()));
         }
     }
 
@@ -495,6 +639,7 @@ impl State {
             ));
         }
         self.enable_arrivals();
+        let order = self.next_key(start)?;
         let key = self.schedule_event(
             start,
             Event::Drive {
@@ -505,7 +650,11 @@ impl State {
                     arrival.phase()
                 },
                 external,
-                arrival: Some((arrival.clone(), start == end)),
+                arrival: Some(ArrivalDelivery {
+                    arrival: arrival.clone(),
+                    start: order,
+                    complete: start == end,
+                }),
             },
         )?;
         let completion = if start == end {
@@ -517,7 +666,11 @@ impl State {
                     driver,
                     drive: arrival.to(),
                     external,
-                    arrival: Some((arrival, true)),
+                    arrival: Some(ArrivalDelivery {
+                        arrival,
+                        start: order,
+                        complete: true,
+                    }),
                 },
             )?)
         };
@@ -526,44 +679,49 @@ impl State {
 
     fn deliver_drive(
         &mut self,
+        network: &Network,
         driver: usize,
         drive: Drive,
-        delivery: Option<(Arrival, bool)>,
+        delivery: Option<ArrivalDelivery>,
     ) -> SpiceResult<bool> {
         let previous = self.drivers[driver];
+        let mut next = drive;
         let mut changed = previous != drive;
+        let mut diagnostic = None;
         if let Some(records) = &mut self.arrivals {
-            let prior = &mut records.drivers[driver];
-            let now = self.time.value();
-            let next = if let Some((arrival, complete)) = delivery {
-                let exact = arrival.window().bounds().is_exact();
-                if (complete
-                    && !exact
-                    && !prior.as_ref().is_some_and(|p| p.same_transition(&arrival)))
-                    || ((!complete || exact)
-                        && (previous != arrival.from()
-                            || prior.as_ref().is_some_and(|p| p.active_at(now))))
-                {
-                    return Err(SpiceError::circuit(
-                        "overlapping or inconsistent causal driver transitions",
-                    ));
-                }
-                Some(arrival)
+            let history = &mut records.drivers[driver];
+            let prior = history.latest.clone();
+            if let Some(delivery) = delivery {
+                diagnostic = history.deliver(delivery)?;
+                next = history.envelope();
             } else {
-                if prior.as_ref().is_some_and(|p| p.active_at(now)) {
+                if !history.active.is_empty() {
                     return Err(SpiceError::circuit(
                         "scalar event interrupts causal driver transition",
                     ));
                 }
-                if !changed {
+                if previous == drive {
                     return Ok(false);
                 }
-                exact_arrival(previous, drive, now)?
-            };
-            changed |= !same_arrival(prior.as_ref(), next.as_ref());
-            *prior = next;
+                history.stable = drive;
+                history.latest = exact_arrival(previous, drive, self.time.value())?;
+            }
+            changed = previous != next || !same_arrival(prior.as_ref(), history.latest.as_ref());
         }
-        self.drivers[driver] = drive;
+        self.drivers[driver] = next;
+        if let Some(detail) = diagnostic {
+            let model = network
+                .models
+                .iter()
+                .find(|m| m.outputs.contains(&driver))
+                .map_or_else(|| format!("source#{driver}").into(), |m| m.name.clone());
+            self.record_diagnostic(EventDiagnostic {
+                model,
+                time: self.time.value(),
+                delta: self.delta,
+                detail,
+            })?;
+        }
         Ok(changed)
     }
 
@@ -578,7 +736,7 @@ impl State {
         };
         let now = self.time.value();
         if let [driver] = binding.drivers.as_slice() {
-            if let Some(arrival) = &records.drivers[*driver] {
+            if let Some(arrival) = &records.drivers[*driver].latest {
                 let from = Drive::resolve([arrival.from()]);
                 let to = Drive::resolve([arrival.to()]);
                 if from != to {
@@ -596,11 +754,22 @@ impl State {
                 exact_arrival(self.nets[net.0], resolved, now)
             };
         }
-        let margin = binding.margin.unwrap_or(std::num::NonZeroU8::MIN);
-        let mut active = binding
+        if binding
             .drivers
             .iter()
-            .filter_map(|&id| records.drivers[id].as_ref().filter(|a| a.active_at(now)));
+            .any(|&id| records.drivers[id].active.len() > 1)
+        {
+            return Err(SpiceError::circuit(
+                "multi-driver cumulative waveform requires correlated bus resolution",
+            ));
+        }
+        let margin = binding.margin.unwrap_or(std::num::NonZeroU8::MIN);
+        let mut active = binding.drivers.iter().filter_map(|&id| {
+            records.drivers[id]
+                .latest
+                .as_ref()
+                .filter(|a| a.active_at(now))
+        });
         if let Some(first) = active.next() {
             // A stable driver which dominates every possible endpoint
             // masks uncertainty independently of the transition order.
@@ -608,10 +777,12 @@ impl State {
                 binding.drivers.iter().any(|&id| {
                     self.drivers[id] == resolved
                         && records.drivers[id]
+                            .latest
                             .as_ref()
                             .is_none_or(|a| !a.active_at(now))
                         && binding.drivers.iter().all(|&other| {
                             records.drivers[other]
+                                .latest
                                 .as_ref()
                                 .filter(|a| a.active_at(now))
                                 .is_none_or(|a| {
@@ -637,6 +808,7 @@ impl State {
                 Drive::resolve_with_margin(
                     binding.drivers.iter().map(|&id| {
                         records.drivers[id]
+                            .latest
                             .as_ref()
                             .filter(|a| a.active_at(now))
                             .map_or(self.drivers[id], |a| if after { a.to() } else { a.from() })
@@ -681,22 +853,57 @@ impl State {
 
     fn model_arrival(&mut self, driver: usize, arrival: Arrival) -> SpiceResult<()> {
         let earliest = Time::new(arrival.window().bounds().minimum())?;
-        // A complete transport transition is indivisible. Do not retain a
-        // stale end event when a later waveform overlaps its uncertainty.
-        if self.pending[driver]
-            .last()
-            .is_some_and(|key| key.time > earliest)
-            || self
-                .arrivals
-                .as_ref()
-                .and_then(|a| a.drivers[driver].as_ref())
-                .is_some_and(|a| a.window().bounds().maximum() > earliest.value())
-        {
+        if self.desired[driver].unwrap_or(self.drivers[driver]) != arrival.from() {
             return Err(SpiceError::circuit(
-                "overlapping causal output transitions require a hazard model",
+                "causal output transition disagrees with requested endpoint",
             ));
         }
+        // A later posted transition that is guaranteed to occur no
+        // later than an undelivered predecessor supersedes that whole
+        // predecessor, including its completion. This applies to
+        // asymmetric exact delays and correlated bounded arrivals.
+        let mut superseded = Vec::new();
+        for key in &self.pending[driver] {
+            if let Some(Event::Drive {
+                arrival: Some(delivery),
+                ..
+            }) = self.queue.get(key)
+                && *key == delivery.start
+                && key.time >= earliest
+            {
+                let separation = arrival
+                    .window()
+                    .relative_to(delivery.arrival.window(), 100_000)?;
+                if separation.maximum() <= 0. {
+                    superseded.push((delivery.start, delivery.arrival.from()));
+                } else if key.time > earliest {
+                    return Err(SpiceError::circuit(
+                        "causal output earliest order may reverse; conditional waveform required",
+                    ));
+                }
+            }
+        }
+        let from = superseded.first().map_or(arrival.from(), |(_, from)| *from);
+        if !superseded.is_empty() {
+            let removed: BTreeSet<_> = superseded.into_iter().map(|(key, _)| key).collect();
+            let keys: Vec<_> = self.pending[driver]
+                .iter()
+                .copied()
+                .filter(|key| {
+                    matches!(self.queue.get(key), Some(Event::Drive { arrival: Some(delivery), .. })
+                    if removed.contains(&delivery.start))
+                })
+                .collect();
+            for key in keys {
+                self.pending[driver].remove(&key);
+                self.queue.remove(&key);
+            }
+        }
         self.desired[driver] = Some(arrival.to());
+        if from == arrival.to() {
+            return Ok(());
+        }
+        let arrival = Arrival::new(from, arrival.to(), arrival.window().clone())?;
         let (start, end) = self.schedule_arrival(driver, arrival, None)?;
         self.pending[driver].insert(start);
         if let Some(end) = end {
@@ -705,7 +912,7 @@ impl State {
         Ok(())
     }
 
-    fn schedule_event(&mut self, time: Time, event: Event) -> SpiceResult<Key> {
+    fn next_key(&self, time: Time) -> SpiceResult<Key> {
         if time < self.time {
             return Err(SpiceError::circuit(
                 "cannot schedule event before current time",
@@ -718,11 +925,15 @@ impl State {
         } else {
             0
         };
-        let key = Key {
+        Ok(Key {
             time,
             delta,
             sequence: self.sequence,
-        };
+        })
+    }
+
+    fn schedule_event(&mut self, time: Time, event: Event) -> SpiceResult<Key> {
+        let key = self.next_key(time)?;
         self.sequence = self
             .sequence
             .checked_add(1)
@@ -1110,7 +1321,7 @@ impl State {
                         ..
                     } => {
                         self.pending[driver].remove(&key);
-                        if self.deliver_drive(driver, drive, arrival)? {
+                        if self.deliver_drive(network, driver, drive, arrival)? {
                             affected.insert(network.drivers[driver]);
                         }
                     }

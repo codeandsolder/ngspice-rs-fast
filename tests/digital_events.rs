@@ -1140,3 +1140,177 @@ fn same_causal_expression_cancels_xor_reconvergence() -> SpiceResult<()> {
     );
     trial.commit()
 }
+
+#[test]
+fn cumulative_arrival_overlap_preserves_later_completion_and_rollback() -> SpiceResult<()> {
+    use Logic::{Falling, One, Rising, Unknown, Zero};
+    use ngspice_rs::analysis::digital::{
+        DiagnosticDetail,
+        timing::{Bounds, DelayWindow},
+    };
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    // The first case reproduces the overlapping edge windows in the
+    // cumulative-ambiguity illustration in the PSpice user guide.
+    // The second covers a later edge that completes first.
+    for (rise_max, fall_max, trace) in [
+        (
+            10.,
+            10.,
+            vec![
+                (0., Zero),
+                (3., Rising),
+                (10., Unknown),
+                (12., Falling),
+                (19., Zero),
+            ],
+        ),
+        (
+            18.,
+            3.,
+            vec![(0., Zero), (3., Rising), (10., Unknown), (12., Zero)],
+        ),
+    ] {
+        let mut network = Network::default();
+        let input = network.add_net();
+        let output = network.add_net();
+        let inverse = network.add_net();
+        let source = network.add_source(input)?;
+        network.add_model(
+            WindowGate::new(
+                GateKind::Buffer,
+                1,
+                WindowDelays::binary(
+                    DelayWindow::new(1., rise_max)?,
+                    DelayWindow::new(1., fall_max)?,
+                ),
+            )?,
+            &[input],
+            &[output],
+        )?;
+        let zero = DelayWindow::new(0., 0.)?;
+        network.add_model(
+            WindowGate::new(GateKind::Inverter, 1, WindowDelays::binary(zero, zero))?,
+            &[output],
+            &[inverse],
+        )?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let mut init = engine.trial();
+        for (t, logic) in [(0., Zero), (2., One), (9., Zero)] {
+            init.schedule(source, t, Drive::strong(logic))?;
+        }
+        init.advance_to(2.)?;
+        init.commit()?;
+        let mut rejected = engine.trial();
+        rejected.advance_to(11.)?;
+        assert_eq!(rejected.value(output), Some(Drive::strong(Unknown)));
+        assert_eq!(rejected.diagnostics().len(), 2);
+        drop(rejected);
+        assert!(engine.diagnostics().is_empty());
+        assert_eq!(engine.value(output), Some(Drive::strong(Zero)));
+        let mut trial = engine.trial();
+        trial.advance_to(30.)?;
+        let actual: Vec<_> = trial
+            .changes()
+            .iter()
+            .filter(|c| c.net == output)
+            .map(|c| (c.time, c.drive.logic))
+            .collect();
+        assert_eq!(actual, trace[1..]);
+        let actual: Vec<_> = trial
+            .changes()
+            .iter()
+            .filter(|c| c.net == inverse)
+            .map(|c| (c.time, c.drive.logic))
+            .collect();
+        let expected: Vec<_> = trace[1..]
+            .iter()
+            .map(|&(time, logic)| (time, logic.invert()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(trial.value(output), Some(Drive::strong(Zero)));
+        assert_eq!(trial.value(inverse), Some(Drive::strong(One)));
+        let diagnostics = trial.diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        for diagnostic in diagnostics {
+            let DiagnosticDetail::CumulativeAmbiguity {
+                earlier,
+                later,
+                separation,
+            } = diagnostic.detail
+            else {
+                panic!("unexpected diagnostic {diagnostic:?}");
+            };
+            assert_eq!(earlier, Bounds::new(3., 2. + rise_max)?);
+            assert_eq!(later, Bounds::new(10., 9. + fall_max)?);
+            assert_eq!(separation, Bounds::new(8. - rise_max, 6. + fall_max)?);
+        }
+        trial.commit()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn absolute_overlap_diagnostic_retains_correlated_relative_pulse_width() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::{
+        DiagnosticDetail,
+        timing::{Arrival, Bounds, DelayWindow, Origin, TimingWindow},
+    };
+    let mut network = Network::default();
+    let output = network.add_net();
+    let source = network.add_source(output)?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let low = Drive::strong(Logic::Zero);
+    let high = Drive::strong(Logic::One);
+    let root = TimingWindow::exact(0.)?.after(DelayWindow::new(5., 15.)?, Origin::shared(77))?;
+    let rise = root.after(DelayWindow::new(3., 3.)?, Origin::shared(78))?;
+    let fall = root.after(DelayWindow::new(5., 5.)?, Origin::shared(79))?;
+    let mut trial = engine.trial();
+    trial.schedule(source, 0., low)?;
+    trial.schedule_arrival(source, Arrival::new(low, high, rise)?)?;
+    trial.schedule_arrival(source, Arrival::new(high, low, fall)?)?;
+    trial.advance_to(11.)?;
+    assert_eq!(trial.value(output), Some(Drive::strong(Logic::Unknown)));
+    let diagnostics = trial.diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    let DiagnosticDetail::CumulativeAmbiguity { separation, .. } = diagnostics[0].detail else {
+        panic!("missing cumulative ambiguity diagnostic");
+    };
+    assert_eq!(separation, Bounds::new(2., 2.)?);
+    trial.advance_to(30.)?;
+    assert_eq!(trial.value(output), Some(low));
+    trial.commit()
+}
+
+#[test]
+fn bounded_transport_cancels_both_boundaries_when_new_arrival_definitely_precedes()
+-> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::timing::DelayWindow;
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    let mut network = Network::default();
+    let input = network.add_net();
+    let output = network.add_net();
+    let source = network.add_source(input)?;
+    network.add_model(
+        WindowGate::new(
+            GateKind::Buffer,
+            1,
+            WindowDelays::binary(DelayWindow::new(10., 20.)?, DelayWindow::new(1., 2.)?),
+        )?,
+        &[input],
+        &[output],
+    )?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let mut trial = engine.trial();
+    for (time, logic) in [(0., Logic::Zero), (5., Logic::One), (6., Logic::Zero)] {
+        trial.schedule(source, time, Drive::strong(logic))?;
+    }
+    trial.advance_to(50.)?;
+    assert_eq!(trial.value(output), Some(Drive::strong(Logic::Zero)));
+    assert_eq!(
+        trial.changes().iter().filter(|c| c.net == output).count(),
+        1
+    );
+    assert!(trial.diagnostics().is_empty());
+    assert!(trial.next_event_time().is_none());
+    trial.commit()
+}
