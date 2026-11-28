@@ -82,6 +82,7 @@ pub mod nport;
 pub mod passive;
 pub mod passive_bias;
 pub mod physical_dae;
+mod polynomial_storage;
 pub mod prepared_model;
 pub mod prepared_waveform;
 pub mod pulse;

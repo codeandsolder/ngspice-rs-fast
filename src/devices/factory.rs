@@ -67,6 +67,9 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Resistor | ModelBackend::Capacitor | ModelBackend::Inductor => {
             crate::devices::passive::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::PolynomialCapacitor | ModelBackend::PolynomialInductor => {
+            crate::devices::polynomial_storage::instantiate(instance, nodes, &model, context)
+        }
         ModelBackend::Diode => {
             crate::devices::nonlinear::Diode::instantiate(instance, nodes, &model, context)
         }

@@ -50,6 +50,10 @@ pub enum ModelFamily {
     Capacitor,
     /// Scalar inductor.
     Inductor,
+    /// Prepared polynomial charge law.
+    PolynomialCapacitor,
+    /// Prepared polynomial flux law.
+    PolynomialInductor,
     /// Junction diode.
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
@@ -105,6 +109,12 @@ impl ModelFamily {
             "r" | "res" => Some(Self::Resistor),
             "c" => Some(Self::Capacitor),
             "l" => Some(Self::Inductor),
+            model_normalize_ngspice::passive_storage::PSPICE_CAPACITOR => {
+                Some(Self::PolynomialCapacitor)
+            }
+            model_normalize_ngspice::passive_storage::PSPICE_INDUCTOR => {
+                Some(Self::PolynomialInductor)
+            }
             "d" => Some(Self::Diode),
             model_kernel_diode::MODEL_FAMILY => Some(Self::SimetrixDiodeLevel1),
             "npn" => Some(Self::Npn),
@@ -138,8 +148,8 @@ impl ModelFamily {
     pub const fn designator(self) -> char {
         match self {
             Self::Resistor => 'r',
-            Self::Capacitor => 'c',
-            Self::Inductor => 'l',
+            Self::Capacitor | Self::PolynomialCapacitor => 'c',
+            Self::Inductor | Self::PolynomialInductor => 'l',
             Self::Diode | Self::SimetrixDiodeLevel1 => 'd',
             Self::Npn | Self::Pnp => 'q',
             Self::Nmos | Self::Pmos => 'm',
@@ -168,6 +178,10 @@ pub enum ModelBackend {
     Capacitor,
     /// Scalar inductor.
     Inductor,
+    /// Prepared polynomial charge law.
+    PolynomialCapacitor,
+    /// Prepared polynomial flux law.
+    PolynomialInductor,
     /// Junction diode.
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
@@ -255,8 +269,32 @@ impl ModelBackend {
     pub(crate) const fn catalog(designator: char) -> &'static [BackendSpec] {
         match designator.to_ascii_lowercase() {
             'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
-            'c' => const { &[BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1])] },
-            'l' => const { &[BackendSpec::new(Self::Inductor, "Scalar inductor", &[1])] },
+            'c' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1]),
+                        BackendSpec::new(
+                            Self::PolynomialCapacitor,
+                            "Prepared polynomial charge",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PolynomialCapacitor),
+                    ]
+                }
+            }
+            'l' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Inductor, "Scalar inductor", &[1]),
+                        BackendSpec::new(
+                            Self::PolynomialInductor,
+                            "Prepared polynomial flux",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PolynomialInductor),
+                    ]
+                }
+            }
             'd' => {
                 const {
                     &[

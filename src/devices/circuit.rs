@@ -186,6 +186,7 @@ struct TopologyBindings {
     state_len: usize,
     stochastic_sources: Vec<usize>,
     prepared_devices: Vec<usize>,
+    context_devices: Vec<usize>,
     native_mixed: Option<crate::analysis::digital::NativeTopology>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
@@ -496,7 +497,7 @@ impl<'a> PreparedRun<'a> {
         preparation_metrics::record(|counts| counts.contexts += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
         let mut replacements = self.circuit.replacements(context)?;
-        for &index in &self.circuit.bindings.prepared_devices {
+        for &index in &self.circuit.bindings.context_devices {
             match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
                 Ok(slot) => {
                     if let Some(device) = replacements[slot].1.reprepare_context(context)? {
@@ -2279,6 +2280,13 @@ impl Circuit {
             .iter()
             .copied()
             .filter(|&index| self.devices[index].prepared_batch_key().is_some())
+            .collect();
+        self.bindings.context_devices = self
+            .bindings
+            .order
+            .iter()
+            .copied()
+            .filter(|&index| self.devices[index].needs_context_preparation())
             .collect();
         self.bindings.native_mixed = crate::devices::code_model::source::mixed_topology(
             &self.devices,
