@@ -93,6 +93,8 @@ pub enum ModelFamily {
     LogicEvent,
     /// Native ideal logic voltage bridge.
     LogicVoltage,
+    /// Native resolved-drive conductance branch.
+    LogicConductance,
     /// Timed conductance switch.
     TimedSwitch,
 }
@@ -123,6 +125,7 @@ impl ModelFamily {
             "s_xfer" => Some(Self::RationalTransfer),
             "preprocess_logic_event" => Some(Self::LogicEvent),
             "preprocess_logic_voltage" => Some(Self::LogicVoltage),
+            "preprocess_logic_conductance" => Some(Self::LogicConductance),
             "preprocess_timed_switch" => Some(Self::TimedSwitch),
             // `inpdomod.c` accepts the HFET spellings as the same families;
             // `level` then selects the device (5 is `hfet1/`, 6 `hfet2/`).
@@ -150,9 +153,11 @@ impl ModelFamily {
             Self::Ltra => 'o',
             Self::Txl => 'y',
             Self::Cpl => 'p',
-            Self::RationalTransfer | Self::LogicEvent | Self::LogicVoltage | Self::TimedSwitch => {
-                'a'
-            }
+            Self::RationalTransfer
+            | Self::LogicEvent
+            | Self::LogicVoltage
+            | Self::LogicConductance
+            | Self::TimedSwitch => 'a',
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -220,6 +225,8 @@ pub enum ModelBackend {
     LogicEvent,
     /// Native ideal logic voltage bridge.
     LogicVoltage,
+    /// Native resolved-drive conductance branch.
+    LogicConductance,
     /// Timed conductance switch.
     TimedSwitch,
 }
@@ -332,6 +339,8 @@ impl ModelBackend {
                             .for_family(ModelFamily::LogicEvent),
                         BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
                             .for_family(ModelFamily::LogicVoltage),
+                        BackendSpec::new(Self::LogicConductance, "Native logic conductance", &[1])
+                            .for_family(ModelFamily::LogicConductance),
                         BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
                             .for_family(ModelFamily::TimedSwitch),
                     ]
