@@ -328,9 +328,15 @@ Normal and transposed retained RHS solves use the rounded factors as a
 preconditioner for exact original-operator residual corrections. This
 addresses branch-current and gain errors even when the underlying bias
 already converged correctly. The refinement uses a bounded number of
-corrections, stops on small relative coordinate updates or lack of
-progress, and warns on exhaustion. The update criterion is not a
-general certificate of forward error. The legacy hidden SPARSE internal
+corrections and stops on small relative coordinate updates. A stalled,
+divergent or exhausted correction escalates to a two-word real sparse
+factorization of the unfolded coefficients, accumulated with exact
+products before rounding to two words. Both normal and transposed
+right-hand sides reuse the promoted frame. The promotion is invalidated
+with the original operator, even if the rounded coefficients do not
+change. The two-word solve checks the physical residual in its own
+precision and reports a numerical failure if correction still fails.
+The update criterion is not a general certificate of forward error. The legacy hidden SPARSE internal
 diagonal cannot be represented by the physical stamp ledger; its
 nonzero stages use the ordinary retained solve.
 

@@ -545,7 +545,7 @@ impl<T> LoadStorage<T> {
         self.retain_linearization = bias && options.diag_gmin == 0. && options.retain_linearization;
     }
 
-    fn begin_iteration(&mut self, progress: &mut Progress) -> usize {
+    const fn begin_iteration(&mut self, progress: &mut Progress) -> usize {
         progress.iterations += 1;
         let iteration = progress.iterations;
         // A prolonged absolute-coordinate bias solve may be unable to pass
@@ -854,10 +854,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
             );
         }
         reconstruct_storage(matrix, rhs, &mut next, phases.private_storage)?;
-        if !next.is_finite() {
-            return Err(failure("nonfinite Newton iterate"));
-        }
-        check_iteration_budget(progress, &guess, options)?;
+        check_iteration_result(progress, &guess, &next, options)?;
         let mut noncon = if flagged || iterno == 1 {
             true
         } else {
@@ -1004,11 +1001,15 @@ fn damp(
         }
     }
 }
-fn check_iteration_budget(
+fn check_iteration_result(
     progress: &mut Progress,
     guess: &Vector,
+    next: &Vector,
     options: &NewtonOptions,
 ) -> SpiceResult<()> {
+    if !next.is_finite() {
+        return Err(failure("nonfinite Newton iterate"));
+    }
     if progress.iterations > options.max_iterations {
         progress.last_iterate = Some(guess.clone());
         return Err(failure(format!(

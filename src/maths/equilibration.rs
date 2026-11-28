@@ -653,6 +653,44 @@ impl<'a> OriginalResidual<'a, f64> {
         original_residual_measure::<_, false>(self, rhs, solution, Some(correction)).map(drop)
     }
 
+    /// Form the exact residual of both solution words against the unfolded
+    /// stamps. Retain both words when rounding each correction RHS.
+    pub(super) fn wide_correction(
+        &self,
+        rhs: &[f64],
+        solution: &[crate::primitives::wide::Wide],
+        out: &mut [crate::primitives::wide::Wide],
+    ) -> SpiceResult<()> {
+        use crate::primitives::{ExactSum, wide::Wide};
+        if rhs.len() != self.order
+            || solution.len() != self.order
+            || out.len() != self.order
+            || rhs.iter().any(|value| !value.is_finite())
+            || solution.iter().any(|value| !value.finite())
+        {
+            return Err(numerical(
+                "original operator residual",
+                "invalid promoted RHS/solution",
+            ));
+        }
+        let mut cursor = 0;
+        for (row, (&rhs_value, correction)) in rhs.iter().zip(out).enumerate() {
+            let mut sum = ExactSum::new();
+            sum.add_product(rhs_value, 1.);
+            while let Some(&index) = self.by_equation.get(cursor) {
+                let (r, c, value) = self.entries[index];
+                let (r, c) = if self.transposed { (c, r) } else { (r, c) };
+                if r != row {
+                    break;
+                }
+                solution[c].add_product(-value, &mut sum);
+                cursor += 1;
+            }
+            *correction = Wide::from_sum(sum);
+        }
+        Ok(())
+    }
+
     /// Inspect many real RHS and solution pairs, reusing the same operator.
     /// # Errors
     /// Invalid input or insufficient report storage.

@@ -527,7 +527,7 @@ fn longer_diode_chains_recover_without_transient_fallback() {
 
 #[test]
 fn recovered_long_chain_transfer_solves_the_original_operator() {
-    for stages in [1000_u32, 2000, 5000] {
+    for stages in [1000_u32, 2000, 5000, 10000] {
         let (junction, _) = exact_chain_point(stages);
         let conductance = (1e-14 / VT).mul_add((junction / VT).exp(), 1e-12);
         let resistance = f64::from(stages).mul_add(100. + conductance.recip(), 1000.);

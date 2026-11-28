@@ -1336,7 +1336,7 @@ impl SparseMatrix {
     }
 
     /// Move the physical contribution ledger into a retained factor frame.
-    pub(super) fn take_original(&mut self) -> Option<Vec<Triplet>> {
+    pub(super) const fn take_original(&mut self) -> Option<Vec<Triplet>> {
         self.original.take()
     }
 
