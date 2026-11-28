@@ -793,7 +793,7 @@ fn benchmark_transient_lifecycle_workloads() {
             writeln!(deck, "ri{i} in 0 1meg").unwrap();
         }
         if nonlinear {
-            deck.push_str("d1 out 0 dm\n.model dm d(is=1e-14 n=1)\n");
+            deck.push_str("d1 out 0 dm\n.model dm d(is=1e-14 n=1)\nb1 out 0 i=1u*v(out)*v(out)\n");
         }
         for i in 0..lines {
             writeln!(deck, "t{i} in 0 l{i} 0 z0=50 td=8n\nrl{i} l{i} 0 50").unwrap();

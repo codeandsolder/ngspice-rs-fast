@@ -79,16 +79,22 @@ pub(crate) mod preparation_metrics {
         pub(crate) replacement_validations: usize,
         pub(crate) physical_validations: usize,
         pub(crate) small_signal_assemblies: usize,
+        pub(crate) truncation_visits: usize,
+        pub(crate) delay_limit_visits: usize,
+        pub(crate) delay_update_visits: usize,
+        pub(crate) accept_notification_visits: usize,
+        pub(crate) accept_validation_visits: usize,
+        pub(crate) convergence_visits: usize,
     }
 
     thread_local! {
         static COUNTS: std::cell::Cell<Counts> = const { std::cell::Cell::new(Counts {
             name_lookups: 0, bindings: 0, contexts: 0, setters: 0,
-            replacement_validations: 0, physical_validations: 0, small_signal_assemblies: 0,
+            replacement_validations: 0, physical_validations: 0, small_signal_assemblies: 0, truncation_visits: 0, delay_limit_visits: 0, delay_update_visits: 0, accept_notification_visits: 0, accept_validation_visits: 0, convergence_visits: 0,
         }) };
     }
 
-    pub(super) fn record(update: impl FnOnce(&mut Counts)) {
+    pub(crate) fn record(update: impl FnOnce(&mut Counts)) {
         COUNTS.with(|cell| {
             let mut counts = cell.get();
             update(&mut counts);
@@ -202,6 +208,7 @@ struct TopologyBindings {
 pub(crate) struct TruncationSlot {
     pub(crate) base: usize,
     pub(crate) explicit_derivative: bool,
+    pub(crate) derived: bool,
 }
 
 pub(crate) struct TruncationBinding {
@@ -256,6 +263,10 @@ impl LifecycleBindings {
                         explicit_derivative: storage
                             .as_ref()
                             .is_some_and(|storage| storage.slot == slot),
+                        derived: storage.as_ref().is_some_and(|storage| {
+                            storage.slot == slot
+                                && storage.policy == crate::devices::InitialStoragePolicy::Derived
+                        }),
                     })
                     .collect();
                 let timestep = !rows.is_empty() && device.timestep_control().is_some();
@@ -2839,6 +2850,8 @@ impl Circuit {
             .as_deref()
             .unwrap_or(&self.bindings.lifecycle.convergence);
         for &index in order {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.convergence_visits += 1);
             let context = crate::devices::traits::ConvergenceContext {
                 unknowns: &self.bindings.unknowns,
                 solution: request.solution,
@@ -4509,6 +4522,8 @@ impl Circuit {
             states: trial.map(|trial| &trial.values()[self.bindings.state_rows[index].clone()]),
         };
         for &index in &self.bindings.lifecycle.accept_validators {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.accept_validation_visits += 1);
             let hook = self.devices[index].accept_validator().ok_or_else(|| {
                 SpiceError::circuit(
                     "finalized acceptance validation capability changed without rebinding",
@@ -4525,6 +4540,8 @@ impl Circuit {
             })
         }).collect::<SpiceResult<Vec<_>>>()?;
         for (index, hook) in notifications {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.accept_notification_visits += 1);
             hook.accept(&context(index));
         }
         Ok(())
@@ -4619,6 +4636,8 @@ impl Circuit {
         let mut updates = Vec::with_capacity(self.bindings.lifecycle.delay_load_order.len());
         // TRAaccept walks C's model/instance lists: the load order.
         for &index in &self.bindings.lifecycle.delay_load_order {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.delay_update_visits += 1);
             let device = &self.devices[index];
             let line = device.delay_line().ok_or_else(|| {
                 SpiceError::circuit("finalized delay capability changed without rebinding")
@@ -4679,6 +4698,8 @@ impl Circuit {
         self.validate_history(history)?;
         let mut limit: Option<Real> = None;
         for &index in &self.bindings.lifecycle.delays {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.delay_limit_visits += 1);
             let device = &self.devices[index];
             let line = device.delay_line().ok_or_else(|| {
                 SpiceError::circuit("finalized delay capability changed without rebinding")
@@ -5819,6 +5840,61 @@ mod tests {
     use petgraph::algo::{connected_components, has_path_connecting};
     use petgraph::graph::NodeIndex;
     use petgraph::visit::EdgeRef;
+
+    #[test]
+    fn transient_lifecycle_visits_only_bound_devices() {
+        use crate::analysis::{AnalysisContext, AnalysisInput, companion_transient};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::AnalysisKind;
+        use std::{fmt::Write as _, path::Path};
+
+        let mut deck = String::from(
+            "lifecycle\nv1 in 0 pulse(0 1 0 2n 2n 100n 200n)\nr1 in out 1k\nc1 out 0 1p\nb1 out 0 i=1u*v(out)*v(out)\nt1 in 0 line 0 z0=50 td=8n\nrl line 0 50\n",
+        );
+        for index in 0..256 {
+            writeln!(deck, "ri{index} in 0 1meg").unwrap();
+        }
+        deck.push_str(".end\n");
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("lifecycle.cir"), &deck))
+            .unwrap();
+        let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+        let plan =
+            AnalysisInput::with_arguments(AnalysisKind::Transient, ["2n", "200n", "0", "2n"])
+                .resolve()
+                .unwrap();
+        super::preparation_metrics::take();
+        let (_, stats) =
+            companion_transient(&mut circuit, &plan, &AnalysisContext::default()).unwrap();
+        let counts = super::preparation_metrics::take();
+        assert_eq!(circuit.bindings.lifecycle.convergence.len(), 1);
+        assert_eq!(circuit.bindings.lifecycle.truncation.len(), 1);
+        assert_eq!(circuit.bindings.lifecycle.delays.len(), 1);
+        assert_eq!(counts.delay_update_visits, stats.accepted + 1);
+        assert_eq!(counts.accept_validation_visits, 0);
+        assert_eq!(counts.accept_notification_visits, 0);
+        assert!(counts.convergence_visits > 0);
+        assert!(counts.delay_limit_visits > 0);
+        assert_eq!(counts.delay_limit_visits, counts.truncation_visits);
+        assert!(counts.convergence_visits < circuit.devices().len() * stats.accepted);
+        eprintln!(
+            "lifecycle visits: {counts:?}; accepted/rejected: {}/{}",
+            stats.accepted, stats.rejected
+        );
+
+        // A topology edit must invalidate ordinal-based history and rebind
+        // delay and convergence capabilities to their new ordinals.
+        let old_history = circuit.state_history().unwrap();
+        let delay = circuit.bindings.lifecycle.delays[0];
+        let inactive = circuit.devices().len() - 1;
+        circuit.swap_devices(delay, inactive).unwrap();
+        circuit.finalize().unwrap();
+        assert_eq!(circuit.bindings.lifecycle.delays, [inactive]);
+        assert!(circuit.validate_history(&old_history).is_err());
+        let history = circuit.state_history().unwrap();
+        assert!(history.delay(delay).is_none());
+        assert!(history.delay(inactive).is_some());
+    }
 
     // Compare the actual production load and observation paths, not just a
     // synthetic cache lookup. Synthetic accepted histories intentionally

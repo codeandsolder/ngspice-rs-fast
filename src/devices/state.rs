@@ -376,7 +376,7 @@ impl StateHistory {
     /// Commit fixed state and delay histories as one transaction. The
     /// preparation callback cannot mutate history; the last fallible step
     /// is the circuit's accept hooks. Breakpoints retain the original
-    /// device visitation order, not the map's ordinal order.
+    /// device visitation order, independent of dense slot order.
     pub(super) fn accept_transaction(
         &mut self,
         trial: TrialState,
@@ -1466,8 +1466,8 @@ mod tests {
         use crate::devices::delay::{DelayHistory, DelayUpdate, WaveformUpdate};
 
         let mut history = StateHistory::new(1).with_delay_lines([
-            (0, DelayHistory::waveform(1)),
-            (1, DelayHistory::waveform(1)),
+            (3, DelayHistory::waveform(1)),
+            (1000, DelayHistory::waveform(1)),
         ]);
         let mut trial = history.trial();
         history
@@ -1488,7 +1488,7 @@ mod tests {
             .accept_transaction(
                 trial.clone(),
                 super::HistoryPublication::Rotate,
-                |_, _| Ok(vec![(0, update(1., 3.)), (0, update(2., 4.))]),
+                |_, _| Ok(vec![(3, update(1., 3.)), (3, update(2., 4.))]),
                 |_| {
                     hook_ran = true;
                     Ok(())
@@ -1499,7 +1499,13 @@ mod tests {
         assert!(!hook_ran);
         assert_eq!(history, original);
 
-        let updates = || vec![(1, update(1., 4.)), (0, update(1., 3.))];
+        assert!(
+            history
+                .check_delays(&[(3, update(1., 3.)), (999, update(1., 4.))])
+                .is_err()
+        );
+        assert_eq!(history, original);
+        let updates = || vec![(1000, update(1., 4.)), (3, update(1., 3.))];
         assert!(
             history
                 .accept_transaction(
@@ -1520,8 +1526,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(breaks, vec![4., 3.]);
+        assert!(history.delay(999).is_none());
         assert_eq!(history.accepted(1), Some(&[42.][..]));
-        for device in [0, 1] {
+        for device in [3, 1000] {
             assert_eq!(
                 history
                     .delay(device)

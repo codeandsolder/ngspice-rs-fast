@@ -2551,6 +2551,10 @@ impl Driver<'_> {
             slots: bases,
         } in &self.truncation
         {
+            #[cfg(test)]
+            crate::devices::circuit::preparation_metrics::record(|counts| {
+                counts.truncation_visits += 1
+            });
             for &crate::devices::circuit::TruncationSlot {
                 base,
                 explicit_derivative,

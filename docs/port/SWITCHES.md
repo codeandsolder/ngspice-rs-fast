@@ -93,7 +93,7 @@ from the flags) seeds the history; every timepoint starts in `Predict`.
 
 ## Timestep control
 
-`Device::timestep_limit` is C's `DEVtrunc` for devices without charge
+`DeviceTimestepControl::timestep_limit` is C's `DEVtrunc` for devices without charge
 storage; the companion driver folds it into the truncation bound. For S
 (`swtrunc.c`): while really off with the control rising below `VT + VH`, or
 in any other state with the control falling above `VT - VH`, the next step is
