@@ -417,7 +417,7 @@ fn poly_dimensions_use_one_validation_rule_across_frontend() {
         let netlist = lowered(&body);
         assert_eq!(
             shape(&expression(&netlist.devices[0], "v").root),
-            "((1 + (2 * v(a,0))) + (3 * v(b,0)))"
+            "(1 + ((2 * v(a,0)) + (3 * v(b,0))))"
         );
     }
     // atoi in the C translator reads a decimal prefix, not a scaled SPICE
