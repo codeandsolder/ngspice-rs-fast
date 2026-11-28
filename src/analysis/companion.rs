@@ -91,6 +91,8 @@
 //! `nicomcof.c` (default 0.5).
 
 mod branch_events;
+mod restart;
+use restart::RestartProbe;
 
 use crate::devices::physical_dae::BranchTrace;
 use crate::devices::{
@@ -129,6 +131,8 @@ pub struct TransientStats {
     pub device_event_retries: usize,
     /// Accepted landings on previously scheduled device boundaries.
     pub device_event_landings: usize,
+    /// Disposable midpoint solves used to estimate error after abrupt events.
+    pub restart_error_probes: usize,
 }
 
 /// Convergence and truncation tolerances. `vntol` applies to node voltages and
@@ -1741,7 +1745,9 @@ impl Driver<'_> {
     }
 
     fn check_step_budget(&self, time: Real) -> SpiceResult<()> {
-        if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
+        if self.stats.accepted + self.stats.rejected + self.stats.restart_error_probes
+            >= self.settings.max_steps
+        {
             return Err(failure(format!(
                 "work limit of {} accepted + rejected steps reached at t = {time:e}",
                 self.settings.max_steps
@@ -1774,6 +1780,9 @@ impl Driver<'_> {
         let physical_event = self.next_physical_event(ready.clock.time);
         let device_boundary = self.next_device_boundary(ready.clock.time)?;
         self.stats.device_event_boundary_probes += self.event_devices.len();
+        let mut restarting = self.steps.is_empty()
+            && ready.clock.phase == Phase::Continuing
+            && !self.event_devices.is_empty();
         loop {
             self.check_step_budget(ready.clock.time)?;
             if let Some(event) = physical_event
@@ -1784,7 +1793,23 @@ impl Driver<'_> {
                 ready.limit_to_event(event);
             }
             let preview = self.preview_events(&mut ready)?;
+            let midpoint = if restarting {
+                self.restart_probe(ready, &iterate)?
+            } else {
+                RestartProbe::Unneeded
+            };
             let attempt = ready.begin(&self.steps, &self.settings)?;
+            let midpoint = match midpoint {
+                RestartProbe::Retry { next, last } => {
+                    iterate = last;
+                    self.stats.rejected += 1;
+                    let start = ready.clock.time;
+                    ready = attempt.retry(next, min_step)?;
+                    ready.clock.time = start;
+                    continue;
+                }
+                other => other,
+            };
             let mut prepared = self.prepared.transient_attempt(
                 &self.history,
                 &self.model_context,
@@ -1834,8 +1859,9 @@ impl Driver<'_> {
                     }
                     let discontinuity = self.device_discontinuity(&state)?;
                     if discontinuity.is_some_and(|at| at <= ready.clock.time)
-                        && attempt.clock.next.order != Order::One
+                        && (!restarting || attempt.clock.next.order != Order::One)
                     {
+                        restarting = true;
                         iterate = x;
                         self.stats.rejected += 1;
                         self.stats.device_event_retries += 1;
@@ -1843,16 +1869,25 @@ impl Driver<'_> {
                         ready = attempt.retry_first_order(ready.clock.time);
                         continue;
                     }
-                    let decision =
+                    let decision = if let Some(decision) =
+                        self.restart_decision(&attempt, &state, &x, &midpoint)?
+                    {
+                        decision
+                    } else {
                         attempt.decision(&self.settings, &self.steps, |coefficients| {
                             self.truncation_limit(coefficients, &state, &x, attempt.clock.time)
-                        })?;
+                        })?
+                    };
                     match decision {
                         StepDecision::Retry(next) => {
                             iterate = x;
                             self.stats.rejected += 1;
                             drop(prepared);
+                            let start = ready.clock.time;
                             ready = attempt.retry(next, min_step)?;
+                            if restarting {
+                                ready.clock.time = start;
+                            }
                         }
                         StepDecision::Accept(next) => {
                             let candidate = self.prepare_accepted_candidate(
