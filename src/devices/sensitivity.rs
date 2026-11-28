@@ -1042,7 +1042,7 @@ fn add_reset_stamps(
             StampAt::NodeBranch(node) | StampAt::BranchNode(node) => {
                 let branch = context
                     .branch
-                    .ok_or_else(|| SpiceError::circuit(format!("{}: missing branch row", name)))?;
+                    .ok_or_else(|| SpiceError::circuit(format!("{name}: missing branch row")))?;
                 let Some(row) = context.unknowns.node_row(node) else {
                     continue;
                 };
