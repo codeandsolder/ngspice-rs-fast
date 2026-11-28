@@ -3,6 +3,7 @@
 //! separates producer-owned declarations from the surrounding native deck;
 //! it does not parse MOS model or instance syntax itself.
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -90,7 +91,7 @@ fn compile_artifact(
     artifact(Arc::new(model), self_heating, fingerprint).map_err(fixture_error)
 }
 
-fn temperature(binding: &VdmosBinding, celsius: f64) -> InstanceTemperature {
+const fn temperature(binding: &VdmosBinding, celsius: f64) -> InstanceTemperature {
     let instance = binding.instance;
     let ambient = if let Some(delta) = instance.dtemp_kelvin {
         AmbientTemperature::DeltaKelvin(delta)
@@ -127,7 +128,6 @@ fn prepare(source: &str, analysis: &str) -> SpiceResult<Fixture> {
         .chain(topology.mos.iter().map(|m| m.location.linked_line))
         .collect();
     let mut native = String::new();
-    use std::fmt::Write as _;
     for (index, line) in cards.lines().enumerate() {
         assert!(
             !line.trim_start().starts_with('+'),
@@ -161,7 +161,7 @@ fn prepare(source: &str, analysis: &str) -> SpiceResult<Fixture> {
             let name = match node {
                 Node::Global(name) => name.clone(),
                 Node::DeviceThermal { terminal, .. } => {
-                    format!("{}-thermal-{terminal:?}", mos.name)
+                    format!("{}-thermal-{terminal:?}", mos.name).to_ascii_lowercase()
                 }
                 Node::Local { .. } => panic!("flat reference fixture has local node"),
             };
