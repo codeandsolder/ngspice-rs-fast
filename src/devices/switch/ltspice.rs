@@ -246,7 +246,7 @@ impl Law {
                         guards,
                     )?
                 } else {
-                    limited_current(g, g_control, limit, voltage.clone())?
+                    limited_current(g, g_control, limit, &voltage)?
                 }
             }
             (_, Some(limit)) => {
@@ -284,8 +284,8 @@ impl Law {
     }
 }
 
-fn limited_current<T: Germ>(g: T, g_control: T, limit: Real, voltage: T) -> SpiceResult<Point<T>> {
-    let linear = g.clone().multiply(&voltage);
+fn limited_current<T: Germ>(g: T, g_control: T, limit: Real, voltage: &T) -> SpiceResult<Point<T>> {
+    let linear = g.clone().multiply(voltage);
     let argument = linear.clone().divide(&linear.constant(limit))?;
     let sech2 = sech_squared(&argument)?;
     // The tiny-argument scalar evaluation is a roundoff shortcut, not a
@@ -297,7 +297,7 @@ fn limited_current<T: Germ>(g: T, g_control: T, limit: Real, voltage: T) -> Spic
     let control_slope = if sech2.value() == 0. {
         voltage.constant(0.)
     } else {
-        g_control.multiply(&sech2).multiply(&voltage)
+        g_control.multiply(&sech2).multiply(voltage)
     };
     Ok(Point::exact(current, g.multiply(&sech2), control_slope))
 }
@@ -354,7 +354,7 @@ fn directional_current<T: Germ>(
         return Ok(Point::exact(zero.clone(), zero.clone(), zero));
     }
     if epsilon == 0. {
-        return limited_current(g, g_control, limit, forward.scale(-1.));
+        return limited_current(g, g_control, limit, &forward.scale(-1.));
     }
     let a = g.clone().scale(epsilon).divide(&g.constant(limit))?;
     let (join, join_log_derivative, implicit_derivative) = epsilon_join(a)?;
