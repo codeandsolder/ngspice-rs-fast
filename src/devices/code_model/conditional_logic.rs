@@ -331,10 +331,14 @@ mod tests {
         assert_eq!(settled_prefix(&events, 99.)?, 0);
         // No cut through a simultaneous group even if both endpoints
         // are at the accepted physical time.
-        let mut same = events[..2].to_vec();
-        same[1].edge.window = same[0].edge.window.clone();
-        same[1].edge.announced = same[0].edge.announced;
-        assert_eq!(settled_prefix(&same, 100.)?, 2);
+        let exact = TimingWindow::exact(10.)?;
+        let uncertain = exact.after(DelayWindow::new(0., 10.)?, Origin::shared(2))?;
+        let same = [
+            edge(0, Logic::Zero, Logic::One, exact, 10.),
+            edge(1, Logic::Zero, Logic::One, uncertain, 10.),
+        ];
+        assert_eq!(settled_prefix(&same, 10.)?, 0);
+        assert_eq!(settled_prefix(&same, 20.)?, 2);
         Ok(())
     }
 }

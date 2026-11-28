@@ -31,8 +31,8 @@ impl OrderCase {
 /// Fast path for a proven total preorder. Compare adjacent expressions
 /// in absolute-bound order; transitivity establishes all other pairs.
 /// Any uncertainty goes to the complete guarded partition.
-pub(crate) fn proven_order<'a>(
-    mut windows: Vec<(usize, &'a TimingWindow)>,
+pub(crate) fn proven_order(
+    mut windows: Vec<(usize, &TimingWindow)>,
     budget: &mut usize,
 ) -> SpiceResult<Option<OrderCase>> {
     let n = windows.len();
@@ -78,7 +78,7 @@ pub(crate) fn proven_order<'a>(
 /// not assert that the guard has a feasible realization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuardStatus {
-    /// At least one required comparison is impossible.
+    /// The conjunction is proven contradictory.
     Impossible,
     /// All required comparisons hold for every realization.
     Always,
@@ -430,7 +430,14 @@ impl OrderPartition {
         // Charge an upper bound for comparison work before invoking the
         // sort (whose comparator cannot return a resource error).
         let n = indices.len();
-        charge(&mut budget, n.saturating_mul(n))?;
+        charge(
+            &mut budget,
+            n.saturating_mul(
+                usize::try_from(n.checked_ilog2().unwrap_or(0))
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1),
+            ),
+        )?;
         indices.sort_by(|&a, &b| values[a].exact_cmp(&values[b]).then_with(|| a.cmp(&b)));
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for index in indices {
