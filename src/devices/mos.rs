@@ -1428,6 +1428,25 @@ impl<L: MosLevel> Device for Mosfet<L> {
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         L::sensitivity(self, context)
     }
+    fn observation_operating(
+        &self,
+        key: &str,
+        context: &ModelContext,
+        voltage: &dyn Fn(NodeId) -> Real,
+        transient: bool,
+    ) -> SpiceResult<Option<Real>> {
+        // mosXask.c returns the intrinsic MOSXcd state, not the isolated
+        // external drain-terminal current. MOSXcd = mode*cdrain - cbd,
+        // with any internal RD/RS and the bulk junction kept distinct.
+        // MOS6 scales its stored per-unit current at the stamp, while
+        // the other classic levels embed M in their temperature parameters.
+        if key != "id" || transient {
+            return Ok(None);
+        }
+        let op = self.operating(context)?;
+        let e = self.small_signal_eval(&op, voltage, context.gmin)?;
+        Ok(Some(e.cd * L::MULTIPLICITY.stamp(self.geometry.m)))
+    }
     fn name(&self) -> &str {
         &self.name
     }

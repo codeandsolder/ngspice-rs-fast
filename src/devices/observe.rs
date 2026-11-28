@@ -47,6 +47,15 @@ fn terminal(key: &str) -> Option<usize> {
 }
 
 fn unit(device: char, key: &str) -> &'static str {
+    if device == 'd' {
+        match key {
+            "c" => return "current",
+            "vd" => return "voltage",
+            "gd" => return "conductance",
+            "cd" => return "capacitance",
+            _ => {}
+        }
+    }
     if key == "ic" && device == 'c' {
         return "voltage";
     }
@@ -146,6 +155,36 @@ impl TerminalLayout {
             rows,
             by_row: by_row.into_iter().collect(),
         }
+    }
+
+    /// Reconstruct displacement currents from one solved physical trial.
+    /// The external series nodes already satisfy KCL, so only electrical
+    /// charge contributions incident on external rows are added.
+    fn add_charge_rates(
+        &self,
+        circuit: &Circuit,
+        device: &dyn crate::devices::Device,
+        values: &[Real],
+        currents: &mut [Real],
+    ) -> SpiceResult<()> {
+        device.physical_charge_histories(&mut |history| {
+            let rate = *values
+                .get(history.slot + 1)
+                .ok_or_else(|| SpiceError::circuit("missing physical terminal charge rate"))?;
+            if history.nodes[0] != history.nodes[1] {
+                for (node, sign) in history.nodes.into_iter().zip([1., -1.]) {
+                    if let Some(row) = circuit.unknowns().node_row(node)
+                        && let Ok(index) = self.by_row.binary_search_by_key(&row, |&(row, _)| row)
+                    {
+                        let current = &mut currents[self.by_row[index].1];
+                        *current = (sign * history.scale).mul_add(rate, *current);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        currents[self.rows.len()] = -currents[..self.rows.len()].iter().sum::<Real>();
+        Ok(())
     }
 
     fn residuals(
@@ -361,6 +400,24 @@ impl PointLoads<'_, '_> {
                 self.request.solution,
                 &mut loaded.currents,
             );
+            if matches!(
+                self.request.mode,
+                crate::devices::AnalysisMode::Instantaneous { .. }
+            ) {
+                // Use solved history, never scratch state overwritten by
+                // the isolated static load.
+                let range = self
+                    .circuit
+                    .state_rows(layout.device)
+                    .ok_or_else(|| gap(name))?;
+                let values = self
+                    .previous
+                    .map(TrialState::values)
+                    .or_else(|| self.request.history.accepted(1))
+                    .and_then(|values| values.get(range))
+                    .ok_or_else(|| gap(name))?;
+                layout.add_charge_rates(self.circuit, device, values, &mut loaded.currents)?;
+            }
             loaded.epoch = work.epoch;
         }
         loaded.currents.get(slot).copied().ok_or_else(|| gap(name))
@@ -766,6 +823,19 @@ mod tests {
     use super::*;
     use crate::devices::{AnalysisMode, Device, StampContext};
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn diode_ask_units_follow_the_c_instance_schema() {
+        for (key, expected) in [
+            ("id", "current"),
+            ("c", "current"),
+            ("vd", "voltage"),
+            ("gd", "conductance"),
+            ("cd", "capacitance"),
+        ] {
+            assert_eq!(unit('d', key), expected, "{key}");
+        }
+    }
 
     /// A deliberately C-ask-aware stand-in with a different intrinsic
     /// quantity and external terminal residual. No physical device model

@@ -50,6 +50,7 @@
 
 pub(super) mod lifecycle;
 pub(super) mod linear;
+mod taylor;
 
 use self::lifecycle::{
     GateStamp, GateUpdate, Junctions, LoadPhase, Loaded, gate_charges, setup_gate_matrix,
@@ -1013,6 +1014,32 @@ impl Device for Jfet {
         }
         .finish(context, start, &loaded)
     }
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        use crate::devices::traits::PhysicalChargeHistory;
+        let [drain, gate, source] = self.inner;
+        let scale = self.model.pol * self.instance.m;
+        visit(PhysicalChargeHistory {
+            slot: slot::QGS,
+            nodes: [gate, source],
+            scale,
+        })?;
+        visit(PhysicalChargeHistory {
+            slot: slot::QGD,
+            nodes: [gate, drain],
+            scale,
+        })
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         context: &mut crate::devices::traits::ChargeContext<'_>,

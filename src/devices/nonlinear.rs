@@ -40,6 +40,7 @@ use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceErro
 pub(super) mod charge;
 mod recovery;
 mod sens;
+pub(super) mod taylor;
 pub(super) mod thermal;
 use thermal::{
     BOLTZMANN, DerivedCache, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureKey, band_gap,
@@ -1842,6 +1843,35 @@ impl Device for Diode {
             _ => None,
         })
     }
+    fn observation_operating(
+        &self,
+        key: &str,
+        context: &ModelContext,
+        voltage: &dyn Fn(NodeId) -> Real,
+        transient: bool,
+    ) -> SpiceResult<Option<Real>> {
+        // dioask.c reads the stored DIOcurrent and DIOconduct of the
+        // completed load. In a real DC analysis, these are precisely the
+        // temperature-adjusted junction evaluation, including gmin.
+        // In transient they additionally contain the charge companion,
+        // which cannot be reconstructed from instantaneous voltage alone.
+        if !matches!(key, "id" | "c" | "vd" | "gd") {
+            return Ok(None);
+        }
+        let vd = voltage(self.junction[0]) - voltage(self.junction[1]);
+        if key == "vd" {
+            return Ok(Some(vd));
+        }
+        if transient {
+            return Ok(None);
+        }
+        let p = self.thermal(context)?.point(vd, context.gmin)?;
+        Ok(match key {
+            "id" | "c" => Some(p.junction.current),
+            "gd" => Some(p.junction.conductance),
+            _ => None,
+        })
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -2023,6 +2053,33 @@ impl Device for Diode {
             recovery.not_converged(context, current)
         })
     }
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        use crate::devices::traits::PhysicalChargeHistory;
+        visit(PhysicalChargeHistory {
+            slot: DIODE_CHARGE_SLOT,
+            nodes: self.junction,
+            scale: 1.,
+        })?;
+        if self.recovery_node.is_some() {
+            visit(PhysicalChargeHistory {
+                slot: recovery::CHARGE_SLOT,
+                nodes: self.junction,
+                scale: 1. - self.parameters.model.vp,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         context: &mut crate::devices::traits::ChargeContext<'_>,
@@ -2323,6 +2380,103 @@ mod tests {
                 p.capacitance
             );
         }
+    }
+
+    #[test]
+    fn diode_taylor_reconstructs_physical_scalar_equations() -> SpiceResult<()> {
+        use crate::maths::taylor::Jet;
+        for (model, instance) in [
+            ("is=1e-18 n=10", ""),
+            (
+                "is=1e-14 n=1.1 bv=5.1 ibv=5m nbv=1.4 tcv=2m cjo=30p vj=0.7 m=0.4 tt=5n",
+                "",
+            ),
+            (
+                "is=1e-14 jsw=2e-15 ns=1.6 cjsw=4p vjsw=0.8 mjsw=0.3 fcs=0.4 bv=5.1",
+                "pj=10",
+            ),
+            (
+                "is=1e-14 jsw=2e-15 cjsw=4p vjsw=0.8 mjsw=0.3 fcs=0.4 ikp=1u",
+                "pj=10 m=2",
+            ),
+            ("isr=1e-11 nr=2.2 vj=0.8 m=0.4 cjo=5p", ""),
+            (
+                "jtun=1e-13 jtunsw=1e-14 ntun=20 xtitun=2 keg=0.9 bv=7",
+                "pj=4",
+            ),
+            ("ikf=1m ikr=1n is=1e-12", ""),
+            (
+                "isr=1e-11 jtun=1e-12 ikf=1m ikr=1u bv=5.1 jsw=1e-15 ns=1.2",
+                "pj=4",
+            ),
+        ] {
+            for temperature in [-40., 27., 100.] {
+                let thermal = thermal(model, instance, temperature);
+                let edges = [
+                    thermal.bottom.threshold,
+                    thermal.sidewall.threshold,
+                    -3. * thermal.n * thermal.vt,
+                    -3. * thermal.ns.unwrap_or(thermal.n) * thermal.vt,
+                    -thermal.breakdown.unwrap_or(Real::INFINITY),
+                ];
+                let voltages = [-9., -6.2, -5.4, -5., -3., -0.5, -0.05, 0.1, 0.4, 0.62, 0.75];
+                for voltage in voltages.into_iter().chain(edges[..2].iter().copied()) {
+                    for direction in [-1., 1.] {
+                        // Each Taylor germ belongs to its own analytic
+                        // interval. In particular C is continuous but its
+                        // higher derivatives change at FC*VJ. Evaluating a
+                        // right-hand germ at negative time is not a valid
+                        // oracle at that boundary.
+                        let step = edges
+                            .iter()
+                            .map(|edge| (edge - voltage) * direction)
+                            .filter(|&distance| distance > 0.)
+                            .fold(1e-4_f64, |step, distance| step.min(distance * 0.5));
+                        let slope = step * direction;
+                        let v = Jet::affine(12, voltage, slope);
+                        let (current, charge) = thermal.taylor(&v, 1e-12, false)?;
+                        for t in [0., 0.25, 0.5] {
+                            let expected =
+                                thermal.point(slope.mul_add(t, voltage), 1e-12)?.junction;
+                            let at = |jet: &Jet| {
+                                jet.coefficients()
+                                    .iter()
+                                    .rev()
+                                    .fold(0_f64, |sum, coefficient| sum.mul_add(t, *coefficient))
+                            };
+                            let close = |kind: &str, actual: Real, expected: Real| {
+                                assert!(
+                                    (actual - expected).abs()
+                                        <= 2e-11 * actual.abs().max(expected.abs()).max(1e-30),
+                                    "{model} {temperature} {voltage} {slope} {t} {kind}: {actual:e} vs {expected:e}"
+                                );
+                            };
+                            close("I", at(&current.value), expected.current);
+                            close("G", at(&current.slope), expected.conductance);
+                            close("Q", at(&charge.value), expected.charge);
+                            close("C", at(&charge.slope), expected.capacitance);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diode_taylor_exponential_coefficients_survive_scaled_overflow() -> SpiceResult<()> {
+        use crate::maths::taylor::Jet;
+        let v = Jet::affine(8, 720., 0.25);
+        let law = super::taylor::exponential(&v, 1., 1e-300);
+        let scaled = 4.920_700_930_263_816e12;
+        let mut expected = scaled;
+        for (k, coefficient) in law.slope.coefficients().iter().enumerate() {
+            if k != 0 {
+                expected *= 0.25 / k as Real;
+            }
+            assert!((coefficient / expected - 1.).abs() < 2e-13);
+        }
+        Ok(())
     }
 
     #[test]

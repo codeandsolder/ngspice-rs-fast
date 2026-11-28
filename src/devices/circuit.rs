@@ -765,6 +765,40 @@ impl<'a> PreparedRun<'a> {
         )
     }
 
+    pub(crate) fn physical_taylor_storage_bindings(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Vec<(usize, String)>> {
+        let point = self.point(context)?;
+        let mut bindings = Vec::new();
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            device.physical_charge_histories(&mut |history| {
+                let range = self
+                    .circuit
+                    .state_rows(index)
+                    .ok_or_else(|| SpiceError::circuit("missing physical Taylor history range"))?;
+                if history.slot.saturating_add(1) >= range.len() {
+                    return Err(SpiceError::circuit(
+                        "physical Taylor history pair outside device",
+                    ));
+                }
+                bindings.push((range.start + history.slot, device.name().to_owned()));
+                Ok(())
+            })?;
+        }
+        bindings.sort_unstable_by_key(|binding| binding.0);
+        if bindings
+            .windows(2)
+            .any(|pair| pair[0].0.saturating_add(1) >= pair[1].0)
+        {
+            return Err(SpiceError::circuit(
+                "overlapping physical Taylor history pairs",
+            ));
+        }
+        Ok(bindings)
+    }
+
     pub(crate) fn dae_nonlinear_taylor(
         &self,
         model: &ModelContext,

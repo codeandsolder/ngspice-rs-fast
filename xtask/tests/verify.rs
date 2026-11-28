@@ -17,7 +17,29 @@ fn default_and_selected_verification_need_no_c_binary() {
     let output = verify(&[]);
     assert!(output.status.success(), "{output:?}");
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("220 verified fixture(s), 0 unsupported fixture(s), 0 failure(s)"));
+    // The registered corpus grows during porting: verify that every
+    // discovered deck was actually accounted for, not a stale hardcoded
+    // fixture count from an earlier revision.
+    let root = ngspice_conformance::fixtures::workspace_root().unwrap();
+    let discovered = ngspice_conformance::fixtures::netlist_paths_at(&root, None)
+        .unwrap()
+        .len();
+    let verified = text
+        .lines()
+        .filter(|line| line.starts_with("  verified   "))
+        .count();
+    let unsupported = text
+        .lines()
+        .filter(|line| line.starts_with("  unsupported "))
+        .count();
+    assert!(verified > 0);
+    assert_eq!(verified + unsupported, discovered, "{text}");
+    assert!(
+        text.contains(&format!(
+            "{verified} verified fixture(s), {unsupported} unsupported fixture(s), 0 failure(s)"
+        )),
+        "{text}"
+    );
     // The default run above already verifies every fixture. Selection is
     // checked on a few representatives (exact name, case-insensitive name with
     // extension, a multi-analysis batch deck, an initial-condition deck), so

@@ -99,7 +99,7 @@ identities; incremental `has_path_connecting` checks reject reachable cycles,
 including self-includes, symlink aliases and recursive library selections.
 Distinct sections of the same file are separate identities. This adds a direct
 use of the existing workspace MIT/Apache-2.0 dependency, not a new package or
-version; MSRV remains 1.89. Subcircuit-reference and parameter graphs are future
+version; the project now uses the pinned nightly in `rust-toolchain.toml`. Subcircuit-reference and parameter graphs are future
 elaboration/evaluation work, not implemented by name indexing.
 
 Default limits per parse:
