@@ -614,7 +614,7 @@ fn sparse_polynomial_candidate_retains_initially_zero_parameter_terms() {
 #[test]
 fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() {
     let source = deck(
-        ".param r=1k analysis=2\n.func delay(x) {x*analysis}\nV1 in 0 2\nR1 in 0 {r} tc1=0.01\n.temp 27\n",
+        ".param r=1k analysis=2\n.func delay(x) {x*analysis}\nV1 in 0 2\nR1 in 0 rm {r}\n.model rm r(tc1=0.01 tnom=27)\n.temp 27\n",
     );
     let location = source.location.clone();
     let plan = CircuitParameterPlan::new(source, &["r", "analysis"]).unwrap();

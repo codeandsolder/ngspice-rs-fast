@@ -1204,7 +1204,7 @@ fn passive_geometry_scale_does_not_change_electrical_scale_or_default_geometry()
 #[test]
 fn explicit_continuation_grids_keep_nonuniform_order_and_duplicates() {
     use ngspice_rs::analysis::sweep::{DcAxisTarget, DcSweepAxis};
-    let mut c = circuit("v1 a 0 1\nr1 a 0 1k tc1=0.01");
+    let mut c = circuit("v1 a 0 1\nr1 a 0 rm 1k\n.model rm r(tc1=0.01 tnom=27)");
     let mut request = AnalysisInput::new(AnalysisKind::DcSweep);
     request.dc_axes = Some(vec![
         DcSweepAxis {
