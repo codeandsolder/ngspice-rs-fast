@@ -97,6 +97,17 @@ impl PreparedInitialConditions {
         Ok(())
     }
 
+    pub(crate) fn validate_selection(&self, kind: AnalysisKind, uic: bool) -> SpiceResult<()> {
+        if self.analyses.contains(&(kind, uic)) {
+            Ok(())
+        } else {
+            Err(SpiceError::circuit(format!(
+                "prepared initialization was not bound for {} (uic={uic})",
+                kind.as_str()
+            )))
+        }
+    }
+
     fn identity(&self, declaration: &PassiveInitialCondition) -> Identity {
         (
             self.artifacts[&declaration.artifact].clone(),

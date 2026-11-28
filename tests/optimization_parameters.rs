@@ -2,9 +2,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ngspice_rs::analysis::optimization::parameters::{CandidateTopology, CircuitParameterPlan};
+use ngspice_rs::analysis::optimization::parameters::{
+    CandidateDeckPlan, CandidateTopology, CircuitParameterPlan,
+};
 use ngspice_rs::analysis::{AnalysisContext, AnalysisInput};
-use ngspice_rs::devices::Circuit;
+use ngspice_rs::devices::{Circuit, subckt::PreparedDeclarations};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
 use ngspice_rs::netlist::eval::{EvalBudget, FunctionScope, ParameterPlan, ParameterScopeSpec};
@@ -617,8 +619,9 @@ fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() 
         ".param r=1k analysis=2\n.func delay(x) {x*analysis}\nV1 in 0 2\nR1 in 0 rm {r}\n.model rm r(tc1=0.01 tnom=27)\n.temp 27\n",
     );
     let location = source.location.clone();
-    let plan = CircuitParameterPlan::new(source, &["r", "analysis"]).unwrap();
-    let mut candidate = plan.independent_session();
+    let plan = CandidateDeckPlan::new(source, &["r", "analysis"], PreparedDeclarations::default())
+        .unwrap();
+    let mut candidate = plan.session();
     let mut budget = EvalBudget::default();
     for (r, analysis, temp) in [
         (1e3, 2., 27.),
@@ -664,12 +667,13 @@ fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() 
 #[test]
 fn independent_edits_rebuild_models_geometry_and_source_values_together() {
     use ngspice_rs::devices::circuit::CandidateEdit;
-    let plan = CircuitParameterPlan::new(
+    let plan = CandidateDeckPlan::new(
         deck("v1 a 0 1\nr1 a 0 rm l=2u w=1u\nr2 a 0 rm l=4u w=1u\n.model rm r(rsh=100)"),
         &[],
+        PreparedDeclarations::default(),
     )
     .unwrap();
-    let mut session = plan.independent_session();
+    let mut session = plan.session();
     let mut budget = EvalBudget::default();
     for (voltage, width, sheet) in [(2., 2e-6, 200.), (-3., 1e-6, 50.), (2., 2e-6, 200.)] {
         let (mut circuit, config) = session
@@ -727,4 +731,22 @@ fn independent_edits_rebuild_models_geometry_and_source_values_together() {
         .run(&mut circuit, &config.context())
         .unwrap();
     close(plot.value("i(v1)", 0).unwrap().re, -0.0075);
+}
+
+#[test]
+fn independent_sweeps_need_no_physically_valid_nominal_circuit() {
+    let source = deck(".param width=0\nv1 in 0 1\nr1 in 0 rm l=2u w={width}\n.model rm r(rsh=100)");
+    assert!(CircuitParameterPlan::new(source.clone(), &["width"]).is_err());
+    let plan = CandidateDeckPlan::new(source, &["width"], PreparedDeclarations::default()).unwrap();
+    let mut session = plan.session();
+    let mut budget = EvalBudget::default();
+    for width in [1e-6, 2e-6, 1e-6] {
+        let (mut circuit, config) = session.prepare(&[width], None, &[], &mut budget).unwrap();
+        let plot = config
+            .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+            .unwrap()
+            .run(&mut circuit, &config.context())
+            .unwrap();
+        close(plot.value("i(v1)", 0).unwrap().re, -width / (2e-6 * 100.));
+    }
 }

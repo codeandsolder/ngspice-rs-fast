@@ -13,7 +13,7 @@ use model_analysis_plan::{
 use model_normalize_ngspice::ltspice::transient::TransientModifier;
 use model_preprocess_command::WorkBudget;
 
-use super::optimization::parameters::CircuitParameterPlan;
+use super::optimization::parameters::CandidateDeckPlan;
 use super::sweep::{DcAxisTarget, DcSweepAxis};
 use super::{
     AnalysisInput, AnalysisPlan, OutputSampling, PlanningLimits, Plot, RunConfig, TimingSegment,
@@ -22,7 +22,7 @@ use super::{
 use crate::devices::circuit::CandidateEdit;
 use crate::devices::subckt::PreparedDeclarations;
 use crate::netlist::ast::Netlist;
-use crate::netlist::eval::EvalBudget;
+use crate::netlist::eval::{EvalBudget, ParamScope};
 use crate::primitives::{AnalysisKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// An explicitly resolved target in the electrical artifact's namespace.
@@ -191,6 +191,32 @@ fn native_kind(kind: SourceKind, entry: &PlanEntry) -> SpiceResult<AnalysisKind>
     }
 }
 
+/// Collect the enclosing native analysis kinds and bias selection needed when
+/// attaching a source-prepared initialization sidecar to an electrical deck.
+///
+/// # Errors
+/// A source request has no qualified native analysis kind.
+pub fn initialization_selection(plan: &SourcePlan) -> SpiceResult<BTreeSet<(AnalysisKind, bool)>> {
+    plan.entries
+        .iter()
+        .filter(|entry| entry.is_analysis())
+        .map(selection)
+        .collect()
+}
+
+fn selection(entry: &PlanEntry) -> SpiceResult<(AnalysisKind, bool)> {
+    match &entry.directive {
+        Directive::Analysis { analysis, uic, .. } => Ok((native_kind(*analysis, entry)?, *uic)),
+        Directive::DcSweep { .. } => Ok((AnalysisKind::DcSweep, false)),
+        Directive::Transient { intent } => Ok((
+            AnalysisKind::Transient,
+            intent.modes.contains(TransientModifier::Uic),
+        )),
+        Directive::ScheduledTransient { intent } => Ok((AnalysisKind::Transient, intent.uic)),
+        _ => Err(at(entry, "expected prepared analysis request")),
+    }
+}
+
 struct Job<'a> {
     entry_index: usize,
     entry: &'a PlanEntry,
@@ -218,7 +244,7 @@ pub struct PreparedResult<'a> {
 /// its plots are materialized during execution; prior candidates never
 /// supply mutable device, Newton, or integration state.
 pub struct PreparedAnalysisPlan<'a> {
-    circuit: CircuitParameterPlan,
+    circuit: CandidateDeckPlan,
     jobs: Vec<Job<'a>>,
 }
 
@@ -246,7 +272,23 @@ impl<'a> PreparedAnalysisPlan<'a> {
                 "prepared analysis requires an executable nonsampled deck",
             ));
         }
-        let nominal = RunConfig::from_netlist(&source)?;
+        for entry in &plan.entries {
+            let requires_initialization = entry.disposition == Disposition::Initialization
+                || matches!(&entry.directive, Directive::Options { settings } if settings.iter().any(|setting| setting.disposition == Disposition::Initialization));
+            if requires_initialization && source.prepared_initialization.is_none() {
+                return Err(at(
+                    entry,
+                    "source initialization requires the prepared initialization sidecar",
+                ));
+            }
+            if entry.is_analysis() {
+                let (kind, uic) = selection(entry)?;
+                if let Some(policy) = &source.prepared_initialization {
+                    policy.validate_selection(kind, uic)?;
+                }
+            }
+        }
+        let nominal = ParamScope::for_netlist(&source)?;
         let mut budget = EvalBudget::for_netlist(&source)?;
         let mut jobs = Vec::new();
         let mut parameters = BTreeSet::new();
@@ -280,7 +322,13 @@ impl<'a> PreparedAnalysisPlan<'a> {
                         if !decl.scope.is_empty() {
                             return Err(at(decl, "scoped sweep requires occurrence binding").into());
                         }
-                        Ok(nominal.prepared_scalar(raw, &location(decl), &mut budget)?)
+                        Ok(crate::netlist::prepared_initialization::evaluate_scalar(
+                            raw,
+                            &location(decl),
+                            &nominal,
+                            None,
+                            &mut budget,
+                        )?)
                     },
                     work,
                 )
@@ -341,7 +389,7 @@ impl<'a> PreparedAnalysisPlan<'a> {
             ));
         }
         let names = parameters.iter().map(String::as_str).collect::<Vec<_>>();
-        let circuit = CircuitParameterPlan::with_declarations(source, &names, declarations)?;
+        let circuit = CandidateDeckPlan::new(source, &names, declarations)?;
         Ok(Self { circuit, jobs })
     }
 
@@ -357,7 +405,7 @@ impl<'a> PreparedAnalysisPlan<'a> {
         work: &WorkBudget,
         mut result: impl FnMut(PreparedResult<'_>) -> SpiceResult<()>,
     ) -> SpiceResult<()> {
-        let mut session = self.circuit.independent_session();
+        let mut session = self.circuit.session();
         let mut budget = EvalBudget::for_netlist(self.circuit.source())?;
         let defaults = self
             .circuit

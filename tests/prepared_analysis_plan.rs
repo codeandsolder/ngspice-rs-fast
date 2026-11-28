@@ -142,3 +142,97 @@ fn unresolved_source_automatic_integration_is_not_replaced_by_native_guess() -> 
     );
     Ok(())
 }
+
+#[test]
+fn hspice_nested_ac_binds_shared_device_parameters_and_temperature() -> anyhow::Result<()> {
+    let (_dir, bundle, netlist) = produce(
+        "Nested AC\n.param r=1k\nv1 in 0 0 AC 1\nr1 in out rm {r}\nr2 out 0 rm {r}\nc1 out 0 1u\n.model rm r(tc1=0.01 tnom=25)\n.ac LIN 3 1k 3k SWEEP r LIN 2 1k 2k SWEEP TEMP 25 75 50\n.end\n",
+        InputFormat::HspiceDeck,
+    )?;
+    let work = WorkBudget::default();
+    let plan = PreparedAnalysisPlan::bind(
+        netlist,
+        bundle.analysis_plan.as_ref().unwrap(),
+        declarations(&bundle),
+        resolve,
+        &work,
+    )?;
+    let mut count = 0;
+    plan.run(&work, |result| {
+        let r = result.coordinates[0].value;
+        let t = result.coordinates[1].value;
+        let resistance = r * (1. + 0.01 * (t - 25.));
+        let plot = &result.plots[0];
+        let f = plot.column("frequency").unwrap();
+        assert_eq!(f.len(), 3);
+        for (index, frequency) in f.iter().enumerate() {
+            let x = std::f64::consts::TAU * frequency.re * 1e-6 * resistance;
+            let expected_re = 2. / (4. + x * x);
+            let expected_im = -x / (4. + x * x);
+            let actual = plot.value("v(out)", index).unwrap();
+            assert!((actual.re - expected_re).abs() < 1e-10);
+            assert!((actual.im - expected_im).abs() < 1e-10);
+        }
+        count += 1;
+        Ok(())
+    })?;
+    assert_eq!(count, 4);
+    Ok(())
+}
+
+#[test]
+fn source_initialization_cannot_be_omitted_or_bound_for_the_wrong_analysis() -> anyhow::Result<()> {
+    use ngspice_rs::analysis::prepared_plan::initialization_selection;
+    use ngspice_rs::netlist::prepared_initialization::PreparedInitialConditions;
+    use ngspice_rs::primitives::AnalysisKind;
+    let (dir, bundle, mut netlist) = produce(
+        include_str!("fixtures/passive-ic/analysis-op.net"),
+        InputFormat::SimetrixDeck,
+    )?;
+    let source = bundle.analysis_plan.as_ref().unwrap();
+    let work = WorkBudget::default();
+    assert!(
+        PreparedAnalysisPlan::bind(
+            netlist.clone(),
+            source,
+            declarations(&bundle),
+            resolve,
+            &work
+        )
+        .is_err()
+    );
+    PreparedInitialConditions::attach(
+        &mut netlist,
+        dir.path(),
+        bundle.initial_conditions.clone().unwrap(),
+        [(AnalysisKind::Ac, false)],
+    )?;
+    assert!(
+        PreparedAnalysisPlan::bind(
+            netlist.clone(),
+            source,
+            declarations(&bundle),
+            resolve,
+            &work
+        )
+        .is_err()
+    );
+    PreparedInitialConditions::attach(
+        &mut netlist,
+        dir.path(),
+        bundle.initial_conditions.clone().unwrap(),
+        initialization_selection(source)?,
+    )?;
+    let plan = PreparedAnalysisPlan::bind(netlist, source, declarations(&bundle), resolve, &work)?;
+    let mut count = 0;
+    plan.run(&work, |result| {
+        let plot = &result.plots[0];
+        for (name, expected) in [("v(cp)", 7.8125), ("v(cn)", 4.375), ("v(lp)", -19.9999998)] {
+            assert!((plot.value(name, 0).unwrap().re - expected).abs() < 1e-5);
+        }
+        count += 1;
+        Ok(())
+    })?;
+    assert_eq!(count, 1);
+    Ok(())
+}
