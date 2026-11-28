@@ -60,6 +60,10 @@ pub enum ModelFamily {
     Npn,
     /// PNP classic BJT.
     Pnp,
+    /// Classic NPN Gummel-Poon with the historical thermal constants.
+    GummelPoonLegacyNpn,
+    /// Classic PNP Gummel-Poon with the historical thermal constants.
+    GummelPoonLegacyPnp,
     /// NMOS (classic, BSIM3 and BSIM4 backends).
     Nmos,
     /// PMOS (classic, BSIM3 and BSIM4 backends).
@@ -112,6 +116,8 @@ impl ModelFamily {
             super::ideal_diode::MODEL_FAMILY => Some(Self::LtspiceIdealDiode),
             "npn" => Some(Self::Npn),
             "pnp" => Some(Self::Pnp),
+            "gummel_poon_legacy_npn" => Some(Self::GummelPoonLegacyNpn),
+            "gummel_poon_legacy_pnp" => Some(Self::GummelPoonLegacyPnp),
             "nmos" => Some(Self::Nmos),
             "pmos" => Some(Self::Pmos),
             "sw" => Some(Self::Switch),
@@ -144,7 +150,7 @@ impl ModelFamily {
             Self::Capacitor => 'c',
             Self::Inductor => 'l',
             Self::Diode | Self::SimetrixDiodeLevel1 | Self::LtspiceIdealDiode => 'd',
-            Self::Npn | Self::Pnp => 'q',
+            Self::Npn | Self::Pnp | Self::GummelPoonLegacyNpn | Self::GummelPoonLegacyPnp => 'q',
             Self::Nmos | Self::Pmos => 'm',
             Self::Switch | Self::LtspiceSwitch => 's',
             Self::CurrentSwitch => 'w',
@@ -277,7 +283,17 @@ impl ModelBackend {
                     ]
                 }
             }
-            'q' => const { &[BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2])] },
+            'q' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2]),
+                        BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal NPN", &[1])
+                            .for_family(ModelFamily::GummelPoonLegacyNpn),
+                        BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal PNP", &[1])
+                            .for_family(ModelFamily::GummelPoonLegacyPnp),
+                    ]
+                }
+            }
             'm' => {
                 const {
                     &[
@@ -1233,6 +1249,16 @@ fn level_setters(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSett
                 return Err(SpiceError::parse(
                     p.location.clone(),
                     format!("SIMetrix diode requires LEVEL=1, got {raw}"),
+                ));
+            }
+            if matches!(
+                family,
+                ModelFamily::GummelPoonLegacyNpn | ModelFamily::GummelPoonLegacyPnp
+            ) && raw.to_bits() != 1_f64.to_bits()
+            {
+                return Err(SpiceError::parse(
+                    p.location.clone(),
+                    format!("legacy Gummel-Poon requires LEVEL=1, got {raw}"),
                 ));
             }
             if family == ModelFamily::LtspiceSwitch
