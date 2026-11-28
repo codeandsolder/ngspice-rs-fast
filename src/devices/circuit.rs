@@ -132,6 +132,8 @@ struct DeviceOrigin {
     generated_by: Option<usize>,
     /// A source-level storage network is not an independently settable primitive.
     prepared_storage: bool,
+    /// The resolved occurrence-level choice is immutable with its network.
+    conditional_voltage_selection: Option<bool>,
 }
 
 /// One elaborated device together with its setup provenance.
@@ -1501,6 +1503,7 @@ impl Circuit {
             .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?
             .origin;
         if origin.prepared_storage
+            || origin.conditional_voltage_selection.is_some()
             || !origin.internal_nodes.is_empty()
             || origin.generated_by.is_some()
             || self
@@ -1525,6 +1528,11 @@ impl Circuit {
             .and_then(|n| n.checked_add(device.state_count()))
             .ok_or_else(|| resource_error(None, "replacement state slots overflow"))?;
         self.elaboration_limits.check(size, None)?;
+        Self::validate_conditional_voltage_topology(
+            self.devices.iter(),
+            Some((index, device.as_ref())),
+            None,
+        )?;
         self.invalidate_topology();
         self.devices[index] = ElaboratedDevice {
             device,
@@ -2382,11 +2390,48 @@ impl Circuit {
         self.runtime.last_digital_stats = stats;
     }
 
+    fn validate_conditional_voltage_topology<'a>(
+        devices: impl Iterator<Item = &'a ElaboratedDevice> + Clone,
+        replacement: Option<(usize, &'a dyn Device)>,
+        addition: Option<&'a dyn Device>,
+    ) -> SpiceResult<()> {
+        if !devices
+            .clone()
+            .any(|entry| entry.origin.conditional_voltage_selection.is_some())
+        {
+            return Ok(());
+        }
+        let controls = devices
+            .clone()
+            .enumerate()
+            .flat_map(|(index, entry)| {
+                let device = replacement
+                    .filter(|(ordinal, _)| *ordinal == index)
+                    .map_or(entry.device.as_ref(), |(_, device)| device);
+                device.controlling_sources()
+            })
+            .chain(addition.into_iter().flat_map(Device::controlling_sources))
+            .map(|control| control.name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        for entry in devices {
+            if let Some(selected) = entry.origin.conditional_voltage_selection
+                && selected != controls.contains(&entry.name().to_ascii_lowercase())
+            {
+                return Err(SpiceError::circuit(format!(
+                    "electrical current consumers of {} change its conditional capacitance topology; re-elaborate the circuit",
+                    entry.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_topology(&mut self) -> SpiceResult<()> {
         // Validate graph before any predecessor binding or numbering mutation.
         self.elaboration_limits
             .check(self.elaboration_size()?, None)?;
         let names = self.validate_topology()?;
+        Self::validate_conditional_voltage_topology(self.devices.iter(), None, None)?;
         let mut previous = crate::devices::Waveform::Constant(0.);
         let mut previous_dc = 0.;
         for entry in self.devices.iter_mut().rev() {
@@ -2882,6 +2927,11 @@ impl Circuit {
             .elaboration_size()?
             .checked_add(ElaborationSize::new(1, 0, device.state_count()), None)?;
         self.elaboration_limits.check(size, None)?;
+        Self::validate_conditional_voltage_topology(
+            self.devices.iter(),
+            None,
+            Some(device.as_ref()),
+        )?;
         self.devices
             .try_reserve(1)
             .map_err(|error| resource_error(None, format!("cannot reserve device: {error}")))?;
@@ -2967,6 +3017,11 @@ impl Circuit {
                     .map(|node| node.id)
                     .collect();
             }
+            Self::validate_conditional_voltage_topology(
+                devices.iter().chain(staged.iter()),
+                None,
+                None,
+            )?;
             reserve(devices, staged.len(), None)?;
             Ok(staged)
         })?;
@@ -4986,6 +5041,11 @@ impl Circuit {
                 nodes.set_kind(id, NodeKind::ProbeAlias)?;
             }
             absent.validate_voltage_binding(nodes)?;
+            Self::validate_conditional_voltage_topology(
+                devices.iter().chain(staged.iter()),
+                None,
+                None,
+            )?;
             // Observation-only records consume the ordinary resource budget,
             // but never introduce a device, unknown, or state slot.
             limits.check(
@@ -5196,6 +5256,7 @@ impl Circuit {
             });
         }
         if let Some(first) = staged.get_mut(first_device) {
+            first.origin.conditional_voltage_selection = network.conditional_selection();
             first.origin.internal_nodes = nodes.nodes()[first_node..]
                 .iter()
                 .filter(|node| node.kind == NodeKind::Internal)

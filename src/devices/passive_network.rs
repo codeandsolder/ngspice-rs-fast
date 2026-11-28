@@ -584,6 +584,7 @@ pub struct PreparedVoltageNetwork {
     excitation: SourceExcitation,
     reporting: Option<CurrentReporting>,
     control: Option<CurrentReference>,
+    conditional_selection: Option<bool>,
 }
 
 /// Identities for voltage forcing and external current reporting.
@@ -622,6 +623,7 @@ impl PreparedVoltageNetwork {
             excitation: SourceExcitation::from_inputs(true, inputs)?,
             reporting: None,
             control: None,
+            conditional_selection: None,
         })
     }
 
@@ -745,6 +747,13 @@ pub(super) enum NetworkPlan {
 }
 
 impl NetworkPlan {
+    pub(super) const fn conditional_selection(&self) -> Option<bool> {
+        match self {
+            Self::Voltage(network) => network.conditional_selection,
+            Self::Storage(_) => None,
+        }
+    }
+
     /// Detect a resolved zero-copy prepared network before dynamic expansion.
     pub(super) fn is_removed(instance: &crate::netlist::ast::DeviceInstance) -> SpiceResult<bool> {
         if !matches!(instance.designator, 'c' | 'l')
@@ -826,6 +835,7 @@ impl NetworkPlan {
                 },
                 super::factory::voltage_network_inputs(&ordinary)?,
             )?;
+            network.conditional_selection = (conditional != 0.).then_some(electrically_referenced);
             if let Some(reporting) = report::parse(&values, 0.)? {
                 network = network.with_reporting(reporting)?;
             }

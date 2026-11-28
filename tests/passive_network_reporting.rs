@@ -531,3 +531,62 @@ fn conditional_voltage_capacitance_is_selected_per_subcircuit_occurrence() -> Sp
     }
     Ok(())
 }
+
+#[test]
+fn conditional_voltage_topology_rejects_late_electrical_changes_atomically() -> SpiceResult<()> {
+    use ngspice_rs::devices::{
+        ControlReference, ControlledKind, ControlledSource, ModelContext, models::ModelResolver,
+    };
+    use ngspice_rs::primitives::NodeId;
+
+    let source = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("network.cir"),
+        "incremental source\nv1 out 0 ac 1 pn_rseries=2 pn_cconditional=1u pn_control=1\nr1 out 0 3\n.end\n",
+    ))?;
+    let consumer = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("consumer.cir"),
+        "late control\nh1 sense 0 v1 1\n.end\n",
+    ))?;
+    let mut existing = Circuit::from_netlist(&source)?;
+    let count = existing.devices().len();
+    let nodes = existing.nodes().len();
+    let models = ModelResolver::new(&[])?;
+    let context = ModelContext::default();
+    let result = existing.add_instances(&consumer.devices, &models, &context);
+    assert!(matches!(result, Err(error) if error.to_string().contains("re-elaborate")));
+    assert_eq!(existing.devices().len(), count);
+    assert_eq!(existing.nodes().len(), nodes);
+    let out = existing
+        .nodes()
+        .get("out")
+        .ok_or_else(|| ngspice_rs::primitives::SpiceError::circuit("missing output"))?;
+    let direct = ControlledSource::current_controlled(
+        "h2",
+        ControlledKind::Ccvs,
+        [out, NodeId::GROUND],
+        ControlReference {
+            name: "v1".into(),
+            location: None,
+        },
+        1.,
+    )?;
+    let result = existing.add_device(Box::new(direct));
+    assert!(matches!(result, Err(error) if error.to_string().contains("re-elaborate")));
+    assert_eq!(existing.devices().len(), count);
+    let mut reverse = Circuit::new();
+    reverse.add_instances(&consumer.devices, &models, &context)?;
+    reverse.add_instances(&source.devices, &models, &context)?;
+    let ac = run(
+        &mut reverse,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    close(
+        ac.value("v(out)", 0)
+            .ok_or_else(|| ngspice_rs::primitives::SpiceError::circuit("missing output"))?,
+        Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+        1e-10,
+        1e-12,
+    );
+    Ok(())
+}

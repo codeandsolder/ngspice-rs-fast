@@ -34,7 +34,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
+use crate::netlist::ast::{CodePortKind, DeviceInstance, ParameterAssignment, ParameterKind};
 use crate::netlist::bexpr::{
     BExpr, BExprKind, BehaviouralExpression, CurrentPolicy, DynamicOperator,
 };
@@ -166,6 +166,20 @@ fn measured_targets(
                         parameter.name == "control" && parameter.kind == ParameterKind::Instance
                     })
                     .map(|parameter| parameter.value.to_ascii_lowercase()),
+            )
+            .chain(
+                instances
+                    .iter()
+                    .flat_map(|instance| &instance.code_ports)
+                    .flat_map(|port| &port.terminals)
+                    .filter(|terminal| terminal.kind == CodePortKind::BranchCurrent)
+                    .map(|terminal| terminal.positive.to_ascii_lowercase()),
+            )
+            .chain(
+                existing
+                    .iter()
+                    .flat_map(|device| device.controlling_sources())
+                    .map(|control| control.name.to_ascii_lowercase()),
             )
             .collect(),
         ..CurrentTargets::default()
