@@ -401,16 +401,35 @@ fn exact_chain_point(stages: u32) -> (f64, f64) {
 /// femtoampere current is ill-conditioned. Eight binary64 epsilons at
 /// 5 V / 100 ohm bound the voltage representation and subtraction error.
 /// This is much tighter than the default absolute current tolerance.
-fn assert_chain_physics(plot: &Plot, stages: u32, drop_bound: f64, tail_relative: f64) {
+fn assert_chain_physics(
+    plot: &Plot,
+    stages: u32,
+    drop_bound: f64,
+    terminal_relative: f64,
+    profile_bound: f64,
+) {
     let (exact_drop, exact_current) = exact_chain_point(stages);
     let residual_bound = 8. * f64::EPSILON * 5. / 100.;
     let mut upstream = -value(plot, "i(v1)");
     let mut node = value(plot, "v(n0)");
     assert!((node - 5.).abs() <= 8. * f64::EPSILON * 5.);
-    assert!(upstream > 0.);
+    assert!(
+        (upstream - exact_current).abs() <= terminal_relative * exact_current,
+        "source {upstream:e} vs physical current {exact_current:e}"
+    );
     for stage in 0..stages {
         let middle = value(plot, &format!("v(m{stage})"));
         let next = value(plot, &format!("v(n{})", stage + 1));
+        let expected = f64::from(stages - stage)
+            .mul_add(exact_drop + 100. * exact_current, 1000. * exact_current);
+        assert!(
+            (node - expected).abs() <= profile_bound,
+            "stage {stage}: {node:e} vs {expected:e}"
+        );
+        assert!(
+            (middle - (expected - 100. * exact_current)).abs() <= profile_bound,
+            "stage {stage}: middle {middle:e} vs {expected:e}"
+        );
         let drop = middle - next;
         let resistor = (node - middle) / 100.;
         let junction = chain_current(drop);
@@ -433,7 +452,7 @@ fn assert_chain_physics(plot: &Plot, stages: u32, drop_bound: f64, tail_relative
     let tail = node / 1000.;
     assert!((upstream - tail).abs() <= residual_bound, "load KCL");
     assert!(
-        (tail - exact_current).abs() <= tail_relative * exact_current,
+        (tail - exact_current).abs() <= terminal_relative * exact_current,
         "load {tail:e} vs physical current {exact_current:e}"
     );
 }
@@ -445,8 +464,8 @@ fn assert_chain_physics(plot: &Plot, stages: u32, drop_bound: f64, tail_relative
 /// scalar solution, and controlled cancellation-recovery ablation.
 #[test]
 fn long_diode_chains_converge_on_original_equations() {
-    use AttemptOutcome::{Converged, Failed};
-    use DcStrategy::{Direct, GminStepping, JunctionGminStepping};
+    use AttemptOutcome::Converged;
+    use DcStrategy::{Direct, GminStepping};
 
     let body = diode_chain(100);
     let (solution, report) = solve(&body, &[]);
@@ -459,27 +478,81 @@ fn long_diode_chains_converge_on_original_equations() {
     assert_original_equations_solved(&report);
     // Linux C's maximum diode-drop error is 5.22 µV; allow 10 µV.
     // The load current must still be within 100 ppm of the exact root.
-    assert_chain_physics(&operating_point(&body), 100, 1e-5, 1e-4);
+    assert_chain_physics(&operating_point(&body), 100, 1e-5, 1e-4, 6e-5);
 
     let body = diode_chain(1000);
     let (solution, report) = solve(&body, &[]);
     solution.unwrap();
-    let path = attempts(&report);
-    assert!(
-        matches!(
-            path.as_slice(),
-            [(Direct, Failed), (GminStepping, Converged)]
-                | [
-                    (Direct, Failed),
-                    (GminStepping, Failed),
-                    (JunctionGminStepping, Converged)
-                ]
-        ),
-        "{path:?}"
-    );
-    assert!(report.total_iterations <= report.budget);
+    assert_eq!(attempts(&report), [(Direct, Converged)]);
+    assert!(report.total_iterations <= 24, "{report:?}");
     assert_original_equations_solved(&report);
-    // C's maximum diode-drop error is 113.09 µV; allow 120 µV.
-    // Its tail current is 0.69% from the scalar root, requiring <1%.
-    assert_chain_physics(&operating_point(&body), 1000, 1.2e-4, 1e-2);
+    assert_chain_physics(&operating_point(&body), 1000, 1e-5, 1e-4, 1e-5);
+
+    // Explicitly exercise the nodal continuation path independently of
+    // the improved direct solve.
+    let (solution, report) = solve(&body, &["noopiter=1"]);
+    solution.unwrap();
+    assert_eq!(
+        attempts(&report),
+        [
+            (Direct, AttemptOutcome::Disabled),
+            (GminStepping, Converged)
+        ]
+    );
+    assert!(report.total_iterations <= 128, "{report:?}");
+    assert_original_equations_solved(&report);
+    assert_chain_physics(
+        &operating_point(&format!("{body}\n.options noopiter")),
+        1000,
+        1.2e-4,
+        1e-4,
+        2e-4,
+    );
+}
+
+#[test]
+fn longer_diode_chains_recover_without_transient_fallback() {
+    for (stages, profile_bound) in [(2000_u32, 2e-5), (5000, 2e-4)] {
+        let body = diode_chain(stages as usize);
+        let (solution, report) = solve(&body, &[]);
+        solution.unwrap();
+        assert_eq!(
+            attempts(&report),
+            [(DcStrategy::Direct, AttemptOutcome::Converged)]
+        );
+        assert_original_equations_solved(&report);
+        assert_chain_physics(&operating_point(&body), stages, 1e-5, 2e-4, profile_bound);
+    }
+}
+
+#[test]
+fn recovered_long_chain_transfer_solves_the_original_operator() {
+    for stages in [1000_u32, 2000, 5000, 10000] {
+        let (junction, _) = exact_chain_point(stages);
+        let conductance = (1e-14 / VT).mul_add((junction / VT).exp(), 1e-12);
+        let resistance = f64::from(stages).mul_add(100. + conductance.recip(), 1000.);
+        let netlist = parse(&format!(
+            "{}\n.tf v(n{stages}) v1",
+            diode_chain(stages as usize)
+        ));
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let plans = config.plans_for(&netlist.analyses).unwrap();
+        let plot = plans[0].run(&mut circuit, &config.context()).unwrap();
+        let output_impedance = format!("v(output_impedance_at_V(n{stages}))");
+        for (name, expected) in [
+            ("v(Transfer_function)", 1000. / resistance),
+            ("v(v1#Input_impedance)", resistance),
+            (
+                output_impedance.as_str(),
+                1000. * (resistance - 1000.) / resistance,
+            ),
+        ] {
+            let got = value(&plot, name);
+            assert!(
+                (got / expected - 1.).abs() <= 1e-6,
+                "{stages} stages {name}: {got:e} != {expected:e}"
+            );
+        }
+    }
 }

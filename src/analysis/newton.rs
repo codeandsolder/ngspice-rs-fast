@@ -76,6 +76,10 @@ pub struct NewtonOptions {
     /// `ipass` keeps the first `MODEINITFLOAT` pass after `MODEINITFIX`
     /// from converging.
     pub had_nodeset: bool,
+    /// Keep the final unfolded real Jacobian with its factors for subsequent
+    /// small-signal or adjoint right-hand sides. Ordinary bias callers do
+    /// not pay for this retained operator.
+    pub retain_linearization: bool,
 }
 impl Default for NewtonOptions {
     fn default() -> Self {
@@ -89,6 +93,7 @@ impl Default for NewtonOptions {
             limiting: StepLimiting::Device,
             diag_gmin: 0.,
             had_nodeset: false,
+            retain_linearization: false,
         }
     }
 }
@@ -437,7 +442,7 @@ impl CircuitNewton<'_, '_> {
             &options,
             policy,
             continued,
-            &mut self.workspace.load,
+            self.workspace.load_for(integration.is_none(), &options),
             |guess, phase, previous, storage| {
                 let spare = storage.spare_trial.take();
                 let mut trial = history
@@ -501,6 +506,8 @@ struct LoadStorage<T> {
     rhs: Option<Vector>,
     spare_trial: Option<T>,
     correction: Correction,
+    late_recovery: bool,
+    retain_linearization: bool,
 }
 
 impl<T> Default for LoadStorage<T> {
@@ -510,11 +517,42 @@ impl<T> Default for LoadStorage<T> {
             rhs: None,
             spare_trial: None,
             correction: Correction::Absolute,
+            late_recovery: false,
+            retain_linearization: false,
         }
     }
 }
 
 impl<T> LoadStorage<T> {
+    fn configure_recovery(&mut self, bias: bool, options: &NewtonOptions) {
+        self.late_recovery = bias && options.diag_gmin == 0.;
+        self.retain_linearization = bias && options.diag_gmin == 0. && options.retain_linearization;
+    }
+
+    const fn begin_iteration(&mut self, progress: &mut Progress) -> usize {
+        progress.iterations += 1;
+        let iteration = progress.iterations;
+        // A prolonged absolute-coordinate bias solve may be unable to pass
+        // NIconvTest at all. Give the inexpensive ordinary iteration its
+        // initial passes, then evaluate the same equations in update
+        // coordinates instead of waiting for all continuation stages to fail.
+        // This is a recovery trigger, not a change to the iteration budget.
+        if self.late_recovery
+            && iteration > ABSOLUTE_RECOVERY_PASSES
+            && !self.correction.capturing()
+        {
+            self.correction = Correction::First;
+        }
+        iteration
+    }
+
+    const fn linearization(&self) -> Linearization {
+        Linearization {
+            correction: self.correction,
+            retain: self.retain_linearization,
+        }
+    }
+
     fn loaded(&mut self, matrix: SparseMatrix, rhs: Vector) {
         self.matrix = Some(matrix);
         self.rhs = Some(rhs);
@@ -542,6 +580,13 @@ impl<T> LoadStorage<T> {
 #[derive(Default)]
 pub(super) struct CircuitNewtonWorkspace {
     load: LoadStorage<TrialState>,
+}
+
+impl CircuitNewtonWorkspace {
+    fn load_for(&mut self, bias: bool, options: &NewtonOptions) -> &mut LoadStorage<TrialState> {
+        self.load.configure_recovery(bias, options);
+        &mut self.load
+    }
 }
 
 impl LoadStorage<TrialState> {
@@ -578,7 +623,7 @@ impl LoadStorage<TrialState> {
             .ok_or_else(|| failure("missing Newton RHS"))?;
         matrix.clear();
         rhs.clear();
-        matrix.record_original(self.correction.capturing());
+        matrix.record_original(self.correction.capturing() || self.retain_linearization);
         rhs.record_original(self.correction.capturing());
         Ok((matrix, rhs))
     }
@@ -747,17 +792,16 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     let mut ordering = None;
     let mut reorder = phases.initial_transient;
     let mut ipass = false;
-    // Each solve begins with ordinary absolute NI iteration. Only an
-    // otherwise converged, potentially cancellation-dominated circuit load
-    // switches to original-stamp correction coordinates.
+    // Each solve begins in ordinary absolute coordinates. A cancellation-
+    // dominated nominal solution or prolonged physical bias solve can switch
+    // to exact original-stamp correction coordinates.
     storage.correction = Correction::Absolute;
     loop {
         // NIiter increments before checking the CKTload return code.
-        progress.iterations += 1;
-        let iterno = progress.iterations;
+        let iterno = storage.begin_iteration(progress);
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
         let flagged = (phases.nonconvergent)(&trial);
-        let correction = storage.correction;
+        let linearization = storage.linearization();
         let (matrix, rhs) = storage.checked_system(n)?;
         if phase == IterationPhase::Junction {
             reorder = true;
@@ -769,7 +813,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
             &mut ordering,
             reorder,
             options,
-            correction.capturing(),
+            linearization,
         )? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
@@ -794,21 +838,21 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
             );
         }
         reconstruct_storage(matrix, rhs, &mut next, phases.private_storage)?;
-        if !next.is_finite() {
-            return Err(failure("nonfinite Newton iterate"));
-        }
-        check_iteration_budget(progress, &guess, options)?;
+        check_iteration_result(progress, &guess, &next, options)?;
         let mut noncon = if flagged || iterno == 1 {
             true
         } else {
             !converged(&next, &guess, branch_rows, phases.coordinate_kinds, options)
                 || device_test(&next, &guess, &trial)?
         };
-        (storage.correction, noncon) = correction.after_solve(noncon, phase, &guess, &next, || {
-            phases.coordinate_kinds.is_some()
-                && options.diag_gmin == 0.
-                && correction_risk(matrix, rhs, &next, options)
-        });
+        (storage.correction, noncon) =
+            linearization
+                .correction
+                .after_solve(noncon, phase, &guess, &next, || {
+                    phases.coordinate_kinds.is_some()
+                        && options.diag_gmin == 0.
+                        && correction_risk(matrix, rhs, &next, options)
+                });
         if phase == IterationPhase::Float {
             if phases.nodesets {
                 noncon |= ipass;
@@ -847,6 +891,16 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         guess = next;
     }
 }
+// Eight inexpensive absolute passes cover the normal short bias solves;
+// subsequent recovery is still bounded by the original NI iteration limit.
+const ABSOLUTE_RECOVERY_PASSES: usize = 8;
+
+#[derive(Clone, Copy)]
+struct Linearization {
+    correction: Correction,
+    retain: bool,
+}
+
 /// A corrective load must be followed by a state-owning reload if the
 /// first correction changes the solution. Subsequent loads use the same
 /// convergence test as the absolute-coordinate solver.
@@ -931,11 +985,15 @@ fn damp(
         }
     }
 }
-fn check_iteration_budget(
+fn check_iteration_result(
     progress: &mut Progress,
     guess: &Vector,
+    next: &Vector,
     options: &NewtonOptions,
 ) -> SpiceResult<()> {
+    if !next.is_finite() {
+        return Err(failure("nonfinite Newton iterate"));
+    }
     if progress.iterations > options.max_iterations {
         progress.last_iterate = Some(guess.clone());
         return Err(failure(format!(
@@ -981,20 +1039,20 @@ fn linearised_solve(
     ordering: &mut Option<crate::maths::SparseSymbolic>,
     reorder: bool,
     options: &NewtonOptions,
-    capturing: bool,
+    linearization: Linearization,
 ) -> SpiceResult<crate::maths::NiStep> {
+    let capturing = linearization.correction.capturing();
     let correction = if capturing {
         Some(matrix.original_correction(rhs, guess)?)
     } else {
         None
     };
-    let mut step = crate::maths::solve_ni(
-        matrix,
-        correction.as_ref().unwrap_or(rhs),
-        ordering,
-        reorder,
-        options.diag_gmin,
-    )?;
+    let solve_rhs = correction.as_ref().unwrap_or(rhs);
+    let mut step = if linearization.retain {
+        crate::maths::linear::solve_ni_recorded(matrix, solve_rhs, ordering, reorder)?
+    } else {
+        crate::maths::solve_ni(matrix, solve_rhs, ordering, reorder, options.diag_gmin)?
+    };
     if capturing && let crate::maths::NiStep::Solved(delta) = &mut step {
         for (new, old) in delta.as_mut_slice().iter_mut().zip(guess.as_slice()) {
             *new += old;
