@@ -213,6 +213,106 @@ fn source_setters_preserve_exact_candidate_and_topology_identity() {
 }
 
 #[test]
+fn prepared_bsim_candidates_match_fresh_elaboration_and_rollback() {
+    use ngspice_rs::devices::{AnalysisMode, LoadRequest, PreparedRun};
+    use ngspice_rs::maths::Vector;
+    use ngspice_rs::primitives::{SpiceResult, parse_spice_number};
+
+    for level in [4, 5] {
+        let source = |extra: &str| {
+            deck(level, extra, "")
+                .replace(".model mm", &format!("m2 d g 0 b mm {GEOMETRY}\n.model mm"))
+        };
+        let base = ModelContext {
+            geometry_scale: 2.,
+            ..context()
+        };
+        let circuit = Circuit::from_netlist_with_context(&parse(&source("")), &base).unwrap();
+        let run = circuit.prepare_run();
+        assert_eq!(
+            device(&circuit, "m1").prepared_batch_key(),
+            device(&circuit, "m2").prepared_batch_key()
+        );
+        let solution = solve_dc(&circuit, &base, &options(), &[], None, None)
+            .unwrap()
+            .values;
+        let snapshot = |run: &PreparedRun<'_>, context: &ModelContext| -> SpiceResult<Vec<u64>> {
+            let circuit = run.circuit();
+            let history = circuit.state_history()?;
+            let mut matrix = circuit.new_matrix()?;
+            let mut rhs = Vector::zeros(circuit.unknown_count());
+            let mut trial = history.trial();
+            run.load(
+                &LoadRequest {
+                    mode: AnalysisMode::OperatingPoint,
+                    solution: &solution,
+                    model_context: context,
+                    integration: None,
+                    history: &history,
+                    forcing: None,
+                },
+                &mut matrix,
+                &mut rhs,
+                &mut trial,
+            )?;
+            Ok(matrix
+                .bound_values()
+                .unwrap()
+                .1
+                .iter()
+                .chain(rhs.as_slice())
+                .map(|value| value.to_bits())
+                .collect())
+        };
+        let baseline = snapshot(&run, &base).unwrap();
+        let warm = ModelContext {
+            temperature: 47.,
+            ..base
+        }
+        .with_gmin(3e-15);
+        let width = circuit.bind_instance_target("m1", "w").unwrap();
+        let multiplier = circuit.bind_instance_target("m1", "m").unwrap();
+        let changed = warm
+            .with_instance_override(
+                width
+                    .at_source(parse_spice_number("20u").unwrap(), warm.geometry_scale)
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_instance_override(multiplier.at(3.).unwrap())
+            .unwrap();
+        let fresh =
+            Circuit::from_netlist_with_context(&parse(&source("w=20u m=3")), &warm).unwrap();
+        let expected = snapshot(&fresh.prepare_run(), &warm).unwrap();
+        assert_ne!(baseline, expected);
+        // The fixed context carries two explicit coordinates. Request a
+        // different valid width on the first lane and a structural failure on
+        // the second, rather than overflowing the context before preparation.
+        let invalid = warm
+            .with_instance_override(
+                width
+                    .at_source(parse_spice_number("21u").unwrap(), warm.geometry_scale)
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_instance_override(
+                circuit
+                    .bind_instance_target("m2", "nrd")
+                    .unwrap()
+                    .at(0.)
+                    .unwrap(),
+            )
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(snapshot(&run, &changed).unwrap(), expected);
+            assert!(run.validate_context(&invalid).is_err());
+            assert_eq!(snapshot(&run, &changed).unwrap(), expected);
+            assert_eq!(snapshot(&run, &base).unwrap(), baseline);
+        }
+    }
+}
+
+#[test]
 fn typed_source_defaults_flags_and_invalid_inputs() {
     for level in [4, 5] {
         let extra = if level == 4 { "xpart" } else { "xpart=1" };
