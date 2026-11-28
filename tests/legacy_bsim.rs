@@ -517,3 +517,125 @@ fn legacy_bsim_tile_load_throughput() {
         );
     }
 }
+
+#[test]
+fn source_initialization_uses_signed_intrinsic_coordinates_on_scalar_and_tile_paths() {
+    use ngspice_rs::devices::{AnalysisMode, IterationPhase, LoadRequest};
+    use ngspice_rs::maths::Vector;
+    use std::fmt::Write;
+
+    for (level, family) in [(4, FAMILY1), (5, FAMILY2)] {
+        for polarity in [1., -1.] {
+            for count in [1, 3] {
+                for off in [false, true] {
+                    let kind = if polarity > 0. { "nmos" } else { "pmos" };
+                    let mut text = format!(
+                        "legacy BSIM source start\n.model mm {kind}(level={level} {MODEL} {family})\n"
+                    );
+                    let supplied = [0.8 * polarity, 2. * polarity, -0.2 * polarity];
+                    let flag = if off { "off" } else { "" };
+                    for lane in 0..count {
+                        writeln!(text,
+                            "m{lane} d{lane} g{lane} s{lane} b{lane} mm {GEOMETRY} {flag} ic={},{},{}",
+                            supplied[0], supplied[1], supplied[2],
+                        ).unwrap();
+                    }
+                    text.push_str(".end\n");
+                    let context = context();
+                    let circuit =
+                        Circuit::from_netlist_with_context(&parse(&text), &context).unwrap();
+                    let run = circuit.prepare_run();
+                    let mut history = circuit.state_history().unwrap();
+                    let mut solution = Vector::zeros(circuit.unknown_count());
+                    for (index, d) in circuit.devices().iter().enumerate() {
+                        assert_eq!(d.terminals().len(), 6);
+                        for (node, value) in
+                            d.terminals().iter().zip([0.1, 0.2, 0.3, -0.1, 0.4, 0.5])
+                        {
+                            let row = circuit.unknowns().node_row(*node).unwrap();
+                            solution.set(row, value * polarity).unwrap();
+                        }
+                        assert_eq!(circuit.state_rows(index).unwrap().len(), 19);
+                    }
+                    let load = |history: &_, mut trial: ngspice_rs::devices::TrialState| {
+                        let mut matrix = circuit.new_matrix().unwrap();
+                        let mut rhs = Vector::zeros(circuit.unknown_count());
+                        run.load(
+                            &LoadRequest {
+                                mode: AnalysisMode::OperatingPoint,
+                                solution: &solution,
+                                model_context: &context,
+                                integration: None,
+                                history,
+                                forcing: None,
+                            },
+                            &mut matrix,
+                            &mut rhs,
+                            &mut trial,
+                        )
+                        .unwrap();
+                        trial
+                    };
+                    let cold = load(
+                        &history,
+                        history.trial_in(IterationPhase::Junction, None).unwrap(),
+                    );
+                    assert!(cold.is_nonconvergent());
+                    for (index, _) in circuit.devices().iter().enumerate() {
+                        let range = circuit.state_rows(index).unwrap();
+                        let state = &cold.values()[range.start + 12..range.end];
+                        let expected = if off { [0.; 3] } else { supplied };
+                        close(
+                            "drain-source",
+                            state[4] - state[5],
+                            expected[0],
+                            1e-14,
+                            1e-14,
+                        );
+                        close(
+                            "gate-source",
+                            state[1] - state[5],
+                            expected[1],
+                            1e-14,
+                            1e-14,
+                        );
+                        close(
+                            "bulk-source",
+                            state[3] - state[5],
+                            expected[2],
+                            1e-14,
+                            1e-14,
+                        );
+                        assert_eq!(state[6], 0.);
+                    }
+                    assert!(
+                        circuit
+                            .accept_point(&solution, None, &mut history, cold)
+                            .is_err()
+                    );
+                    let exact = load(&history, history.trial());
+                    for (index, _) in circuit.devices().iter().enumerate() {
+                        let range = circuit.state_rows(index).unwrap();
+                        let state = &exact.values()[range.start + 12..range.end];
+                        for (actual, expected) in
+                            state[..6].iter().zip([0.1, 0.2, 0.3, -0.1, 0.4, 0.5])
+                        {
+                            close(
+                                "exact coordinate",
+                                *actual,
+                                expected * polarity,
+                                1e-14,
+                                1e-14,
+                            );
+                        }
+                        assert_eq!(state[6], 1.);
+                    }
+                    circuit
+                        .accept_point(&solution, None, &mut history, exact)
+                        .unwrap();
+                    assert_eq!(history.depth(), 1);
+                }
+            }
+        }
+    }
+}
