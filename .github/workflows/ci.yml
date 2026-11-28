@@ -18,7 +18,7 @@ permissions:
 jobs:
   rust:
     name: Nightly Rust build, tests, docs and goldens
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
     with:
       command: |
         cargo test --workspace --locked --no-fail-fast
@@ -28,15 +28,15 @@ jobs:
 
   strict-rust:
     name: Strict Rust and workflow policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@cb9083676196a8ec3bf013e7253907b2759020c7 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@4f29271a2aa27bef1f34bd70407b0db3d39904a9 # main
     with:
       allow-test-panics: true
 
   source-quality:
-    uses: codeandsolder/ci-workflows/.github/workflows/source-quality.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/source-quality.yml@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
 
   clone-regression:
-    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
 
   # The shared strict gate already enforces the quarantine on pull requests.
   # Also enforce it for direct campaign-branch pushes and merge queues.
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
-      - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@9c14ef2d72423958c56944febc620ec50f01d65a # main
+      - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
         with:
           base-ref: ${{ github.event.merge_group.base_sha || github.event.before }}
           hours: "72"
