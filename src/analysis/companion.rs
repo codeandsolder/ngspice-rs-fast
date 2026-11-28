@@ -1749,7 +1749,7 @@ impl Driver<'_> {
             >= self.settings.max_steps
         {
             return Err(failure(format!(
-                "work limit of {} accepted + rejected steps reached at t = {time:e}",
+                "work limit of {} accepted + rejected steps + restart probes reached at t = {time:e}",
                 self.settings.max_steps
             )));
         }

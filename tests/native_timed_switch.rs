@@ -541,8 +541,10 @@ fn instantaneous_stiff_switch_rc_converges_to_piecewise_physical_solution() -> S
     };
     let before_rise = evolve(initial, steady0, rise - 1e-9, tau0);
     let before_fall = evolve(before_rise, steady1, fall - rise, tau1);
-    let expected = |time| {
-        if time < rise {
+    let expected = |time: f64| {
+        if time < 1e-9 {
+            steady0 * (time / 1e-9 + tau0 / 1e-9 * (-time / tau0).exp_m1())
+        } else if time < rise {
             evolve(initial, steady0, time - 1e-9, tau0)
         } else if time < fall {
             evolve(before_rise, steady1, time - rise, tau1)
@@ -555,6 +557,18 @@ fn instantaneous_stiff_switch_rc_converges_to_piecewise_physical_solution() -> S
         let p = plan(&config, AnalysisKind::Transient, &["1n", "8u", "0", step])?;
         let (plot, stats) = companion_transient(&mut c, &p, &config.context())?;
         let t = times(&plot);
+        // Compare integration error at real solver knots. In particular,
+        // interpolating a stiff exponential onto an arbitrary output grid
+        // creates a separate error even for an exact integrated solution.
+        for (index, &at) in t.iter().enumerate() {
+            close(
+                &format!("RC accepted point {at:e}, step {step}"),
+                value(&plot, "v(out)", index),
+                expected(at),
+                0.002,
+                2e-5,
+            );
+        }
         for at in [
             0.5e-6,
             rise,
@@ -567,15 +581,26 @@ fn instantaneous_stiff_switch_rc_converges_to_piecewise_physical_solution() -> S
             fall + 1e-6,
             8e-6,
         ] {
+            let index = t.partition_point(|&time| time < at);
+            let reference = if index == 0 {
+                expected(t[0])
+            } else if index == t.len() {
+                expected(t[index - 1])
+            } else {
+                let a = expected(t[index - 1]);
+                let b = expected(t[index]);
+                a + (b - a) * (at - t[index - 1]) / (t[index] - t[index - 1])
+            };
             close(
-                &format!("RC at {at:e}, step {step}"),
+                &format!("RC sampled at {at:e}, step {step}"),
                 interpolate(&plot, &t, "v(out)", at),
-                expected(at),
+                reference,
                 0.002,
                 2e-5,
             );
         }
         assert!(stats.device_event_landings >= 2);
+        assert!(stats.restart_error_probes > 0);
     }
     Ok(())
 }

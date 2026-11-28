@@ -110,11 +110,13 @@ impl Driver<'_> {
         // endpoint. Retrying at the midpoint (or its localized crossing)
         // makes that event go through the ordinary transactional path.
         self.stats.device_event_trial_probes += self.event_devices.len();
-        if let Some(next) = self.mixed_retry(&attempt, &point.x)?.or(self.device_retry(
-            &attempt,
-            &point.x,
-            &mut point.state,
-        )?) {
+        let mixed = self.mixed_retry(&attempt, &point.x)?;
+        let device = self.device_retry(&attempt, &point.x, &mut point.state)?;
+        if let Some(next) = mixed
+            .into_iter()
+            .chain(device)
+            .min_by(|a, b| a.delta.total_cmp(&b.delta))
+        {
             return Ok(RestartProbe::Retry {
                 next,
                 last: point.x,
@@ -160,7 +162,11 @@ impl Driver<'_> {
                 state.values()[base],
             ];
             let rates = [point.state.values()[base + 1], state.values()[base + 1]];
-            ratio = ratio.max(charge_ratio(values, rates, dt, *half, tolerance));
+            let estimate = charge_ratio(values, rates, dt, *half, tolerance);
+            if !estimate.is_finite() {
+                return Err(failure("nonfinite restart charge error estimate"));
+            }
+            ratio = ratio.max(estimate);
         }
         if let Some(history) = &self.voltage_history
             && let Some(initial) = history.accepted.front()
@@ -177,8 +183,11 @@ impl Driver<'_> {
                     .relative
                     .mul_add(magnitude, history.options.absolute)
                     * history.options.factor;
-                ratio =
-                    ratio.max(restart_error(values[0], values[1], values[2], dt, *half) / bound);
+                let estimate = restart_error(values[0], values[1], values[2], dt, *half) / bound;
+                if !estimate.is_finite() {
+                    return Err(failure("nonfinite restart voltage error estimate"));
+                }
+                ratio = ratio.max(estimate);
             }
         }
         if !ratio.is_finite() {
