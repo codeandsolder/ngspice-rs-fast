@@ -1,10 +1,29 @@
 //! Accepted diagnostic history with cheap disposable event snapshots.
-use crate::devices::code_model::ModelDiagnostic;
+use crate::devices::code_model::{Drive, ModelDiagnostic};
 use crate::primitives::Real;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Timing warning at a resolved event, retained only on transaction commit.
+/// Typed diagnostic produced by a native digital or mixed-domain model.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DiagnosticDetail {
+    /// A sequential timing constraint.
+    Timing(ModelDiagnostic),
+    /// A voltage receiver encountered an uncovered region and applied
+    /// its declared fallback policy.
+    RangeGap {
+        /// Whether the declared policy rejects this candidate.
+        fatal: bool,
+        /// Converged differential input voltage.
+        voltage: Real,
+        /// Selected output drive.
+        drive: Drive,
+        /// Cyclic scan index retained or selected by the fallback.
+        range_index: usize,
+    },
+}
+
+/// Model warning at a resolved event, retained only on transaction commit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventDiagnostic {
     /// Flattened instance name, or a generated model ordinal for a model
@@ -14,23 +33,60 @@ pub struct EventDiagnostic {
     pub time: Real,
     /// Delta-cycle ordinal at the physical time.
     pub delta: usize,
-    /// Constraint and measured interval.
-    pub detail: ModelDiagnostic,
+    /// Model-specific diagnostic data.
+    pub detail: DiagnosticDetail,
+}
+
+impl EventDiagnostic {
+    /// Access the sequential timing detail, when this is a timing diagnostic.
+    #[must_use = "the returned detail describes the observed timing constraint"]
+    pub const fn timing(&self) -> Option<&ModelDiagnostic> {
+        match &self.detail {
+            DiagnosticDetail::Timing(timing) => Some(timing),
+            DiagnosticDetail::RangeGap { .. } => None,
+        }
+    }
+
+    pub(super) fn is_fatal(&self) -> bool {
+        match &self.detail {
+            DiagnosticDetail::Timing(timing) => timing.fatal,
+            DiagnosticDetail::RangeGap { fatal, .. } => *fatal,
+        }
+    }
 }
 
 impl std::fmt::Display for EventDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: {} violation at t={:e} (delta {}): input {} interval {:e} < required {:e}",
-            self.model,
-            self.detail.kind,
-            self.time,
-            self.delta,
-            self.detail.input + 1,
-            self.detail.elapsed,
-            self.detail.minimum
-        )
+        match &self.detail {
+            DiagnosticDetail::Timing(detail) => write!(
+                f,
+                "{}: {} violation at t={:e} (delta {}): input {} interval {:e} < required {:e}",
+                self.model,
+                detail.kind,
+                self.time,
+                self.delta,
+                detail.input + 1,
+                detail.elapsed,
+                detail.minimum
+            ),
+            DiagnosticDetail::RangeGap {
+                fatal,
+                voltage,
+                drive,
+                range_index,
+            } => {
+                write!(
+                    f,
+                    "{}: receiver voltage {:e} V outside all ranges at t={:e}",
+                    self.model, voltage, self.time
+                )?;
+                if *fatal {
+                    write!(f, "; rejected by gap policy")
+                } else {
+                    write!(f, "; fallback {:?}, scan index {}", drive, range_index)
+                }
+            }
+        }
     }
 }
 
@@ -116,13 +172,13 @@ mod tests {
             model: Arc::from("a1"),
             time: 1.,
             delta,
-            detail: ModelDiagnostic {
+            detail: DiagnosticDetail::Timing(ModelDiagnostic {
                 fatal: false,
                 kind: "setup",
                 input: 0,
                 elapsed: 0.,
                 minimum: 1.,
-            },
+            }),
         };
         for i in 0..(2 * CHUNK + 1) {
             log.push(diagnostic(i));

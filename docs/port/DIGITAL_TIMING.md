@@ -174,3 +174,33 @@ seven-entry conductance table with four additional entries (strong R,
 strong F, resistive R, resistive F) to bind directional states. Missing
 R/F entries diagnose a directional phase at runtime. Inverted terminals
 exchange R and F as well as L and H.
+
+## Ordered differential-voltage receivers
+
+A source-bound `preprocess_logic_range` instance connects one analog
+voltage (single-ended or differential) to one digital net. Its `ranges`
+vector contains ordered groups of four finite numbers: inclusive minimum
+voltage, inclusive maximum voltage, logic code (0=L, 1=H, 2=X, 3=R,
+4=F) and explicit ordinal strength. A zero strength is disconnected.
+Range order is retained, including overlapping intervals and duplicate
+logic labels. `initial_range` supplies the bias scan origin (default 0).
+A sample contained in the current range does not switch; otherwise the
+search proceeds cyclically from that range.
+
+A gap uses one explicit policy: `gap_policy=0` rejects a final candidate
+(default); `gap_policy=1` selects the nearest interval (ties use the cyclic
+scan order); `gap_drive=[logic rank]` selects an explicit fallback and
+retains the preceding scan origin. Gap entry or nearest-index changes
+generate typed accepted diagnostics, with voltage and selected range,
+rather than warning at every analog sample. During mixed bias settlement
+gap diagnostics are provisional until the final bias is accepted. Range
+identity changes trigger crossing localization even if the output drive
+does not change. The index is held per occurrence and committed together
+with the converged analog/event point. Rejected trials cannot change it.
+
+The generic ordered-range rule corresponds to the cyclic search described
+in the PSpice reference guide (digital/analog interface devices). Initial
+index and nearest tie behavior are explicit generic choices pending
+source-specific qualification. Converter input resistance and capacitance
+are ordinary physical elements; this receiver does not replace them with
+a digital approximation.

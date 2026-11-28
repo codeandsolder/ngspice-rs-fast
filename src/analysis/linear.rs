@@ -129,7 +129,7 @@ fn op_inner(
             let changed = mixed.initial_changed(&point)?;
             mixed.commit_point(point);
             if !changed {
-                mixed.accept_initial();
+                mixed.accept_initial()?;
                 settled = true;
                 break;
             }

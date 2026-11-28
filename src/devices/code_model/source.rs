@@ -12,6 +12,8 @@ pub enum SourceModel {
     RationalTransfer,
     /// Qualified analog receivers with event logic output.
     LogicEvent,
+    /// Ordered differential-voltage ranges with independent occurrence history.
+    LogicRange,
     /// Ideal digital-to-voltage bridge.
     LogicVoltage,
     /// Digital drive-selected passive conductance.
@@ -100,6 +102,8 @@ impl SourceModel {
             Some(Self::RationalTransfer)
         } else if base.eq_ignore_ascii_case("preprocess_logic_event") {
             Some(Self::LogicEvent)
+        } else if base.eq_ignore_ascii_case("preprocess_logic_range") {
+            Some(Self::LogicRange)
         } else if base.eq_ignore_ascii_case("preprocess_logic_voltage") {
             Some(Self::LogicVoltage)
         } else if base.eq_ignore_ascii_case("preprocess_logic_conductance") {
@@ -122,6 +126,10 @@ impl SourceModel {
             PortSpec::new(Voltage, LOGIC_INPUT, true, true),
             PortSpec::new(Digital, EVENT, false, false),
         ];
+        const RANGE_PORTS: &[PortSpec] = &[
+            PortSpec::new(Voltage, ANALOG, false, false),
+            PortSpec::new(Digital, EVENT, false, false),
+        ];
         const VOLTAGE_PORTS: &[PortSpec] = &[
             PortSpec::new(Digital, EVENT, false, true),
             PortSpec::new(Voltage, ANALOG, false, false),
@@ -137,6 +145,7 @@ impl SourceModel {
         match self {
             Self::RationalTransfer => TRANSFER_PORTS,
             Self::LogicEvent => LOGIC_PORTS,
+            Self::LogicRange => RANGE_PORTS,
             Self::LogicVoltage => VOLTAGE_PORTS,
             Self::LogicConductance => CONDUCTANCE_PORTS,
             Self::TimedSwitch => SWITCH_PORTS,
@@ -167,6 +176,12 @@ impl SourceModel {
                 "inertial" => Some(Boolean),
                 "inverted" => Some(BooleanVector),
                 "rx_ic" | "async_policy" | "strength_paths" => Some(IntegerVector),
+                _ => None,
+            },
+            Self::LogicRange => match name {
+                "ranges" => Some(RealVector),
+                "initial_range" | "gap_policy" => Some(Integer),
+                "gap_drive" => Some(IntegerVector),
                 _ => None,
             },
             Self::LogicVoltage => match name {
@@ -309,9 +324,11 @@ use super::sequential_timing::TimingSpec;
 use super::source_logic::{AsyncPolicy, CausalPaths, DriveStrengths, LogicKernel, Operation};
 use super::{
     Adc, AnalogOutputConfig, AnalogOutputDevice, ConductanceConfig, DacConfig, DelayMode, Delays,
-    Logic, OutputPort, Strength,
+    Drive, GapPolicy, Logic, OutputPort, RangeReceiver, Strength, VoltageRange,
 };
-use crate::analysis::digital::{AdcBinding, AnalogOutputBinding, NativeTopology, NetId, Network};
+use crate::analysis::digital::{
+    AdcBinding, AnalogOutputBinding, NativeTopology, NetId, Network, RangeBinding, ReceiverBinding,
+};
 use crate::devices::circuit::ElaboratedDevice;
 use crate::devices::models::{PreparationKey, ResolvedModel};
 use crate::devices::{Device, ElaborationLimits};
@@ -747,6 +764,113 @@ impl Device for LogicReceiverDevice {
     }
 }
 
+#[derive(Debug)]
+struct RangeReceiverDevice {
+    name: String,
+    model: String,
+    terminals: [NodeId; 2],
+    output: String,
+    receiver: RangeReceiver,
+}
+
+impl Device for RangeReceiverDevice {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn designator(&self) -> char {
+        'a'
+    }
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+    fn terminals(&self) -> &[NodeId] {
+        &self.terminals
+    }
+    fn setup_matrix(&self, _: &mut crate::devices::setup::MatrixSetup<'_>) -> SpiceResult<bool> {
+        Ok(true)
+    }
+    fn stamp(&self, _: &mut crate::devices::StampContext<'_>) -> SpiceResult<()> {
+        Ok(())
+    }
+    fn assemble_linear(
+        &self,
+        _: &mut crate::devices::linear::LinearContext<'_>,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+}
+
+fn range_drive(value: Real, strength: Real) -> SpiceResult<Drive> {
+    let logic = match value {
+        0. => Logic::Zero,
+        1. => Logic::One,
+        2. => Logic::Unknown,
+        3. => Logic::Rising,
+        4. => Logic::Falling,
+        _ => return Err(SpiceError::circuit("invalid receiver range logic code")),
+    };
+    Ok(Drive {
+        logic,
+        strength: rank(strength)?,
+    })
+}
+
+fn range_material(card: &ModelCard) -> SpiceResult<RangeReceiver> {
+    SourceModel::LogicRange.validate_parameters(card)?;
+    let mut ranges = Vec::new();
+    let mut initial = 0;
+    let mut gap = None;
+    for parameter in &card.parameters {
+        match parameter.name.as_str() {
+            "ranges" => {
+                let values = numeric_vector(parameter)?;
+                let (entries, remainder) = values.as_chunks::<4>();
+                if entries.is_empty() || !remainder.is_empty() {
+                    return Err(SpiceError::circuit(
+                        "ranges requires voltage-low, voltage-high, logic, strength tuples",
+                    ));
+                }
+                ranges = entries
+                    .iter()
+                    .map(|&[lo, hi, logic, strength]| {
+                        VoltageRange::new(lo, hi, range_drive(logic, strength)?)
+                    })
+                    .collect::<SpiceResult<_>>()?;
+            }
+            "initial_range" => {
+                initial = crate::primitives::exact_nonnegative_integer(numeric_scalar(parameter)?)
+                    .ok_or_else(|| {
+                    SpiceError::circuit("invalid receiver initial range index")
+                })?
+            }
+            "gap_policy" | "gap_drive" => {
+                if gap.is_some() {
+                    return Err(SpiceError::circuit("specify one receiver gap policy"));
+                }
+                gap = Some(if parameter.name == "gap_policy" {
+                    match numeric_scalar(parameter)? {
+                        0. => GapPolicy::Error,
+                        1. => GapPolicy::Nearest,
+                        _ => return Err(SpiceError::circuit("invalid receiver gap policy")),
+                    }
+                } else {
+                    let [logic, strength]: [Real; 2] =
+                        numeric_vector(parameter)?.try_into().map_err(|_| {
+                            SpiceError::circuit("gap_drive requires logic and strength")
+                        })?;
+                    GapPolicy::Drive(range_drive(logic, strength)?)
+                });
+            }
+            _ => {
+                return Err(SpiceError::circuit(
+                    "unregistered ordered receiver parameter",
+                ));
+            }
+        }
+    }
+    RangeReceiver::new(ranges, initial, gap.unwrap_or(GapPolicy::Error))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct NativeOutputBinding {
     pub(crate) model: String,
@@ -812,6 +936,21 @@ pub(in crate::devices) fn instantiate(
                 output_capacitance: material.output_capacitance,
                 load_resistance: material.load_resistance,
                 inputs,
+            }))
+        }
+        SourceModel::LogicRange => {
+            let receiver =
+                model.prepare(PreparationKey::Inputs, || range_material(model.card()))?;
+            let [input, output] = instance.code_ports.as_slice() else {
+                return Err(SpiceError::circuit("ordered receiver port count mismatch"));
+            };
+            let terminals = analog_pair(&input.terminals[0], nodes)?;
+            Ok(Box::new(RangeReceiverDevice {
+                name: instance.name.clone(),
+                model: model.card().name.clone(),
+                terminals,
+                output: output.terminals[0].positive.clone(),
+                receiver: (*receiver).clone(),
             }))
         }
         SourceModel::LogicVoltage | SourceModel::LogicConductance => {
@@ -892,7 +1031,7 @@ fn bind_receiver(
     device: &LogicReceiverDevice,
     network: &mut Network,
     names: &mut BTreeMap<String, NetId>,
-    adcs: &mut Vec<AdcBinding>,
+    adcs: &mut Vec<ReceiverBinding>,
     capacitances: &BTreeMap<&str, Real>,
     limits: ElaborationLimits,
 ) -> SpiceResult<()> {
@@ -918,13 +1057,16 @@ fn bind_receiver(
                 // have identical analog node spelling.
                 let net = network.add_net();
                 let source = network.add_source(net)?;
-                adcs.push(AdcBinding {
-                    terminals: *terminals,
-                    source,
-                    thresholds: *thresholds,
-                    delays: zero,
-                    mode: DelayMode::Transport,
-                });
+                adcs.push(
+                    AdcBinding {
+                        terminals: *terminals,
+                        source,
+                        thresholds: *thresholds,
+                        delays: zero,
+                        mode: DelayMode::Transport,
+                    }
+                    .into(),
+                );
                 net
             }
         };
@@ -1002,20 +1144,41 @@ pub(in crate::devices) fn mixed_topology(
         }
         let any = device.as_ref() as &dyn std::any::Any;
         let receiver = any.downcast_ref::<LogicReceiverDevice>();
+        let range = any.downcast_ref::<RangeReceiverDevice>();
         let voltage = any
             .downcast_ref::<AnalogOutputDevice>()
             .and_then(|device| device.native.as_ref().map(|binding| (device, binding)));
-        if receiver.is_none() && voltage.is_none() {
+        if receiver.is_none() && range.is_none() && voltage.is_none() {
             continue;
         }
         let (network, names, adcs, analog_outputs): &mut (
             Network,
             BTreeMap<String, NetId>,
-            Vec<AdcBinding>,
+            Vec<ReceiverBinding>,
             Vec<AnalogOutputBinding>,
         ) = topology.get_or_insert_with(Default::default);
         if let Some(receiver) = receiver {
             bind_receiver(receiver, network, names, adcs, &capacitances, limits)?;
+        }
+        if let Some(device) = range {
+            if adcs.len() >= limits.state_slots {
+                return Err(SpiceError::circuit(
+                    "ordered receiver resource limit exceeded",
+                ));
+            }
+            let net = digital_net(network, names, &device.output, limits.nodes)?;
+            let source = network.add_source(net)?;
+            adcs.push(
+                RangeBinding {
+                    name: device.name.as_str().into(),
+                    terminals: device.terminals,
+                    source,
+                    receiver: device.receiver.clone(),
+                    delays: Delays::ZERO,
+                    mode: DelayMode::Transport,
+                }
+                .into(),
+            );
         }
         if let Some((device, binding)) = voltage {
             let net = digital_net(network, names, &binding.net, limits.nodes)?;

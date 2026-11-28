@@ -4,7 +4,9 @@
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
 mod pulse;
+mod range_receiver;
 pub mod rational;
+pub use range_receiver::{GapPolicy, RangeReceiver, RangeSample, RangeState, VoltageRange};
 mod sequential_timing;
 pub mod source;
 mod source_logic;

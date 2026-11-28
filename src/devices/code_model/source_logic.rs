@@ -1143,7 +1143,7 @@ mod tests {
         let records = engine.diagnostics();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].model.as_ref(), "xstage.a1");
-        assert_eq!(records[0].detail.kind, "setup");
+        assert_eq!(records[0].timing().unwrap().kind, "setup");
         assert_eq!(engine.stats().diagnostics, 1);
         assert_eq!(engine.value(output), Some(Drive::strong(Logic::One)));
         Ok(())
@@ -1188,7 +1188,7 @@ mod tests {
         rejected.schedule(c, 2., Drive::strong(Logic::One))?;
         rejected.advance_to(2.)?;
         assert_eq!(rejected.diagnostics().len(), 1);
-        assert!(rejected.diagnostics()[0].detail.fatal);
+        assert!(rejected.diagnostics()[0].timing().unwrap().fatal);
         assert!(
             rejected
                 .commit()

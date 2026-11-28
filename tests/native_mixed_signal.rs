@@ -656,9 +656,9 @@ fn source_bound_sequential_timing_policies() -> SpiceResult<()> {
             let warnings = c.last_digital_diagnostics();
             assert_eq!(warnings.len(), 1, "{warnings:?}");
             assert_eq!(warnings[0].model.as_ref(), "a1");
-            assert_eq!(warnings[0].detail.kind, "setup");
-            assert_eq!(warnings[0].detail.input, 0);
-            assert!((warnings[0].detail.elapsed - 50e-9).abs() <= 1e-12);
+            assert_eq!(warnings[0].timing().unwrap().kind, "setup");
+            assert_eq!(warnings[0].timing().unwrap().input, 0);
+            assert!((warnings[0].timing().unwrap().elapsed - 50e-9).abs() <= 1e-12);
         } else {
             assert!(result.unwrap_err().to_string().contains("setup violation"));
             assert!(c.last_digital_diagnostics().is_empty());
@@ -851,5 +851,80 @@ fn source_bound_window_propagates_both_causal_boundaries_to_physical_output() ->
         samples[region] += 1;
     }
     assert!(samples.iter().all(|&count| count > 10), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn ordered_receiver_preserves_range_identity_through_equal_logic_and_differential_reference()
+-> SpiceResult<()> {
+    let mut c = circuit(
+        "vref ref 0 7\n\
+         vd data ref PWL(0 1.5 1u 1.5 1.1u 2.5 2u 2.5 2.1u 1.5 3u 1.5 3.1u 4.5 4u 4.5 4.1u 3.5 5u 3.5)\n\
+         a1 %vd(data ref) q r\n\
+         .model r preprocess_logic_range(ranges=[0 2 0 63 3 5 1 63 1 4 0 63 4 6 3 63] initial_range=0 gap_policy=0)\n\
+         a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    for _ in 0..2 {
+        let plot = run(&mut c, AnalysisKind::Transient, &["5n", "5u", "0", "50n"])?;
+        let mut seen = [false; 3];
+        for i in 0..plot.point_count() {
+            let time = plot.value("time", i).unwrap().re;
+            let (region, expected) = if time < 3.07e-6 {
+                (0, 0.)
+            } else if (3.09e-6..4.04e-6).contains(&time) {
+                (1, 2.5)
+            } else if time > 4.06e-6 {
+                (2, 5.)
+            } else {
+                continue;
+            };
+            close(output(&plot, i), expected);
+            seen[region] = true;
+        }
+        assert!(seen.into_iter().all(|value| value));
+        assert!(c.last_digital_diagnostics().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn ordered_receiver_gap_diagnostics_and_nearest_midpoint_are_transactional() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::DiagnosticDetail;
+    for (policy, expected) in [("gap_policy=1", 5.), ("gap_drive=[2 63]", 2.5)] {
+        let mut c = circuit(&format!(
+            "vd data 0 PWL(0 -1.5 1u -1.5 2u 0.5 3u 0.5 4u 1.5 5u 1.5)\n\
+             a1 %v(data) q r\n.model r preprocess_logic_range(ranges=[-2 -1 0 63 1 2 1 63] {policy})\n\
+             a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+        ))?;
+        let plot = run(&mut c, AnalysisKind::Transient, &["2n", "5u", "0", "100n"])?;
+        for i in 0..plot.point_count() {
+            let time = plot.value("time", i).unwrap().re;
+            if (2.1e-6..3.9e-6).contains(&time) && time < 3.45e-6 {
+                close(output(&plot, i), expected);
+            }
+            if time > 4.05e-6 {
+                close(output(&plot, i), 5.);
+            }
+        }
+        let warnings = c.last_digital_diagnostics();
+        let count = if policy == "gap_policy=1" { 2 } else { 1 };
+        assert_eq!(warnings.len(), count, "{warnings:?}");
+        for record in warnings {
+            assert_eq!(record.model.as_ref(), "a1");
+            assert!(matches!(record.detail, DiagnosticDetail::RangeGap { .. }));
+        }
+        assert_eq!(c.last_digital_stats().unwrap().diagnostics, count);
+    }
+    let mut c = circuit(
+        "vd data 0 0\na1 data q r\n.model r preprocess_logic_range(ranges=[-2 -1 0 63 1 2 1 63] gap_policy=0)\n\
+         a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    assert!(
+        run(&mut c, AnalysisKind::OperatingPoint, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("outside all ranges")
+    );
+    assert!(c.last_digital_diagnostics().is_empty());
     Ok(())
 }

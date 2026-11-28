@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod diagnostics;
 pub mod timing;
 use diagnostics::DiagnosticLog;
-pub use diagnostics::EventDiagnostic;
+pub use diagnostics::{DiagnosticDetail, EventDiagnostic};
 use timing::{Arrival, TimedInput, TimedOutput, TimingWindow};
 
 use crate::devices::code_model::{
@@ -793,6 +793,19 @@ impl State {
 }
 
 impl State {
+    fn record_diagnostic(&mut self, diagnostic: EventDiagnostic) -> SpiceResult<()> {
+        self.stats.diagnostics = self
+            .stats
+            .diagnostics
+            .checked_add(1)
+            .ok_or_else(|| SpiceError::circuit("digital diagnostic count overflow"))?;
+        if diagnostic.is_fatal() && self.first_fatal.is_none() {
+            self.first_fatal = Some(diagnostic.clone());
+        }
+        self.diagnostics.push(diagnostic);
+        Ok(())
+    }
+
     fn check_acceptance(&self) -> SpiceResult<()> {
         if let Some(diagnostic) = &self.first_fatal {
             return Err(SpiceError::circuit(diagnostic.to_string()));
@@ -858,24 +871,15 @@ impl State {
                         .evaluate(context, &inputs, self.models[index].as_mut())?;
                 (Evaluated::Scalar(outputs), diagnostics)
             };
-            self.stats.diagnostics = self
-                .stats
-                .diagnostics
-                .checked_add(diagnostics.len())
-                .ok_or_else(|| SpiceError::circuit("digital diagnostic count overflow"))?;
-            self.charge_work(before, limit)?;
             for detail in diagnostics {
-                let diagnostic = EventDiagnostic {
+                self.record_diagnostic(EventDiagnostic {
                     model: instance.name.clone(),
                     time: self.time.value(),
                     delta: self.delta,
-                    detail,
-                };
-                if diagnostic.detail.fatal && self.first_fatal.is_none() {
-                    self.first_fatal = Some(diagnostic.clone());
-                }
-                self.diagnostics.push(diagnostic);
+                    detail: DiagnosticDetail::Timing(detail),
+                })?;
             }
+            self.charge_work(before, limit)?;
             match outputs {
                 Evaluated::Scalar(outputs) => self.accept_model_outputs(network, index, outputs)?,
                 Evaluated::Timed(outputs) => self.accept_timed_outputs(network, index, outputs)?,
@@ -1403,6 +1407,7 @@ impl Trial<'_> {
 use crate::devices::Circuit;
 use crate::devices::code_model::{
     Adc, AnalogOutputConfig, AnalogOutputDevice, DacConfig, Delays, OutputPort, OutputRamp,
+    RangeReceiver, RangeState,
 };
 use crate::maths::Vector;
 use crate::primitives::NodeId;
@@ -1422,6 +1427,130 @@ pub struct AdcBinding {
     pub mode: DelayMode,
 }
 
+/// Ordered analog receiver coupled to an exclusively owned digital source.
+#[derive(Clone, Debug)]
+pub struct RangeBinding {
+    /// Instance name used by accepted gap diagnostics.
+    pub name: std::sync::Arc<str>,
+    /// Positive and negative analog terminals.
+    pub terminals: [NodeId; 2],
+    /// Digital source dedicated to this receiver.
+    pub source: SourceId,
+    /// Ordered voltage intervals and explicit fallback policy.
+    pub receiver: RangeReceiver,
+    /// Propagation delays.
+    pub delays: Delays,
+    /// Output cancellation policy.
+    pub mode: DelayMode,
+}
+
+#[derive(Clone, Debug)]
+enum ReceiverKind {
+    Binary(Adc),
+    Ordered {
+        name: std::sync::Arc<str>,
+        material: RangeReceiver,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReceiverBinding {
+    terminals: [NodeId; 2],
+    source: SourceId,
+    kind: ReceiverKind,
+    delays: Delays,
+    mode: DelayMode,
+}
+
+impl From<AdcBinding> for ReceiverBinding {
+    fn from(binding: AdcBinding) -> Self {
+        Self {
+            terminals: binding.terminals,
+            source: binding.source,
+            kind: ReceiverKind::Binary(binding.thresholds),
+            delays: binding.delays,
+            mode: binding.mode,
+        }
+    }
+}
+
+impl From<RangeBinding> for ReceiverBinding {
+    fn from(binding: RangeBinding) -> Self {
+        Self {
+            terminals: binding.terminals,
+            source: binding.source,
+            kind: ReceiverKind::Ordered {
+                name: binding.name,
+                material: binding.receiver,
+            },
+            delays: binding.delays,
+            mode: binding.mode,
+        }
+    }
+}
+
+impl ReceiverBinding {
+    fn initial_state(&self) -> Option<RangeState> {
+        match &self.kind {
+            ReceiverKind::Binary(_) => None,
+            ReceiverKind::Ordered { material, .. } => Some(material.initial_state()),
+        }
+    }
+
+    fn crossing(
+        &self,
+        start: (Real, Real),
+        end: (Real, Real),
+        previous: Drive,
+        state: Option<RangeState>,
+    ) -> SpiceResult<Option<Real>> {
+        match (&self.kind, state) {
+            (ReceiverKind::Binary(adc), None) => adc.crossing(start, end, previous.logic),
+            (ReceiverKind::Ordered { material, .. }, Some(state)) => {
+                material.crossing(start, end, state)
+            }
+            _ => Err(SpiceError::circuit("receiver state does not match binding")),
+        }
+    }
+
+    fn sample(
+        &self,
+        time: Time,
+        voltage: Real,
+        previous: Drive,
+        state: Option<&mut RangeState>,
+        diagnostics: &mut Vec<EventDiagnostic>,
+    ) -> SpiceResult<(Drive, bool)> {
+        match (&self.kind, state) {
+            (ReceiverKind::Binary(adc), None) => Ok((
+                Drive::strong(adc.sample_at(voltage, previous.logic, time == Time(0))?),
+                adc.is_qualified(),
+            )),
+            (ReceiverKind::Ordered { name, material }, Some(prior)) => {
+                let sample = material.select(voltage, *prior)?;
+                if sample.state.in_gap()
+                    && (time == Time(0) || sample.state != *prior || material.rejects_gaps())
+                {
+                    diagnostics.push(EventDiagnostic {
+                        model: name.clone(),
+                        time: time.value(),
+                        delta: 0,
+                        detail: DiagnosticDetail::RangeGap {
+                            fatal: material.rejects_gaps(),
+                            voltage,
+                            drive: sample.drive,
+                            range_index: sample.state.index(),
+                        },
+                    });
+                }
+                *prior = sample.state;
+                Ok((sample.drive, true))
+            }
+            _ => Err(SpiceError::circuit("receiver state does not match binding")),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AnalogOutputBinding {
     pub(crate) name: String,
@@ -1435,19 +1564,19 @@ pub(crate) struct AnalogOutputBinding {
 #[derive(Debug)]
 pub(crate) struct NativeTopology {
     network: std::rc::Rc<Network>,
-    adcs: Vec<AdcBinding>,
+    receivers: Vec<ReceiverBinding>,
     analog_outputs: Vec<AnalogOutputBinding>,
 }
 
 impl NativeTopology {
     pub(crate) fn new(
         network: Network,
-        adcs: Vec<AdcBinding>,
+        receivers: Vec<ReceiverBinding>,
         analog_outputs: Vec<AnalogOutputBinding>,
     ) -> Self {
         Self {
             network: std::rc::Rc::new(network),
-            adcs,
+            receivers,
             analog_outputs,
         }
     }
@@ -1457,7 +1586,12 @@ impl NativeTopology {
             std::rc::Rc::clone(&self.network),
             Limits::default(),
         )?);
-        mixed.adcs.clone_from(&self.adcs);
+        mixed.receivers.clone_from(&self.receivers);
+        mixed.range_states = self
+            .receivers
+            .iter()
+            .filter_map(ReceiverBinding::initial_state)
+            .collect();
         mixed.analog_outputs.clone_from(&self.analog_outputs);
         Ok(mixed)
     }
@@ -1468,8 +1602,10 @@ impl NativeTopology {
 #[derive(Debug)]
 pub struct MixedSignal {
     engine: Engine,
-    adcs: Vec<AdcBinding>,
+    receivers: Vec<ReceiverBinding>,
     analog_outputs: Vec<AnalogOutputBinding>,
+    range_states: Vec<RangeState>,
+    initial_gap_diagnostics: Vec<EventDiagnostic>,
     previous: Option<(Time, Vec<Real>)>,
     changes: Vec<Change>,
     initial_backup: Option<State>,
@@ -1494,6 +1630,8 @@ impl EventPreview {
 pub(super) struct MixedPoint {
     time: Time,
     voltages: Vec<Real>,
+    range_states: Vec<RangeState>,
+    initial_gap_diagnostics: Vec<EventDiagnostic>,
     state: Option<State>,
     ramps: Vec<OutputRamp>,
     changes: Vec<Change>,
@@ -1507,7 +1645,9 @@ impl MixedSignal {
     pub const fn new(engine: Engine) -> Self {
         Self {
             engine,
-            adcs: Vec::new(),
+            receivers: Vec::new(),
+            range_states: Vec::new(),
+            initial_gap_diagnostics: Vec::new(),
             analog_outputs: Vec::new(),
             previous: None,
             changes: Vec::new(),
@@ -1533,13 +1673,28 @@ impl MixedSignal {
     /// # Errors
     /// Unknown or already assigned source.
     pub fn add_adc(&mut self, binding: AdcBinding) -> SpiceResult<()> {
+        self.add_receiver(binding.into())
+    }
+
+    /// Bind an ordered differential voltage receiver to an exclusive source.
+    ///
+    /// # Errors
+    /// Unknown or already assigned source.
+    pub fn add_range_receiver(&mut self, binding: RangeBinding) -> SpiceResult<()> {
+        self.add_receiver(binding.into())
+    }
+
+    fn add_receiver(&mut self, binding: ReceiverBinding) -> SpiceResult<()> {
         let driver = *self
             .engine
             .network
             .sources
             .get(binding.source.0)
             .ok_or_else(|| SpiceError::circuit("unknown ADC source"))?;
-        if self.adcs.iter().any(|adc| adc.source == binding.source)
+        if self
+            .receivers
+            .iter()
+            .any(|receiver| receiver.source == binding.source)
             || self
                 .engine
                 .accepted
@@ -1550,7 +1705,8 @@ impl MixedSignal {
         {
             return Err(SpiceError::circuit("ADC source must be exclusively owned"));
         }
-        self.adcs.push(binding);
+        self.range_states.extend(binding.initial_state());
+        self.receivers.push(binding);
         Ok(())
     }
 
@@ -1598,8 +1754,8 @@ impl MixedSignal {
                 "mixed-signal transient requires an unused time-zero engine",
             ));
         }
-        for adc in &self.adcs {
-            if adc
+        for receiver in &self.receivers {
+            if receiver
                 .terminals
                 .iter()
                 .any(|&node| circuit.nodes().node(node).is_none())
@@ -1646,13 +1802,28 @@ impl MixedSignal {
         if let Some(previous) = self.initial_backup.take() {
             self.engine.accepted = previous;
             self.previous = None;
+            self.range_states = self
+                .receivers
+                .iter()
+                .filter_map(ReceiverBinding::initial_state)
+                .collect();
+            self.initial_gap_diagnostics.clear();
             self.changes.clear();
             self.boundary = false;
         }
     }
 
-    pub(super) fn accept_initial(&mut self) {
+    pub(super) fn accept_initial(&mut self) -> SpiceResult<()> {
+        let before = self.engine.accepted.stats;
+        for diagnostic in std::mem::take(&mut self.initial_gap_diagnostics) {
+            self.engine.accepted.record_diagnostic(diagnostic)?;
+        }
+        self.engine
+            .accepted
+            .charge_work(before, self.engine.limits.work)?;
+        self.engine.accepted.check_acceptance()?;
         self.initial_backup = None;
+        Ok(())
     }
 
     fn voltages(&self, circuit: &Circuit, solution: &Vector) -> SpiceResult<Vec<Real>> {
@@ -1667,10 +1838,10 @@ impl MixedSignal {
                     .ok_or_else(|| SpiceError::circuit("missing ADC analog row"))
             }
         };
-        self.adcs
+        self.receivers
             .iter()
-            .map(|adc| {
-                let v = voltage(adc.terminals[0])? - voltage(adc.terminals[1])?;
+            .map(|receiver| {
+                let v = voltage(receiver.terminals[0])? - voltage(receiver.terminals[1])?;
                 if !v.is_finite() {
                     return Err(SpiceError::circuit("nonfinite differential ADC input"));
                 }
@@ -1679,8 +1850,8 @@ impl MixedSignal {
             .collect()
     }
 
-    fn adc_previous(&self, adc: &AdcBinding) -> Drive {
-        let driver = self.engine.network.sources[adc.source.0];
+    fn receiver_previous(&self, receiver: &ReceiverBinding) -> Drive {
+        let driver = self.engine.network.sources[receiver.source.0];
         self.engine.accepted.desired[driver].unwrap_or(self.engine.accepted.drivers[driver])
     }
 
@@ -1695,14 +1866,23 @@ impl MixedSignal {
         };
         let voltages = self.voltages(circuit, solution)?;
         let mut earliest = None;
-        for ((adc, &v0), v1) in self.adcs.iter().zip(previous).zip(voltages) {
-            if let Some(crossing) = adc.thresholds.crossing(
+        let mut states = self.range_states.iter().copied();
+        for ((receiver, &v0), v1) in self.receivers.iter().zip(previous).zip(voltages) {
+            let state = match receiver.kind {
+                ReceiverKind::Binary(_) => None,
+                ReceiverKind::Ordered { .. } => states.next(),
+            };
+            if let Some(crossing) = receiver.crossing(
                 (start.value(), v0),
                 (time, v1),
-                self.adc_previous(adc).logic,
+                self.receiver_previous(receiver),
+                state,
             )? {
                 earliest = Some(earliest.map_or(crossing, |old: Real| old.min(crossing)));
             }
+        }
+        if states.next().is_some() {
+            return Err(SpiceError::circuit("surplus ordered receiver state"));
         }
         Ok(earliest)
     }
@@ -1780,28 +1960,35 @@ impl MixedSignal {
         let voltages = self.voltages(circuit, solution)?;
         let mut updates = Vec::new();
         let mut qualified_updates = Vec::new();
-        for (adc, &voltage) in self.adcs.iter().zip(&voltages) {
-            let previous = self.adc_previous(adc);
-            let drive = Drive::strong(adc.thresholds.sample_at(
-                voltage,
-                previous.logic,
-                end == Time(0),
-            )?);
+        let mut range_states = self.range_states.clone();
+        let mut range_diagnostics = Vec::new();
+        let mut states = range_states.iter_mut();
+        for (receiver, &voltage) in self.receivers.iter().zip(&voltages) {
+            let range_state = match receiver.kind {
+                ReceiverKind::Binary(_) => None,
+                ReceiverKind::Ordered { .. } => states.next(),
+            };
+            let previous = self.receiver_previous(receiver);
+            let (drive, qualified) =
+                receiver.sample(end, voltage, previous, range_state, &mut range_diagnostics)?;
             if drive != previous {
-                let destination = if adc.thresholds.is_qualified() {
+                let destination = if qualified {
                     &mut qualified_updates
                 } else {
                     &mut updates
                 };
                 destination.push((
-                    self.engine.network.sources[adc.source.0],
+                    self.engine.network.sources[receiver.source.0],
                     Output {
                         drive,
-                        delays: adc.delays,
-                        mode: adc.mode,
+                        delays: receiver.delays,
+                        mode: receiver.mode,
                     },
                 ));
             }
+        }
+        if states.next().is_some() {
+            return Err(SpiceError::circuit("surplus ordered receiver state"));
         }
         let events_due = (self.engine.has_lookahead() && end > self.engine.accepted.time)
             || self
@@ -1821,16 +2008,28 @@ impl MixedSignal {
         let mut point = MixedPoint {
             time: end,
             voltages,
+            range_states,
+            initial_gap_diagnostics: Vec::new(),
             state: None,
             ramps: Vec::new(),
             changes: Vec::new(),
             boundary: ramp_boundary,
         };
-        if !events_due && updates.is_empty() && qualified_updates.is_empty() {
+        if end == Time(0) {
+            point.initial_gap_diagnostics = std::mem::take(&mut range_diagnostics);
+        }
+        if !events_due
+            && updates.is_empty()
+            && qualified_updates.is_empty()
+            && range_diagnostics.is_empty()
+        {
             return Ok(point);
         }
-        let state =
+        let mut state =
             self.prepare_event_state(end, preview, qualified_updates, updates, &mut point.changes)?;
+        for diagnostic in range_diagnostics {
+            state.record_diagnostic(diagnostic)?;
+        }
         state.charge_work(self.engine.accepted.stats, self.engine.limits.work)?;
         // Previews can discover tentative timing failures. Only the replay
         // with converged receiver values may prevent analog acceptance.
@@ -1936,6 +2135,10 @@ impl MixedSignal {
         } else if self.engine.accepted.time < point.time {
             self.engine.accepted.time = point.time;
             self.engine.accepted.delta = 0;
+        }
+        self.range_states = point.range_states;
+        if point.time == Time(0) {
+            self.initial_gap_diagnostics = point.initial_gap_diagnostics;
         }
         self.previous = Some((point.time, point.voltages));
         self.changes.extend(point.changes);
