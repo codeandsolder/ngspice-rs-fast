@@ -1,8 +1,7 @@
 //! A symbolic partition by physical arrival order. Each case is guarded
 //! by simultaneous equality inside groups and strict order between them.
-//! Pairwise relative bounds may exclude cases, but cannot establish
-//! joint feasibility. Retaining those guards avoids inventing realizable
-//! paths from independently possible comparisons.
+//! Relative bounds reject simple contradictions; exact joint
+//! feasibility rules out impossible orders from correlated paths.
 
 use super::{Expression, Extremum, Origin, TimingWindow, charge, relative};
 use crate::primitives::{ExactSum, Real, SpiceError, SpiceResult};
@@ -73,24 +72,63 @@ pub(crate) fn proven_order(
     Ok(Some(OrderCase { groups }))
 }
 
-/// Result of a sound interval proof about an ordering guard. Conditional
-/// means neither tautology nor contradiction has been proven; it does
-/// not assert that the guard has a feasible realization.
+/// Result of a sound feasibility proof about an ordering guard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuardStatus {
     /// The conjunction is proven contradictory.
     Impossible,
     /// All required comparisons hold for every realization.
     Always,
-    /// Joint feasibility or universality needs a stronger proof.
+    /// A feasible realization exists; universality is not proven.
     Conditional,
 }
 
+/// A comparison of two physical arrival expressions. Inclusive
+/// comparisons describe delivery at an exact observation boundary
+/// without splitting a single half-space into a strict case and tie.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimingRelation {
+    /// Strictly earlier.
+    Before,
+    /// Earlier or simultaneous.
+    NoLater,
+    /// Simultaneous.
+    Coincident,
+    /// Later or simultaneous.
+    NoEarlier,
+    /// Strictly later.
+    After,
+}
+
+impl TimingRelation {
+    fn classify(self, bounds: super::Bounds) -> (bool, bool) {
+        let lo = bounds.minimum();
+        let hi = bounds.maximum();
+        match self {
+            Self::Before => (lo < 0., hi < 0.),
+            Self::NoLater => (lo <= 0., hi <= 0.),
+            Self::Coincident => (lo <= 0. && hi >= 0., lo == 0. && hi == 0.),
+            Self::NoEarlier => (hi >= 0., lo >= 0.),
+            Self::After => (hi > 0., lo > 0.),
+        }
+    }
+
+    fn accepts(self, order: Ordering) -> bool {
+        match self {
+            Self::Before => order == Ordering::Less,
+            Self::NoLater => order != Ordering::Greater,
+            Self::Coincident => order == Ordering::Equal,
+            Self::NoEarlier => order != Ordering::Less,
+            Self::After => order == Ordering::Greater,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-struct Comparison {
-    lhs: TimingWindow,
-    rhs: TimingWindow,
-    relation: Ordering,
+pub(super) struct Comparison {
+    pub(super) lhs: TimingWindow,
+    pub(super) rhs: TimingWindow,
+    pub(super) relation: TimingRelation,
 }
 
 /// A conjunction of physical-time comparisons on shared delay origins.
@@ -102,6 +140,14 @@ pub struct TimingGuard {
 }
 
 impl TimingGuard {
+    /// One exact physical-time comparison, preserving both expressions.
+    #[must_use = "the guard constrains a joint timing realization"]
+    pub fn compare(lhs: TimingWindow, rhs: TimingWindow, relation: TimingRelation) -> Self {
+        Self {
+            comparisons: vec![Comparison { lhs, rhs, relation }],
+        }
+    }
+
     /// Conjoin two guarded conditions, retaining the original expressions.
     #[must_use = "the conjunction retains upstream causal constraints"]
     pub fn and(mut self, other: Self) -> Self {
@@ -109,35 +155,70 @@ impl TimingGuard {
         self
     }
 
-    /// Check a guard with sound relative enclosures and strict-order
-    /// cycle detection. A joint contradiction not established by these
-    /// proofs remains conditional.
+    /// Check a guard with fast relative enclosures and strict-order
+    /// cycle detection, followed by exact affine feasibility including
+    /// shared min/max selections when the fast proofs are inconclusive.
     ///
     /// # Errors
     /// Exhausted comparison budget or invalid relative arithmetic.
     pub fn status(&self, mut budget: usize) -> SpiceResult<GuardStatus> {
-        let mut status = GuardStatus::Always;
+        self.status_with_budget(&mut budget)
+    }
+
+    pub(super) fn status_with_budget(&self, budget: &mut usize) -> SpiceResult<GuardStatus> {
+        let mut uncertain = Vec::new();
         for comparison in &self.comparisons {
-            let b = relative(&comparison.lhs, &comparison.rhs, &mut budget)?;
-            let (possible, always) = match comparison.relation {
-                Ordering::Less => (b.minimum() < 0., b.maximum() < 0.),
-                Ordering::Equal => (
-                    b.minimum() <= 0. && b.maximum() >= 0.,
-                    b.is_exact() && b.minimum() == 0.,
-                ),
-                Ordering::Greater => (b.maximum() > 0., b.minimum() > 0.),
-            };
+            let b = relative(&comparison.lhs, &comparison.rhs, budget)?;
+            let (possible, always) = comparison.relation.classify(b);
             if !possible {
                 return Ok(GuardStatus::Impossible);
             }
             if !always {
-                status = GuardStatus::Conditional;
+                uncertain.push(comparison.clone());
             }
         }
-        if status == GuardStatus::Conditional && self.has_strict_cycle(&mut budget)? {
+        if uncertain.is_empty() {
+            return Ok(GuardStatus::Always);
+        }
+        if self.has_strict_cycle(budget)?
+            || !super::feasibility::guard_feasible(&uncertain, budget)?
+        {
             return Ok(GuardStatus::Impossible);
         }
-        Ok(status)
+        Ok(GuardStatus::Conditional)
+    }
+
+    /// Project this guard and a set of event-time comparisons against
+    /// an observation time onto the representable nonnegative time axis.
+    /// Each tuple means `event relation observation`. All delay origins
+    /// and extremum selections remain shared. Returned intervals are
+    /// sorted, disjoint, and inclusive on the binary64 lattice.
+    ///
+    /// # Errors
+    /// Invalid expression or exhausted exact feasibility budget.
+    pub fn observation_intervals(
+        &self,
+        events: &[(TimingWindow, TimingRelation)],
+        mut budget: usize,
+    ) -> SpiceResult<Vec<super::ProjectedInterval>> {
+        self.observation_intervals_with_budget(events, &mut budget)
+    }
+
+    pub(super) fn observation_intervals_with_budget(
+        &self,
+        events: &[(TimingWindow, TimingRelation)],
+        budget: &mut usize,
+    ) -> SpiceResult<Vec<super::ProjectedInterval>> {
+        let observations = events
+            .iter()
+            .map(
+                |(window, relation)| super::feasibility::ObservationComparison {
+                    window: window.clone(),
+                    relation: *relation,
+                },
+            )
+            .collect::<Vec<_>>();
+        super::feasibility::guard_projection(&self.comparisons, &observations, budget)
     }
 
     // Equality is a pair of non-strict edges. A strongly connected
@@ -157,15 +238,21 @@ impl TimingGuard {
             let lhs = node(&comparison.lhs);
             let rhs = node(&comparison.rhs);
             match comparison.relation {
-                Ordering::Less => {
+                TimingRelation::Before => {
                     graph.add_edge(lhs, rhs, true);
                 }
-                Ordering::Greater => {
-                    graph.add_edge(rhs, lhs, true);
+                TimingRelation::NoLater => {
+                    graph.add_edge(lhs, rhs, false);
                 }
-                Ordering::Equal => {
+                TimingRelation::Coincident => {
                     graph.add_edge(lhs, rhs, false);
                     graph.add_edge(rhs, lhs, false);
+                }
+                TimingRelation::NoEarlier => {
+                    graph.add_edge(rhs, lhs, false);
+                }
+                TimingRelation::After => {
+                    graph.add_edge(rhs, lhs, true);
                 }
             }
         }
@@ -189,7 +276,7 @@ impl TimingGuard {
         for comparison in &self.comparisons {
             let lhs = exact_at(&comparison.lhs, origins, &mut budget)?;
             let rhs = exact_at(&comparison.rhs, origins, &mut budget)?;
-            if lhs.exact_cmp(&rhs) != comparison.relation {
+            if !comparison.relation.accepts(lhs.exact_cmp(&rhs)) {
                 return Ok(false);
             }
         }
@@ -232,9 +319,8 @@ impl<T> Conditional<T> {
 }
 
 /// A disjoint symbolic partition of the joint delay-origin domain.
-/// Cases not ruled out by relative bounds can have empty guards. Every
-/// concrete realization belongs to exactly one case; callers must not
-/// treat a retained case as proof of existential feasibility.
+/// Every retained case has a jointly feasible guard, and every
+/// concrete realization belongs to exactly one case.
 #[derive(Clone, Debug)]
 pub struct OrderPartition {
     windows: Vec<TimingWindow>,
@@ -259,7 +345,7 @@ impl Relations {
 }
 
 impl OrderPartition {
-    /// Construct all cases not excluded by sound relative comparisons.
+    /// Construct the complete partition of feasible physical orders.
     /// No assumption of independent absolute timing windows is made.
     /// The shared budget bounds comparison, case expansion and cloning
     /// work; exhaustion is an explicit error, never a partial partition.
@@ -339,14 +425,22 @@ impl OrderPartition {
             }
             cases = next;
         }
-        if cases.is_empty() {
+        let mut partition = Self {
+            windows,
+            cases: Vec::new(),
+        };
+        for case in cases {
+            if partition.guard(&case).status_with_budget(&mut budget)? != GuardStatus::Impossible {
+                partition.cases.push(case);
+            }
+        }
+        if partition.cases.is_empty() {
             return Err(SpiceError::circuit("empty conditional timing partition"));
         }
-        Ok(Self { windows, cases })
+        Ok(partition)
     }
 
-    /// The mutually exclusive order cases. An individual case can be
-    /// infeasible because relative bounds need not be jointly tight.
+    /// The mutually exclusive and jointly feasible order cases.
     #[must_use = "retain each case's ordering guard"]
     pub fn cases(&self) -> &[OrderCase] {
         &self.cases
@@ -361,14 +455,14 @@ impl OrderPartition {
                     comparisons.push(Comparison {
                         lhs: self.windows[prior].clone(),
                         rhs: self.windows[first].clone(),
-                        relation: Ordering::Less,
+                        relation: TimingRelation::Before,
                     });
                 }
                 for &other in rest {
                     comparisons.push(Comparison {
                         lhs: self.windows[first].clone(),
                         rhs: self.windows[other].clone(),
-                        relation: Ordering::Equal,
+                        relation: TimingRelation::Coincident,
                     });
                 }
                 previous = Some(first);
@@ -569,7 +663,7 @@ mod tests {
         let b = base.after(DelayWindow::new(0., 20.)?, u)?;
         let c = base.after(DelayWindow::new(0., 20.)?, v)?;
         let partition = OrderPartition::new(vec![a, b, c], 100_000)?;
-        assert_eq!(partition.cases().len(), 13);
+        assert_eq!(partition.cases().len(), 3);
         for i in 0..=16 {
             for j in 0..=16 {
                 let values = BTreeMap::from([(u, f64::from(i) / 16.), (v, f64::from(j) / 16.)]);
@@ -649,7 +743,7 @@ mod tests {
             comparisons: vec![Comparison {
                 lhs,
                 rhs,
-                relation: Ordering::Less,
+                relation: TimingRelation::Before,
             }],
         };
         let cycle = before(a.clone(), b.clone())

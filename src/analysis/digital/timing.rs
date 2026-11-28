@@ -8,8 +8,12 @@
 use crate::primitives::{ExactSum, Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
 mod conditional;
+mod feasibility;
 pub(crate) use conditional::proven_order;
-pub use conditional::{Conditional, GuardStatus, OrderCase, OrderPartition, TimingGuard};
+pub use conditional::{
+    Conditional, GuardStatus, OrderCase, OrderPartition, TimingGuard, TimingRelation,
+};
+pub use feasibility::ProjectedInterval;
 use std::sync::Arc;
 mod constraints;
 pub use constraints::{ApertureResult, Certainty, ConstraintResult};

@@ -113,6 +113,9 @@ model-normalize-ngspice = { git = "https://github.com/codeandsolder/ngspice-rs-p
 model-kernel-diode = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
 model-preprocess-command = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
 model-statistics = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8d2d5f756dbd2566932789fc4bf73fdf4a6a4245" }
+# Exact integer coefficients for guarded affine timing feasibility.
+num-bigint = "0.5.1"
+num-integer = "0.1.46"
 sha2 = "0.11"
 anyhow = "1"
 

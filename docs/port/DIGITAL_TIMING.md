@@ -304,9 +304,9 @@ endpoint identity without discarding the preceding logical edge.
 
 An order partition retains each physically distinct ordering, including
 simultaneous groups, as a conjunction of exact arrival comparisons.
-Relative enclosures and strict-order-cycle detection eliminate proven
-contradictions. They do not prove that every retained branch has a
-jointly feasible origin assignment. For a concrete joint assignment,
+Relative enclosures and strict-order-cycle detection eliminate simple
+contradictions; exact integer affine feasibility then establishes a
+jointly feasible origin assignment for each retained case. For a concrete joint assignment,
 exact weighted-product sums evaluate min/max and shared affine paths,
 so one and only one order case is selected without sub-ULP time-order
 loss. The same native reducer evaluates each case's logical output
@@ -322,6 +322,26 @@ compacted even when its absolute envelopes overlap the remaining suffix,
 provided relative comparisons prove the physical order. If branches
 differ or an already-published request requires revision, conditional
 delivery is required. The branch representation preserves optional
-pulses; the event engine still needs guarded delivery, joint feasibility
-for nontrivial affine/extremum constraints and conditional sequential
+pulses; the event engine still needs guarded delivery and conditional sequential
 timing checks. These are not silently replaced by deterministic paths.
+
+### Exact joint feasibility and observation projection
+
+Order cases are pruned by exact affine feasibility, rather than only
+pairwise relative enclosures. Binary64 constants become integers in
+units of the smallest subnormal. Shared origins are real variables
+bounded by [0,1]. Integer Fourier–Motzkin elimination preserves strict
+and non-strict inequalities without epsilon tests. A min/max expression
+uses one selected child and its defining inequalities; shared nodes
+reuse that selector. A work budget bounds enumeration and integer
+arithmetic, with explicit failure on exhaustion.
+
+For an observation at an unspecified time, retain time as one variable
+and eliminate every delay origin. This projects each guarded branch
+onto the representable physical-time axis, including interior endpoints
+created by correlated constraints (not just unconditional arrival
+bounds). Strict rational endpoints are converted using exact integer
+comparisons to the first or last satisfying binary64 observation.
+Intervals are merged only when adjacent on that lattice. Feasibility
+over real origins and exact projection onto representable observation
+times are distinct operations.
