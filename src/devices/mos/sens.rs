@@ -11,14 +11,14 @@
 
 use super::surface::{Surface, SurfaceCard};
 use super::{CELSIUS_TO_KELVIN, Common, MosLevel, Mosfet};
+use crate::devices::LinearContext;
 use crate::devices::ModelContext;
 use crate::devices::nonlinear::thermal::TemperatureCache;
 use crate::devices::sensitivity::{
-    AcReset, ParameterScope, RecordPair, ResetStamp, ResetStamps, SensitivityFamily,
-    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
-    SensitivityRecord as Record, StampAt, StampPart,
+    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    SensitivityFamily, SensitivityKernel, SensitivityParameter as P, SensitivityRecord as Record,
+    StampPart, node_stamps, stamp_reset,
 };
-use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 
 /// Level-owned model record mapping. `derived` selects the already-stored
@@ -286,19 +286,8 @@ impl<L: SensitivityLevel> SensitivityKernel for MosSensitivity<'_, L> {
         }
         Ok(())
     }
-    fn load(
-        &self,
-        _setup: RecordPair<'_>,
-        r: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(format!(
-                "{}'s AC sensitivity load is its reset load",
-                L::LABEL
-            )));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(self.mosfet(r)?)))
+    fn dc_load(&self, _setup: RecordPair<'_>, r: RecordPair<'_>) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::replacement(self.mosfet(r)?))
     }
 
     /// `capbd`/`capbs` (`mosXacld.c`).
@@ -322,12 +311,12 @@ impl<L: SensitivityLevel> SensitivityKernel for MosSensitivity<'_, L> {
     /// walk had not started), the final transient load's stored fields
     /// ([`AcReset::transient`]), or C's zero-initialised fields; the series
     /// conductances and overlap capacitances come from `current`.
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<AcSensitivityLoad> {
         L::small_signal(self.device, "AC")?;
         let transient = reset
             .transient
@@ -341,7 +330,7 @@ impl<L: SensitivityLevel> SensitivityKernel for MosSensitivity<'_, L> {
                 },
             )
             .transpose()?;
-        Ok(SensitivityLoad::Replacement(Box::new(ResetMosfet {
+        Ok(AcSensitivityLoad::stamp(ResetMosfet {
             state: self.mosfet(reset.state)?,
             current: self.mosfet(current)?,
             omega: reset.omega,
@@ -349,7 +338,7 @@ impl<L: SensitivityLevel> SensitivityKernel for MosSensitivity<'_, L> {
             stale: reset
                 .small_signal
                 .map(|bias| (self.pristine(), bias.clone())),
-        })))
+        }))
     }
 }
 
@@ -417,7 +406,7 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
 }
 
 /// A classic MOSFET's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
 #[derive(Debug)]
 struct ResetMosfet<L: MosLevel> {
     /// Built from the reset load's records: the conductances and the mode.
@@ -434,30 +423,11 @@ struct ResetMosfet<L: MosLevel> {
     transient: Option<[Real; 2]>,
 }
 
-impl<L: MosLevel> Device for ResetMosfet<L> {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'm'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl<L: MosLevel> AcSensitivityStamp for ResetMosfet<L> {
     /// `mos1acld.c`'s stamps (`mos3acld.c`'s with the effective width) in
     /// its order: the imaginary parts `xg* = cap * CKTomega` and their sums,
     /// then the real parts.
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let model = context.model_context;
         let state = &self.state;
         let op = state.operating(model)?;
@@ -531,20 +501,11 @@ impl<L: MosLevel> Device for ResetMosfet<L> {
             (sp, b, -f64::mul_add(xnrm - xrev, gmbs, gbs)),
             (sp, dp, -f64::mul_add(xrev, gm + gmbs, gds)),
         ];
-        let stamps = imaginary
-            .into_iter()
-            .map(|(a, b, value)| (a, b, value, StampPart::Imaginary))
-            .chain(
-                real.into_iter()
-                    .map(|(a, b, value)| (a, b, value, StampPart::Real)),
-            )
-            .map(|(a, b, value, part)| ResetStamp {
-                at: StampAt::Nodes(a, b),
-                value,
-                part,
-            })
-            .collect();
-        ResetStamps::new(&self.current.name, 'm', &self.current.terminals, stamps)?
-            .assemble_linear(context)
+        stamp_reset(
+            &self.current.name,
+            node_stamps(&imaginary, StampPart::Imaginary)
+                .chain(node_stamps(&real, StampPart::Real)),
+            context,
+        )
     }
 }

@@ -81,8 +81,8 @@ use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter, SensitivityRecord,
+    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -965,36 +965,28 @@ impl SensitivityKernel for MesfetSensitivity<'_> {
         Ok(())
     }
 
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "a MESFET's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(
-            self.mesfet(current)?,
-        )))
+    ) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::replacement(self.mesfet(current)?))
     }
 
     /// `MESacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
     /// `ggd` are the `CKTstate0` values `mesload.c` stored at zero junction
     /// voltages with the reset records, the charge slots `qgs`/`qgd` are
     /// zero, and `RD`/`RS`, `area` and `m` come from `current`.
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(ResetMesfet {
+    ) -> SpiceResult<AcSensitivityLoad> {
+        Ok(AcSensitivityLoad::stamp(ResetMesfet {
             state: self.mesfet(reset.state)?,
             current: self.mesfet(current)?,
-        })))
+        }))
     }
 }
 
@@ -1036,7 +1028,7 @@ impl MesfetSensitivity<'_> {
 }
 
 /// A MESFET's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
 #[derive(Debug)]
 struct ResetMesfet {
     /// Built from the reset load's records: the junction conductances.
@@ -1045,29 +1037,10 @@ struct ResetMesfet {
     current: Mesfet,
 }
 
-impl Device for ResetMesfet {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'z'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl AcSensitivityStamp for ResetMesfet {
     /// `mesacl.c`'s real stamps (`jfetacld.c`'s list); its `xgs`/`xgd`
     /// imaginary parts are zero.
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let state = &self.state;
         let op = state.operating()?;
         let [vgs, vgd] = state.normalized([0.; 3]);

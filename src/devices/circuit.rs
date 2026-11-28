@@ -3592,7 +3592,7 @@ impl Circuit {
     }
 
     /// The small-signal assembly of the single device at ordinal `index`, with
-    /// `device` in its place, added to `system` (C's `DEVacLoad` of one
+    /// the selected AC sensitivity load in its place, added to `system` (C's `DEVacLoad` of one
     /// isolated instance, as `.sens` performs it). An inductor stamps no
     /// mutual-inductance terms: `.sens` loads each K's `MUTacLoad` as a device
     /// of its own. `bias` and `state` are as for
@@ -3601,10 +3601,10 @@ impl Circuit {
     /// # Errors
     /// Stale numbering, an ordinal out of range, mismatched dimensions or
     /// unsupported device physics.
-    pub fn assemble_small_signal_device(
+    pub fn assemble_sensitivity_ac(
         &self,
         index: usize,
-        device: &dyn Device,
+        load: &crate::devices::sensitivity::AcSensitivityLoad,
         context: &ModelContext,
         bias: &Vector,
         state: Option<&StateSnapshot>,
@@ -3641,7 +3641,7 @@ impl Circuit {
             pole_zero_statements: None,
             pole_zero_setups: 0,
         };
-        device.assemble_small_signal(&mut linear, bias)
+        load.assemble(&mut linear, bias)
     }
 
     /// Disposable devices carrying the context's resistor and instance-parameter

@@ -18,12 +18,12 @@ use super::thermal::DerivedCache;
 use super::{
     Diode, DiodeGeometry, DiodeInstanceParameters, DiodeParameters, DiodeSetup, EPSMIN, default_eg,
 };
+use crate::devices::LinearContext;
 use crate::devices::sensitivity::{
-    AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetStamp, ResetStamps,
-    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
-    SensitivityParameter as P, SensitivityRecord, StampAt, StampPart, written,
+    AcReset, AcSensitivityLoad, AcSensitivityStamp, CELSIUS_TO_KELVIN, DcSensitivityLoad,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
+    SensitivityRecord, StampPart, node_stamps, stamp_reset, written,
 };
-use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 
 /// `DIOmPTable` entries `set_param()` accepts in a DC analysis (the `IF_AC`
@@ -410,18 +410,12 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         Ok(())
     }
 
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "a diode's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(self.diode(current)?)))
+    ) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::replacement(self.diode(current)?))
     }
 
     /// `DIOacLoad` after `cktsens.c`'s reset load: the series conductance
@@ -429,16 +423,16 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
     /// `CKTstate0[DIOconduct]` that `dioload.c` stored at `vd = 0` with the
     /// `state` records, and no capacitance (`DIOcapCurrent` is written only by
     /// a small-signal load, so it is still zero).
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(ResetDiode {
+    ) -> SpiceResult<AcSensitivityLoad> {
+        Ok(AcSensitivityLoad::stamp(ResetDiode {
             state: self.diode(reset.state)?,
             current: self.diode(current)?,
-        })))
+        }))
     }
 }
 
@@ -499,7 +493,7 @@ impl DiodeSensitivity<'_> {
 }
 
 /// A diode's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
 #[derive(Debug)]
 struct ResetDiode {
     /// Built from the records of the reset load, which sets the junction
@@ -509,29 +503,10 @@ struct ResetDiode {
     current: Diode,
 }
 
-impl Device for ResetDiode {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'd'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl AcSensitivityStamp for ResetDiode {
     /// `dioacld.c`'s stamps in its order: `gspr` and `geq` (the `xceq`
     /// imaginary parts are zero).
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let model = context.model_context;
         let gspr = self.current.thermal(model)?.conductance;
         let geq = self
@@ -552,16 +527,11 @@ impl Device for ResetDiode {
             (prime, pos, -gspr),
             (prime, neg, -geq),
         ];
-        let stamps = stamps
-            .into_iter()
-            .map(|(a, b, value)| ResetStamp {
-                at: StampAt::Nodes(a, b),
-                value,
-                part: StampPart::Real,
-            })
-            .collect();
-        ResetStamps::new(&self.current.name, 'd', &self.current.terminals, stamps)?
-            .assemble_linear(context)?;
+        stamp_reset(
+            &self.current.name,
+            node_stamps(&stamps, StampPart::Real),
+            context,
+        )?;
         // C's reset AC load retains the resistive Jacobian from the
         // reset records but uses current VP/TT for the recovery subcircuit.
         let thermal = self.current.thermal(model)?;
@@ -575,6 +545,7 @@ impl Device for ResetDiode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::Device;
     use crate::devices::{ModelContext, initial::InstanceInitial};
     use crate::primitives::{NodeTable, SourceLoc};
     use std::path::PathBuf;
