@@ -237,29 +237,44 @@ impl PassiveInitialization {
         Ok(())
     }
 
-    /// Replace only the inductor's branch equation during bias. Its
-    /// terminal KCL current and physical flux state are unchanged.
-    pub(super) fn stamp_inductor(
+    /// Replace a storage device's owned branch equation during bias.
+    /// KCL always retains the physical terminal current. The ordinary
+    /// constitutive equation is restored outside the selected bias.
+    pub(super) fn stamp_owned_branch(
         &self,
         terminals: [NodeId; 2],
         row: usize,
         context: &mut StampContext<'_>,
     ) -> SpiceResult<bool> {
-        let Some(PassiveBias::Current {
-            current,
-            conductance,
-        }) = self.active(context)
-        else {
+        let Some(constraint) = self.active(context) else {
             return Ok(false);
+        };
+        let (voltage, current, rhs) = match constraint {
+            PassiveBias::Voltage {
+                voltage,
+                conductance: None,
+            } => (1., 0., voltage),
+            PassiveBias::Voltage {
+                voltage,
+                conductance: Some(g),
+            } => (-g, 1., -g * voltage),
+            PassiveBias::Current {
+                current,
+                conductance,
+            } => (-conductance, 1., current),
         };
         for (node, sign) in [(terminals[0], 1.), (terminals[1], -1.)] {
             if let Some(node_row) = context.unknowns.node_row(node) {
                 context.matrix.add(node_row, row, sign)?;
-                context.matrix.add(row, node_row, -sign * conductance)?;
+                if voltage != 0. {
+                    context.matrix.add(row, node_row, sign * voltage)?;
+                }
             }
         }
-        context.matrix.add(row, row, 1.)?;
-        context.rhs.add_to(row, current)?;
+        if current != 0. {
+            context.matrix.add(row, row, current)?;
+        }
+        context.rhs.add_to(row, rhs)?;
         Ok(true)
     }
 

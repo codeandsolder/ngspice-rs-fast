@@ -831,16 +831,20 @@ impl Switch {
         gmin: Real,
     ) -> SpiceResult<ltspice::Point> {
         law.evaluate(
-            ltspice::Conductance {
-                on: self.model.on_conductance,
-                off: self.model.off_conductance.unwrap_or(gmin),
-                threshold: self.model.threshold,
-                width: self.model.hysteresis.abs(),
-                gmin,
-            },
+            self.ltspice_parameters(gmin),
             ltspice::Bias { voltage, control },
             closed,
         )
+    }
+
+    fn ltspice_parameters(&self, gmin: Real) -> ltspice::Conductance {
+        ltspice::Conductance {
+            on: self.model.on_conductance,
+            off: self.model.off_conductance.unwrap_or(gmin),
+            threshold: self.model.threshold,
+            width: self.model.hysteresis.abs(),
+            gmin,
+        }
     }
 
     fn ltspice_closed(
@@ -1102,6 +1106,74 @@ impl Device for Switch {
             .reltol
             .mul_add(point.current.abs().max(predicted.abs()), context.abstol);
         Ok((predicted - point.current).abs() > tol)
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        use crate::devices::physical_dae::TaylorControl;
+        use crate::maths::taylor::differential::Differential;
+
+        let Some(law) = self.model.ltspice.filter(|law| !law.discrete()) else {
+            return Err(SpiceError::Unsupported {
+                feature: format!("memoryless physical Taylor switch for {}", self.name),
+                location: None,
+            });
+        };
+        let node = |terminal| context.unknowns.node_row(terminal);
+        let output = self.conducting_terminals().map(node);
+        let input = match self.kind {
+            SwitchKind::Voltage => [self.terminals[2], self.terminals[3]].map(node),
+            SwitchKind::Current => {
+                let row = context
+                    .controls
+                    .first()
+                    .copied()
+                    .ok_or_else(|| SpiceError::circuit("missing Taylor switch control row"))?;
+                [Some(row), None]
+            }
+        };
+        let controls = [
+            TaylorControl {
+                rows: output,
+                polarity: 1.,
+            },
+            TaylorControl {
+                rows: input,
+                polarity: 1.,
+            },
+        ];
+        let voltage = controls[0].input::<2>(0, context)?.value;
+        let control = controls[1].input::<2>(1, context)?.value;
+        let mut guards = context.output.guards.is_some().then(Vec::new);
+        let point = law.taylor(
+            self.ltspice_parameters(context.model.gmin),
+            voltage,
+            control,
+            &mut guards,
+        )?;
+        let current = Differential {
+            value: point.current,
+            gradient: [Some(point.jacobian.voltage), Some(point.jacobian.control)],
+        };
+        context.local_law(output, &current, &controls, 1., None)?;
+        if let (Some(trace), Some(guards)) = (&mut context.output.guards, guards) {
+            trace.extend(context.device, guards)?;
+        }
+        if let Some(series) = self.series() {
+            let branch = context
+                .branch
+                .ok_or_else(|| SpiceError::circuit("missing Taylor Lser branch"))?;
+            let row = Some(branch);
+            for (terminal, sign) in series.terminals.into_iter().zip([1., -1.]) {
+                let terminal = context.unknowns.node_row(terminal);
+                context.linear_static(terminal, row, sign)?;
+                context.linear_static(row, terminal, sign)?;
+            }
+            context.linear_charge(row, row, -series.value)?;
+        }
+        Ok(())
     }
 
     fn assemble_nonlinear_charge(

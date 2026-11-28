@@ -472,3 +472,226 @@ W1 p2 0 Vsen mi
     }
     Ok(())
 }
+
+#[test]
+fn continuous_physical_taylor_preserves_all_laws_and_one_sided_joins() -> SpiceResult<()> {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    use ngspice_rs::maths::Vector;
+    for (model, logarithmic, cubic, bounded) in [
+        ("pswitch", true, true, true),
+        ("pswitch", false, false, true),
+        ("aswitch", true, false, true),
+        ("aswitch", false, false, true),
+        ("aswitch", true, false, false),
+        ("aswitch", false, false, false),
+    ] {
+        for (off, on) in [(2., 4.), (4., 2.)] {
+            let input = if model == "pswitch" { "gd" } else { "vd" };
+            let parameters = if model == "pswitch" {
+                "r_cntl_in=200".to_owned()
+            } else {
+                format!("limit={bounded}")
+            };
+            let cards = format!(
+                "A1 %{input}(c z) %gd(p n) m\n.model m {model}(cntl_off={off} cntl_on={on} r_on=10 r_off=1k log={logarithmic} {parameters})"
+            );
+            let netlist = parse(&cards)?;
+            let config = RunConfig::from_netlist(&netlist)?;
+            let c = config.circuit(&netlist)?;
+            let rows = ["c", "z", "p", "n"]
+                .map(|name| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap());
+            let [cp, cn, p, n] = rows;
+            let prepared = c.prepare_run();
+            let dae = prepared.prepare_physical_dae(
+                &config.context().model_context(),
+                TransientTiming::new(1e-6, 1e-3)?,
+            )?;
+            let width = on - off;
+            // Include the bounded joins and the unbounded floor. The
+            // reference below is independent of the engine's local germs.
+            let floor = if logarithmic {
+                (1e-12_f64).ln() / (0.01_f64).ln()
+            } else {
+                (1e-9 - 1000.) / (10. - 1000.)
+            };
+            let mut fractions = vec![-0.2, 0., 0.3, 0.8, 1., 1.2];
+            if !bounded {
+                fractions.extend([floor - 0.01, floor + 0.01]);
+            }
+            for fraction in fractions {
+                let mut state = vec![Vector::zeros(c.unknown_count()); 9];
+                state[0].set(cp, fraction.mul_add(width, off) + 0.25)?;
+                state[0].set(cn, 0.25)?;
+                state[0].set(p, -1.5)?;
+                state[0].set(n, 0.5)?;
+                // Slow normalized control variation avoids crossing a join
+                // inside either tested Taylor germ.
+                let rate = if !bounded && !logarithmic && (fraction - floor).abs() < 0.02 {
+                    1e-5
+                } else {
+                    0.002
+                };
+                state[1].set(cp, rate * width + 0.04)?;
+                state[1].set(cn, 0.04)?;
+                state[1].set(p, 0.03)?;
+                state[1].set(n, -0.01)?;
+                for (limit, tau) in [(Limit::Left, -0.1_f64), (Limit::Right, 0.1_f64)] {
+                    let result = dae.evaluate_taylor(&state, 0., 1e-6, limit)?;
+                    let series = |values: &[Vector], row| {
+                        values.iter().rev().fold(0_f64, |sum, value| {
+                            sum.mul_add(tau, value.get(row).unwrap())
+                        })
+                    };
+                    let gradient = |row, col| {
+                        result
+                            .conductance
+                            .iter()
+                            .rev()
+                            .fold(0_f64, |sum, matrix| sum.mul_add(tau, matrix.get(row, col)))
+                    };
+                    let t = rate.mul_add(tau, fraction);
+                    let x = if bounded { t.clamp(0., 1.) } else { t };
+                    let flat = bounded && (t < 0. || t > 1.);
+                    let (g, dg) = if logarithmic {
+                        let (exponent, slope) = if cubic {
+                            (x * x * (3. - 2. * x), 6. * x * (1. - x))
+                        } else {
+                            (x, 1.)
+                        };
+                        let r = 1000. * 0.01_f64.powf(exponent);
+                        if !bounded && r <= 1e-9 {
+                            (1e9, 0.)
+                        } else {
+                            (
+                                r.recip(),
+                                if flat {
+                                    0.
+                                } else {
+                                    -0.01_f64.ln() * slope / r / width
+                                },
+                            )
+                        }
+                    } else {
+                        let r = (-990_f64).mul_add(x, 1000.);
+                        if !bounded && r <= 1e-9 {
+                            (1e9, 0.)
+                        } else {
+                            (r.recip(), if flat { 0. } else { 990. / width / r / r })
+                        }
+                    };
+                    let v = 0.04_f64.mul_add(tau, -2.);
+                    let expected = v * g;
+                    close(
+                        "output current",
+                        series(&result.residual, p),
+                        expected,
+                        1e-9,
+                        1e-11,
+                    );
+                    close(
+                        "negative current",
+                        series(&result.residual, n),
+                        -expected,
+                        1e-9,
+                        1e-11,
+                    );
+                    close("output derivative", gradient(p, p), g, 1e-9, 1e-11);
+                    close("output reverse derivative", gradient(p, n), -g, 1e-9, 1e-11);
+                    close("control derivative", gradient(p, cp), v * dg, 1e-8, 1e-11);
+                    close(
+                        "control reverse derivative",
+                        gradient(p, cn),
+                        -v * dg,
+                        1e-8,
+                        1e-11,
+                    );
+                    let input_g = if model == "pswitch" { 0.005 } else { 0. };
+                    let control = width.mul_add(t, off);
+                    close(
+                        "input loading",
+                        series(&result.residual, cp),
+                        input_g * control,
+                        1e-10,
+                        1e-13,
+                    );
+                    close(
+                        "input loading derivative",
+                        gradient(cp, cn),
+                        -input_g,
+                        1e-10,
+                        1e-13,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn derivative_arrays_follow_continuous_switches_and_current_ports() -> SpiceResult<()> {
+    let cards = "\
+Vctrl c 0 PWL(0 -0.5 2m 1.5)
+Ictrl 0 x PWL(0 -0.5 2m 1.5)
+Vsen x y 0
+Rsen y 0 1
+Vcommon cm 0 5
+Idiff cm ip PWL(0 -0.5 2m 1.5)
+Vb1 p1 0 1
+Vb2 p2 0 -2
+Vb3 p3 0 3
+A1 %gd(c 0) %gd(p1 0) mp
+A2 %id(ip cm) %gd(p2 0) ma
+A3 %vnam(vsen) %gd(p3 0) ma
+.model mp pswitch(cntl_off=0 cntl_on=1 r_on=10 r_off=1k log=true r_cntl_in=100)
+.model ma aswitch(cntl_off=0 cntl_on=1 r_on=10 r_off=1k log=true limit=true)
+B1 o1 0 v=1m*ddt(i(vb1))
+B2 o2 0 v=1m*ddt(i(vb2))
+B3 o3 0 v=1m*ddt(i(vb3))
+R1 o1 0 1k
+R2 o2 0 1k
+R3 o3 0 1k
+.options reltol=1e-8 vntol=1n";
+    let p = run(cards, AnalysisKind::Transient, &["5u", "2m", "0", "20u"])?;
+    let mut interior = 0;
+    let mut exterior = 0;
+    for k in 0..p.point_count() {
+        let t = value(&p, "time", k);
+        let x = 1000_f64.mul_add(t, -0.5);
+        let z = x.clamp(0., 1.);
+        let smooth = z * z * 2_f64.mul_add(-z, 3.);
+        let gp = 100_f64.powf(smooth) / 1000.;
+        let ga = 100_f64.powf(z) / 1000.;
+        for (name, want) in [
+            ("i(vb1)", -gp),
+            ("i(vb2)", 2. * ga),
+            ("i(vb3)", -3. * ga),
+            ("i(vsen)", x),
+            ("v(ip)", 5.),
+        ] {
+            close(name, value(&p, name, k), want, 1e-7, 1e-8);
+        }
+        // Exclude the exact derivative discontinuities of the exponential
+        // clamps, while retaining samples on both sides of each event.
+        if (x - 0.).abs() < 1e-7 || (x - 1.).abs() < 1e-7 || t == 0. || (t - 2e-3).abs() < 1e-12 {
+            continue;
+        }
+        let active = x > 0. && x < 1.;
+        let dp = if active {
+            gp * 100_f64.ln() * 6. * z * (1. - z)
+        } else {
+            0.
+        };
+        let da = if active { ga * 100_f64.ln() } else { 0. };
+        for (name, want) in [("v(o1)", -dp), ("v(o2)", 2. * da), ("v(o3)", -3. * da)] {
+            close(name, value(&p, name, k), want, 2e-6, 1e-8);
+        }
+        if active {
+            interior += 1;
+        } else {
+            exterior += 1;
+        }
+    }
+    assert!(interior > 10 && exterior > 10);
+    Ok(())
+}
