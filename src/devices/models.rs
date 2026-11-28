@@ -103,8 +103,12 @@ pub enum ModelFamily {
     FrequencyTransfer,
     /// Native hybrid analog receiver/event logic.
     LogicEvent,
+    /// Native ordered differential receiver.
+    LogicRange,
     /// Native ideal logic voltage bridge.
     LogicVoltage,
+    /// Native resolved-drive conductance branch.
+    LogicConductance,
     /// Timed conductance switch.
     TimedSwitch,
     /// XSPICE cubic logarithmic switch.
@@ -148,7 +152,9 @@ impl ModelFamily {
             "s_xfer" => Some(Self::RationalTransfer),
             "xfer" => Some(Self::FrequencyTransfer),
             "preprocess_logic_event" => Some(Self::LogicEvent),
+            "preprocess_logic_range" => Some(Self::LogicRange),
             "preprocess_logic_voltage" => Some(Self::LogicVoltage),
+            "preprocess_logic_conductance" => Some(Self::LogicConductance),
             "preprocess_timed_switch" => Some(Self::TimedSwitch),
             "pswitch" => Some(Self::PSwitch),
             "aswitch" => Some(Self::ASwitch),
@@ -181,7 +187,9 @@ impl ModelFamily {
             Self::RationalTransfer
             | Self::FrequencyTransfer
             | Self::LogicEvent
+            | Self::LogicRange
             | Self::LogicVoltage
+            | Self::LogicConductance
             | Self::TimedSwitch
             | Self::PSwitch
             | Self::ASwitch => 'a',
@@ -258,8 +266,12 @@ pub enum ModelBackend {
     FrequencyTransfer,
     /// Native hybrid event logic.
     LogicEvent,
+    /// Native ordered differential receiver.
+    LogicRange,
     /// Native ideal logic voltage bridge.
     LogicVoltage,
+    /// Native resolved-drive conductance branch.
+    LogicConductance,
     /// Timed conductance switch.
     TimedSwitch,
     /// XSPICE cubic logarithmic switch.
@@ -393,8 +405,12 @@ impl ModelBackend {
                     .for_family(ModelFamily::FrequencyTransfer),
                 BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
                     .for_family(ModelFamily::LogicEvent),
+                BackendSpec::new(Self::LogicRange, "Native ordered range receiver", &[1])
+                    .for_family(ModelFamily::LogicRange),
                 BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
                     .for_family(ModelFamily::LogicVoltage),
+                BackendSpec::new(Self::LogicConductance, "Native logic conductance", &[1])
+                    .for_family(ModelFamily::LogicConductance),
                 BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
                     .for_family(ModelFamily::TimedSwitch),
                 BackendSpec::new(Self::PSwitch, "Continuous cubic switch", &[1])

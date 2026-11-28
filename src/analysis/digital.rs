@@ -2,9 +2,15 @@
 //! iterations. See upstream XSPICE evtqueue.c, evtiter.c and evtbackup.c.
 
 use std::collections::{BTreeMap, BTreeSet};
+mod diagnostics;
+pub mod timing;
+use diagnostics::DiagnosticLog;
+pub use diagnostics::{DiagnosticDetail, EventDiagnostic};
+use timing::{Arrival, TimedInput, TimedOutput, TimingWindow};
 
 use crate::devices::code_model::{
-    AutonomousAdvance, CodeModel, DelayMode, Drive, EventContext, Output,
+    AutonomousAdvance, CodeModel, DelayMode, Drive, EventContext, Logic, ModelDiagnostic, Output,
+    Strength,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -43,6 +49,7 @@ struct Key {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventId {
     key: Key,
+    completion: Option<Key>,
     identity: u64,
 }
 
@@ -53,18 +60,27 @@ fn external_identity() -> SpiceResult<u64> {
         .map_err(|_| SpiceError::circuit("external event identity space exhausted"))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Event {
     Drive {
         driver: usize,
         drive: Drive,
         external: Option<u64>,
+        arrival: Option<ArrivalDelivery>,
     },
     Wake(usize),
 }
 
+#[derive(Clone, Debug)]
+struct ArrivalDelivery {
+    arrival: Arrival,
+    start: Key,
+    complete: bool,
+}
+
 #[derive(Debug, Default)]
 struct Net {
+    margin: Option<std::num::NonZeroU8>,
     drivers: Vec<usize>,
     subscribers: Vec<usize>,
 }
@@ -99,7 +115,13 @@ trait ErasedModel: std::fmt::Debug {
         context: EventContext,
         inputs: &[Drive],
         state: &mut dyn ModelState,
-    ) -> SpiceResult<Vec<Output>>;
+    ) -> SpiceResult<(Vec<Output>, Vec<ModelDiagnostic>)>;
+    fn evaluate_timed(
+        &self,
+        context: EventContext,
+        inputs: &[TimedInput],
+        state: &mut dyn ModelState,
+    ) -> SpiceResult<(Vec<TimedOutput>, Vec<ModelDiagnostic>)>;
 }
 
 impl<M: CodeModel> ErasedModel for M {
@@ -131,16 +153,30 @@ impl<M: CodeModel> ErasedModel for M {
         context: EventContext,
         inputs: &[Drive],
         state: &mut dyn ModelState,
-    ) -> SpiceResult<Vec<Output>> {
+    ) -> SpiceResult<(Vec<Output>, Vec<ModelDiagnostic>)> {
         let state = (state as &mut dyn std::any::Any)
             .downcast_mut::<M::State>()
             .ok_or_else(|| SpiceError::circuit("digital model state identity mismatch"))?;
-        CodeModel::evaluate(self, context, inputs, state)
+        let outputs = CodeModel::evaluate(self, context, inputs, state)?;
+        Ok((outputs, CodeModel::take_diagnostics(self, state)))
+    }
+    fn evaluate_timed(
+        &self,
+        context: EventContext,
+        inputs: &[TimedInput],
+        state: &mut dyn ModelState,
+    ) -> SpiceResult<(Vec<TimedOutput>, Vec<ModelDiagnostic>)> {
+        let state = (state as &mut dyn std::any::Any)
+            .downcast_mut::<M::State>()
+            .ok_or_else(|| SpiceError::circuit("digital model state identity mismatch"))?;
+        let outputs = CodeModel::evaluate_timed(self, context, inputs, state)?;
+        Ok((outputs, CodeModel::take_diagnostics(self, state)))
     }
 }
 
 #[derive(Debug)]
 struct Model {
+    name: std::sync::Arc<str>,
     kernel: Box<dyn ErasedModel>,
     inputs: Vec<NetId>,
     outputs: Vec<usize>,
@@ -154,6 +190,7 @@ pub struct Network {
     sources: Vec<usize>,
     models: Vec<Model>,
     lookahead: Vec<usize>,
+    track_arrivals: bool,
 }
 
 impl Network {
@@ -172,6 +209,27 @@ impl Network {
         if id.0 >= self.nets.len() {
             return Err(SpiceError::circuit("unknown digital net"));
         }
+        Ok(())
+    }
+
+    /// Declare the minimum rank difference required to override a
+    /// conflicting connected driver. Repeated declarations must agree.
+    ///
+    /// # Errors
+    /// Unknown net, inconsistent declaration, or rank margin above 63.
+    pub fn set_override_margin(
+        &mut self,
+        net: NetId,
+        margin: std::num::NonZeroU8,
+    ) -> SpiceResult<()> {
+        self.check_net(net)?;
+        let slot = &mut self.nets[net.0].margin;
+        if margin.get() > 63 || slot.is_some_and(|prior| prior != margin) {
+            return Err(SpiceError::circuit(
+                "inconsistent or invalid digital net strength margin",
+            ));
+        }
+        *slot = Some(margin);
         Ok(())
     }
 
@@ -205,6 +263,26 @@ impl Network {
         inputs: &[NetId],
         outputs: &[NetId],
     ) -> SpiceResult<()> {
+        self.add_named_model(
+            &format!("model#{}", self.models.len()),
+            model,
+            inputs,
+            outputs,
+        )
+    }
+
+    /// Bind a named instance for timing diagnostics, using the same port
+    /// and resource checks as an ordinary event model.
+    ///
+    /// # Errors
+    /// Unknown nets or port-count mismatch.
+    pub fn add_named_model<M: CodeModel>(
+        &mut self,
+        name: &str,
+        model: M,
+        inputs: &[NetId],
+        outputs: &[NetId],
+    ) -> SpiceResult<()> {
         if model.schema()
             != crate::devices::code_model::ModelSchema::digital(inputs.len(), outputs.len())
         {
@@ -214,6 +292,7 @@ impl Network {
             self.check_net(net)?;
         }
         let index = self.models.len();
+        self.track_arrivals |= model.tracks_arrivals();
         if model.requires_lookahead() {
             self.lookahead.push(index);
         }
@@ -222,6 +301,7 @@ impl Network {
         }
         let drivers = outputs.iter().map(|&net| self.add_driver(net)).collect();
         self.models.push(Model {
+            name: name.into(),
             kernel: Box::new(model),
             inputs: inputs.to_vec(),
             outputs: drivers,
@@ -259,10 +339,12 @@ pub struct Stats {
     pub rounds: usize,
     /// Autonomous horizon probes of external simulators.
     pub probes: usize,
+    /// Timing diagnostics committed during model evaluation.
+    pub diagnostics: usize,
 }
 
 /// Resolved net change after all output events at a time/delta are applied.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Change {
     /// Physical time.
     pub time: Real,
@@ -272,6 +354,8 @@ pub struct Change {
     pub net: NetId,
     /// Resolved value.
     pub drive: Drive,
+    /// Causal transition behind this boundary, if tracked.
+    pub arrival: Option<Arrival>,
 }
 
 #[derive(Clone, Debug)]
@@ -286,6 +370,174 @@ struct Group {
     delta: usize,
 }
 
+/// A driver waveform consists of a settled prefix and an ordered set
+/// of arrivals whose starts have been announced but whose ends have not
+/// yet become certain. A later completion supersedes any earlier event
+/// that could still have been pending. This is transport queue ordering,
+/// applied to each admissible realization rather than a guessed delay.
+#[derive(Clone, Debug)]
+struct DriverArrivals {
+    stable: Drive,
+    latest: Option<Arrival>,
+    active: BTreeMap<Key, Arrival>,
+    targets: BTreeMap<(Strength, Logic), usize>,
+    completed: Option<Key>,
+}
+
+impl DriverArrivals {
+    fn new(stable: Drive) -> Self {
+        Self {
+            stable,
+            latest: None,
+            active: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            completed: None,
+        }
+    }
+
+    fn envelope(&self) -> Drive {
+        match self.targets.len() {
+            0 => self.stable,
+            1 => {
+                let Some((&(strength, logic), _)) = self.targets.first_key_value() else {
+                    return self.stable;
+                };
+                timing::phase_between(self.stable, Drive { logic, strength })
+            }
+            _ => {
+                let strength = self
+                    .targets
+                    .last_key_value()
+                    .map_or(self.stable.strength, |(&(strength, _), _)| {
+                        strength.max(self.stable.strength)
+                    });
+                Drive {
+                    logic: Logic::Unknown,
+                    strength,
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, order: Key, drive: Drive) -> SpiceResult<()> {
+        self.stable = drive;
+        self.completed = Some(order);
+        while let Some((&first, _)) = self.active.first_key_value() {
+            if first > order {
+                break;
+            }
+            let (_, arrival) = self
+                .active
+                .pop_first()
+                .ok_or_else(|| SpiceError::circuit("missing active causal arrival"))?;
+            let key = (arrival.to().strength, arrival.to().logic);
+            let count = self
+                .targets
+                .get_mut(&key)
+                .ok_or_else(|| SpiceError::circuit("missing active causal drive count"))?;
+            *count -= 1;
+            if *count == 0 {
+                self.targets.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    fn start(&mut self, delivery: ArrivalDelivery) -> SpiceResult<Option<DiagnosticDetail>> {
+        let ArrivalDelivery {
+            arrival,
+            start,
+            complete,
+        } = delivery;
+        let prior = self.latest.as_ref().map_or(self.stable, Arrival::to);
+        if prior != arrival.from() {
+            return Err(SpiceError::circuit(
+                "causal driver transitions have inconsistent logical endpoints",
+            ));
+        }
+        let overlap = if let Some((_, previous)) = self.active.last_key_value()
+            && previous.window().bounds().maximum() > arrival.window().bounds().minimum()
+        {
+            let earlier = previous.window().bounds();
+            let later = arrival.window().bounds();
+            Some(DiagnosticDetail::CumulativeAmbiguity {
+                earlier,
+                later,
+                separation: arrival.window().relative_to(previous.window(), 100_000)?,
+            })
+        } else {
+            None
+        };
+        self.latest = Some(arrival.clone());
+        if complete {
+            self.finish(start, arrival.to())?;
+        } else {
+            *self
+                .targets
+                .entry((arrival.to().strength, arrival.to().logic))
+                .or_default() += 1;
+            self.active.insert(start, arrival);
+        }
+        Ok(overlap)
+    }
+
+    fn deliver(&mut self, delivery: ArrivalDelivery) -> SpiceResult<Option<DiagnosticDetail>> {
+        if !delivery.complete || delivery.arrival.window().bounds().is_exact() {
+            return self.start(delivery);
+        }
+        if self.completed.is_some_and(|order| delivery.start <= order) {
+            // A newer completion has made this delivery irrelevant.
+            return Ok(None);
+        }
+        if !self
+            .active
+            .get(&delivery.start)
+            .is_some_and(|a| a.same_transition(&delivery.arrival))
+        {
+            return Err(SpiceError::circuit(
+                "causal completion without matching start",
+            ));
+        }
+        self.finish(delivery.start, delivery.arrival.to())?;
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Arrivals {
+    drivers: Vec<DriverArrivals>,
+    nets: Vec<Option<Arrival>>,
+}
+
+impl Arrivals {
+    fn new(drivers: impl IntoIterator<Item = Drive>, nets: usize) -> Self {
+        Self {
+            drivers: drivers.into_iter().map(DriverArrivals::new).collect(),
+            nets: vec![None; nets],
+        }
+    }
+}
+
+fn same_arrival(a: Option<&Arrival>, b: Option<&Arrival>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_transition(b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn exact_arrival(from: Drive, to: Drive, time: Real) -> SpiceResult<Option<Arrival>> {
+    use crate::devices::code_model::Logic;
+    if from == to
+        || [from, to]
+            .iter()
+            .any(|d| matches!(d.logic, Logic::Rising | Logic::Falling))
+    {
+        return Ok(None);
+    }
+    Ok(Some(Arrival::new(from, to, TimingWindow::exact(time)?)?))
+}
+
 #[derive(Clone, Debug)]
 struct State {
     time: Time,
@@ -298,9 +550,12 @@ struct State {
     pending: Vec<BTreeSet<Key>>,
     wakeups: Vec<Option<Key>>,
     nets: Vec<Drive>,
+    arrivals: Option<Arrivals>,
     models: Vec<Box<dyn ModelState>>,
     predictions: Vec<Option<Prediction>>,
     stats: Stats,
+    diagnostics: DiagnosticLog,
+    first_fatal: Option<EventDiagnostic>,
 }
 
 impl State {
@@ -316,6 +571,12 @@ impl State {
             pending: vec![BTreeSet::new(); network.drivers.len()],
             wakeups: vec![None; network.models.len()],
             nets: vec![Drive::default(); network.nets.len()],
+            arrivals: network.track_arrivals.then(|| {
+                Arrivals::new(
+                    std::iter::repeat_n(Drive::default(), network.drivers.len()),
+                    network.nets.len(),
+                )
+            }),
             models: network
                 .models
                 .iter()
@@ -323,6 +584,8 @@ impl State {
                 .collect(),
             predictions: vec![None; network.models.len()],
             stats: Stats::default(),
+            diagnostics: DiagnosticLog::default(),
+            first_fatal: None,
         }
     }
 
@@ -339,11 +602,319 @@ impl State {
                 driver,
                 drive,
                 external,
+                arrival: None,
             },
         )
     }
 
-    fn schedule_event(&mut self, time: Time, event: Event) -> SpiceResult<Key> {
+    fn enable_arrivals(&mut self) {
+        if self.arrivals.is_none() {
+            self.arrivals = Some(Arrivals::new(self.drivers.iter().copied(), self.nets.len()));
+        }
+    }
+
+    fn schedule_arrival(
+        &mut self,
+        driver: usize,
+        arrival: Arrival,
+        external: Option<u64>,
+    ) -> SpiceResult<(Key, Option<Key>)> {
+        let bounds = arrival.window().bounds();
+        let start = Time::new(bounds.minimum())?;
+        let end = Time::new(bounds.maximum())?;
+        if start == Time(0) && start != end {
+            return Err(SpiceError::circuit(
+                "causal uncertainty starts before initial settlement",
+            ));
+        }
+        if start < self.time
+            || self
+                .sequence
+                .checked_add(if start == end { 1 } else { 2 })
+                .is_none()
+            || (start == self.time && self.initialized && self.delta == usize::MAX)
+        {
+            return Err(SpiceError::circuit(
+                "noncausal or unrepresentable arrival boundaries",
+            ));
+        }
+        self.enable_arrivals();
+        let order = self.next_key(start)?;
+        let key = self.schedule_event(
+            start,
+            Event::Drive {
+                driver,
+                drive: if start == end {
+                    arrival.to()
+                } else {
+                    arrival.phase()
+                },
+                external,
+                arrival: Some(ArrivalDelivery {
+                    arrival: arrival.clone(),
+                    start: order,
+                    complete: start == end,
+                }),
+            },
+        )?;
+        let completion = if start == end {
+            None
+        } else {
+            Some(self.schedule_event(
+                end,
+                Event::Drive {
+                    driver,
+                    drive: arrival.to(),
+                    external,
+                    arrival: Some(ArrivalDelivery {
+                        arrival,
+                        start: order,
+                        complete: true,
+                    }),
+                },
+            )?)
+        };
+        Ok((key, completion))
+    }
+
+    fn deliver_drive(
+        &mut self,
+        network: &Network,
+        driver: usize,
+        drive: Drive,
+        delivery: Option<ArrivalDelivery>,
+    ) -> SpiceResult<bool> {
+        let previous = self.drivers[driver];
+        let mut next = drive;
+        let mut changed = previous != drive;
+        let mut diagnostic = None;
+        if let Some(records) = &mut self.arrivals {
+            let history = &mut records.drivers[driver];
+            let prior = history.latest.clone();
+            if let Some(delivery) = delivery {
+                diagnostic = history.deliver(delivery)?;
+                next = history.envelope();
+            } else {
+                if !history.active.is_empty() {
+                    return Err(SpiceError::circuit(
+                        "scalar event interrupts causal driver transition",
+                    ));
+                }
+                if previous == drive {
+                    return Ok(false);
+                }
+                history.stable = drive;
+                history.latest = exact_arrival(previous, drive, self.time.value())?;
+            }
+            changed = previous != next || !same_arrival(prior.as_ref(), history.latest.as_ref());
+        }
+        self.drivers[driver] = next;
+        if let Some(detail) = diagnostic {
+            let model = network
+                .models
+                .iter()
+                .find(|m| m.outputs.contains(&driver))
+                .map_or_else(|| format!("source#{driver}").into(), |m| m.name.clone());
+            self.record_diagnostic(EventDiagnostic {
+                model,
+                time: self.time.value(),
+                delta: self.delta,
+                detail,
+            })?;
+        }
+        Ok(changed)
+    }
+
+    fn net_arrival(
+        &self,
+        binding: &Net,
+        net: NetId,
+        resolved: Drive,
+    ) -> SpiceResult<Option<Arrival>> {
+        let Some(records) = &self.arrivals else {
+            return Ok(None);
+        };
+        let now = self.time.value();
+        if let [driver] = binding.drivers.as_slice() {
+            if let Some(arrival) = &records.drivers[*driver].latest {
+                let from = Drive::resolve([arrival.from()]);
+                let to = Drive::resolve([arrival.to()]);
+                if from != to {
+                    return Ok(Some(Arrival::new(from, to, arrival.window().clone())?));
+                }
+                if arrival.active_at(now) {
+                    return Err(SpiceError::circuit(
+                        "causal drive has indistinguishable resolved endpoints",
+                    ));
+                }
+            }
+            return if self.nets[net.0] == resolved {
+                Ok(records.nets[net.0].clone())
+            } else {
+                exact_arrival(self.nets[net.0], resolved, now)
+            };
+        }
+        if binding
+            .drivers
+            .iter()
+            .any(|&id| records.drivers[id].active.len() > 1)
+        {
+            return Err(SpiceError::circuit(
+                "multi-driver cumulative waveform requires correlated bus resolution",
+            ));
+        }
+        let margin = binding.margin.unwrap_or(std::num::NonZeroU8::MIN);
+        let mut active = binding.drivers.iter().filter_map(|&id| {
+            records.drivers[id]
+                .latest
+                .as_ref()
+                .filter(|a| a.active_at(now))
+        });
+        if let Some(first) = active.next() {
+            // A stable driver which dominates every possible endpoint
+            // masks uncertainty independently of the transition order.
+            let masked =
+                binding.drivers.iter().any(|&id| {
+                    self.drivers[id] == resolved
+                        && records.drivers[id]
+                            .latest
+                            .as_ref()
+                            .is_none_or(|a| !a.active_at(now))
+                        && binding.drivers.iter().all(|&other| {
+                            records.drivers[other]
+                                .latest
+                                .as_ref()
+                                .filter(|a| a.active_at(now))
+                                .is_none_or(|a| {
+                                    resolved.strength.rank().saturating_sub(
+                                        a.from().strength.max(a.to().strength).rank(),
+                                    ) >= margin.get()
+                                })
+                        })
+                });
+            if masked {
+                return if self.nets[net.0] == resolved {
+                    Ok(records.nets[net.0].clone())
+                } else {
+                    exact_arrival(self.nets[net.0], resolved, now)
+                };
+            }
+            if active.any(|a| !a.window().same_expression(first.window())) {
+                return Err(SpiceError::circuit(
+                    "independent overlapping causal arrivals on resolved bus",
+                ));
+            }
+            let endpoint = |after: bool| {
+                Drive::resolve_with_margin(
+                    binding.drivers.iter().map(|&id| {
+                        records.drivers[id]
+                            .latest
+                            .as_ref()
+                            .filter(|a| a.active_at(now))
+                            .map_or(self.drivers[id], |a| if after { a.to() } else { a.from() })
+                    }),
+                    margin,
+                )
+            };
+            let from = endpoint(false);
+            let to = endpoint(true);
+            if from == to && from == resolved {
+                return if self.nets[net.0] == resolved {
+                    Ok(records.nets[net.0].clone())
+                } else {
+                    exact_arrival(self.nets[net.0], resolved, now)
+                };
+            }
+            let arrival = Arrival::new(from, to, first.window().clone())?;
+            if arrival.phase() != resolved
+                || (self.nets[net.0] != from
+                    && !records.nets[net.0]
+                        .as_ref()
+                        .is_some_and(|old| old.same_transition(&arrival)))
+            {
+                return Err(SpiceError::circuit(
+                    "bus resolution changes within causal arrival",
+                ));
+            }
+            return Ok(Some(arrival));
+        }
+        let prior = &records.nets[net.0];
+        if prior
+            .as_ref()
+            .is_some_and(|a| a.window().bounds().maximum() == now && a.to() == resolved)
+        {
+            return Ok(prior.clone());
+        }
+        if self.nets[net.0] == resolved {
+            return Ok(prior.clone());
+        }
+        exact_arrival(self.nets[net.0], resolved, now)
+    }
+
+    fn model_arrival(&mut self, driver: usize, arrival: Arrival) -> SpiceResult<()> {
+        let earliest = Time::new(arrival.window().bounds().minimum())?;
+        if self.desired[driver].unwrap_or(self.drivers[driver]) != arrival.from() {
+            return Err(SpiceError::circuit(
+                "causal output transition disagrees with requested endpoint",
+            ));
+        }
+        // A later posted transition that is guaranteed to occur no
+        // later than an undelivered predecessor supersedes that whole
+        // predecessor, including its completion. This applies to
+        // asymmetric exact delays and correlated bounded arrivals.
+        let mut superseded = Vec::new();
+        for key in self.pending[driver].iter().rev() {
+            if let Some(Event::Drive {
+                arrival: Some(delivery),
+                ..
+            }) = self.queue.get(key)
+                && *key == delivery.start
+                && key.time >= earliest
+            {
+                let separation = arrival
+                    .window()
+                    .relative_to(delivery.arrival.window(), 100_000)?;
+                if separation.maximum() <= 0. {
+                    superseded.push((delivery.start, delivery.arrival.from()));
+                } else if key.time > earliest {
+                    return Err(SpiceError::circuit(
+                        "causal output earliest order may reverse; conditional waveform required",
+                    ));
+                } else {
+                    break;
+                }
+            }
+        }
+        let from = superseded.last().map_or(arrival.from(), |(_, from)| *from);
+        if !superseded.is_empty() {
+            let removed: BTreeSet<_> = superseded.into_iter().map(|(key, _)| key).collect();
+            let keys: Vec<_> = self.pending[driver]
+                .iter()
+                .copied()
+                .filter(|key| {
+                    matches!(self.queue.get(key), Some(Event::Drive { arrival: Some(delivery), .. })
+                    if removed.contains(&delivery.start))
+                })
+                .collect();
+            for key in keys {
+                self.pending[driver].remove(&key);
+                self.queue.remove(&key);
+            }
+        }
+        self.desired[driver] = Some(arrival.to());
+        if from == arrival.to() {
+            return Ok(());
+        }
+        let arrival = Arrival::new(from, arrival.to(), arrival.window().clone())?;
+        let (start, end) = self.schedule_arrival(driver, arrival, None)?;
+        self.pending[driver].insert(start);
+        if let Some(end) = end {
+            self.pending[driver].insert(end);
+        }
+        Ok(())
+    }
+
+    fn next_key(&self, time: Time) -> SpiceResult<Key> {
         if time < self.time {
             return Err(SpiceError::circuit(
                 "cannot schedule event before current time",
@@ -356,11 +927,15 @@ impl State {
         } else {
             0
         };
-        let key = Key {
+        Ok(Key {
             time,
             delta,
             sequence: self.sequence,
-        };
+        })
+    }
+
+    fn schedule_event(&mut self, time: Time, event: Event) -> SpiceResult<Key> {
+        let key = self.next_key(time)?;
         self.sequence = self
             .sequence
             .checked_add(1)
@@ -374,6 +949,21 @@ impl State {
     }
 
     fn model_output_at(&mut self, driver: usize, output: Output, at: Time) -> SpiceResult<()> {
+        if self.arrivals.is_some()
+            && self.pending[driver].iter().any(|key| {
+                matches!(
+                    self.queue.get(key),
+                    Some(Event::Drive {
+                        arrival: Some(_),
+                        ..
+                    })
+                )
+            })
+        {
+            return Err(SpiceError::circuit(
+                "scalar output supersedes an unfinished causal transition",
+            ));
+        }
         let previous = self.desired[driver];
         if previous == Some(output.drive) {
             return Ok(());
@@ -395,7 +985,7 @@ impl State {
         let delay = if at == Time(0) {
             0.
         } else {
-            output.delays.transition(old.logic, output.drive.logic)
+            output.delays.transition(old, output.drive)
         };
         let time = Time::new(at.value() + delay)?;
         if delay > 0. && time == at {
@@ -416,11 +1006,36 @@ impl State {
 }
 
 impl State {
+    fn record_diagnostic(&mut self, diagnostic: EventDiagnostic) -> SpiceResult<()> {
+        self.stats.diagnostics = self
+            .stats
+            .diagnostics
+            .checked_add(1)
+            .ok_or_else(|| SpiceError::circuit("digital diagnostic count overflow"))?;
+        if diagnostic.is_fatal() && self.first_fatal.is_none() {
+            self.first_fatal = Some(diagnostic.clone());
+        }
+        self.diagnostics.push(diagnostic);
+        Ok(())
+    }
+
+    fn check_acceptance(&self) -> SpiceResult<()> {
+        if let Some(diagnostic) = &self.first_fatal {
+            return Err(SpiceError::circuit(diagnostic.to_string()));
+        }
+        Ok(())
+    }
+
     fn charge_work(&self, before: Stats, limit: usize) -> SpiceResult<()> {
         let events = self.stats.events - before.events;
         let evaluations = self.stats.evaluations - before.evaluations;
         let probes = self.stats.probes - before.probes;
-        if events.saturating_add(evaluations).saturating_add(probes) > limit {
+        if events
+            .saturating_add(evaluations)
+            .saturating_add(probes)
+            .saturating_add(self.stats.diagnostics - before.diagnostics)
+            > limit
+        {
             return Err(SpiceError::circuit("digital event work limit exceeded"));
         }
         Ok(())
@@ -437,17 +1052,51 @@ impl State {
             self.stats.evaluations += 1;
             self.charge_work(before, limit)?;
             let instance = &network.models[index];
-            let inputs: Vec<_> = instance.inputs.iter().map(|id| self.nets[id.0]).collect();
-            let outputs = instance.kernel.evaluate(
-                EventContext {
+            let context = EventContext {
+                time: self.time.value(),
+                delta: self.delta,
+                initial: self.time == Time(0),
+            };
+            enum Evaluated {
+                Scalar(Vec<Output>),
+                Timed(Vec<TimedOutput>),
+            }
+            let (outputs, diagnostics) = if let Some(records) = &self.arrivals {
+                let inputs: Vec<_> = instance
+                    .inputs
+                    .iter()
+                    .map(|id| TimedInput {
+                        drive: self.nets[id.0],
+                        arrival: records.nets[id.0].clone(),
+                    })
+                    .collect();
+                let (outputs, diagnostics) = instance.kernel.evaluate_timed(
+                    context,
+                    &inputs,
+                    self.models[index].as_mut(),
+                )?;
+                (Evaluated::Timed(outputs), diagnostics)
+            } else {
+                let inputs: Vec<_> = instance.inputs.iter().map(|id| self.nets[id.0]).collect();
+                let (outputs, diagnostics) =
+                    instance
+                        .kernel
+                        .evaluate(context, &inputs, self.models[index].as_mut())?;
+                (Evaluated::Scalar(outputs), diagnostics)
+            };
+            for detail in diagnostics {
+                self.record_diagnostic(EventDiagnostic {
+                    model: instance.name.clone(),
                     time: self.time.value(),
                     delta: self.delta,
-                    initial: self.time == Time(0),
-                },
-                &inputs,
-                self.models[index].as_mut(),
-            )?;
-            self.accept_model_outputs(network, index, outputs)?;
+                    detail: DiagnosticDetail::Timing(detail),
+                })?;
+            }
+            self.charge_work(before, limit)?;
+            match outputs {
+                Evaluated::Scalar(outputs) => self.accept_model_outputs(network, index, outputs)?,
+                Evaluated::Timed(outputs) => self.accept_timed_outputs(network, index, outputs)?,
+            }
         }
         Ok(())
     }
@@ -467,6 +1116,38 @@ impl State {
         for (&driver, output) in instance.outputs.iter().zip(outputs) {
             self.model_output(driver, output)?;
         }
+        self.update_wakeup(network, index)
+    }
+
+    fn accept_timed_outputs(
+        &mut self,
+        network: &Network,
+        index: usize,
+        outputs: Vec<TimedOutput>,
+    ) -> SpiceResult<()> {
+        let instance = &network.models[index];
+        if outputs.len() != instance.outputs.len() {
+            return Err(SpiceError::circuit(
+                "digital model returned incorrect output count",
+            ));
+        }
+        for (&driver, output) in instance.outputs.iter().zip(outputs) {
+            match output {
+                TimedOutput::Retain => {}
+                TimedOutput::Scalar(output) => self.model_output(driver, output)?,
+                TimedOutput::Arrival(arrival) => self.model_arrival(driver, arrival)?,
+                TimedOutput::Waveform(arrivals) => {
+                    for arrival in arrivals {
+                        self.model_arrival(driver, arrival)?;
+                    }
+                }
+            }
+        }
+        self.update_wakeup(network, index)
+    }
+
+    fn update_wakeup(&mut self, network: &Network, index: usize) -> SpiceResult<()> {
+        let instance = &network.models[index];
         if let Some(key) = self.wakeups[index].take() {
             self.queue.remove(&key);
         }
@@ -640,10 +1321,14 @@ impl State {
                 self.stats.events += 1;
                 self.charge_work(before, limits.work)?;
                 match event {
-                    Event::Drive { driver, drive, .. } => {
+                    Event::Drive {
+                        driver,
+                        drive,
+                        arrival,
+                        ..
+                    } => {
                         self.pending[driver].remove(&key);
-                        if self.drivers[driver] != drive {
-                            self.drivers[driver] = drive;
+                        if self.deliver_drive(network, driver, drive, arrival)? {
                             affected.insert(network.drivers[driver]);
                         }
                     }
@@ -655,14 +1340,26 @@ impl State {
             }
             for net in affected {
                 let binding = &network.nets[net.0];
-                let resolved = Drive::resolve(binding.drivers.iter().map(|&id| self.drivers[id]));
-                if self.nets[net.0] != resolved {
+                let resolved = Drive::resolve_with_margin(
+                    binding.drivers.iter().map(|&id| self.drivers[id]),
+                    binding.margin.unwrap_or(std::num::NonZeroU8::MIN),
+                );
+                let arrival = self.net_arrival(binding, net, resolved)?;
+                let provenance_changed = if let Some(records) = &mut self.arrivals {
+                    let changed = !same_arrival(records.nets[net.0].as_ref(), arrival.as_ref());
+                    records.nets[net.0] = arrival.clone();
+                    changed
+                } else {
+                    false
+                };
+                if self.nets[net.0] != resolved || provenance_changed {
                     self.nets[net.0] = resolved;
                     changes.push(Change {
                         time: self.time.value(),
                         delta: self.delta,
                         net,
                         drive: resolved,
+                        arrival,
                     });
                     dirty.extend(binding.subscribers.iter().copied());
                 }
@@ -749,10 +1446,22 @@ impl Engine {
         self.accepted.nets.get(net.0).copied()
     }
 
+    /// Latest accepted causal arrival for a valid net, if tracked.
+    #[must_use = "the accepted expression retains correlated event timing"]
+    pub fn arrival(&self, net: NetId) -> Option<&Arrival> {
+        self.accepted.arrivals.as_ref()?.nets.get(net.0)?.as_ref()
+    }
+
     /// Accepted counters.
     #[must_use = "the returned counters quantify committed digital engine work"]
     pub const fn stats(&self) -> Stats {
         self.accepted.stats
+    }
+
+    /// Chronologically ordered diagnostics from committed event evaluations.
+    #[must_use = "the returned records report accepted timing violations"]
+    pub fn diagnostics(&self) -> Vec<EventDiagnostic> {
+        self.accepted.diagnostics.records()
     }
 
     /// Start a disposable trial. Dropping it leaves all accepted state and
@@ -792,22 +1501,50 @@ impl Trial<'_> {
         let key = self
             .state
             .schedule(Time::new(time)?, driver, drive, Some(identity))?;
-        Ok(EventId { key, identity })
+        Ok(EventId {
+            key,
+            completion: None,
+            identity,
+        })
     }
 
-    /// Cancel an external event if it has not yet been delivered.
-    pub fn cancel(&mut self, event: EventId) -> bool {
-        if self
+    /// Queue both boundaries of one causal transition atomically.
+    ///
+    /// # Errors
+    /// Invalid source, past arrival or exhausted event identifiers.
+    /// Overlapping or inconsistent source waveforms are rejected at delivery.
+    pub fn schedule_arrival(&mut self, source: SourceId, arrival: Arrival) -> SpiceResult<EventId> {
+        let driver = *self
+            .engine
+            .network
+            .sources
+            .get(source.0)
+            .ok_or_else(|| SpiceError::circuit("unknown digital source"))?;
+        let identity = external_identity()?;
+        let (key, completion) = self
             .state
-            .queue
-            .get(&event.key)
-            .is_some_and(|queued| matches!(queued, Event::Drive { external: Some(id), .. } if *id == event.identity))
-        {
-            self.state.queue.remove(&event.key);
-            true
-        } else {
-            false
+            .schedule_arrival(driver, arrival, Some(identity))?;
+        Ok(EventId {
+            key,
+            completion,
+            identity,
+        })
+    }
+
+    /// Cancel an external event before its first boundary has been delivered.
+    pub fn cancel(&mut self, event: EventId) -> bool {
+        let matches = |key| {
+            self.state.queue.get(&key).is_some_and(
+            |queued| matches!(queued, Event::Drive { external: Some(id), .. } if *id == event.identity))
+        };
+        if !matches(event.key) || event.completion.is_some_and(|key| !matches(key)) {
+            return false;
         }
+        self.state.queue.remove(&event.key);
+        if let Some(key) = event.completion {
+            self.state.queue.remove(&key);
+        }
+        true
     }
 
     /// Evaluate all events up to and including the specified physical time.
@@ -838,6 +1575,19 @@ impl Trial<'_> {
         self.state.nets.get(net.0).copied()
     }
 
+    /// Latest provisional causal arrival for a valid net, if tracked.
+    #[must_use = "the provisional expression retains correlated event timing"]
+    pub fn arrival(&self, net: NetId) -> Option<&Arrival> {
+        self.state.arrivals.as_ref()?.nets.get(net.0)?.as_ref()
+    }
+
+    /// Diagnostics in the disposable event state, including prior committed
+    /// diagnostics. Dropping the trial discards newly generated records.
+    #[must_use = "the returned records describe trial timing violations"]
+    pub fn diagnostics(&self) -> Vec<EventDiagnostic> {
+        self.state.diagnostics.records()
+    }
+
     /// Resolved net transitions in this trial, in deterministic order.
     #[must_use = "the returned ordered transitions supply the trial changes for mixed-signal synchronization"]
     pub fn changes(&self) -> &[Change] {
@@ -866,13 +1616,17 @@ impl Trial<'_> {
         if self.failed {
             return Err(SpiceError::circuit("cannot commit failed digital trial"));
         }
+        self.state.check_acceptance()?;
         self.engine.accepted = self.state;
         Ok(())
     }
 }
 
 use crate::devices::Circuit;
-use crate::devices::code_model::{Adc, DacConfig, DacPort, DacRamp, DacSource, Delays};
+use crate::devices::code_model::{
+    Adc, AnalogOutputConfig, AnalogOutputDevice, DacConfig, Delays, OutputPort, OutputRamp,
+    RangeReceiver, RangeState,
+};
 use crate::maths::Vector;
 use crate::primitives::NodeId;
 
@@ -891,12 +1645,136 @@ pub struct AdcBinding {
     pub mode: DelayMode,
 }
 
+/// Ordered analog receiver coupled to an exclusively owned digital source.
 #[derive(Clone, Debug)]
-pub(crate) struct DacBinding {
+pub struct RangeBinding {
+    /// Instance name used by accepted gap diagnostics.
+    pub name: std::sync::Arc<str>,
+    /// Positive and negative analog terminals.
+    pub terminals: [NodeId; 2],
+    /// Digital source dedicated to this receiver.
+    pub source: SourceId,
+    /// Ordered voltage intervals and explicit fallback policy.
+    pub receiver: RangeReceiver,
+    /// Propagation delays.
+    pub delays: Delays,
+    /// Output cancellation policy.
+    pub mode: DelayMode,
+}
+
+#[derive(Clone, Debug)]
+enum ReceiverKind {
+    Binary(Adc),
+    Ordered {
+        name: std::sync::Arc<str>,
+        material: RangeReceiver,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReceiverBinding {
+    terminals: [NodeId; 2],
+    source: SourceId,
+    kind: ReceiverKind,
+    delays: Delays,
+    mode: DelayMode,
+}
+
+impl From<AdcBinding> for ReceiverBinding {
+    fn from(binding: AdcBinding) -> Self {
+        Self {
+            terminals: binding.terminals,
+            source: binding.source,
+            kind: ReceiverKind::Binary(binding.thresholds),
+            delays: binding.delays,
+            mode: binding.mode,
+        }
+    }
+}
+
+impl From<RangeBinding> for ReceiverBinding {
+    fn from(binding: RangeBinding) -> Self {
+        Self {
+            terminals: binding.terminals,
+            source: binding.source,
+            kind: ReceiverKind::Ordered {
+                name: binding.name,
+                material: binding.receiver,
+            },
+            delays: binding.delays,
+            mode: binding.mode,
+        }
+    }
+}
+
+impl ReceiverBinding {
+    fn initial_state(&self) -> Option<RangeState> {
+        match &self.kind {
+            ReceiverKind::Binary(_) => None,
+            ReceiverKind::Ordered { material, .. } => Some(material.initial_state()),
+        }
+    }
+
+    fn crossing(
+        &self,
+        start: (Real, Real),
+        end: (Real, Real),
+        previous: Drive,
+        state: Option<RangeState>,
+    ) -> SpiceResult<Option<Real>> {
+        match (&self.kind, state) {
+            (ReceiverKind::Binary(adc), None) => adc.crossing(start, end, previous.logic),
+            (ReceiverKind::Ordered { material, .. }, Some(state)) => {
+                material.crossing(start, end, state)
+            }
+            _ => Err(SpiceError::circuit("receiver state does not match binding")),
+        }
+    }
+
+    fn sample(
+        &self,
+        time: Time,
+        voltage: Real,
+        previous: Drive,
+        state: Option<&mut RangeState>,
+        diagnostics: &mut Vec<EventDiagnostic>,
+    ) -> SpiceResult<(Drive, bool)> {
+        match (&self.kind, state) {
+            (ReceiverKind::Binary(adc), None) => Ok((
+                Drive::strong(adc.sample_at(voltage, previous.logic, time == Time(0))?),
+                adc.is_qualified(),
+            )),
+            (ReceiverKind::Ordered { name, material }, Some(prior)) => {
+                let sample = material.select(voltage, *prior)?;
+                if sample.state.in_gap()
+                    && (time == Time(0) || sample.state != *prior || material.rejects_gaps())
+                {
+                    diagnostics.push(EventDiagnostic {
+                        model: name.clone(),
+                        time: time.value(),
+                        delta: 0,
+                        detail: DiagnosticDetail::RangeGap {
+                            fatal: material.rejects_gaps(),
+                            voltage,
+                            drive: sample.drive,
+                            range_index: sample.state.index(),
+                        },
+                    });
+                }
+                *prior = sample.state;
+                Ok((sample.drive, true))
+            }
+            _ => Err(SpiceError::circuit("receiver state does not match binding")),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AnalogOutputBinding {
     pub(crate) name: String,
     pub(crate) net: NetId,
-    pub(crate) config: DacConfig,
-    pub(crate) port: DacPort,
+    pub(crate) config: AnalogOutputConfig,
+    pub(crate) port: OutputPort,
 }
 
 /// Immutable source-bound topology. Each analysis receives a new event
@@ -904,16 +1782,20 @@ pub(crate) struct DacBinding {
 #[derive(Debug)]
 pub(crate) struct NativeTopology {
     network: std::rc::Rc<Network>,
-    adcs: Vec<AdcBinding>,
-    dacs: Vec<DacBinding>,
+    receivers: Vec<ReceiverBinding>,
+    analog_outputs: Vec<AnalogOutputBinding>,
 }
 
 impl NativeTopology {
-    pub(crate) fn new(network: Network, adcs: Vec<AdcBinding>, dacs: Vec<DacBinding>) -> Self {
+    pub(crate) fn new(
+        network: Network,
+        receivers: Vec<ReceiverBinding>,
+        analog_outputs: Vec<AnalogOutputBinding>,
+    ) -> Self {
         Self {
             network: std::rc::Rc::new(network),
-            adcs,
-            dacs,
+            receivers,
+            analog_outputs,
         }
     }
 
@@ -922,8 +1804,13 @@ impl NativeTopology {
             std::rc::Rc::clone(&self.network),
             Limits::default(),
         )?);
-        mixed.adcs.clone_from(&self.adcs);
-        mixed.dacs.clone_from(&self.dacs);
+        mixed.receivers.clone_from(&self.receivers);
+        mixed.range_states = self
+            .receivers
+            .iter()
+            .filter_map(ReceiverBinding::initial_state)
+            .collect();
+        mixed.analog_outputs.clone_from(&self.analog_outputs);
         Ok(mixed)
     }
 }
@@ -933,8 +1820,10 @@ impl NativeTopology {
 #[derive(Debug)]
 pub struct MixedSignal {
     engine: Engine,
-    adcs: Vec<AdcBinding>,
-    dacs: Vec<DacBinding>,
+    receivers: Vec<ReceiverBinding>,
+    analog_outputs: Vec<AnalogOutputBinding>,
+    range_states: Vec<RangeState>,
+    initial_gap_diagnostics: Vec<EventDiagnostic>,
     previous: Option<(Time, Vec<Real>)>,
     changes: Vec<Change>,
     initial_backup: Option<State>,
@@ -959,8 +1848,10 @@ impl EventPreview {
 pub(super) struct MixedPoint {
     time: Time,
     voltages: Vec<Real>,
+    range_states: Vec<RangeState>,
+    initial_gap_diagnostics: Vec<EventDiagnostic>,
     state: Option<State>,
-    ramps: Vec<DacRamp>,
+    ramps: Vec<OutputRamp>,
     changes: Vec<Change>,
     boundary: bool,
 }
@@ -972,8 +1863,10 @@ impl MixedSignal {
     pub const fn new(engine: Engine) -> Self {
         Self {
             engine,
-            adcs: Vec::new(),
-            dacs: Vec::new(),
+            receivers: Vec::new(),
+            range_states: Vec::new(),
+            initial_gap_diagnostics: Vec::new(),
+            analog_outputs: Vec::new(),
             previous: None,
             changes: Vec::new(),
             initial_backup: None,
@@ -998,13 +1891,28 @@ impl MixedSignal {
     /// # Errors
     /// Unknown or already assigned source.
     pub fn add_adc(&mut self, binding: AdcBinding) -> SpiceResult<()> {
+        self.add_receiver(binding.into())
+    }
+
+    /// Bind an ordered differential voltage receiver to an exclusive source.
+    ///
+    /// # Errors
+    /// Unknown or already assigned source.
+    pub fn add_range_receiver(&mut self, binding: RangeBinding) -> SpiceResult<()> {
+        self.add_receiver(binding.into())
+    }
+
+    fn add_receiver(&mut self, binding: ReceiverBinding) -> SpiceResult<()> {
         let driver = *self
             .engine
             .network
             .sources
             .get(binding.source.0)
             .ok_or_else(|| SpiceError::circuit("unknown ADC source"))?;
-        if self.adcs.iter().any(|adc| adc.source == binding.source)
+        if self
+            .receivers
+            .iter()
+            .any(|receiver| receiver.source == binding.source)
             || self
                 .engine
                 .accepted
@@ -1015,7 +1923,8 @@ impl MixedSignal {
         {
             return Err(SpiceError::circuit("ADC source must be exclusively owned"));
         }
-        self.adcs.push(binding);
+        self.range_states.extend(binding.initial_state());
+        self.receivers.push(binding);
         Ok(())
     }
 
@@ -1037,17 +1946,18 @@ impl MixedSignal {
             return Err(SpiceError::circuit("DAC output terminals must differ"));
         }
         let name = name.into();
-        let port = DacPort::default();
-        circuit.add_device(Box::new(DacSource {
+        let port = OutputPort::default();
+        circuit.add_device(Box::new(AnalogOutputDevice {
             name: name.clone(),
             terminals,
             port: port.clone(),
+            config: AnalogOutputConfig::Voltage(config),
             native: None,
         }))?;
-        self.dacs.push(DacBinding {
+        self.analog_outputs.push(AnalogOutputBinding {
             name,
             net,
-            config,
+            config: AnalogOutputConfig::Voltage(config),
             port,
         });
         Ok(())
@@ -1062,8 +1972,8 @@ impl MixedSignal {
                 "mixed-signal transient requires an unused time-zero engine",
             ));
         }
-        for adc in &self.adcs {
-            if adc
+        for receiver in &self.receivers {
+            if receiver
                 .terminals
                 .iter()
                 .any(|&node| circuit.nodes().node(node).is_none())
@@ -1071,47 +1981,67 @@ impl MixedSignal {
                 return Err(SpiceError::circuit("ADC terminal is not in the circuit"));
             }
         }
-        for dac in &self.dacs {
+        for binding in &self.analog_outputs {
             let device = circuit
-                .device(&dac.name)
-                .and_then(|device| (device as &dyn std::any::Any).downcast_ref::<DacSource>())
-                .ok_or_else(|| SpiceError::circuit("DAC device is missing from the circuit"))?;
-            if !device.port.same(&dac.port) {
+                .device(&binding.name)
+                .and_then(|device| {
+                    (device as &dyn std::any::Any).downcast_ref::<AnalogOutputDevice>()
+                })
+                .ok_or_else(|| {
+                    SpiceError::circuit("analog output device is missing from the circuit")
+                })?;
+            if !device.port.same(&binding.port) {
                 return Err(SpiceError::circuit(
-                    "DAC binding belongs to a different circuit",
+                    "analog output binding belongs to a different circuit",
                 ));
             }
         }
         let ramps = self
-            .dacs
+            .analog_outputs
             .iter()
-            .map(|dac| {
-                dac.config
-                    .target(self.engine.accepted.nets[dac.net.0].logic)
-                    .map(DacRamp::initial)
+            .map(|binding| {
+                binding
+                    .config
+                    .target(self.engine.accepted.nets[binding.net.0])
+                    .map(OutputRamp::initial)
             })
             .collect::<SpiceResult<Vec<_>>>()?;
         self.initial_backup = Some(self.engine.accepted.clone());
-        for (dac, ramp) in self.dacs.iter().zip(ramps) {
-            dac.port.set(Some(ramp));
+        for (binding, ramp) in self.analog_outputs.iter().zip(ramps) {
+            binding.port.set(Some(ramp));
         }
         Ok(())
     }
 
     pub(super) fn deactivate(&mut self) {
-        for dac in &self.dacs {
-            dac.port.set(None);
+        for binding in &self.analog_outputs {
+            binding.port.set(None);
         }
         if let Some(previous) = self.initial_backup.take() {
             self.engine.accepted = previous;
             self.previous = None;
+            self.range_states = self
+                .receivers
+                .iter()
+                .filter_map(ReceiverBinding::initial_state)
+                .collect();
+            self.initial_gap_diagnostics.clear();
             self.changes.clear();
             self.boundary = false;
         }
     }
 
-    pub(super) fn accept_initial(&mut self) {
+    pub(super) fn accept_initial(&mut self) -> SpiceResult<()> {
+        let before = self.engine.accepted.stats;
+        for diagnostic in std::mem::take(&mut self.initial_gap_diagnostics) {
+            self.engine.accepted.record_diagnostic(diagnostic)?;
+        }
+        self.engine
+            .accepted
+            .charge_work(before, self.engine.limits.work)?;
+        self.engine.accepted.check_acceptance()?;
         self.initial_backup = None;
+        Ok(())
     }
 
     fn voltages(&self, circuit: &Circuit, solution: &Vector) -> SpiceResult<Vec<Real>> {
@@ -1126,10 +2056,10 @@ impl MixedSignal {
                     .ok_or_else(|| SpiceError::circuit("missing ADC analog row"))
             }
         };
-        self.adcs
+        self.receivers
             .iter()
-            .map(|adc| {
-                let v = voltage(adc.terminals[0])? - voltage(adc.terminals[1])?;
+            .map(|receiver| {
+                let v = voltage(receiver.terminals[0])? - voltage(receiver.terminals[1])?;
                 if !v.is_finite() {
                     return Err(SpiceError::circuit("nonfinite differential ADC input"));
                 }
@@ -1138,8 +2068,8 @@ impl MixedSignal {
             .collect()
     }
 
-    fn adc_previous(&self, adc: &AdcBinding) -> Drive {
-        let driver = self.engine.network.sources[adc.source.0];
+    fn receiver_previous(&self, receiver: &ReceiverBinding) -> Drive {
+        let driver = self.engine.network.sources[receiver.source.0];
         self.engine.accepted.desired[driver].unwrap_or(self.engine.accepted.drivers[driver])
     }
 
@@ -1154,14 +2084,23 @@ impl MixedSignal {
         };
         let voltages = self.voltages(circuit, solution)?;
         let mut earliest = None;
-        for ((adc, &v0), v1) in self.adcs.iter().zip(previous).zip(voltages) {
-            if let Some(crossing) = adc.thresholds.crossing(
+        let mut states = self.range_states.iter().copied();
+        for ((receiver, &v0), v1) in self.receivers.iter().zip(previous).zip(voltages) {
+            let state = match receiver.kind {
+                ReceiverKind::Binary(_) => None,
+                ReceiverKind::Ordered { .. } => states.next(),
+            };
+            if let Some(crossing) = receiver.crossing(
                 (start.value(), v0),
                 (time, v1),
-                self.adc_previous(adc).logic,
+                self.receiver_previous(receiver),
+                state,
             )? {
                 earliest = Some(earliest.map_or(crossing, |old: Real| old.min(crossing)));
             }
+        }
+        if states.next().is_some() {
+            return Err(SpiceError::circuit("surplus ordered receiver state"));
         }
         Ok(earliest)
     }
@@ -1169,8 +2108,8 @@ impl MixedSignal {
     /// Earliest end of an accepted DAC ramp.
     pub(super) fn next_ramp_boundary(&self, now: Real) -> SpiceResult<Option<Real>> {
         let mut next: Option<Real> = None;
-        for dac in &self.dacs {
-            if let Some(end) = dac.port.ramp()?.next_break(now) {
+        for binding in &self.analog_outputs {
+            if let Some(end) = binding.port.ramp()?.next_break(now) {
                 next = Some(next.map_or(end, |old| old.min(end)));
             }
         }
@@ -1181,7 +2120,7 @@ impl MixedSignal {
     /// change, rather than forcing an analog solve for every digital event.
     /// Reuse this state on acceptance if the analog endpoint is unchanged.
     pub(super) fn preview(&self, horizon: Real) -> SpiceResult<Option<EventPreview>> {
-        if self.dacs.is_empty()
+        if self.analog_outputs.is_empty()
             || (!self.engine.has_lookahead()
                 && self
                     .engine
@@ -1199,11 +2138,11 @@ impl MixedSignal {
             self.engine.limits,
             &mut changes,
             |trial| {
-                for dac in &self.dacs {
-                    let old = dac
+                for binding in &self.analog_outputs {
+                    let old = binding
                         .config
-                        .target(self.engine.accepted.nets[dac.net.0].logic)?;
-                    let new = dac.config.target(trial.nets[dac.net.0].logic)?;
+                        .target(self.engine.accepted.nets[binding.net.0])?;
+                    let new = binding.config.target(trial.nets[binding.net.0])?;
                     if old.to_bits() != new.to_bits() {
                         return Ok(true);
                     }
@@ -1239,60 +2178,87 @@ impl MixedSignal {
         let voltages = self.voltages(circuit, solution)?;
         let mut updates = Vec::new();
         let mut qualified_updates = Vec::new();
-        for (adc, &voltage) in self.adcs.iter().zip(&voltages) {
-            let previous = self.adc_previous(adc);
-            let drive = Drive::strong(adc.thresholds.sample_at(
-                voltage,
-                previous.logic,
-                end == Time(0),
-            )?);
+        let mut range_states = self.range_states.clone();
+        let mut range_diagnostics = Vec::new();
+        let mut states = range_states.iter_mut();
+        for (receiver, &voltage) in self.receivers.iter().zip(&voltages) {
+            let range_state = match receiver.kind {
+                ReceiverKind::Binary(_) => None,
+                ReceiverKind::Ordered { .. } => states.next(),
+            };
+            let previous = self.receiver_previous(receiver);
+            let (drive, qualified) =
+                receiver.sample(end, voltage, previous, range_state, &mut range_diagnostics)?;
             if drive != previous {
-                let destination = if adc.thresholds.is_qualified() {
+                let destination = if qualified {
                     &mut qualified_updates
                 } else {
                     &mut updates
                 };
                 destination.push((
-                    self.engine.network.sources[adc.source.0],
+                    self.engine.network.sources[receiver.source.0],
                     Output {
                         drive,
-                        delays: adc.delays,
-                        mode: adc.mode,
+                        delays: receiver.delays,
+                        mode: receiver.mode,
                     },
                 ));
             }
+        }
+        if states.next().is_some() {
+            return Err(SpiceError::circuit("surplus ordered receiver state"));
         }
         let events_due = (self.engine.has_lookahead() && end > self.engine.accepted.time)
             || self
                 .engine
                 .next_event_time()
                 .is_some_and(|next| next <= time);
-        let ramp_boundary = self.dacs.iter().try_fold(false, |found, dac| {
-            let ramp = dac.port.ramp()?;
-            let previous = self.engine.time();
-            Ok::<_, SpiceError>(found || ramp.next_break(previous).is_some_and(|end| end <= time))
-        })?;
+        let ramp_boundary = self
+            .analog_outputs
+            .iter()
+            .try_fold(false, |found, binding| {
+                let ramp = binding.port.ramp()?;
+                let previous = self.engine.time();
+                Ok::<_, SpiceError>(
+                    found || ramp.next_break(previous).is_some_and(|end| end <= time),
+                )
+            })?;
         let mut point = MixedPoint {
             time: end,
             voltages,
+            range_states,
+            initial_gap_diagnostics: Vec::new(),
             state: None,
             ramps: Vec::new(),
             changes: Vec::new(),
             boundary: ramp_boundary,
         };
-        if !events_due && updates.is_empty() && qualified_updates.is_empty() {
+        if end == Time(0) {
+            point.initial_gap_diagnostics = std::mem::take(&mut range_diagnostics);
+        }
+        if !events_due
+            && updates.is_empty()
+            && qualified_updates.is_empty()
+            && range_diagnostics.is_empty()
+        {
             return Ok(point);
         }
-        let state =
+        let mut state =
             self.prepare_event_state(end, preview, qualified_updates, updates, &mut point.changes)?;
+        for diagnostic in range_diagnostics {
+            state.record_diagnostic(diagnostic)?;
+        }
         state.charge_work(self.engine.accepted.stats, self.engine.limits.work)?;
-        for dac in &self.dacs {
-            let logic = state.nets[dac.net.0].logic;
-            let previous_ramp = dac.port.ramp()?;
+        // Previews can discover tentative timing failures. Only the replay
+        // with converged receiver values may prevent analog acceptance.
+        state.check_acceptance()?;
+        for binding in &self.analog_outputs {
+            let drive = state.nets[binding.net.0];
+            let previous_ramp = binding.port.ramp()?;
             let ramp = if end == Time(0) {
-                DacRamp::initial(dac.config.target(logic)?)
+                OutputRamp::initial(binding.config.target(drive)?)
             } else {
-                dac.config.retarget(previous_ramp, time, logic)?
+                binding.config.retarget(previous_ramp, time, drive)?
             };
             point.boundary |= !ramp.same_target(previous_ramp);
             point.ramps.push(ramp);
@@ -1344,8 +2310,8 @@ impl MixedSignal {
     }
 
     pub(super) fn initial_changed(&self, point: &MixedPoint) -> SpiceResult<bool> {
-        for (dac, ramp) in self.dacs.iter().zip(&point.ramps) {
-            if dac.port.ramp()?.value(0.).to_bits() != ramp.value(0.).to_bits() {
+        for (binding, ramp) in self.analog_outputs.iter().zip(&point.ramps) {
+            if binding.port.ramp()?.value(0.).to_bits() != ramp.value(0.).to_bits() {
                 return Ok(true);
             }
         }
@@ -1355,17 +2321,20 @@ impl MixedSignal {
     /// Update the initial linear source RHS to match the current mixed bias
     /// candidate; the companion system's topology and A/E remain immutable.
     pub(super) fn initial_rhs(&self, circuit: &Circuit, rhs: &mut Vector) -> SpiceResult<()> {
-        for dac in &self.dacs {
+        for binding in &self.analog_outputs {
+            if !binding.config.is_voltage() {
+                continue;
+            }
             let index = circuit
                 .devices()
                 .iter()
-                .position(|device| device.name().eq_ignore_ascii_case(&dac.name))
+                .position(|device| device.name().eq_ignore_ascii_case(&binding.name))
                 .ok_or_else(|| SpiceError::circuit("missing DAC device"))?;
             let row = circuit
                 .branch_rows(index)
                 .and_then(|mut rows| rows.next())
                 .ok_or_else(|| SpiceError::circuit("missing DAC branch row"))?;
-            let value = dac.port.ramp()?.value(0.);
+            let value = binding.port.ramp()?.value(0.);
             let slot = rhs
                 .as_mut_slice()
                 .get_mut(row)
@@ -1378,12 +2347,16 @@ impl MixedSignal {
     pub(super) fn commit_point(&mut self, point: MixedPoint) {
         if let Some(state) = point.state {
             self.engine.accepted = state;
-            for (dac, ramp) in self.dacs.iter().zip(point.ramps) {
-                dac.port.set(Some(ramp));
+            for (binding, ramp) in self.analog_outputs.iter().zip(point.ramps) {
+                binding.port.set(Some(ramp));
             }
         } else if self.engine.accepted.time < point.time {
             self.engine.accepted.time = point.time;
             self.engine.accepted.delta = 0;
+        }
+        self.range_states = point.range_states;
+        if point.time == Time(0) {
+            self.initial_gap_diagnostics = point.initial_gap_diagnostics;
         }
         self.previous = Some((point.time, point.voltages));
         self.changes.extend(point.changes);

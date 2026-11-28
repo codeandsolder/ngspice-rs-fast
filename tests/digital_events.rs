@@ -35,7 +35,7 @@ fn simultaneous_drives_resolve_before_fanout() -> SpiceResult<()> {
         1.,
         Drive {
             logic: Logic::Zero,
-            strength: Strength::Resistive,
+            strength: Strength::RESISTIVE,
         },
     )?;
     trial.advance_to(1.)?;
@@ -163,7 +163,7 @@ fn zero_delay_oscillation_is_bounded_and_cannot_commit() -> SpiceResult<()> {
         0.,
         Drive {
             logic: Logic::Zero,
-            strength: Strength::Resistive,
+            strength: Strength::RESISTIVE,
         },
     )?;
     assert!(trial.advance_to(0.).is_err());
@@ -859,4 +859,513 @@ fn sequential_logic_matches_xspice() -> SpiceResult<()> {
         assert!((a - b).abs() < 15e-9, "{a:e} vs {b:e}");
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct DrivePathEcho(Delays);
+
+impl ngspice_rs::devices::code_model::CodeModel for DrivePathEcho {
+    type State = ();
+
+    fn schema(&self) -> ngspice_rs::devices::code_model::ModelSchema {
+        ngspice_rs::devices::code_model::ModelSchema::digital(1, 1)
+    }
+
+    fn initial_state(&self) -> Self::State {}
+
+    fn evaluate(
+        &self,
+        _context: ngspice_rs::devices::code_model::EventContext,
+        inputs: &[Drive],
+        _state: &mut (),
+    ) -> SpiceResult<Vec<ngspice_rs::devices::code_model::Output>> {
+        Ok(vec![ngspice_rs::devices::code_model::Output {
+            drive: inputs[0],
+            delays: self.0,
+            mode: DelayMode::Transport,
+        }])
+    }
+}
+
+#[test]
+fn six_physical_paths_include_strength_and_disconnection() -> SpiceResult<()> {
+    let delays = Delays::paths([2., 3., 4., 5., 6., 7.])?;
+    assert!(Delays::paths([2., 3., -1., 5., 6., 7.]).is_err());
+    assert!(Delays::paths([2., 3., 4., 5., f64::NAN, 7.]).is_err());
+    assert!(
+        ngspice_rs::devices::code_model::DacConfig::new(
+            Dac {
+                low: 0.,
+                high: 1.,
+                unknown: 0.5
+            },
+            delays
+        )
+        .is_err()
+    );
+    let mut network = Network::default();
+    let input = network.add_net();
+    let output = network.add_net();
+    let source = network.add_source(input)?;
+    network.add_model(DrivePathEcho(delays), &[input], &[output])?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let zero = Drive::strong(Logic::Zero);
+    let one = Drive::strong(Logic::One);
+    let z = Drive::default();
+    let mut trial = engine.trial();
+    for (at, drive) in [
+        (0., zero),
+        (10., one),
+        (20., zero),
+        (30., z),
+        (40., zero),
+        (50., one),
+        (60., z),
+        (70., one),
+    ] {
+        trial.schedule(source, at, drive)?;
+    }
+    trial.advance_to(80.)?;
+    let actual: Vec<_> = trial
+        .changes()
+        .iter()
+        .filter(|change| change.net == output)
+        .map(|change| (change.time, change.drive))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (0., zero),
+            (12., one),
+            (23., zero),
+            (34., z),
+            (46., zero),
+            (52., one),
+            (65., z),
+            (77., one)
+        ]
+    );
+    trial.commit()
+}
+
+#[test]
+fn ordinal_drive_resolution_is_order_independent_and_margin_exact() -> SpiceResult<()> {
+    use std::num::NonZeroU8;
+    let rank = |logic, level| -> SpiceResult<Drive> {
+        Ok(Drive {
+            logic,
+            strength: Strength::from_rank(level)?,
+        })
+    };
+    let strongest = rank(Logic::One, 35)?;
+    let competing = rank(Logic::Zero, 32)?;
+    let weaker = rank(Logic::One, 30)?;
+    let margin = NonZeroU8::new(4).unwrap();
+    let expected = rank(Logic::Unknown, 35)?;
+    for drives in [
+        [strongest, competing, weaker],
+        [strongest, weaker, competing],
+        [competing, strongest, weaker],
+        [competing, weaker, strongest],
+        [weaker, strongest, competing],
+        [weaker, competing, strongest],
+    ] {
+        assert_eq!(Drive::resolve_with_margin(drives, margin), expected);
+    }
+    assert_eq!(
+        Drive::resolve_with_margin([strongest, rank(Logic::Zero, 31)?], margin),
+        strongest,
+    );
+    assert_eq!(
+        Drive::resolve_with_margin([strongest, rank(Logic::Unknown, 32)?], margin),
+        expected,
+    );
+    assert_eq!(
+        Drive::resolve_with_margin([rank(Logic::Zero, 0)?, rank(Logic::One, 0)?], margin),
+        Drive::default(),
+    );
+    Ok(())
+}
+
+#[test]
+fn causal_arrival_boundaries_fanout_and_rollback_preserve_correlation() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::timing::{
+        Arrival, Bounds, DelayWindow, Origin, TimingWindow,
+    };
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    let mut network = Network::default();
+    let input = network.add_net();
+    let data = network.add_net();
+    let clock = network.add_net();
+    let source = network.add_source(input)?;
+    for (net, low, high) in [(data, 10., 30.), (clock, 40., 60.)] {
+        let delay = DelayWindow::new(low, high)?;
+        network.add_model(
+            WindowGate::new(GateKind::Buffer, 1, WindowDelays::binary(delay, delay))?,
+            &[input],
+            &[net],
+        )?;
+    }
+    let mut engine = Engine::new(network, Limits::default())?;
+    let zero = Drive::strong(Logic::Zero);
+    let one = Drive::strong(Logic::One);
+    let mut init = engine.trial();
+    init.schedule(source, 0., zero)?;
+    let shared = TimingWindow::exact(0.)?.after(DelayWindow::new(15., 30.)?, Origin::shared(77))?;
+    let edge = Arrival::new(zero, one, shared.clone())?;
+    let cancelled = init.schedule_arrival(source, edge.clone())?;
+    assert!(init.cancel(cancelled));
+    let live = init.schedule_arrival(source, edge)?;
+    init.advance_to(10.)?;
+    init.commit()?;
+    {
+        let mut rejected = engine.trial();
+        rejected.advance_to(26.)?;
+        assert_eq!(rejected.value(data), Some(Drive::strong(Logic::Rising)));
+        assert_eq!(
+            rejected.arrival(data).unwrap().window().bounds(),
+            Bounds::new(25., 60.)?
+        );
+        assert!(!rejected.cancel(live));
+    }
+    assert_eq!(engine.value(data), Some(zero));
+    assert_eq!(engine.next_event_time(), Some(15.));
+    let mut trial = engine.trial();
+    trial.advance_to(55.)?;
+    assert_eq!(trial.value(clock), Some(Drive::strong(Logic::Rising)));
+    assert_eq!(
+        trial
+            .arrival(clock)
+            .unwrap()
+            .window()
+            .relative_to(trial.arrival(data).unwrap().window(), 100)?,
+        Bounds::new(10., 50.)?
+    );
+    trial.advance_to(100.)?;
+    assert_eq!(trial.value(data), Some(one));
+    assert_eq!(trial.value(clock), Some(one));
+    assert_eq!(
+        trial
+            .arrival(clock)
+            .unwrap()
+            .window()
+            .relative_to(trial.arrival(data).unwrap().window(), 100)?,
+        Bounds::new(10., 50.)?
+    );
+    trial.commit()?;
+    assert!(
+        engine
+            .arrival(input)
+            .unwrap()
+            .window()
+            .same_expression(&shared)
+    );
+    Ok(())
+}
+
+#[test]
+fn monotone_causal_gate_joins_previously_masked_arrivals() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::timing::{
+        Arrival, Bounds, DelayWindow, Origin, TimingWindow,
+    };
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    let mut network = Network::default();
+    let a = network.add_net();
+    let b = network.add_net();
+    let output = network.add_net();
+    let sa = network.add_source(a)?;
+    let sb = network.add_source(b)?;
+    let delay = DelayWindow::new(2., 3.)?;
+    network.add_model(
+        WindowGate::new(GateKind::And, 2, WindowDelays::binary(delay, delay))?,
+        &[a, b],
+        &[output],
+    )?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let mut trial = engine.trial();
+    let zero = Drive::strong(Logic::Zero);
+    let one = Drive::strong(Logic::One);
+    trial.schedule(sa, 0., zero)?;
+    trial.schedule(sb, 0., zero)?;
+    for (source, min, max, id) in [(sa, 5., 8., 1), (sb, 6., 10., 2)] {
+        let window =
+            TimingWindow::exact(0.)?.after(DelayWindow::new(min, max)?, Origin::shared(id))?;
+        trial.schedule_arrival(source, Arrival::new(zero, one, window)?)?;
+    }
+    trial.advance_to(7.)?;
+    assert_eq!(trial.value(output), Some(zero));
+    trial.advance_to(8.)?;
+    assert_eq!(trial.value(output), Some(Drive::strong(Logic::Rising)));
+    assert_eq!(
+        trial.arrival(output).unwrap().window().bounds(),
+        Bounds::new(8., 13.)?
+    );
+    trial.advance_to(13.)?;
+    assert_eq!(trial.value(output), Some(one));
+    trial.commit()
+}
+
+#[test]
+fn same_causal_expression_cancels_xor_reconvergence() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::timing::{Arrival, DelayWindow, Origin, TimingWindow};
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    let mut network = Network::default();
+    let input = network.add_net();
+    let output = network.add_net();
+    let source = network.add_source(input)?;
+    let delay = DelayWindow::new(1., 2.)?;
+    network.add_model(
+        WindowGate::new(GateKind::Xor, 2, WindowDelays::binary(delay, delay))?,
+        &[input, input],
+        &[output],
+    )?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let mut trial = engine.trial();
+    let zero = Drive::strong(Logic::Zero);
+    let one = Drive::strong(Logic::One);
+    trial.schedule(source, 0., zero)?;
+    trial.schedule_arrival(
+        source,
+        Arrival::new(
+            zero,
+            one,
+            TimingWindow::exact(0.)?.after(DelayWindow::new(5., 10.)?, Origin::shared(1))?,
+        )?,
+    )?;
+    trial.advance_to(20.)?;
+    assert_eq!(trial.value(output), Some(zero));
+    assert_eq!(
+        trial.changes().iter().filter(|c| c.net == output).count(),
+        1
+    );
+    trial.commit()
+}
+
+#[test]
+fn cumulative_arrival_overlap_preserves_later_completion_and_rollback() -> SpiceResult<()> {
+    use Logic::{Falling, One, Rising, Unknown, Zero};
+    use ngspice_rs::analysis::digital::{
+        DiagnosticDetail,
+        timing::{Bounds, DelayWindow},
+    };
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    // The first case reproduces the overlapping edge windows in the
+    // cumulative-ambiguity illustration in the PSpice user guide.
+    // The second covers a later edge that completes first.
+    for (rise_max, fall_max, trace) in [
+        (
+            10.,
+            10.,
+            vec![
+                (0., Zero),
+                (3., Rising),
+                (10., Unknown),
+                (12., Falling),
+                (19., Zero),
+            ],
+        ),
+        (
+            18.,
+            3.,
+            vec![(0., Zero), (3., Rising), (10., Unknown), (12., Zero)],
+        ),
+    ] {
+        let mut network = Network::default();
+        let input = network.add_net();
+        let output = network.add_net();
+        let inverse = network.add_net();
+        let source = network.add_source(input)?;
+        network.add_model(
+            WindowGate::new(
+                GateKind::Buffer,
+                1,
+                WindowDelays::binary(
+                    DelayWindow::new(1., rise_max)?,
+                    DelayWindow::new(1., fall_max)?,
+                ),
+            )?,
+            &[input],
+            &[output],
+        )?;
+        let zero = DelayWindow::new(0., 0.)?;
+        network.add_model(
+            WindowGate::new(GateKind::Inverter, 1, WindowDelays::binary(zero, zero))?,
+            &[output],
+            &[inverse],
+        )?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let mut init = engine.trial();
+        for (t, logic) in [(0., Zero), (2., One), (9., Zero)] {
+            init.schedule(source, t, Drive::strong(logic))?;
+        }
+        init.advance_to(2.)?;
+        init.commit()?;
+        let mut rejected = engine.trial();
+        rejected.advance_to(11.)?;
+        assert_eq!(rejected.value(output), Some(Drive::strong(Unknown)));
+        assert_eq!(rejected.diagnostics().len(), 2);
+        drop(rejected);
+        assert!(engine.diagnostics().is_empty());
+        assert_eq!(engine.value(output), Some(Drive::strong(Zero)));
+        let mut trial = engine.trial();
+        trial.advance_to(30.)?;
+        let actual: Vec<_> = trial
+            .changes()
+            .iter()
+            .filter(|c| c.net == output)
+            .map(|c| (c.time, c.drive.logic))
+            .collect();
+        assert_eq!(actual, trace[1..]);
+        let actual: Vec<_> = trial
+            .changes()
+            .iter()
+            .filter(|c| c.net == inverse)
+            .map(|c| (c.time, c.drive.logic))
+            .collect();
+        let expected: Vec<_> = trace[1..]
+            .iter()
+            .map(|&(time, logic)| (time, logic.invert()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(trial.value(output), Some(Drive::strong(Zero)));
+        assert_eq!(trial.value(inverse), Some(Drive::strong(One)));
+        let diagnostics = trial.diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        for diagnostic in diagnostics {
+            let DiagnosticDetail::CumulativeAmbiguity {
+                earlier,
+                later,
+                separation,
+            } = diagnostic.detail
+            else {
+                panic!("unexpected diagnostic {diagnostic:?}");
+            };
+            assert_eq!(earlier, Bounds::new(3., 2. + rise_max)?);
+            assert_eq!(later, Bounds::new(10., 9. + fall_max)?);
+            assert_eq!(separation, Bounds::new(8. - rise_max, 6. + fall_max)?);
+        }
+        trial.commit()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn absolute_overlap_diagnostic_retains_correlated_relative_pulse_width() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::{
+        DiagnosticDetail,
+        timing::{Arrival, Bounds, DelayWindow, Origin, TimingWindow},
+    };
+    let mut network = Network::default();
+    let output = network.add_net();
+    let source = network.add_source(output)?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let low = Drive::strong(Logic::Zero);
+    let high = Drive::strong(Logic::One);
+    let root = TimingWindow::exact(0.)?.after(DelayWindow::new(5., 15.)?, Origin::shared(77))?;
+    let rise = root.after(DelayWindow::new(3., 3.)?, Origin::shared(78))?;
+    let fall = root.after(DelayWindow::new(5., 5.)?, Origin::shared(79))?;
+    let mut trial = engine.trial();
+    trial.schedule(source, 0., low)?;
+    trial.schedule_arrival(source, Arrival::new(low, high, rise)?)?;
+    trial.schedule_arrival(source, Arrival::new(high, low, fall)?)?;
+    trial.advance_to(11.)?;
+    assert_eq!(trial.value(output), Some(Drive::strong(Logic::Unknown)));
+    let diagnostics = trial.diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    let DiagnosticDetail::CumulativeAmbiguity { separation, .. } = diagnostics[0].detail else {
+        panic!("missing cumulative ambiguity diagnostic");
+    };
+    assert_eq!(separation, Bounds::new(2., 2.)?);
+    trial.advance_to(30.)?;
+    assert_eq!(trial.value(output), Some(low));
+    trial.commit()
+}
+
+#[test]
+fn bounded_transport_cancels_both_boundaries_when_new_arrival_definitely_precedes()
+-> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::timing::DelayWindow;
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    let mut network = Network::default();
+    let input = network.add_net();
+    let output = network.add_net();
+    let source = network.add_source(input)?;
+    network.add_model(
+        WindowGate::new(
+            GateKind::Buffer,
+            1,
+            WindowDelays::binary(DelayWindow::new(10., 20.)?, DelayWindow::new(1., 2.)?),
+        )?,
+        &[input],
+        &[output],
+    )?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let mut trial = engine.trial();
+    for (time, logic) in [(0., Logic::Zero), (5., Logic::One), (6., Logic::Zero)] {
+        trial.schedule(source, time, Drive::strong(logic))?;
+    }
+    trial.advance_to(50.)?;
+    assert_eq!(trial.value(output), Some(Drive::strong(Logic::Zero)));
+    assert_eq!(
+        trial.changes().iter().filter(|c| c.net == output).count(),
+        1
+    );
+    assert!(trial.diagnostics().is_empty());
+    assert!(trial.next_event_time().is_none());
+    trial.commit()
+}
+
+#[test]
+fn shared_origin_ordered_xor_retains_both_overlapping_output_edges() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::{
+        DiagnosticDetail,
+        timing::{Arrival, Bounds, DelayWindow, Origin, TimingWindow},
+    };
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    let mut network = Network::default();
+    let a = network.add_net();
+    let b = network.add_net();
+    let q = network.add_net();
+    let sa = network.add_source(a)?;
+    let sb = network.add_source(b)?;
+    let zero = DelayWindow::new(0., 0.)?;
+    network.add_model(
+        WindowGate::new(GateKind::Xor, 2, WindowDelays::binary(zero, zero))?,
+        &[a, b],
+        &[q],
+    )?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let low = Drive::strong(Logic::Zero);
+    let high = Drive::strong(Logic::One);
+    let first = TimingWindow::exact(0.)?.after(DelayWindow::new(10., 20.)?, Origin::shared(77))?;
+    let second = first.after(DelayWindow::new(2., 2.)?, Origin::shared(78))?;
+    let mut trial = engine.trial();
+    trial.schedule(sa, 0., low)?;
+    trial.schedule(sb, 0., low)?;
+    trial.schedule_arrival(sa, Arrival::new(low, high, first)?)?;
+    trial.schedule_arrival(sb, Arrival::new(low, high, second)?)?;
+    trial.advance_to(30.)?;
+    let actual: Vec<_> = trial
+        .changes()
+        .iter()
+        .filter(|c| c.net == q)
+        .map(|c| (c.time, c.drive.logic))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (0., Logic::Zero),
+            (10., Logic::Rising),
+            (12., Logic::Unknown),
+            (20., Logic::Falling),
+            (22., Logic::Zero)
+        ]
+    );
+    let warnings = trial.diagnostics();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let DiagnosticDetail::CumulativeAmbiguity { separation, .. } = warnings[0].detail else {
+        panic!("missing timing diagnostic");
+    };
+    assert_eq!(separation, Bounds::new(2., 2.)?);
+    trial.commit()
 }

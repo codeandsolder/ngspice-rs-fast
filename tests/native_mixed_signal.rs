@@ -246,12 +246,33 @@ fn scoped_arrays_and_typed_port_validation() -> SpiceResult<()> {
         "operation=17",
         "operation=4",
         "delay=-1n",
+        "delay_paths=[1n 2n 3n]",
+        "delay_gate=[1n 2n]",
+        "delay_preset=[1n 2n]",
+        "delay_clear=[1n -2n]",
+        "delay_paths=[1n 2n 3n 4n 5n -6n]",
+        "delay=1n delay_paths=[1n 2n 3n 4n 5n 6n]",
         "low=4 high=3",
-        "ic=2",
+        "ic=3",
+        "strength=0",
+        "strength=3",
+        "strength_paths=[1 2]",
+        "strength_paths=[0 64 1]",
+        "strength=1 strength_paths=[0 1 1]",
+        "override_margin=0",
+        "override_margin=64",
+        "load_resistance=[1 2]",
+        "load_resistance=[1 2 -3]",
+        "input_capacitance=[1p]",
+        "output_capacitance=-1p",
+        "async_policy=[1 1 2]",
+        "async_policy=[1 1 3]",
         "inverted=[1 0]",
         "inverted=[2]",
         "rx_ic=[2]",
         "inertial=2",
+        "pulse_reject=-1n",
+        "inertial=0 pulse_reject=1n",
         "unknown=1",
     ] {
         let result = circuit(&format!(
@@ -565,5 +586,590 @@ R4 bb 0 100
         );
     }
     assert!(c.last_digital_stats().unwrap().evaluations > 0);
+    Ok(())
+}
+
+#[test]
+fn source_bound_digital_bus_resolves_strength_and_unknown() -> SpiceResult<()> {
+    for data in [0, 4] {
+        for enable in [0, 4] {
+            for pull in [0, 4] {
+                let mut c = circuit(&format!(
+                    "vdata d 0 {data}\nvenable e 0 {enable}\nvpull p 0 {pull}\n                    a1 %v[d e] bus tri\n.model tri preprocess_logic_event(operation=21 delay_paths=[1n 2n 3n 4n 5n 6n])\n                    a2 %v[p] bus weak\n.model weak preprocess_logic_event(operation=25 strength=1)\n                    a3 %d[bus] direct buf\n.model buf preprocess_logic_event(operation=25)\n                    a4 direct out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+                ))?;
+                let expected = if enable == 4 { data } else { pull };
+                close(
+                    output(&run(&mut c, AnalysisKind::OperatingPoint, &[])?, 0),
+                    if expected == 4 { 5. } else { 0. },
+                );
+                assert!(c.nodes().get("bus").is_none());
+                assert!(c.nodes().get("direct").is_none());
+            }
+        }
+    }
+    // A disconnected input is unknown, but AND with a decisive zero is
+    // still zero. Invert the second digital terminal after net resolution.
+    let mut c = circuit(
+        "vzero zero 0 0\na1 %v[zero zero] floating tri\n.model tri preprocess_logic_event(operation=21)\n         a2 %v[zero] known buf\n.model buf preprocess_logic_event(operation=25)\n         a3 %d[floating known] result gate\n.model gate preprocess_logic_event(operation=0)\n         a4 %d[floating ~known] uncertain gate\n         a5 result out bridge\na6 uncertain other bridge\n.model bridge preprocess_logic_voltage(out_high=5)\n         r1 out 0 1k\nr2 other 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+    close(output(&plot, 0), 0.);
+    close(plot.value("v(other)", 0).unwrap().re, 2.5);
+    Ok(())
+}
+
+#[test]
+fn source_bound_asymmetric_tristate_delivery() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vd data 0 4\nve en 0 PWL(0 0 1u 0 1002n 4 3u 4 3002n 0 5u 0)\n         vp pull 0 0\n         a1 %v[data en] bus tri\n.model tri preprocess_logic_event(operation=21 delay_paths=[10n 20n 30n 40n 50n 60n])\n         a2 %v[pull] bus weak\n.model weak preprocess_logic_event(operation=25 strength=1)\n         a3 %d[bus] result copy\n.model copy preprocess_logic_event(operation=25)\n         a4 result out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "5u", "0", "10n"])?;
+    let edges: Vec<_> = (1..plot.point_count())
+        .filter(|&i| (output(&plot, i) > 2.5) != (output(&plot, i - 1) > 2.5))
+        .map(|i| (plot.value("time", i).unwrap().re, output(&plot, i)))
+        .collect();
+    assert_eq!(edges.len(), 2, "{edges:?}");
+    // Qualified ADC strict crossing: rising at 3 V, falling at 2 V.
+    // The existing one-sided plot convention shows a new voltage at the
+    // first sample after the event (within the 10 ns maximum step).
+    for ((time, voltage), (at, expected)) in
+        edges.into_iter().zip([(1.0615e-6, 5.), (3.041e-6, 0.)])
+    {
+        close(voltage, expected);
+        assert!((time - at).abs() <= 10e-9, "{time:e} != {at:e}");
+    }
+    Ok(())
+}
+
+#[test]
+fn source_bound_sequential_timing_policies() -> SpiceResult<()> {
+    for (policy, expected) in [(0, None), (1, Some(2.5)), (2, Some(5.))] {
+        let mut c = circuit(&format!(
+            "vd d 0 PWL(0 0 1u 0 1002n 4 3u 4)\nvc clk 0 PWL(0 0 1050n 0 1052n 4 3u 4)\n\
+             a1 %v[d clk] q ff\n.model ff preprocess_logic_event(operation=11 timing_setup=[100n] timing_hold=[0] timing_violation={policy})\n\
+             a2 q out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+        ))?;
+        let result = run(&mut c, AnalysisKind::Transient, &["1n", "3u", "0", "25n"]);
+        if let Some(expected) = expected {
+            let plot = result?;
+            close(output(&plot, plot.point_count() - 1), expected);
+            let warnings = c.last_digital_diagnostics();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].model.as_ref(), "a1");
+            assert_eq!(warnings[0].timing().unwrap().kind, "setup");
+            assert_eq!(warnings[0].timing().unwrap().input, 0);
+            assert!((warnings[0].timing().unwrap().elapsed - 50e-9).abs() <= 1e-12);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("setup violation"));
+            assert!(c.last_digital_diagnostics().is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn powered_digital_output_conductance_and_supply_current() -> SpiceResult<()> {
+    for (data, enable, strength, conflict, high, low) in [
+        (4, 4, 2, false, 0.01, 0.),
+        (0, 4, 2, false, 0., 0.02),
+        (4, 4, 1, false, 0.001, 0.),
+        (0, 4, 1, false, 0., 0.002),
+        (4, 4, 2, true, 0.002, 0.003),
+        (4, 0, 2, false, 0., 0.),
+    ] {
+        let conflicting_driver = if conflict {
+            "a4 %v[0] q opposite\n.model opposite preprocess_logic_event(operation=25)"
+        } else {
+            ""
+        };
+        let mut c = circuit(&format!(
+            "vhi hi 0 7\nvlo lo 0 -2\nvd data 0 {data}\nve en 0 {enable}\n\
+             a1 %v[data en] q tri\n.model tri preprocess_logic_event(operation=21 strength={strength})\n\
+             a2 q %gd(out hi) high\n.model high preprocess_logic_conductance(conductance=[0 .01 .002 0 .001 .0002 0])\n\
+             a3 q %gd(out lo) low\n.model low preprocess_logic_conductance(conductance=[.02 0 .003 .002 0 .0003 0])\n\
+             {conflicting_driver}\nrload out 0 1k"
+        ))?;
+        let expected = (7. * high - 2. * low) / (high + low + 0.001);
+        let plot = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+        close(output(&plot, 0), expected);
+        close(plot.value("i(vhi)", 0).unwrap().re, high * (expected - 7.));
+        close(plot.value("i(vlo)", 0).unwrap().re, low * (expected + 2.));
+    }
+    Ok(())
+}
+
+#[test]
+fn powered_output_reacts_to_strength_only_transitions() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 4\nve en 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 4u 0)\n\
+         a1 %v[data en] q tri\n.model tri preprocess_logic_event(operation=21)\n\
+         a2 %v[data] q pull\n.model pull preprocess_logic_event(operation=25 strength=1)\n\
+         a3 q %gd(out hi) drive\n.model drive preprocess_logic_conductance(conductance=[0 .01 0 0 .001 0 0])\n\
+         rload out 0 1k\ncload out 0 1n",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "4u", "0", "1n"])?;
+    let rise = 1.0015e-6;
+    let fall = 2.001e-6;
+    let strong = 5. * 0.01 / 0.011;
+    let weak = 2.5;
+    let at_fall = strong + (weak - strong) * (-0.011_f64 * (fall - rise) / 1e-9).exp();
+    for index in 0..plot.point_count() {
+        let time = plot.value("time", index).unwrap().re;
+        let expected = if time <= rise {
+            weak
+        } else if time <= fall {
+            strong + (weak - strong) * (-0.011 * (time - rise) / 1e-9).exp()
+        } else {
+            weak + (at_fall - weak) * (-0.002 * (time - fall) / 1e-9).exp()
+        };
+        assert!(
+            (output(&plot, index) - expected).abs() < 0.005,
+            "t={time:e}: {} != {expected}",
+            output(&plot, index)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn level_specific_strength_and_net_margin() -> SpiceResult<()> {
+    // Each high output can disconnect without changing its logical state;
+    // a weak high then wins over the open-drain output, but not a low.
+    for (input, rank, expected) in [(0, 40, 0.), (4, 40, 5.), (0, 29, 2.5), (0, 26, 5.)] {
+        let mut c = circuit(&format!(
+            "vd data 0 {input}\n             a1 %v[data] bus open\n.model open preprocess_logic_event(operation=25 strength_paths=[{rank} 0 {rank}] override_margin=3)\n             a2 %v[high] bus pull\n.model pull preprocess_logic_event(operation=25 strength_paths=[29 29 29] override_margin=3)\n             vh high 0 4\na3 bus out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+        ))?;
+        close(
+            output(&run(&mut c, AnalysisKind::OperatingPoint, &[])?, 0),
+            expected,
+        );
+    }
+    let body = "vhi hi 0 4\na1 %v[hi] bus m1\n.model m1 preprocess_logic_event(operation=25 override_margin=3)\n                a2 %v[hi] bus m2\n.model m2 preprocess_logic_event(operation=25 override_margin=4)\n                a3 bus out b\n.model b preprocess_logic_voltage\nrload out 0 1k";
+    assert!(
+        circuit(body)
+            .unwrap_err()
+            .to_string()
+            .contains("strength margin")
+    );
+    Ok(())
+}
+
+#[test]
+fn digital_fanout_loading_is_occurrence_based_and_respects_zero_paths() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vd data 0 PWL(0 0 1u 0 1002n 4 3u 4 3002n 0 5u 0)\n         a1 %v[data] bus driver\n.model driver preprocess_logic_event(operation=25 delay_paths=[10n 0] output_capacitance=2n load_resistance=[100 20 0])\n         a2 %v[data 0] bus off\n.model off preprocess_logic_event(operation=21 output_capacitance=4n)\n         a3 %d[bus bus] q load\n.model load preprocess_logic_event(operation=0 input_capacitance=[3n 5n])\n         a4 q out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "5u", "0", "1n"])?;
+    let expected_rise = 1.0015e-6 + 10e-9 + 20. * 14e-9 * std::f64::consts::LN_2;
+    let expected_fall = 3.001e-6;
+    let edges: Vec<_> = (1..plot.point_count())
+        .filter(|&i| (output(&plot, i) > 2.5) != (output(&plot, i - 1) > 2.5))
+        .map(|i| (plot.value("time", i).unwrap().re, output(&plot, i)))
+        .collect();
+    assert_eq!(edges.len(), 2, "{edges:?}");
+    for ((time, voltage), (at, expected)) in edges
+        .into_iter()
+        .zip([(expected_rise, 5.), (expected_fall, 0.)])
+    {
+        close(voltage, expected);
+        assert!((time - at).abs() <= 1e-9, "{time:e} != {at:e}");
+    }
+    Ok(())
+}
+
+#[test]
+fn short_pulse_direction_reaches_explicit_physical_interface() -> SpiceResult<()> {
+    for (operation, base, phase) in [(25, 0., 2.5), (26, 5. * 0.01 / 0.011, 4.)] {
+        let mut c = circuit(&format!(
+            "vhi hi 0 5\nvd data 0 PWL(0 0 1u 0 1002n 4 1008n 4 1010n 0 2u 0)\n             a1 %v[data] q pulse\n.model pulse preprocess_logic_event(operation={operation} delay=20n pulse_reject=5n)\n             a2 q %gd(out hi) drive\n.model drive preprocess_logic_conductance(conductance=[0 .01 .003 0 0 0 0 .001 .004 0 0])\n             rload out 0 1k"
+        ))?;
+        let plot = run(
+            &mut c,
+            AnalysisKind::Transient,
+            &["0.5n", "2u", "0", "0.5n"],
+        )?;
+        let mut seen = 0;
+        for index in 0..plot.point_count() {
+            let time = plot.value("time", index).unwrap().re;
+            if (1.022e-6..1.0285e-6).contains(&time) {
+                close(output(&plot, index), phase);
+                seen += 1;
+            } else if !(1.021e-6..1.0295e-6).contains(&time) {
+                close(output(&plot, index), base);
+            }
+        }
+        assert!(seen >= 10, "missing directional pulse samples");
+    }
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 PWL(0 0 1u 0 1002n 4 1008n 4 1010n 0 2u 0)\n         a1 %v[data] q pulse\n.model pulse preprocess_logic_event(operation=25 delay=20n pulse_reject=5n)\n         a2 q %gd(out hi) drive\n.model drive preprocess_logic_conductance(conductance=[0 .01 .003 0 0 0 0])\n         rload out 0 1k",
+    )?;
+    let result = run(&mut c, AnalysisKind::Transient, &["1n", "2u", "0", "1n"]);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("R/F conductance entries")
+    );
+    Ok(())
+}
+
+#[test]
+fn source_bound_window_propagates_both_causal_boundaries_to_physical_output() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 3u 0)\n\
+         a1 %v[data] first bounded\n.model bounded preprocess_logic_event(operation=25 delay_windows=[10n 30n 20n 40n])\n\
+         a2 %d[first] q second\n.model second preprocess_logic_event(operation=25 delay_windows=[5n 15n 2n 12n])\n\
+         a3 q %gd(out hi) drive\n.model drive preprocess_logic_conductance(conductance=[0 .01 .003 0 0 0 0 .001 .004 0 0])\n\
+         rload out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "3u", "0", "1n"])?;
+    let rise_min = 1.0015e-6 + 15e-9;
+    let rise_max = 1.0015e-6 + 45e-9;
+    let fall_min = 2.001e-6 + 22e-9;
+    let fall_max = 2.001e-6 + 52e-9;
+    let mut samples = [0; 5];
+    for index in 0..plot.point_count() {
+        let t = plot.value("time", index).unwrap().re;
+        if [rise_min, rise_max, fall_min, fall_max]
+            .iter()
+            .any(|&edge| (t - edge).abs() <= 1.1e-9)
+        {
+            continue;
+        }
+        let (region, expected) = if t < rise_min {
+            (0, 0.)
+        } else if t < rise_max {
+            (1, 2.5)
+        } else if t < fall_min {
+            (2, 5. * 0.01 / 0.011)
+        } else if t < fall_max {
+            (3, 4.)
+        } else {
+            (4, 0.)
+        };
+        close(output(&plot, index), expected);
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&count| count > 10), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn ordered_receiver_preserves_range_identity_through_equal_logic_and_differential_reference()
+-> SpiceResult<()> {
+    let mut c = circuit(
+        "vref ref 0 7\n\
+         vd data ref PWL(0 1.5 1u 1.5 1.1u 2.5 2u 2.5 2.1u 1.5 3u 1.5 3.1u 4.5 4u 4.5 4.1u 3.5 5u 3.5)\n\
+         a1 %vd(data ref) q r\n\
+         .model r preprocess_logic_range(ranges=[0 2 0 63 3 5 1 63 1 4 0 63 4 6 3 63] initial_range=0 gap_policy=0)\n\
+         a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    for _ in 0..2 {
+        let plot = run(&mut c, AnalysisKind::Transient, &["5n", "5u", "0", "50n"])?;
+        let mut seen = [false; 3];
+        for i in 0..plot.point_count() {
+            let time = plot.value("time", i).unwrap().re;
+            let (region, expected) = if time < 3.07e-6 {
+                (0, 0.)
+            } else if (3.09e-6..4.04e-6).contains(&time) {
+                (1, 2.5)
+            } else if time > 4.06e-6 {
+                (2, 5.)
+            } else {
+                continue;
+            };
+            close(output(&plot, i), expected);
+            seen[region] = true;
+        }
+        assert!(seen.into_iter().all(|value| value));
+        assert!(c.last_digital_diagnostics().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn ordered_receiver_gap_diagnostics_and_nearest_midpoint_are_transactional() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::DiagnosticDetail;
+    for (policy, expected) in [("gap_policy=1", 5.), ("gap_drive=[2 63]", 2.5)] {
+        let mut c = circuit(&format!(
+            "vd data 0 PWL(0 -1.5 1u -1.5 2u 0.5 3u 0.5 4u 1.5 5u 1.5)\n\
+             a1 %v(data) q r\n.model r preprocess_logic_range(ranges=[-2 -1 0 63 1 2 1 63] {policy})\n\
+             a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+        ))?;
+        let plot = run(&mut c, AnalysisKind::Transient, &["2n", "5u", "0", "100n"])?;
+        for i in 0..plot.point_count() {
+            let time = plot.value("time", i).unwrap().re;
+            if (2.1e-6..3.9e-6).contains(&time) && time < 3.45e-6 {
+                close(output(&plot, i), expected);
+            }
+            if time > 4.05e-6 {
+                close(output(&plot, i), 5.);
+            }
+        }
+        let warnings = c.last_digital_diagnostics();
+        let count = if policy == "gap_policy=1" { 2 } else { 1 };
+        assert_eq!(warnings.len(), count, "{warnings:?}");
+        for record in warnings {
+            assert_eq!(record.model.as_ref(), "a1");
+            assert!(matches!(record.detail, DiagnosticDetail::RangeGap { .. }));
+        }
+        assert_eq!(c.last_digital_stats().unwrap().diagnostics, count);
+    }
+    let mut c = circuit(
+        "vd data 0 0\na1 data q r\n.model r preprocess_logic_range(ranges=[-2 -1 0 63 1 2 1 63] gap_policy=0)\n\
+         a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    assert!(
+        run(&mut c, AnalysisKind::OperatingPoint, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("outside all ranges")
+    );
+    assert!(c.last_digital_diagnostics().is_empty());
+    Ok(())
+}
+
+#[test]
+fn deck_bound_causal_clock_cancels_common_path_uncertainty() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::timing::Certainty;
+    for (setup, policy, expected, classification) in [
+        (9, 2, 5., None),
+        (11, 2, 5., Some(Certainty::PossibleViolation)),
+        (11, 1, 2.5, Some(Certainty::PossibleViolation)),
+        (51, 2, 5., Some(Certainty::DefiniteViolation)),
+    ] {
+        let mut c = circuit(&format!(
+            "vd data 0 PWL(0 0 1u 0 1002n 4 2u 4)\n\
+             a0 %v[data] root common\n.model common preprocess_logic_event(operation=25 delay_windows=[15n 30n 15n 30n])\n\
+             a1 %d[root] d data_delay\n.model data_delay preprocess_logic_event(operation=25 delay_windows=[10n 30n 10n 30n])\n\
+             a2 %d[root] clk clock_delay\n.model clock_delay preprocess_logic_event(operation=25 delay_windows=[40n 60n 40n 60n])\n\
+             a3 %d[d clk] q ff\n.model ff preprocess_logic_event(operation=11 delay_windows=[1n 2n 1n 2n] timing_setup=[{setup}n] timing_violation={policy})\n\
+             a4 q out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+        ))?;
+        let plot = run(&mut c, AnalysisKind::Transient, &["1n", "2u", "0", "5n"])?;
+        close(output(&plot, plot.point_count() - 1), expected);
+        let diagnostics = c.last_digital_diagnostics();
+        if let Some(classification) = classification {
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            let timing = diagnostics[0].timing().expect("timing diagnostic");
+            assert_eq!((timing.kind, timing.certainty), ("setup", classification));
+            assert!((timing.elapsed - 10e-9).abs() < 1e-18);
+            assert!((timing.maximum_elapsed - 50e-9).abs() < 1e-18);
+        } else {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ranked_electrical_drive_table_distinguishes_intermediate_strengths() -> SpiceResult<()> {
+    // All five logic states and each connected rank have explicit
+    // electrical values. Keep the receiver's ordinal rank through binding.
+    let values = std::iter::once("0".to_owned())
+        .chain((1..=63).flat_map(|rank| {
+            (0..5).map(move |logic| format!("{}", (rank * 5 + logic) as f64 * 1e-5))
+        }))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut c = circuit(&format!(
+        "vhi hi 0 5\nvd data 0 0\n\
+         a1 data q r\n.model r preprocess_logic_range(ranges=[-1 1 1 17])\n\
+         a2 q %gd(out hi) b\n.model b preprocess_logic_conductance(conductance_by_rank=[{values}])\n\
+         r1 out 0 1k"
+    ))?;
+    let plot = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+    let g = 86. * 1e-5;
+    close(output(&plot, 0), 5. * g / (g + 0.001));
+    Ok(())
+}
+
+#[test]
+fn exponential_resistance_slew_matches_analytic_interrupted_waveform() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 PWL(0 0 1u 0 1002n 4 1200n 4 1202n 0 2u 0)\n\
+         a1 %v[data] q r\n.model r preprocess_logic_event(operation=25)\n\
+         a2 q %gd(out hi) b\n.model b preprocess_logic_conductance(conductance=[.01 .001 .002 .01 .001 .002 .0001] resistance_duration=[200n 400n 300n 0 0 0] resistance_shape=2)\n\
+         r1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["2n", "2u", "0", "2n"])?;
+    let t0 = 1.0015e-6;
+    let t1 = 1.201e-6;
+    let blend = |from: f64, to: f64, u: f64| {
+        let w = -(-2. * u.clamp(0., 1.)).exp_m1() / -(-2_f64).exp_m1();
+        (to - from).mul_add(w, from)
+    };
+    let mid = blend(100., 1000., (t1 - t0) / 400e-9);
+    let mut samples = [0; 4];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        let (region, r) = if t < t0 {
+            (0, 100.)
+        } else if t < t1 {
+            (1, blend(100., 1000., (t - t0) / 400e-9))
+        } else if t < t1 + 200e-9 {
+            (2, blend(mid, 100., (t - t1) / 200e-9))
+        } else {
+            (3, 100.)
+        };
+        let expected = 5000. / (1000. + r);
+        assert!(
+            (output(&plot, i) - expected).abs() < 2e-6,
+            "{t:e}: {} != {expected}",
+            output(&plot, i)
+        );
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 20), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn independent_physical_driver_branches_retain_charge_after_disconnect() -> SpiceResult<()> {
+    // Driver occurrences are electrically realized BEFORE resolution.
+    // The analog node, not an arbitrary digital latch, retains charge.
+    let mut c = circuit(
+        "vhi hi 0 5\nvd highdata 0 4\nvl lowdata 0 0\n\
+         ve1 e1 0 PWL(0 4 1u 4 1002n 0 12u 0)\n\
+         ve2 e2 0 PWL(0 0 6u 0 6002n 4 12u 4)\n\
+         a1 %v[highdata e1] highdrv tri\na2 %v[lowdata e2] lowdrv tri\n\
+         .model tri preprocess_logic_event(operation=21)\n\
+         a3 highdrv %gd(out hi) up\n.model up preprocess_logic_conductance(conductance=[0 .01 0 0 .01 0 0])\n\
+         a4 lowdrv %gd(out 0) down\n.model down preprocess_logic_conductance(conductance=[.01 0 0 .01 0 0 0])\n\
+         cleak out 0 1n\nrleak out 0 10k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["5n", "12u", "0", "5n"])?;
+    let released = 1.001e-6;
+    let connected = 6.0015e-6;
+    let initial = 5. * 10000. / 10100.;
+    let held = initial * (-(connected - released) / 10e-6_f64).exp();
+    let mut samples = [0; 3];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        let (region, expected) = if t < released {
+            (0, initial)
+        } else if t < connected {
+            (1, initial * (-(t - released) / 10e-6).exp())
+        } else {
+            (2, held * (-(t - connected) / (1e-9 / 0.0101)).exp())
+        };
+        assert!(
+            (output(&plot, i) - expected).abs() <= 0.002 * expected.abs() + 20e-6,
+            "{t:e}: {} != {expected}",
+            output(&plot, i)
+        );
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 20), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn bounded_async_paths_are_independent_of_primary_clock_delay() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vd data 0 0\nvc clk 0 0\n\
+         vp p 0 PWL(0 0 1u 0 1002n 4 1500n 4 1502n 0 3u 0)\n\
+         vr reset 0 PWL(0 0 2u 0 2002n 4 3u 4)\n\
+         a1 %v[data clk p reset] q ff\n.model ff preprocess_logic_event(operation=11 async_policy=[1 1 2] delay=0 delay_preset_windows=[10n 20n 30n 40n] delay_clear_windows=[50n 60n 70n 80n])\n\
+         a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "3u", "0", "1n"])?;
+    let boundaries = [1.0115e-6, 1.0215e-6, 2.0715e-6, 2.0815e-6];
+    let mut samples = [0; 5];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        if boundaries.iter().any(|b| (t - b).abs() <= 1.1e-9) {
+            continue;
+        }
+        let region = boundaries.iter().filter(|&&b| t > b).count();
+        close(output(&plot, i), [0., 2.5, 5., 2.5, 0.][region]);
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 4), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn bounded_tristate_uses_declared_impedance_paths() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 4\nve en 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 3u 0)\n\
+         a1 %v[data en] q tri\n.model tri preprocess_logic_event(operation=21 delay_windows=[1n 2n 3n 4n 5n 6n 7n 8n 9n 10n 11n 12n])\n\
+         a2 q %gd(out hi) b\n.model b preprocess_logic_conductance(conductance=[0 .01 .003 0 0 0 0])\nr1 out 0 1k",
+    )?;
+    let plot = run(
+        &mut c,
+        AnalysisKind::Transient,
+        &["0.1n", "3u", "0", "0.1n"],
+    )?;
+    let boundaries = [1.0125e-6, 1.0135e-6, 2.008e-6, 2.009e-6];
+    let mut samples = [0; 5];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        if boundaries.iter().any(|b| (t - b).abs() <= 0.11e-9) {
+            continue;
+        }
+        let region = boundaries.iter().filter(|&&b| t > b).count();
+        close(
+            output(&plot, i),
+            [0., 3.75, 5. * 0.01 / 0.011, 3.75, 0.][region],
+        );
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 4), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn causal_descendants_preserve_uncertainty_through_exact_transport_and_zero_delay()
+-> SpiceResult<()> {
+    // Deliberately declare receivers in reverse signal-flow order.
+    // Exact paths need not repeat the bounded timing declaration.
+    let mut c = circuit(
+        "vd data 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 3u 0)\n\
+         a3 %d[middle] q zero\n.model zero preprocess_logic_event(operation=25 delay=0)\n\
+         a2 %d[first] middle exact\n.model exact preprocess_logic_event(operation=25 delay_paths=[5n 7n] inertial=0)\n\
+         a1 %v[data] first bounded\n.model bounded preprocess_logic_event(operation=25 delay_windows=[10n 30n 20n 40n])\n\
+         a4 q out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "3u", "0", "1n"])?;
+    let boundaries = [1.0165e-6, 1.0365e-6, 2.028e-6, 2.048e-6];
+    let mut samples = [0; 5];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        if boundaries.iter().any(|b| (t - b).abs() <= 1.1e-9) {
+            continue;
+        }
+        let region = boundaries.iter().filter(|&&b| t > b).count();
+        close(output(&plot, i), [0., 2.5, 5., 2.5, 0.][region]);
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 10), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn bounded_latch_paths_preserve_transparency_hold_and_async_controls() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vd data 0 PWL(0 4 1500n 4 1502n 0 2500n 0 2502n 4 4u 4)\n\
+         vg gate 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 4u 0)\n\
+         vp preset 0 PWL(0 0 3u 0 3002n 4 4u 4)\nvc clear 0 0\n\
+         a1 %v[data gate preset clear] q latch\n.model latch preprocess_logic_event(operation=15 async_policy=[1 1 2] delay_windows=[5n 15n 30n 40n] delay_gate_windows=[10n 20n 10n 20n] delay_preset_windows=[50n 60n 70n 80n])\n\
+         a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "4u", "0", "1n"])?;
+    let boundaries = [
+        1.0115e-6, 1.0215e-6, 1.531e-6, 1.541e-6, 3.0515e-6, 3.0615e-6,
+    ];
+    let mut samples = [0; 7];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        if boundaries.iter().any(|b| (t - b).abs() <= 1.1e-9) {
+            continue;
+        }
+        let region = boundaries.iter().filter(|&&b| t > b).count();
+        close(output(&plot, i), [0., 2.5, 5., 2.5, 0., 2.5, 5.][region]);
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 4), "{samples:?}");
     Ok(())
 }

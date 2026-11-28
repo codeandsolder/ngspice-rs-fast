@@ -533,6 +533,9 @@ impl<'a> ControlSession<'a> {
                     "control driver did not complete planned plots",
                 ));
             }
+            for warning in self.circuit_mut().last_digital_diagnostics() {
+                emit(&format!("warning: {warning}\n"))?;
+            }
             for index in 0..plan.plot_count() {
                 let kind = if index == 0 && plan.retains_bias() {
                     AnalysisKind::OperatingPoint

@@ -1,0 +1,14 @@
+Independent digital bus resolution
+Asource [data enable] stimulus
+Atri data enable bus tri
+Apull bus pull
+.model stimulus d_source(input_file="tristate.txt" input_load=0)
+.model tri d_tristate(delay=1u inertial_delay=false input_load=0 enable_load=0)
+.model pull d_pulldown(load=0)
+.control
+set numdgt=17
+tran 10n 30u 0 10n
+eprint data enable bus
+quit
+.endc
+.end
