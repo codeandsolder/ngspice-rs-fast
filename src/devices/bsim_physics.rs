@@ -227,6 +227,179 @@ pub(super) fn depletion_charge<S: Constitutive>(k1: Real, increment: S) -> Spice
     Ok((difference.scale(k1), slope))
 }
 
+/// A charge value and its local partials in the (overdrive, effective
+/// drain voltage, bulk factor) coordinates. All include oxide area.
+pub(super) struct ChargePart<S> {
+    pub(super) value: S,
+    partials: [S; 3],
+}
+
+/// The scalar load's existing local-coordinate derivatives. Oxide area
+/// changes in proportion to effective oxide capacitance.
+pub(super) struct ChargeChain {
+    pub(super) overdrive: [Real; 3],
+    pub(super) drain: [Real; 3],
+    pub(super) bulk: [Real; 3],
+    pub(super) relative_oxide: [Real; 3],
+}
+
+impl ChargeChain {
+    pub(super) fn apply(&self, part: &ChargePart<Real>) -> [Real; 3] {
+        std::array::from_fn(|i| {
+            part.partials[0].mul_add(
+                self.overdrive[i],
+                part.partials[1].mul_add(
+                    self.drain[i],
+                    part.partials[2].mul_add(self.bulk[i], part.value * self.relative_oxide[i]),
+                ),
+            )
+        })
+    }
+}
+
+/// Conservative channel inversion, bulk and source charges in reference
+/// orientation, before accumulation/depletion, overlap or junction terms.
+/// The 50/50 source fraction is half the inversion charge, not half the
+/// gate charge. The normalized ratios retain the regularizing 1e-20 in both
+/// the values and the exact derivatives.
+pub(super) fn channel_inversion<S: Constitutive>(
+    overdrive: &S,
+    drain: &S,
+    bulk: &S,
+    oxide_area: &S,
+    partition: Real,
+) -> SpiceResult<[ChargePart<S>; 3]> {
+    const REGULARIZATION: Real = 1e-20;
+    let one = overdrive.constant(1.);
+    let weighted_drain = bulk.clone().multiply(drain);
+    let width = weighted_drain
+        .clone()
+        .scale(-0.5)
+        .add(overdrive)
+        .offset(REGULARIZATION);
+    let ratio = weighted_drain.clone().divide(&width)?;
+    let normalized_sum = overdrive.clone().offset(REGULARIZATION).divide(&width)?;
+    let fraction = ratio.clone().scale(1. / 12.);
+    let edge = fraction.clone().scale(-1.).offset(0.5);
+    // weighted_drain * d(fraction)/d(weighted_drain).
+    let weighted_fraction_partial = fraction.clone().multiply(&normalized_sum);
+    let inversion_du = ratio.clone().scale(-1.).mul_add(&fraction, &one);
+    let inversion_dt = weighted_fraction_partial
+        .clone()
+        .add(&edge.clone().scale(-1.));
+    let inversion_value = weighted_drain.clone().scale(-1.).mul_add(&edge, overdrive);
+    let part = |value: S, du: S, dd: S, da: S| ChargePart {
+        value: value.multiply(oxide_area),
+        partials: [du, dd, da].map(|derivative| derivative.multiply(oxide_area)),
+    };
+    let inversion = part(
+        inversion_value.clone(),
+        inversion_du.clone(),
+        inversion_dt.clone().multiply(bulk),
+        inversion_dt.clone().multiply(drain),
+    );
+    let complement = bulk.clone().scale(-1.).offset(1.);
+    let normalized_drain = drain.clone().divide(&width)?;
+    let bulk_du = complement
+        .clone()
+        .multiply(&normalized_drain)
+        .multiply(&fraction);
+    let bulk_dd = complement
+        .clone()
+        .multiply(&inversion_dt.clone().scale(-1.));
+    let bulk_da = complement
+        .clone()
+        .multiply(&normalized_drain)
+        .multiply(&normalized_sum)
+        .scale(1. / 12.)
+        .add(&edge)
+        .multiply(drain)
+        .scale(-1.);
+    let bulk_charge = part(
+        complement.multiply(drain).multiply(&edge),
+        bulk_du,
+        bulk_dd,
+        bulk_da,
+    );
+    let (source_value, source_du, source_dt) = if partition > 0.5 {
+        (
+            weighted_drain.clone().mul_add(
+                &fraction.clone().scale(0.5).offset(-0.25),
+                &overdrive.clone().scale(-0.5),
+            ),
+            ratio
+                .clone()
+                .scale(-0.5)
+                .mul_add(&fraction, &overdrive.constant(-0.5)),
+            fraction
+                .clone()
+                .add(&weighted_fraction_partial)
+                .scale(0.5)
+                .offset(-0.25),
+        )
+    } else if partition < 0.5 {
+        partition_40_60(overdrive, &weighted_drain, &ratio, &width)?
+    } else {
+        (
+            inversion_value.scale(-0.5),
+            inversion_du.scale(-0.5),
+            inversion_dt.scale(-0.5),
+        )
+    };
+    let source = part(
+        source_value,
+        source_du,
+        source_dt.clone().multiply(bulk),
+        source_dt.multiply(drain),
+    );
+    Ok([inversion, bulk_charge, source])
+}
+
+/// Evaluate the Ward-Dutton polynomial and its overdrive/weighted-drain partials.
+fn partition_40_60<S: Constitutive>(
+    overdrive: &S,
+    weighted_drain: &S,
+    ratio: &S,
+    width: &S,
+) -> SpiceResult<(S, S, S)> {
+    // Evaluate the Ward-Dutton cubic divided by width² without forming
+    // powers of a small dimensional voltage in numerator/denominator.
+    let normalized_gate = overdrive.clone().divide(width)?;
+    let ratio_squared = ratio.clone().multiply(ratio);
+    let gate_squared = normalized_gate.clone().multiply(&normalized_gate);
+    let mixed = normalized_gate.multiply(ratio);
+    let polynomial = ratio_squared
+        .clone()
+        .scale(2. / 3.)
+        .add(&gate_squared)
+        .add(&mixed.clone().scale(-4. / 3.));
+    let value = overdrive
+        .clone()
+        .mul_add(
+            &polynomial,
+            &weighted_drain
+                .clone()
+                .multiply(&ratio_squared)
+                .scale(-2. / 15.),
+        )
+        .scale(-0.5);
+    let relative = value.clone().divide(width)?;
+    let du = gate_squared
+        .clone()
+        .scale(3.)
+        .add(&mixed.clone().scale(-8. / 3.))
+        .add(&ratio_squared.clone().scale(2. / 3.))
+        .scale(-0.5)
+        .add(&relative.clone().scale(-2.));
+    let dt = gate_squared
+        .scale(-4. / 3.)
+        .add(&mixed.scale(4. / 3.))
+        .add(&ratio_squared.scale(-0.4))
+        .scale(-0.5)
+        .add(&relative);
+    Ok((value, du, dt))
+}
+
 /// Effective gate voltage and local gate derivative after poly-Si depletion.
 /// BSIM3 and BSIM4 use the same law, but their reference electron-charge
 /// constants differ. The prepared scale preserves that distinction.
@@ -440,6 +613,66 @@ mod tests {
                 let reference =
                     (base + extra) * v - extra * (half + 0.5 * kappa * (secondary - 1.));
                 close(value_at(&charge.value, sample), reference, 2e-23);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inversion_partitions_match_independent_charge_formulas_and_full_partial_germs()
+    -> SpiceResult<()> {
+        type Local = Differential<4>;
+        let area = 1.7e-12;
+        for partition in [0., 0.5, 1.] {
+            for (overdrive, drain, bulk) in [
+                (0.8, 0., 1.2),
+                (0.8, 0.2, 1.2),
+                (0.8, 0.6, 1.2),
+                (0.2, 0.1, 1.),
+                (1e-21, 1e-22, 0.8),
+            ] {
+                let rates = [overdrive * 0.01, overdrive * 0.01, -0.003, area * 0.02];
+                let point = [overdrive, drain, bulk, area];
+                let [u, d, a, c] = point;
+                let laws = channel_inversion(
+                    &Local::variable(0, Jet::affine(ORDER, u, rates[0]))?,
+                    &Local::variable(1, Jet::affine(ORDER, d, rates[1]))?,
+                    &Local::variable(2, Jet::affine(ORDER, a, rates[2]))?,
+                    &Local::variable(3, Jet::affine(ORDER, c, rates[3]))?,
+                    partition,
+                )?;
+                for law in &laws {
+                    for (coordinate, partial) in law.partials.iter().enumerate() {
+                        for (degree, &expected) in partial.value.coefficients().iter().enumerate() {
+                            let actual = law.value.gradient[coordinate]
+                                .as_ref()
+                                .map_or(0., |g| g.coefficients()[degree]);
+                            close(actual, expected, 3e-26);
+                        }
+                    }
+                }
+                for time in [0., 0.01, 0.025] {
+                    let [u, d, a, c]: [Real; 4] =
+                        std::array::from_fn(|i| rates[i].mul_add(time, point[i]));
+                    // Independently evaluate the original C cubic and charge laws.
+                    let weighted = a * d;
+                    let width = (-0.5_f64).mul_add(weighted, u) + 1e-20;
+                    let denominator = 12. * width;
+                    let gate = c * (u - weighted * (0.5 - weighted / denominator));
+                    let bulk = c * (1. - a) * (d * 0.5 - weighted * d / denominator);
+                    let source = if partition > 0.5 {
+                        -c * (u * 0.5 + weighted * 0.25 - weighted * weighted * 0.5 / denominator)
+                    } else if partition < 0.5 {
+                        -0.5 * c / (width * width)
+                            * (u * (2. * weighted * weighted / 3. + u * (u - 4. * weighted / 3.))
+                                - 2. * weighted * weighted * weighted / 15.)
+                    } else {
+                        -gate * 0.5
+                    };
+                    for (law, expected) in laws.iter().zip([gate, bulk, source]) {
+                        close(value_at(&law.value.value, time), expected, 3e-16 * c * u);
+                    }
+                }
             }
         }
         Ok(())
