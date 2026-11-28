@@ -94,7 +94,7 @@
 //! request arguments (`rtol=`, `vntol=`, `abstol=`, `chgtol=`, `trtol=`, `method=`,
 //! `maxord=`, `xmu=`, `tranmaxiter=`, `maxsteps=`, `maxiter=`, `srcsteps=`,
 //! `gminsteps=`, `gminfactor=`, `noopiter=`, `adaptiter=`, `trcvmaxiter=`),
-//! then the deck's options, then driver defaults (27 C). Each name is resolved independently, so a request
+//! then the last scalar `.temp` directive, then the deck's options, then driver defaults (27 C). Each name is resolved independently, so a request
 //! `gminsteps=` combines with a deck `gminfactor`.
 //! Defaults are ngspice's (reltol 1e-3, vntol 1e-6, abstol 1e-12, chgtol 1e-14,
 //! trtol 7). A request's `backend=` is not interpreted here: the `.tran`
@@ -107,7 +107,9 @@
 
 use crate::analysis::IntegrationFamily;
 use crate::devices::Circuit;
-use crate::netlist::ast::{AnalysisCard, Netlist, OptionCard, OptionSetting};
+use crate::netlist::ast::{
+    AnalysisCard, Netlist, OptionCard, OptionCardKind, OptionSetting, Subcircuit,
+};
 use crate::netlist::eval::{EvalBudget, ParamScope};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
@@ -469,11 +471,7 @@ impl RunConfig {
         scope: std::sync::Arc<ParamScope>,
     ) -> SpiceResult<Self> {
         // Body front-end cards follow expanded instance/card order, not definition order.
-        let expanded = if netlist.subcircuits.iter().any(|sub| {
-            !sub.options.is_empty()
-                || !sub.initial_conditions.is_empty()
-                || !sub.nodesets.is_empty()
-        }) {
+        let expanded = if netlist.subcircuits.iter().any(has_frontend_directives) {
             let literal = crate::netlist::elaborate::literalize_with(
                 netlist,
                 std::sync::Arc::clone(&scope),
@@ -570,7 +568,18 @@ impl RunConfig {
         let mut flagged = std::collections::BTreeSet::new();
         let mut valued = std::collections::BTreeSet::new();
         let mut budget = EvalBudget::default();
-        for setting in cards.iter().flat_map(|card| &card.settings) {
+        // The C front end applies scalar .temp after ordinary deck options,
+        // regardless of their relative source positions. Preserve order within
+        // each class, including the expanded order of instantiated subcircuits.
+        let ordered = cards
+            .iter()
+            .filter(|card| card.kind == OptionCardKind::Options)
+            .chain(
+                cards
+                    .iter()
+                    .filter(|card| card.kind == OptionCardKind::Temperature),
+            );
+        for setting in ordered.flat_map(|card| &card.settings) {
             let seen = if setting.value.is_some() {
                 &mut valued
             } else {
@@ -1375,6 +1384,13 @@ fn accepted(name: &str) -> bool {
 /// ([`crate::primitives::c_integer`]), limited to `u32`.
 fn integer_value(value: Real) -> Option<u32> {
     crate::primitives::c_integer(value).and_then(|n| u32::try_from(n).ok())
+}
+
+fn has_frontend_directives(sub: &Subcircuit) -> bool {
+    !sub.options.is_empty()
+        || !sub.initial_conditions.is_empty()
+        || !sub.nodesets.is_empty()
+        || sub.subcircuits.iter().any(has_frontend_directives)
 }
 
 fn temperature(value: Real, location: &SourceLoc, what: &str) -> SpiceResult<Real> {

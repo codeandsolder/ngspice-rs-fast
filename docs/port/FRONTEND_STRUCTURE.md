@@ -140,15 +140,23 @@ flattening or simulation comparison. No rawfile goldens/tolerances are changed.
 ## Options and globals (#16)
 
 `.option`/`.options`/`.opt` parse (winnow, `parser/options.rs`) into
-`OptionCard { settings: Vec<OptionSetting>, location }`; each setting has a
+`OptionCard { kind, settings: Vec<OptionSetting>, location }`; each setting has a
 lowercased name, optional positioned value text (`None` for a flag) and its
 location. Order and duplicates are kept; syntax only. `.global` parses into
 `GlobalCard { nodes: Vec<GlobalNode> }` using the device-node normalization
 (`gnd` -> `0` only with automatic aliasing). Cards are indexed by
 `ScopedCardKind::Options(i)`/`Global(i)` into `Netlist::options`/`globals`.
 `Netlist::is_global_node`/`global_node_names` are the flattener contract: `0` is
-always global, other names only if a top-level `.global` listed them. Options or
-globals inside a `.subckt` body return `NotYetPorted`.
+always global, other names only if a top-level `.global` listed them. Configuration cards inside instantiated subcircuits are resolved in expanded card order.
+
+A scalar `.temp` directive (#261) is a distinct typed configuration card with
+one `temp` setter. Its numeric literal is finite decimal Celsius (no SPICE
+engineering suffix), or a brace/single-quoted parameter expression. The
+writer preserves `.temp` instead of converting it to `.options temp=`.
+The last instantiated `.temp` overrides every ordinary deck temperature
+option independently of source order, but explicit `RunOverrides` wins.
+`tnom`, per-device `TEMP` and `DTEMP` retain their existing semantics.
+A temperature list is not silently reduced to a scalar; use a typed sweep.
 
 `analysis::RunConfig` (docs in `config.rs`) resolves the settings. Repeats
 override in order; a name used both as flag and value, unknown names (including
