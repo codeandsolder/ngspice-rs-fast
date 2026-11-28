@@ -108,7 +108,7 @@ petgraph = "0.8.3"
 [dependencies]
 winnow.workspace = true
 petgraph.workspace = true
-model-kernel-api = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
+model-kernel-api = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "17a6511ec8473a8936f1454129d96852fac057f2" }
 model-normalize-ngspice = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
 model-kernel-diode = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
 model-preprocess-command = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
