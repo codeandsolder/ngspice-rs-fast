@@ -381,7 +381,7 @@ pub enum CodePortKind {
 
 impl CodePortKind {
     /// Whether one element contains an ordered pair of nodes.
-    #[must_use]
+    #[must_use = "the result determines whether a terminal consumes an ordered node pair"]
     pub const fn differential(self) -> bool {
         matches!(
             self,
@@ -390,7 +390,7 @@ impl CodePortKind {
     }
 
     /// Canonical explicit marker; the default is written without a marker.
-    #[must_use]
+    #[must_use = "the marker determines the explicit terminal syntax during serialization"]
     pub const fn marker(self) -> Option<&'static str> {
         match self {
             Self::Default => None,

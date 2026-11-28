@@ -169,7 +169,7 @@ pub enum BranchQuantity {
 
 impl BranchQuantity {
     /// Plot vector identity and unit for this coordinate.
-    #[must_use]
+    #[must_use = "the returned identity and unit define the requested branch observation"]
     pub fn observation(self, name: &str) -> (String, &'static str) {
         match self {
             Self::Current => (format!("i({name})"), "current"),
@@ -650,7 +650,7 @@ pub struct ConvergenceContext<'a> {
 
 impl ConvergenceContext<'_> {
     /// A device-local accepted state value, age one being the latest.
-    #[must_use]
+    #[must_use = "the returned value is the accepted state used for device convergence checks"]
     pub fn accepted(&self, age: usize, slot: usize) -> Option<Real> {
         self.history
             .accepted(age)?
@@ -1807,7 +1807,7 @@ pub struct TransientEventContext<'a> {
 
 impl TransientEventContext<'_> {
     /// Candidate node potential, zero at ground.
-    #[must_use]
+    #[must_use = "the candidate node potential is required to evaluate the event law"]
     pub fn voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)
