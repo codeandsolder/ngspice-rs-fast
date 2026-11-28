@@ -1013,7 +1013,9 @@ fn solve_retained_rhs(
     work: &mut PatternWork,
 ) -> SpiceResult<Vector> {
     if rhs.len() != symbolic.n || !rhs.is_finite() {
-        return Err(numerical("retained sparse solve", "invalid RHS"));
+        let result = Err(numerical("retained sparse solve", "invalid RHS"));
+        work.record_rhs(&result);
+        return result;
     }
     if let Some(original) = &mut symbolic.original
         && original.promoted()
