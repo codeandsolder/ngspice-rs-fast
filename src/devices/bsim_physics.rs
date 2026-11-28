@@ -55,17 +55,21 @@ pub(super) struct JunctionCapacitance {
 
 /// Three physical junction regions (bottom, sidewall, gate sidewall). The
 /// reverse integral and quadratic forward continuation meet at zero bias.
-/// Returns (charge, differential capacitance), before multiplicity.
+/// Returns (charge, differential capacitance), before multiplicity. The
+/// observer receives the running charge in reference region order, so the
+/// BSIM4 host retains the state-write sequence while other consumers can
+/// use the final constitutive pair directly.
 pub(super) fn depletion<S: Constitutive>(
     voltage: S,
     parts: [JunctionCapacitance; 3],
+    mut observe_charge: impl FnMut(&S),
 ) -> SpiceResult<(S, S)> {
     let [bottom, side, gate] = parts;
     let zero = bottom.zero + side.zero + gate.zero;
     if voltage.compare(0.) == Some(Ordering::Less) {
         let mut charge = voltage.constant(0.);
         let mut cap = voltage.constant(0.);
-        for part in parts {
+        for (index, part) in parts.into_iter().enumerate() {
             if part.zero > 0. {
                 let relative = voltage
                     .clone()
@@ -95,6 +99,9 @@ pub(super) fn depletion<S: Constitutive>(
                     .constant(part.potential * part.zero)
                     .mul_add(&integral, &charge);
                 cap = voltage.constant(part.zero).mul_add(&factor, &cap);
+                observe_charge(&charge);
+            } else if index == 0 {
+                observe_charge(&charge);
             }
         }
         Ok((charge, cap))
@@ -109,6 +116,7 @@ pub(super) fn depletion<S: Constitutive>(
                 .constant(0.5)
                 .mul_add(&increment, &voltage.constant(zero)),
         );
+        observe_charge(&charge);
         Ok((charge, increment.offset(zero)))
     }
 }
@@ -218,8 +226,8 @@ mod tests {
             (0., 0.04),
             (0.25, -0.03),
         ] {
-            let (charge, cap) = depletion(variable(bias, rate)?, parts)?;
-            let (scalar_charge, scalar_cap) = depletion(bias, parts)?;
+            let (charge, cap) = depletion(variable(bias, rate)?, parts, |_| {})?;
+            let (scalar_charge, scalar_cap) = depletion(bias, parts, |_| {})?;
             close(charge.value.value(), scalar_charge, 2e-28);
             close(cap.value.value(), scalar_cap, 2e-28);
             check_charge_gradient(&charge, &cap);
@@ -252,7 +260,7 @@ mod tests {
                 }
             }
             let sample = 0.02;
-            let (reference, _) = depletion(rate.mul_add(sample, bias), parts)?;
+            let (reference, _) = depletion(rate.mul_add(sample, bias), parts, |_| {})?;
             close(value_at(&charge.value, sample), reference, 2e-25);
         }
         Ok(())
