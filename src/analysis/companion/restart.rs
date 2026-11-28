@@ -3,7 +3,7 @@
 
 use super::{
     AttemptedStep, Boundary, Driver, NextStep, Order, ReadyStep, StepDecision, Tolerances, Trial,
-    TrialPoint, failure,
+    failure,
 };
 use crate::devices::{Forcing, TrialState};
 use crate::maths::Vector;
@@ -14,7 +14,8 @@ pub(super) enum RestartProbe {
     Unneeded,
     Midpoint {
         dt: Real,
-        point: TrialPoint,
+        x: Vector,
+        state: TrialState,
     },
     Retry {
         next: NextStep,
@@ -96,8 +97,8 @@ impl Driver<'_> {
         let outcome = self.solve_trial(&attempt, &mut prepared, iterate, &mut workspace);
         self.workspace = workspace;
         drop(prepared);
-        let mut point = match outcome? {
-            Trial::Converged(point) => point,
+        let (x, mut state) = match outcome? {
+            Trial::Converged { x, state } => (x, state),
             Trial::NotConverged { last } => {
                 return Ok(RestartProbe::Retry {
                     next: NextStep {
@@ -112,20 +113,17 @@ impl Driver<'_> {
         // endpoint. Retrying at the midpoint (or its localized crossing)
         // makes that event go through the ordinary transactional path.
         self.stats.device_event_trial_probes += self.event_devices.len();
-        let mixed = self.mixed_retry(&attempt, &point.x)?;
-        let device = self.device_retry(&attempt, &point.x, &mut point.state)?;
+        let mixed = self.mixed_retry(&attempt, &x)?;
+        let device = self.device_retry(&attempt, &x, &mut state)?;
         if let Some(next) = mixed
             .into_iter()
             .chain(device)
             .min_by(|a, b| a.delta.total_cmp(&b.delta))
         {
-            return Ok(RestartProbe::Retry {
-                next,
-                last: point.x,
-            });
+            return Ok(RestartProbe::Retry { next, last: x });
         }
         if self
-            .device_discontinuity(&point.state)?
+            .device_discontinuity(&state)?
             .is_some_and(|time| time > start)
         {
             return Ok(RestartProbe::Retry {
@@ -133,10 +131,10 @@ impl Driver<'_> {
                     delta: dt,
                     order: Order::One,
                 },
-                last: point.x,
+                last: x,
             });
         }
-        Ok(RestartProbe::Midpoint { dt, point })
+        Ok(RestartProbe::Midpoint { dt, x, state })
     }
 
     pub(super) fn restart_decision(
@@ -146,7 +144,12 @@ impl Driver<'_> {
         solution: &Vector,
         midpoint: &RestartProbe,
     ) -> SpiceResult<Option<StepDecision>> {
-        let RestartProbe::Midpoint { dt: half, point } = midpoint else {
+        let RestartProbe::Midpoint {
+            dt: half,
+            x: middle_x,
+            state: middle_state,
+        } = midpoint
+        else {
             return Ok(None);
         };
         let dt = attempt.coefficients.dt();
@@ -160,10 +163,10 @@ impl Driver<'_> {
             let base = slot.base;
             let values = [
                 accepted[base],
-                point.state.values()[base],
+                middle_state.values()[base],
                 state.values()[base],
             ];
-            let rates = [point.state.values()[base + 1], state.values()[base + 1]];
+            let rates = [middle_state.values()[base + 1], state.values()[base + 1]];
             let estimate = charge_ratio(values, rates, dt, *half, tolerance);
             if !estimate.is_finite() {
                 return Err(failure("nonfinite restart charge error estimate"));
@@ -176,7 +179,7 @@ impl Driver<'_> {
             for &row in &history.rows {
                 let values = [
                     initial.as_slice()[row],
-                    point.x.as_slice()[row],
+                    middle_x.as_slice()[row],
                     solution.as_slice()[row],
                 ];
                 let magnitude = values.into_iter().map(Real::abs).fold(0., Real::max);
