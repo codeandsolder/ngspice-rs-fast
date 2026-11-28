@@ -401,3 +401,34 @@ fn independent_sidewall_noise_sources_reach_the_terminal() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn fn_source_geometry_overrides_signed_values_and_invalid_domains() -> Result<()> {
+    for row in include_str!("fixtures/ltspice_diode/fn-geometry-ac.tsv")
+        .lines()
+        .skip(1)
+    {
+        let fields: Vec<_> = row.split('|').collect();
+        let [name, bias, model, instance, real, imaginary] = fields.as_slice() else {
+            anyhow::bail!("invalid Fowler–Nordheim AC witness");
+        };
+        let re: f64 = real.parse()?;
+        let im: f64 = imaginary.parse()?;
+        let source = format!(
+            "FN geometry {name}\nVx x 0 DC {bias} AC 1\nD1 x 0 dm {instance}\n.model dm D(Level=2 {model})\n.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12\n.ac lin 1 1k 1k\n.end\n"
+        );
+        if !re.is_finite() || !im.is_finite() {
+            ensure!(
+                plot(&source).is_err(),
+                "{name}: expected invalid physical domain"
+            );
+        } else {
+            let actual = plot(&source)?
+                .value("i(vx)", 0)
+                .context("missing F-N terminal current")?;
+            close(name, actual.re, re, 3e-8, 1e-18)?;
+            close(name, actual.im, im, 3e-8, 1e-18)?;
+        }
+    }
+    Ok(())
+}
