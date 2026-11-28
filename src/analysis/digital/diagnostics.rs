@@ -117,6 +117,7 @@ mod tests {
             time: 1.,
             delta,
             detail: ModelDiagnostic {
+                fatal: false,
                 kind: "setup",
                 input: 0,
                 elapsed: 0.,

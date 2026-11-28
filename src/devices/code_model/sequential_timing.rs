@@ -163,6 +163,7 @@ fn check(
         && (now <= previous || now < previous + minimum)
     {
         violations.push(ModelDiagnostic {
+            fatal: false,
             kind,
             input,
             elapsed: now - previous,
@@ -318,14 +319,9 @@ impl TimingContract {
             return Ok(false);
         }
         if matches!(self.policy, ViolationPolicy::Error) {
-            let violation = &violations[0];
-            return Err(SpiceError::circuit(format!(
-                "{} violation at t={now:e}: input {} interval {:e} < required {:e}",
-                violation.kind,
-                violation.input + 1,
-                violation.elapsed,
-                violation.minimum
-            )));
+            for violation in &mut violations {
+                violation.fatal = true;
+            }
         }
         // A known preset/clear drives the result independently of a
         // violating clock or data interval. An async-width violation is
@@ -376,7 +372,8 @@ mod tests {
         time: Real,
         bits: [Logic; 4],
     ) -> SpiceResult<bool> {
-        contract.observe(
+        let mut diagnostics = Vec::new();
+        let unknown = contract.observe(
             EventContext {
                 time,
                 delta: 0,
@@ -384,8 +381,12 @@ mod tests {
             },
             &bits.map(Drive::strong),
             state,
-            &mut Vec::new(),
-        )
+            &mut diagnostics,
+        )?;
+        if let Some(violation) = diagnostics.iter().find(|violation| violation.fatal) {
+            return Err(SpiceError::circuit(format!("{} violation", violation.kind)));
+        }
+        Ok(unknown)
     }
 
     #[test]

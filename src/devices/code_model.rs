@@ -220,6 +220,8 @@ pub struct EventContext {
 /// event engine assigns its model identity and physical timestamp at acceptance.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelDiagnostic {
+    /// Whether this diagnostic prevents accepting the trial.
+    pub fatal: bool,
     /// Type of timing constraint (setup, hold, pulse width, recovery).
     pub kind: &'static str,
     /// Zero-based input port involved in the constraint.

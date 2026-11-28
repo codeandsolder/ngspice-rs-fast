@@ -53,8 +53,8 @@ logic levels establish state but do not claim a transition prior to time zero.
 Exact deadline equality passes, including explicitly disabled zero intervals.
 Known asserted asynchronous controls supersede synchronous captures.
 
-`timing_violation=0` (default when a constraint is declared) rejects the
-simulation; `1` emits a diagnostic and invalidates affected storage to X;
+`timing_violation=0` (default when a constraint is declared) prevents
+acceptance of the offending candidate, not its speculative evaluation; `1` emits a diagnostic and invalidates affected storage to X;
 `2` reports a diagnostic without changing the ideal logical result. Diagnostic
 records carry the flattened instance name, physical time, delta, input port,
 observed interval and required interval. Only accepted event transactions

@@ -638,6 +638,61 @@ mod tests {
     }
 
     #[test]
+    fn fatal_timing_violation_is_deferred_to_commit() -> SpiceResult<()> {
+        use super::super::sequential_timing::TimingSpec;
+        let mut network = Network::default();
+        let data = network.add_net();
+        let clock = network.add_net();
+        let output = network.add_net();
+        let d = network.add_source(data)?;
+        let c = network.add_source(clock)?;
+        let operation = Operation::from_value(11., 2, None)?;
+        let mut spec = TimingSpec::default();
+        spec.set_vector("timing_setup", vec![2.])?;
+        network.add_model(
+            LogicKernel {
+                operation,
+                inputs: 2,
+                initial: Logic::Zero,
+                delays: Delays::ZERO,
+                mode: DelayMode::Inertial,
+                strength: Strength::Strong,
+                invert: Vec::new(),
+                timing: spec.bind(operation, 2)?,
+            },
+            &[data, clock],
+            &[output],
+        )?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let mut initial = engine.trial();
+        initial.schedule(d, 0., Drive::strong(Logic::Zero))?;
+        initial.schedule(c, 0., Drive::strong(Logic::Zero))?;
+        initial.schedule(d, 1., Drive::strong(Logic::One))?;
+        initial.advance_to(1.)?;
+        initial.commit()?;
+        let mut rejected = engine.trial();
+        rejected.schedule(c, 2., Drive::strong(Logic::One))?;
+        rejected.advance_to(2.)?;
+        assert_eq!(rejected.diagnostics().len(), 1);
+        assert!(rejected.diagnostics()[0].detail.fatal);
+        assert!(
+            rejected
+                .commit()
+                .unwrap_err()
+                .to_string()
+                .contains("setup violation")
+        );
+        assert!(engine.diagnostics().is_empty());
+        let mut accepted = engine.trial();
+        accepted.schedule(c, 3., Drive::strong(Logic::One))?;
+        accepted.advance_to(3.)?;
+        accepted.commit()?;
+        assert!(engine.diagnostics().is_empty());
+        assert_eq!(engine.value(output), Some(Drive::strong(Logic::One)));
+        Ok(())
+    }
+
+    #[test]
     fn independent_rise_fall_paths_and_explicit_zero() -> SpiceResult<()> {
         let zero = Drive::strong(Logic::Zero);
         let one = Drive::strong(Logic::One);

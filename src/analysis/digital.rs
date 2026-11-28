@@ -330,6 +330,7 @@ struct State {
     predictions: Vec<Option<Prediction>>,
     stats: Stats,
     diagnostics: DiagnosticLog,
+    first_fatal: Option<EventDiagnostic>,
 }
 
 impl State {
@@ -353,6 +354,7 @@ impl State {
             predictions: vec![None; network.models.len()],
             stats: Stats::default(),
             diagnostics: DiagnosticLog::default(),
+            first_fatal: None,
         }
     }
 
@@ -446,6 +448,13 @@ impl State {
 }
 
 impl State {
+    fn check_acceptance(&self) -> SpiceResult<()> {
+        if let Some(diagnostic) = &self.first_fatal {
+            return Err(SpiceError::circuit(diagnostic.to_string()));
+        }
+        Ok(())
+    }
+
     fn charge_work(&self, before: Stats, limit: usize) -> SpiceResult<()> {
         let events = self.stats.events - before.events;
         let evaluations = self.stats.evaluations - before.evaluations;
@@ -489,12 +498,16 @@ impl State {
                 .ok_or_else(|| SpiceError::circuit("digital diagnostic count overflow"))?;
             self.charge_work(before, limit)?;
             for detail in diagnostics {
-                self.diagnostics.push(EventDiagnostic {
+                let diagnostic = EventDiagnostic {
                     model: instance.name.clone(),
                     time: self.time.value(),
                     delta: self.delta,
                     detail,
-                });
+                };
+                if diagnostic.detail.fatal && self.first_fatal.is_none() {
+                    self.first_fatal = Some(diagnostic.clone());
+                }
+                self.diagnostics.push(diagnostic);
             }
             self.accept_model_outputs(network, index, outputs)?;
         }
@@ -928,6 +941,7 @@ impl Trial<'_> {
         if self.failed {
             return Err(SpiceError::circuit("cannot commit failed digital trial"));
         }
+        self.state.check_acceptance()?;
         self.engine.accepted = self.state;
         Ok(())
     }
@@ -1348,6 +1362,9 @@ impl MixedSignal {
         let state =
             self.prepare_event_state(end, preview, qualified_updates, updates, &mut point.changes)?;
         state.charge_work(self.engine.accepted.stats, self.engine.limits.work)?;
+        // Previews can discover tentative timing failures. Only the replay
+        // with converged receiver values may prevent analog acceptance.
+        state.check_acceptance()?;
         for dac in &self.dacs {
             let logic = state.nets[dac.net.0].logic;
             let previous_ramp = dac.port.ramp()?;
