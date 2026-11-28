@@ -657,7 +657,7 @@ impl ReactiveLoad<'_> {
         if context.mode.is_dc() {
             record_dc_state(context, flux)?;
             if let Some(bias) = self.bias
-                && bias.stamp_inductor(self.terminals, row, context)?
+                && bias.stamp_owned_branch(self.terminals, row, context)?
             {
                 return Ok(());
             }
