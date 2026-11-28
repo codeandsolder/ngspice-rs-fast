@@ -9,8 +9,8 @@
 //! after `m` was perturbed zeroes the coefficient). The port replays this.
 
 use super::{
-    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter as P, SensitivityRecord,
+    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, SensitivityFamily,
+    SensitivityKernel, SensitivityParameter as P, SensitivityRecord,
 };
 use crate::devices::{ControlledKind, ControlledSource};
 use crate::primitives::{Real, SpiceResult};
@@ -98,15 +98,27 @@ impl SensitivityKernel for ControlledSensitivity<'_> {
         }
     }
 
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        _mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(
-            self.source
-                .with_coefficient(current.instance.value("gain")?)?,
-        )))
+    ) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::replacement(self.replacement(current)?))
+    }
+
+    fn ac_load(
+        &self,
+        _setup: RecordPair<'_>,
+        _reset: AcReset<'_>,
+        current: RecordPair<'_>,
+    ) -> SpiceResult<AcSensitivityLoad> {
+        Ok(AcSensitivityLoad::device(self.replacement(current)?))
+    }
+}
+
+impl ControlledSensitivity<'_> {
+    fn replacement(&self, current: RecordPair<'_>) -> SpiceResult<ControlledSource> {
+        self.source
+            .with_coefficient(current.instance.value("gain")?)
     }
 }

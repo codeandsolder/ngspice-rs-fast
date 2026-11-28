@@ -53,7 +53,7 @@
 use super::channel::{ChannelModel, ChannelTemperature};
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
 use super::{CELSIUS_TO_KELVIN, HfetInstance as Instance};
-use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
+use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
 use crate::devices::limiting;
@@ -61,8 +61,9 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter, SensitivityRecord,
+    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord, StampPart,
+    node_stamps, stamp_reset,
 };
 use crate::devices::{
     AnalysisMode, Device, DeviceState, LinearContext, ModelContext, ResolvedModel, StampContext,
@@ -1828,18 +1829,12 @@ impl SensitivityKernel for Hfet1Sensitivity<'_> {
         Ok(())
     }
 
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "an HFET1's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(self.hfet1(current)?)))
+    ) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::replacement(self.hfet1(current)?))
     }
 
     /// `HFETAacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
@@ -1848,17 +1843,17 @@ impl SensitivityKernel for Hfet1Sensitivity<'_> {
     /// `qgs`/`qgd` are zero, and the model conductances, `CDS`, the
     /// frequency-dependent output conductance (`kappa`, `fgds`, `delf`) and
     /// `m` come from `current`.
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(ResetHfet1 {
+    ) -> SpiceResult<AcSensitivityLoad> {
+        Ok(AcSensitivityLoad::stamp(ResetHfet1 {
             state: self.hfet1(reset.state)?,
             current: self.hfet1(current)?,
             omega: reset.omega,
-        })))
+        }))
     }
 }
 
@@ -1953,7 +1948,7 @@ impl Hfet1Sensitivity<'_> {
 }
 
 /// An HFET1's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
 #[derive(Debug)]
 struct ResetHfet1 {
     /// Built from the reset load's records: the gate and channel
@@ -1965,29 +1960,10 @@ struct ResetHfet1 {
     omega: Real,
 }
 
-impl Device for ResetHfet1 {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'z'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl AcSensitivityStamp for ResetHfet1 {
     /// `hfetacl.c`'s stamps in its order: the real parts, then the
     /// imaginary ones (`xgs`/`xgd` zero, `xds = CDS * CKTomega`).
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let temperature = context.model_context.temperature;
         let state = &self.state;
         // `type * (0 - 0)`: a signed zero, as C's at zero node voltages.
@@ -2058,7 +2034,12 @@ impl Device for ResetHfet1 {
             (n.dp, n.sp, -(m * xds)),
             (n.sp, n.dp, -(m * xds)),
         ];
-        stamp_reset(&current.name, context, &real, &imaginary)
+        stamp_reset(
+            &current.name,
+            node_stamps(&real, StampPart::Real)
+                .chain(node_stamps(&imaginary, StampPart::Imaginary)),
+            context,
+        )
     }
 }
 
