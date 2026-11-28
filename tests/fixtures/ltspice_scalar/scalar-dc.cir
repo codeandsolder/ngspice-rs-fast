@@ -1,0 +1,24 @@
+LTspice scalar witness
+.options reltol=1e-10 abstol=1e-14 vntol=1e-12
+Vx x 0 0
+B1 a 0 V=table(V(x),-1,2,0,5,2,1)
+B2 b 0 V=uplim(V(x),1,.5)
+B3 c 0 V=dnlim(V(x),-1,.5)
+B4 d 0 V=V(x)^0.4
+B5 e 0 V=V(x)&0.6
+B6 f 0 V=V(x)|0.4
+B7 g 0 V=!V(x)
+B8 h 0 V=~V(x)
+B9 j 0 V=1|1&0
+B10 k 0 V=1^1|1
+B11 l 0 V=1|1^1
+B12 m 0 V=-2**2
+B13 n 0 V=2**3**2
+B14 p 0 V=pow(-2,0.5)
+B15 q 0 V=pow(-2,1.5)
+B16 r 0 V=pow(-2,2.5)
+B17 s 0 V=pow(-2,1.25)
+B18 t 0 V=pow(-2,3)
+B19 u 0 V=0**0
+B20 w 0 V=table(V(x),0,10)
+.end

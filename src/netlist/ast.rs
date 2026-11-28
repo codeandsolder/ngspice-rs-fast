@@ -583,7 +583,7 @@ pub struct FuncCard {
     /// distinct, lowercased and never a built-in function name.
     pub parameters: Vec<FuncParameter>,
     /// The unevaluated body (`{...}`, `'...'` or the bare rest of the card).
-    pub body: crate::netlist::expr::ParameterExpression,
+    pub body: crate::netlist::expr::FunctionBody,
     /// Which card spelled the definition (kept for the writer only).
     pub spelling: FuncSpelling,
     /// Where the card was written.

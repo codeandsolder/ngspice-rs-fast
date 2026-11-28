@@ -435,6 +435,11 @@ impl<F: Fn(&str) -> Option<Real>> VectorCompiler<'_, F> {
             }
             ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => self.is_vector(operand),
             ExprKind::Binary { lhs, rhs, .. } => self.is_vector(lhs) || self.is_vector(rhs),
+            ExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => self.is_vector(condition) || self.is_vector(then) || self.is_vector(otherwise),
             ExprKind::Call { arguments, .. } => {
                 arguments.iter().any(|argument| self.is_vector(argument))
             }
@@ -517,14 +522,21 @@ impl<F: Fn(&str) -> Option<Real>> VectorCompiler<'_, F> {
             ExprKind::Group(operand) => self.compile(operand)?,
             ExprKind::Unary { op, operand } => {
                 self.compile(operand)?;
-                if *op == UnaryOp::Minus {
-                    self.code.push(VectorOp::Unary(Unary::Negate));
+                match op {
+                    UnaryOp::Plus => {}
+                    UnaryOp::Minus => self.code.push(VectorOp::Unary(Unary::Negate)),
+                    UnaryOp::Not => {
+                        return Err(failure("logical negation is unsupported for vectors"));
+                    }
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 self.compile(lhs)?;
                 self.compile(rhs)?;
                 self.code.push(VectorOp::Binary(*op));
+            }
+            ExprKind::Ternary { .. } => {
+                return Err(failure("conditional vector expressions are unsupported"));
             }
             ExprKind::Call {
                 function,
@@ -572,6 +584,7 @@ fn binary(operation: BinaryOp, left: Complex, right: Complex) -> SpiceResult<Com
             Ok(Complex::real(left.re.powf(right.re)))
         }
         BinaryOp::Pow => Err(failure("complex vector powers are unsupported")),
+        _ => Err(failure("non-arithmetic vector operator is unsupported")),
     }
 }
 
