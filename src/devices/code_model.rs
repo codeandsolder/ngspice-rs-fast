@@ -3,6 +3,8 @@
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
+mod continuous_switch;
+mod continuous_switch_device;
 mod frequency;
 pub mod rational;
 pub mod source;

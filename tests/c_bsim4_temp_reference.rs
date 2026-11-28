@@ -115,7 +115,7 @@ fn bsim4_temperature_stage_matches_c_fields() {
         }
         let names: Vec<_> = asks.iter().map(|(n, _)| format!("@m1[{n}]")).collect();
         control.push_str(&format!("print {}\nquit\n.endc\n.end\n", names.join(" ")));
-        // The port's parser does not accept `.temp` yet; only C reads it.
+        // The direct model probe above takes its temperature explicitly; C reads the deck directive.
         let c_text = text.replace(".end\n", &format!(".temp {temp}\n{control}"));
         let log = probe(&binary, label, &c_text);
         let actual: BTreeMap<String, f64> = log

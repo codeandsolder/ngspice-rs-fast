@@ -188,6 +188,7 @@ struct TopologyBindings {
     state_len: usize,
     stochastic_sources: Vec<usize>,
     prepared_devices: Vec<usize>,
+    context_devices: Vec<usize>,
     native_mixed: Option<crate::analysis::digital::NativeTopology>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
@@ -341,7 +342,8 @@ pub struct PreparedRun<'a> {
 
 impl Drop for PreparedRun<'_> {
     fn drop(&mut self) {
-        if !self.circuit.bindings.prepared_devices.is_empty()
+        if (!self.circuit.bindings.prepared_devices.is_empty()
+            || !self.circuit.bindings.context_devices.is_empty())
             && let Some(point) = self.point.get_mut().take()
         {
             self.circuit.runtime.prepared_idle.replace(Some(point));
@@ -552,6 +554,23 @@ impl<'a> PreparedRun<'a> {
         replacements: &mut Vec<(usize, Box<dyn Device>)>,
         previous: Option<&PreparedPoint>,
     ) -> SpiceResult<()> {
+        // Context-only native storage models are independent of the
+        // physical tile ownership contract. Stage these first, so an invalid
+        // scalar recipe cannot mutate an existing candidate's prepared lanes.
+        for &index in &self.circuit.bindings.context_devices {
+            match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
+                Ok(slot) => {
+                    if let Some(device) = replacements[slot].1.reprepare_context(context)? {
+                        replacements[slot].1 = device;
+                    }
+                }
+                Err(slot) => {
+                    if let Some(device) = self.circuit.devices[index].reprepare_context(context)? {
+                        replacements.insert(slot, (index, device));
+                    }
+                }
+            }
+        }
         for &index in &self.circuit.bindings.prepared_devices {
             let prior = previous.map(|point| point.device(self.circuit, index));
             match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
@@ -2336,6 +2355,13 @@ impl Circuit {
             .copied()
             .filter(|&index| self.devices[index].prepared_batch_key().is_some())
             .collect();
+        self.bindings.context_devices = self
+            .bindings
+            .order
+            .iter()
+            .copied()
+            .filter(|&index| self.devices[index].needs_context_preparation())
+            .collect();
         self.bindings.native_mixed = crate::devices::code_model::source::mixed_topology(
             &self.devices,
             self.elaboration_limits,
@@ -3602,7 +3628,7 @@ impl Circuit {
                 device.validate_dc_inputs(&inputs)?;
             }
         }
-        if !self.bindings.prepared_devices.is_empty() {
+        if !self.bindings.prepared_devices.is_empty() || !self.bindings.context_devices.is_empty() {
             let run = self.prepare_run();
             run.install_point(context, replacements, std::cell::OnceCell::from(mutual))?;
         }

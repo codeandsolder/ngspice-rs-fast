@@ -23,9 +23,14 @@ pub(in crate::devices) fn band_gap(kelvin: Real) -> Real {
 }
 
 /// Built-in potential shift from the C temperature routines.
-pub(in crate::devices) fn potential_shift(vt: Real, relative: Real, arg: Real) -> Real {
+pub(in crate::devices) fn potential_shift(
+    vt: Real,
+    relative: Real,
+    arg: Real,
+    charge: Real,
+) -> Real {
     let logarithmic = 1.5 * relative.ln();
-    let electrical = CHARGE * arg;
+    let electrical = charge * arg;
     -2. * vt * (logarithmic + electrical)
 }
 
@@ -94,7 +99,7 @@ impl SiliconTemperature {
         let kt = BOLTZMANN * kelvin;
         let gap = band_gap(kelvin);
         let arg = -gap / (kt + kt) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
-        let shift = potential_shift(vt, kelvin / REFTEMP, arg);
+        let shift = potential_shift(vt, kelvin / REFTEMP, arg, CHARGE);
         Self {
             vt,
             gap,

@@ -73,7 +73,7 @@ use crate::devices::noise::{
 };
 use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{
-    BOLTZMANN, CELSIUS_TO_KELVIN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache,
+    BOLTZMANN, CELSIUS_TO_KELVIN, CHARGE, PotentialTemperature, REFTEMP, TemperatureCache,
     TemperatureKey, band_gap, potential_shift,
 };
 use crate::devices::nonlinear::{DepletionLaw, unaliased_conductance};
@@ -307,6 +307,7 @@ const fn poly(c: TempCo, dt: Real) -> Real {
 /// Validated model data at the parameter-measurement temperature.
 #[derive(Debug, Clone, Copy)]
 struct Model {
+    thermal_convention: ThermalConvention,
     is: Real,
     /// `IBE`/`IBC`, used only when both are given (`bjttemp.c`).
     ibe_ibc: Option<(Real, Real)>,
@@ -410,8 +411,32 @@ fn integer_selector(values: &ScalarValues, name: &str, allowed: &[u8]) -> SpiceR
         })
 }
 
+/// Source-selected convention for the junction temperature laws. The
+/// historical constants are from ngspice const.h before 0183964d6; the
+/// legacy k/q ratio is independently witnessed by source BJT DC data.
+/// Noise-generator prefactors are separate from this thermal convention.
+#[derive(Debug, Clone, Copy)]
+enum ThermalConvention {
+    Native,
+    Legacy,
+}
+
+impl ThermalConvention {
+    const fn constants(self) -> (Real, Real) {
+        match self {
+            Self::Native => (BOLTZMANN, CHARGE),
+            Self::Legacy => (1.380_622_6e-23, 1.602_191_8e-19),
+        }
+    }
+
+    const fn voltage(self, kelvin: Real) -> Real {
+        let (boltzmann, charge) = self.constants();
+        kelvin * (boltzmann / charge)
+    }
+}
+
 impl Model {
-    fn from_values(m: &ScalarValues) -> SpiceResult<Self> {
+    fn from_values(m: &ScalarValues, thermal_convention: ThermalConvention) -> SpiceResult<Self> {
         let pair = |a: &str, b: &str| -> SpiceResult<TempCo> { Ok([get(m, a)?, get(m, b)?]) };
         // bjttemp.c: BF/BR use the TBF/TBR polynomial when either is given.
         let optional_pair = |a: &str, b: &str| -> Option<TempCo> {
@@ -430,6 +455,7 @@ impl Model {
         let fc = get(m, "fc")?;
         let xcjc = get(m, "xcjc")?;
         let model = Self {
+            thermal_convention,
             is,
             ibe_ibc: given(m, "ibe").zip(given(m, "ibc")),
             ibe: given(m, "ibe"),
@@ -581,11 +607,12 @@ struct Thermal {
 }
 
 /// `bjttemp.c`'s silicon band-gap built-in-potential shift `pbfact` at `t`.
-fn pbfact(t: Real) -> Real {
-    let vt = K_OVER_Q * t;
+fn pbfact(t: Real, convention: ThermalConvention) -> Real {
+    let (boltzmann, charge) = convention.constants();
+    let vt = convention.voltage(t);
     let egfet = band_gap(t);
-    let arg = -egfet / (2. * BOLTZMANN * t) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
-    potential_shift(vt, t / REFTEMP, arg)
+    let arg = -egfet / (2. * boltzmann * t) + 1.115_087_7 / (boltzmann * (REFTEMP + REFTEMP));
+    potential_shift(vt, t / REFTEMP, arg, charge)
 }
 
 impl Model {
@@ -619,9 +646,10 @@ impl Model {
             (areac, areab)
         };
         let dt = t - tnom;
-        let vt = t * K_OVER_Q;
-        let nominal = PotentialTemperature::new(tnom, pbfact(tnom));
-        let actual = PotentialTemperature::new(t, pbfact(t));
+        let convention = self.thermal_convention;
+        let vt = convention.voltage(t);
+        let nominal = PotentialTemperature::new(tnom, pbfact(tnom, convention));
+        let actual = PotentialTemperature::new(t, pbfact(t, convention));
         let ratio1 = dt / tnom;
         let ratlog = ratio1.ln_1p();
         let factlog = self.xti.mul_add(ratlog, ratio1 * self.eg / vt);
@@ -936,7 +964,18 @@ impl Bjt {
         );
         let assignments: Vec<_> = model_side.into_iter().map(canonical).collect();
         let values = MODEL_SCHEMA.validate(&assignments, &card.location)?;
-        let parameters = Model::from_values(&values)?;
+        let (pol, convention) = match model.family() {
+            ModelFamily::Npn => (1., ThermalConvention::Native),
+            ModelFamily::Pnp => (-1., ThermalConvention::Native),
+            ModelFamily::GummelPoonLegacyNpn => (1., ThermalConvention::Legacy),
+            ModelFamily::GummelPoonLegacyPnp => (-1., ThermalConvention::Legacy),
+            _ => {
+                return Err(SpiceError::circuit(
+                    "BJT model family does not specify polarity",
+                ));
+            }
+        };
+        let parameters = Model::from_values(&values, convention)?;
         let excess_phase = get(&values, "ptf")? * parameters.tf;
         if excess_phase != 0. {
             return Err(SpiceError::not_yet_ported(
@@ -960,11 +999,6 @@ impl Bjt {
             multiplier: get(&instance_values, "m")?,
             temp: given(&instance_values, "temp").map(|t| t + CELSIUS_TO_KELVIN),
             dtemp: get(&instance_values, "dtemp")?,
-        };
-        let pol = if model.family() == ModelFamily::Pnp {
-            -1.
-        } else {
-            1.
         };
         // bjtsetup.c: SUBS other than +1/-1 takes the polarity default,
         // vertical for NPN and lateral for PNP.
@@ -2598,7 +2632,7 @@ mod tests {
         let card = &netlist.models[0];
         let assignments: Vec<_> = card.parameters.iter().map(canonical).collect();
         let values = MODEL_SCHEMA.validate(&assignments, &card.location).unwrap();
-        let model = Model::from_values(&values).unwrap();
+        let model = Model::from_values(&values, ThermalConvention::Native).unwrap();
         let instance = Instance {
             area: 1.3,
             areab: 1.3,
@@ -2863,7 +2897,7 @@ q1 c b e s qm area=1.3 m=2 temp=85
         assert!((nominal.bf - 100.).abs() < 1e-12);
         let hot = thermal("is=1e-15 bf=100 xtb=1.5 cje=1p", 127., true);
         let (t, tnom) = (400.15, 300.15);
-        let vt = K_OVER_Q * t;
+        let vt = (BOLTZMANN / CHARGE) * t;
         let factlog = (t / tnom - 1.) * 1.11 / vt + 3. * (t / tnom).ln();
         let expected = 1.3e-15 * factlog.exp();
         assert!((hot.is_be - expected).abs() < 1e-12 * expected);

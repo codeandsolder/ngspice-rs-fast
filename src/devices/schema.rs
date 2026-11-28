@@ -55,6 +55,12 @@ pub enum ScalarUnit {
     AmperePerVoltSquared,
     /// Channel-length modulation coefficient, inverse volts.
     InverseVolt,
+    /// Second-order voltage coefficient, inverse volts squared.
+    InverseVoltSquared,
+    /// First-order current coefficient, inverse amperes.
+    InverseAmpere,
+    /// Second-order current coefficient, inverse amperes squared.
+    InverseAmpereSquared,
     /// Body-effect coefficient, square root of volts.
     SquareRootVolt,
     /// Activation (band-gap) energy in electron-volts.
@@ -97,7 +103,7 @@ pub enum ScalarDomain {
 }
 
 impl ScalarDomain {
-    fn accepts(self, value: Real) -> bool {
+    pub(super) fn accepts(self, value: Real) -> bool {
         value.is_finite()
             && match self {
                 Self::Finite => true,

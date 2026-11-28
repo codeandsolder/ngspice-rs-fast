@@ -981,28 +981,18 @@ impl Correction {
     }
 }
 
-/// A conservative roundoff envelope (eight binary64 epsilons) on the
-/// scale of the largest original stamped product or RHS term. This is
-/// only a trigger for a physical correction, never a singularity test.
-/// No row traversal, exact sums or factorization are required here.
+/// A roundoff envelope on the scale of the original stamped products and
+/// RHS terms. Compare the coefficient with the coordinate it actually
+/// multiplies: a large auxiliary coefficient and an unrelated voltage do
+/// not imply cancellation in any physical equation.
 fn correction_risk(
     matrix: &SparseMatrix,
     rhs: &Vector,
     values: &Vector,
     options: &NewtonOptions,
 ) -> bool {
-    let roundoff = 8. * Real::EPSILON;
-    let source = roundoff * rhs.peak_stamp();
-    if source >= options.abstol {
-        return true;
-    }
-    let coefficient = roundoff * matrix.peak_stamp();
-    // The solution has already passed the finite check. Integer magnitude
-    // reduction avoids a serial floating-point max and NaN handling.
-    let largest = values.as_slice().iter().fold(0_u64, |peak, value| {
-        peak.max(value.to_bits() & i64::MAX.cast_unsigned())
-    });
-    coefficient * Real::from_bits(largest) >= options.abstol
+    let threshold = options.abstol / (8. * Real::EPSILON);
+    rhs.peak_stamp() >= threshold || matrix.has_large_original_product(values, threshold)
 }
 
 /// [`StepLimiting::Global`]: scale the step so no watched nodal voltage moves

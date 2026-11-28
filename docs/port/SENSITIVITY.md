@@ -897,6 +897,12 @@ refined independently. Full- and half-step slopes are extrapolated using
 Richardson's leading-order cancellation (factor four for symmetric
 second-order central slopes and factor two for first-order one-sided
 slopes); the pair with the least observed refinement discrepancy is used.
+The two-sided cusp test requires a significant separation of the one-sided
+slopes: differences below the binary64 finite-difference resolution scale
+(sqrt(machine epsilon) times the larger secant magnitude) are not evidence
+of nonsmoothness. Above that scale the separation must contract on refinement.
+This prevents rounded residual subtraction from being mistaken for a cusp;
+it does not relax the independent refinement-discrepancy check.
 Invalid setters, nonfinite parameter values, changes to the device's setup
 element pattern or lack of a representable physical neighborhood cannot
 silently turn into a purported gradient: they return NaN in that column.

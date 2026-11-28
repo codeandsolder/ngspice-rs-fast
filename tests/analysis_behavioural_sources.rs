@@ -565,3 +565,131 @@ fn prepared_power_laws_reach_operating_point_and_complex_ac_stamps() {
     let singular = "vx x 0 0\nb1 out 0 v=simetrix_abs_pow(v(x),-.5)";
     assert!(run(singular, AnalysisKind::OperatingPoint, &[]).is_err());
 }
+
+#[test]
+fn wide_polynomial_matches_independent_quadratic_and_directional_jacobian() {
+    use std::fmt::Write as _;
+    const DIM: usize = 32;
+    let mut body = String::new();
+    let x = std::array::from_fn::<_, DIM, _>(|i| (i as f64 - 16.) / 16.);
+    let direction = std::array::from_fn::<_, DIM, _>(|i| (i + 1) as f64 / 32.);
+    for i in 0..DIM {
+        writeln!(body, "v{i} n{i} 0 dc {} ac {}", x[i], direction[i]).unwrap();
+    }
+    write!(body, "eout out 0 poly({DIM})").unwrap();
+    for i in 0..DIM {
+        write!(body, " n{i} 0").unwrap();
+    }
+    let mut coefficients = vec!["2".to_owned()];
+    let mut expected = 2.;
+    let mut slope = 0.;
+    for i in 0..DIM {
+        let c = (i % 7) as f64 - 3.;
+        coefficients.push(c.to_string());
+        expected += c * x[i];
+        slope += c * direction[i];
+    }
+    // Independently enumerate the dense quadratic, not the production
+    // sparse cursor. More than 256 nonzero terms as well as written ones.
+    for i in 0..DIM {
+        for j in i..DIM {
+            let c = ((i + j) % 7) as f64 - 3.;
+            coefficients.push(c.to_string());
+            expected += c * x[i] * x[j];
+            slope += c * (direction[i] * x[j] + x[i] * direction[j]);
+        }
+    }
+    assert_eq!(coefficients.len(), 561);
+    writeln!(body, " {}\nrload out 0 1k", coefficients.join(" ")).unwrap();
+    let op = run(&body, AnalysisKind::OperatingPoint, &[]).unwrap();
+    close(value(&op, "v(out)", 0), expected, 1e-12);
+    close(value(&op, "i(eout)", 0), -expected / 1000., 1e-12);
+    let ac = run(&body, AnalysisKind::Ac, &["lin", "2", "1k", "2k"]).unwrap();
+    for point in 0..ac.point_count() {
+        close(value(&ac, "v(out)", point), slope, 1e-12);
+        assert!(ac.value("v(out)", point).unwrap().im.abs() < 1e-12);
+    }
+}
+
+#[test]
+fn sparse_high_degree_polynomial_preserves_signed_powers_ac_and_transient() {
+    let mut coefficients = vec!["0"; 302];
+    for (degree, coefficient) in [(0, "1"), (1, "{k}"), (33, "-0.5"), (300, "2"), (301, "3")] {
+        coefficients[degree] = coefficient;
+    }
+    let law = format!(
+        ".param k=0.25\neout out 0 poly(1) in 0 {}\nrload out 0 1k",
+        coefficients.join(" ")
+    );
+    let expected = |x: f64| 1. + 0.25 * x - 0.5 * x.powi(33) + 2. * x.powi(300) + 3. * x.powi(301);
+    let derivative = |x: f64| 0.25 - 16.5 * x.powi(32) + 600. * x.powi(299) + 903. * x.powi(300);
+    let body = format!("vin in 0 dc -1 ac 1\n{law}");
+    let op = run(&body, AnalysisKind::OperatingPoint, &[]).unwrap();
+    close(value(&op, "v(out)", 0), expected(-1.), 1e-12);
+    let ac = run(&body, AnalysisKind::Ac, &["lin", "2", "1k", "2k"]).unwrap();
+    for point in 0..ac.point_count() {
+        close(value(&ac, "v(out)", point), derivative(-1.), 1e-12);
+    }
+    // Qualify arithmetic independently of default Newton stopping error.
+    let dc = run(
+        &body,
+        AnalysisKind::DcSweep,
+        &[
+            "vin",
+            "-1",
+            "1",
+            "0.25",
+            "rtol=1e-10",
+            "vntol=1e-12",
+            "abstol=1e-14",
+        ],
+    )
+    .unwrap();
+    for point in 0..dc.point_count() {
+        close(
+            value(&dc, "v(out)", point),
+            expected(value(&dc, "v(in)", point)),
+            1e-10,
+        );
+    }
+    let transient = format!("vin in 0 pwl(0 -1 1m -0.98 2m 0.98 3m 1)\n{law}");
+    let plot = run(
+        &transient,
+        AnalysisKind::Transient,
+        &[
+            "10u",
+            "3m",
+            "0",
+            "10u",
+            "rtol=1e-10",
+            "vntol=1e-12",
+            "abstol=1e-14",
+        ],
+    )
+    .unwrap();
+    assert!(plot.point_count() > 200);
+    for point in 0..plot.point_count() {
+        close(
+            value(&plot, "v(out)", point),
+            expected(value(&plot, "v(in)", point)),
+            1e-8,
+        );
+    }
+}
+
+#[test]
+fn zero_polynomial_terms_retain_control_validation_and_singleton_constant_semantics() {
+    for body in [
+        "v1 in 0 1\nr1 in 0 1\nfout 0 out poly(2) v1 missing 0 1 0\nrload out 0 1",
+        "hout out 0 poly(1) missing 7\nrload out 0 1",
+        "hout out 0 poly(1) missing 0 0 0\nrload out 0 1",
+    ] {
+        let error = circuit(body).unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
+    }
+    let plot = run("v1 in 0 2\nr1 in 0 1\nhout h 0 poly(1) v1 5\nrh h 0 1\nfout 0 f poly(1) v1 0 1 0 -2 m=2\nrf f 0 1\neout e 0 poly(1) in 0 7\nre e 0 1", AnalysisKind::OperatingPoint, &[]).unwrap();
+    close(value(&plot, "v(h)", 0), 5., 1e-12);
+    close(value(&plot, "v(e)", 0), 7., 1e-12);
+    // i(v1) = -2; output gain is -2 - 2*(-2)^3 = 14, times m=2.
+    close(value(&plot, "v(f)", 0), 28., 1e-12);
+}

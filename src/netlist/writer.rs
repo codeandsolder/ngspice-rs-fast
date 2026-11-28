@@ -109,8 +109,8 @@ use crate::primitives::{AnalysisKind, SourceLoc, SpiceError, SpiceResult, parse_
 use crate::netlist::ast::{
     AnalysisCard, CodePortKind, DeviceInstance, FuncCard, FuncSpelling, GlobalCard,
     IncludeDirective, ModelCard, Netlist, NodeHintCard, NodeHintValue, NumericVectorEntry,
-    OptionCard, ParamCard, ParameterAssignment, ParameterKind, PositionedValue, ScopeEntry,
-    ScopeView, ScopedCardKind, SourceWaveform, Subcircuit,
+    OptionCard, OptionCardKind, ParamCard, ParameterAssignment, ParameterKind, PositionedValue,
+    ScopeEntry, ScopeView, ScopedCardKind, SourceWaveform, Subcircuit,
 };
 use crate::netlist::behavioural::forms::{
     B_SETTERS, NonlinearForm, PolyControls, PolyForm, TableForm, TableInput,
@@ -637,7 +637,33 @@ impl Writer<'_> {
     }
 
     fn options(&mut self, card: &OptionCard, depth: usize) -> SpiceResult<()> {
-        self.settings(card, depth, ".options")
+        match card.kind {
+            OptionCardKind::Options => self.settings(card, depth, ".options"),
+            OptionCardKind::Temperature => self.temperature(card, depth),
+        }
+    }
+
+    fn temperature(&mut self, card: &OptionCard, depth: usize) -> SpiceResult<()> {
+        let location = &card.location;
+        let [setting] = card.settings.as_slice() else {
+            return Err(refuse(".temp requires one scalar value", Some(location)));
+        };
+        let Some(value) = &setting.value else {
+            return Err(refuse(".temp requires one scalar value", Some(location)));
+        };
+        if setting.name != "temp" {
+            return Err(refuse("invalid .temp setting", Some(location)));
+        }
+        let mut parts = self.card(depth, location)?;
+        parts.check_length(value.text.len())?;
+        if let Some(expression) = &setting.expression {
+            check_value_expression(&parts, &value.text, expression, location)?;
+        } else if !value.text.parse::<f64>().is_ok_and(f64::is_finite) {
+            return Err(refuse("invalid scalar .temp value", Some(&value.location)));
+        }
+        parts.word(".temp")?;
+        parts.word(&value.text)?;
+        self.finish_card(depth, location)
     }
 
     fn settings(&mut self, card: &OptionCard, depth: usize, prefix: &str) -> SpiceResult<()> {

@@ -198,3 +198,32 @@ fn option_expressions_round_trip_through_the_writer() {
         parse(".param g=1u\n.options gmin={g/100} temp='27+3' reltol=1m acct\n.end\n").unwrap();
     assert!(!semantic_eq(&n, &other));
 }
+
+#[test]
+fn scalar_temperature_retains_directive_kind_and_value_location() {
+    use ngspice_rs::netlist::ast::OptionCardKind;
+    let n = parse(".TeMP -30\n.option temp=75\n.temp {t+1}\n.end\n").unwrap();
+    assert_eq!(n.options[0].kind, OptionCardKind::Temperature);
+    assert_eq!(n.options[1].kind, OptionCardKind::Options);
+    let s = &n.options[0].settings[0];
+    assert_eq!(s.name, "temp");
+    let value = s.value.as_ref().unwrap();
+    assert_eq!(value.text, "-30");
+    assert_eq!((value.location.line, value.location.column), (2, 7));
+    assert!(n.options[2].settings[0].expression.is_some());
+    for invalid in [
+        ".temp",
+        ".temp 10 20",
+        ".temp -30,75",
+        ".temp 30m",
+        ".temp hot",
+        ".temp 1e999",
+        ".temp {t+}",
+    ] {
+        let error = parse(&format!("{invalid}\n.end\n")).unwrap_err();
+        assert!(
+            matches!(error, SpiceError::Parse { .. }),
+            "{invalid}: {error}"
+        );
+    }
+}

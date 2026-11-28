@@ -63,6 +63,7 @@ fn port_type(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePortKin
         "%vd" => CodePortKind::VoltageDifferential,
         "%i" => CodePortKind::Current,
         "%id" => CodePortKind::CurrentDifferential,
+        "%vnam" => CodePortKind::BranchCurrent,
         "%d" => CodePortKind::Digital,
         "%g" => CodePortKind::Conductance,
         "%gd" => CodePortKind::ConductanceDifferential,
@@ -115,7 +116,10 @@ fn element(input: &mut Input<'_>, kind: CodePortKind) -> Result<CodeTerminal> {
         return Err(malformed(input, "inverted analog terminal"));
     }
     let node = |token: &Token, auto_gnd| {
-        if matches!(kind, CodePortKind::Digital | CodePortKind::Default) {
+        if matches!(
+            kind,
+            CodePortKind::Digital | CodePortKind::Default | CodePortKind::BranchCurrent
+        ) {
             token.text.to_ascii_lowercase()
         } else {
             canonical_node(token, auto_gnd)
