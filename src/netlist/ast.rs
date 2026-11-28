@@ -371,6 +371,8 @@ pub enum CodePortKind {
     Current,
     /// Differential current.
     CurrentDifferential,
+    /// Current through an existing named voltage-defined branch.
+    BranchCurrent,
     /// Digital event terminal.
     Digital,
     /// Single-ended conductance.
@@ -398,6 +400,7 @@ impl CodePortKind {
             Self::VoltageDifferential => Some("%vd"),
             Self::Current => Some("%i"),
             Self::CurrentDifferential => Some("%id"),
+            Self::BranchCurrent => Some("%vnam"),
             Self::Digital => Some("%d"),
             Self::Conductance => Some("%g"),
             Self::ConductanceDifferential => Some("%gd"),
@@ -410,7 +413,7 @@ impl CodePortKind {
 pub struct CodeTerminal {
     /// Type of this element, including changes within a vector.
     pub kind: CodePortKind,
-    /// Positive or single-ended node, case folded.
+    /// Positive or single-ended node, or a named branch for %vnam, case folded.
     pub positive: NodeName,
     /// Explicit negative node, absent for single-ended terminals.
     pub negative: Option<NodeName>,
