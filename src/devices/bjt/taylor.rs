@@ -5,7 +5,7 @@ use crate::devices::nonlinear::taylor::{
     depletion_differential as depletion_law, junction_differential as junction,
 };
 use crate::devices::nonlinear::{DepletionLaw, exponential_junction_at_argument};
-use crate::devices::physical_dae::{TaylorContext, TaylorControl};
+use crate::devices::physical_dae::{ConstitutiveGuards, TaylorContext, TaylorControl};
 use crate::maths::taylor::differential::Differential;
 use crate::primitives::{Real, SpiceResult};
 
@@ -15,7 +15,26 @@ const BX: usize = 2;
 const SUB: usize = 3;
 const BB: usize = 4;
 type Law = Differential<5>;
-fn base_charge(t: &Thermal, v: &[Law; 5], be: &Law, bc: &Law) -> SpiceResult<Law> {
+const BE_JUNCTION: usize = 0;
+const BC_JUNCTION: usize = 1;
+const BE_LEAKAGE: usize = 2;
+const BC_LEAKAGE: usize = 3;
+const BASE_CHARGE: usize = 4;
+const SPREAD_CLAMP: usize = 5;
+const SUBSTRATE_CLAMP: usize = 6;
+const SUBSTRATE_JUNCTION: usize = 7;
+const BE_DEPLETION: usize = 8;
+const BC_DEPLETION: usize = 9;
+const BX_DEPLETION: usize = 10;
+const SUBSTRATE_DEPLETION: usize = 11;
+const FORWARD_DIFFUSION: usize = 12;
+fn base_charge(
+    t: &Thermal,
+    v: &[Law; 5],
+    be: &Law,
+    bc: &Law,
+    guards: &mut ConstitutiveGuards<'_>,
+) -> SpiceResult<Law> {
     let mut denominator = v[BE]
         .clone()
         .scale(-t.inv_var)
@@ -36,7 +55,7 @@ fn base_charge(t: &Thermal, v: &[Law; 5], be: &Law, bc: &Law) -> SpiceResult<Law
         .add(&bc.clone().scale(t.inv_ikr))
         .scale(4.)
         .offset(1.);
-    let root = if argument.value.sign().is_gt() {
+    let root = if guards.above(BASE_CHARGE, &argument.value, 0., true)? {
         argument.power(t.nkf.unwrap_or(0.5))?
     } else {
         // C uses a unit root on the clamped nonpositive branch.
@@ -75,7 +94,12 @@ fn resistance_reduction(ratio: Law) -> SpiceResult<Law> {
     }
 }
 
-fn base_conductance(t: &Thermal, base: &Law, qb: &Law) -> SpiceResult<Law> {
+fn base_conductance(
+    t: &Thermal,
+    base: &Law,
+    qb: &Law,
+    guards: &mut ConstitutiveGuards<'_>,
+) -> SpiceResult<Law> {
     let spread = t.rb - t.rbm;
     if spread == 0. {
         return Ok(Law::constant(
@@ -87,11 +111,7 @@ fn base_conductance(t: &Thermal, base: &Law, qb: &Law) -> SpiceResult<Law> {
         qb.clone().reciprocal()?.scale(spread).offset(t.rbm)
     } else {
         let ratio = base.clone().scale(t.irb.recip());
-        let ratio = if ratio
-            .value
-            .compare(1e-9)
-            .is_some_and(std::cmp::Ordering::is_gt)
-        {
+        let ratio = if guards.above(SPREAD_CLAMP, &ratio.value, 1e-9, true)? {
             ratio
         } else {
             Law::constant(ratio.value.order(), 1e-9)
@@ -105,8 +125,16 @@ fn base_conductance(t: &Thermal, base: &Law, qb: &Law) -> SpiceResult<Law> {
     }
 }
 
-fn forward_diffusion(t: &Thermal, v: &[Law; 5], be: &Law, qb: &Law) -> SpiceResult<Law> {
-    if t.tf == 0. || !v[BE].value.sign().is_gt() {
+fn forward_diffusion(
+    t: &Thermal,
+    v: &[Law; 5],
+    be: &Law,
+    qb: &Law,
+    guards: &mut ConstitutiveGuards<'_>,
+) -> SpiceResult<Law> {
+    let active =
+        t.xtf != 0. || t.inv_var != 0. || t.inv_vaf != 0. || t.inv_ikf != 0. || t.inv_ikr != 0.;
+    if t.tf == 0. || !guards.above(FORWARD_DIFFUSION, &v[BE].value, 0., active)? {
         return Ok(be.clone().scale(t.tf));
     }
     let mut factor = if t.xtf == 0. {
@@ -124,20 +152,21 @@ fn forward_diffusion(t: &Thermal, v: &[Law; 5], be: &Law, qb: &Law) -> SpiceResu
         .map(|charge| charge.scale(t.tf))
 }
 
-fn substrate(t: &Thermal, v: &Law, gmin: Real) -> SpiceResult<Law> {
+fn substrate(
+    t: &Thermal,
+    v: &Law,
+    gmin: Real,
+    guards: &mut ConstitutiveGuards<'_>,
+) -> SpiceResult<Law> {
     let mut current = v.clone().scale(gmin);
     if let Some(sat) = t.iss {
         let vt = t.ns * t.vt;
-        let intrinsic = if v
-            .value
-            .compare(709. * vt)
-            .is_some_and(std::cmp::Ordering::is_gt)
-        {
+        let intrinsic = if guards.above(SUBSTRATE_CLAMP, &v.value, 709. * vt, sat != 0.)? {
             // The physical current is clamped, unlike C's retained Newton slope.
             let (value, _) = exponential_junction_at_argument(709., vt, sat);
             Law::constant(v.value.order(), value)
         } else {
-            junction(v, vt, sat)?
+            junction(v, vt, sat, guards, SUBSTRATE_JUNCTION)?
         };
         current = current.add(&intrinsic);
     }
@@ -153,14 +182,19 @@ struct Point {
 }
 
 impl Thermal {
-    fn taylor_point(&self, v: &[Law; 5], gmin: Real) -> SpiceResult<Point> {
-        let be = junction(&v[BE], self.nf * self.vt, self.is_be)?;
-        let bc = junction(&v[BC], self.nr * self.vt, self.is_bc)?;
-        let be_leak =
-            junction(&v[BE], self.ne * self.vt, self.ise)?.add(&v[BE].clone().scale(gmin));
-        let bc_leak =
-            junction(&v[BC], self.nc * self.vt, self.isc)?.add(&v[BC].clone().scale(gmin));
-        let qb = base_charge(self, v, &be, &bc)?;
+    fn taylor_point(
+        &self,
+        v: &[Law; 5],
+        gmin: Real,
+        guards: &mut ConstitutiveGuards<'_>,
+    ) -> SpiceResult<Point> {
+        let be = junction(&v[BE], self.nf * self.vt, self.is_be, guards, BE_JUNCTION)?;
+        let bc = junction(&v[BC], self.nr * self.vt, self.is_bc, guards, BC_JUNCTION)?;
+        let be_leak = junction(&v[BE], self.ne * self.vt, self.ise, guards, BE_LEAKAGE)?
+            .add(&v[BE].clone().scale(gmin));
+        let bc_leak = junction(&v[BC], self.nc * self.vt, self.isc, guards, BC_LEAKAGE)?
+            .add(&v[BC].clone().scale(gmin));
+        let qb = base_charge(self, v, &be, &bc, guards)?;
         let reverse = bc.clone().scale(self.br.recip()).add(&bc_leak);
         let base = be
             .clone()
@@ -172,14 +206,21 @@ impl Thermal {
             .add(&bc.clone().scale(-1.))
             .divide(&qb)?
             .add(&reverse.scale(-1.));
-        let spread = base_conductance(self, &base, &qb)?.multiply(&v[BB]);
-        let substrate = substrate(self, &v[SUB], gmin)?;
+        let spread = base_conductance(self, &base, &qb, guards)?.multiply(&v[BB]);
+        let substrate = substrate(self, &v[SUB], gmin, guards)?;
         let cap_bc = self.cjc * self.xcjc;
         let charges = [
-            depletion_law(&v[BE], self.be, self.cje)?.add(&forward_diffusion(self, v, &be, &qb)?),
-            depletion_law(&v[BC], self.bc, cap_bc)?.add(&bc.scale(self.tr)),
-            depletion_law(&v[BX], self.bc, self.cjc - cap_bc)?,
-            depletion_law(&v[SUB], DepletionLaw::new(self.vjs, self.mjs, 0.), self.cjs)?,
+            depletion_law(&v[BE], self.be, self.cje, guards, BE_DEPLETION)?
+                .add(&forward_diffusion(self, v, &be, &qb, guards)?),
+            depletion_law(&v[BC], self.bc, cap_bc, guards, BC_DEPLETION)?.add(&bc.scale(self.tr)),
+            depletion_law(&v[BX], self.bc, self.cjc - cap_bc, guards, BX_DEPLETION)?,
+            depletion_law(
+                &v[SUB],
+                DepletionLaw::new(self.vjs, self.mjs, 0.),
+                self.cjs,
+                guards,
+                SUBSTRATE_DEPLETION,
+            )?,
         ];
         Ok(Point {
             collector,
@@ -240,7 +281,11 @@ impl Bjt {
             controls[SUB].input(SUB, context)?,
             controls[BB].input(BB, context)?,
         ];
-        let point = thermal.taylor_point(&voltages, context.model.gmin)?;
+        let point = thermal.taylor_point(
+            &voltages,
+            context.model.gmin,
+            &mut context.constitutive_guards(),
+        )?;
         for (rows, law, scale) in [
             (
                 [collector_prime, emitter_prime],

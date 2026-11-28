@@ -1,7 +1,7 @@
 //! Branch observations of the executed compiled physical expression graph.
 //! A predicted Taylor root is a probe hint, never proof of an event.
 
-use super::{BranchTrace, Guard, LocalGuard, Region};
+use super::{BranchTrace, ConstitutiveGuards, Guard, LocalGuard, Region};
 use crate::maths::taylor::Jet;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::cmp::Ordering;
@@ -75,18 +75,75 @@ impl LocalGuard {
     }
 }
 
+impl ConstitutiveGuards<'_> {
+    /// Record the branch actually taken, including its equality convention.
+    /// Slot identities belong to the device's constitutive law, independent
+    /// of the active region or the order of the local Taylor expansion.
+    fn split(
+        &mut self,
+        slot: usize,
+        argument: &Jet,
+        boundary: Real,
+        lower: bool,
+        active: bool,
+    ) -> SpiceResult<()> {
+        if active && let Some(trace) = self.trace.as_deref_mut() {
+            trace.push(
+                self.device,
+                LocalGuard {
+                    slot,
+                    operand: 0,
+                    region: Region::Interval(usize::from(!lower)),
+                    argument: argument.clone(),
+                    boundaries: [Some(boundary), None],
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn below(
+        &mut self,
+        slot: usize,
+        argument: &Jet,
+        boundary: Real,
+        active: bool,
+    ) -> SpiceResult<bool> {
+        let lower = argument.compare(boundary).is_some_and(Ordering::is_lt);
+        self.split(slot, argument, boundary, lower, active)?;
+        Ok(lower)
+    }
+
+    pub(crate) fn above(
+        &mut self,
+        slot: usize,
+        argument: &Jet,
+        boundary: Real,
+        active: bool,
+    ) -> SpiceResult<bool> {
+        let upper = argument.compare(boundary).is_some_and(Ordering::is_gt);
+        self.split(slot, argument, boundary, !upper, active)?;
+        Ok(upper)
+    }
+}
+
 impl BranchTrace {
+    fn push(&mut self, device: usize, local: LocalGuard) -> SpiceResult<()> {
+        self.coefficients = self
+            .coefficients
+            .checked_add(local.argument.coefficients().len())
+            .filter(|&count| count <= MAX_GUARD_COEFFICIENTS)
+            .ok_or_else(|| SpiceError::circuit("physical branch guard resource limit"))?;
+        self.guards
+            .try_reserve(1)
+            .map_err(|_| SpiceError::circuit("physical branch guard allocation failed"))?;
+        self.guards.push(Guard { device, local });
+        Ok(())
+    }
+
     pub(crate) fn extend(&mut self, device: usize, guards: Vec<LocalGuard>) -> SpiceResult<()> {
         for local in guards {
-            self.coefficients = self
-                .coefficients
-                .checked_add(local.argument.coefficients().len())
-                .filter(|&count| count <= MAX_GUARD_COEFFICIENTS)
-                .ok_or_else(|| SpiceError::circuit("physical branch guard resource limit"))?;
-            self.guards
-                .try_reserve(1)
-                .map_err(|_| SpiceError::circuit("physical branch guard allocation failed"))?;
-            self.guards.push(Guard { device, local });
+            self.push(device, local)?;
         }
         Ok(())
     }

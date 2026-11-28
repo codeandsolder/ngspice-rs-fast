@@ -5,7 +5,7 @@ use super::{
     DepletionLaw, Diode, Thermal, cubic_reverse_junction, exponential_junction_at_argument,
     high_injection,
 };
-use crate::devices::physical_dae::TaylorContext;
+use crate::devices::physical_dae::{ConstitutiveGuards, TaylorContext};
 use crate::maths::taylor::Jet;
 use crate::primitives::{Real, SpiceResult};
 
@@ -62,13 +62,16 @@ impl Law {
     }
 }
 
-fn below(v: &Jet, edge: Real) -> bool {
-    v.compare(edge).is_some_and(std::cmp::Ordering::is_lt)
-}
-
-fn above(v: &Jet, edge: Real) -> bool {
-    v.compare(edge).is_some_and(std::cmp::Ordering::is_gt)
-}
+// Stable device-local constitutive sites; not state-history offsets.
+const BOTTOM_REGION: usize = 0;
+const BOTTOM_BREAKDOWN: usize = 1;
+const BOTTOM_FORWARD_KNEE: usize = 2;
+const BOTTOM_REVERSE_KNEE: usize = 3;
+const SIDEWALL_REGION: usize = 4;
+const SIDEWALL_BREAKDOWN: usize = 5;
+const SIDEWALL_KNEE: usize = 6;
+const BOTTOM_DEPLETION: usize = 7;
+const SIDEWALL_DEPLETION: usize = 8;
 
 /// Lift the exponential using the scalar kernel's cancellation-safe value
 /// and scaled derivative, including representable results beyond exp overflow.
@@ -83,10 +86,13 @@ fn characteristic(
     vt: Real,
     sat: Real,
     breakdown: Option<(Real, Real)>,
+    forward: bool,
+    guards: &mut ConstitutiveGuards<'_>,
+    breakdown_site: usize,
 ) -> SpiceResult<Law> {
     if let Some((bv, vbr)) = breakdown
-        && below(v, -3. * vt)
-        && below(v, -bv)
+        && !forward
+        && guards.below(breakdown_site, v, -bv, sat != 0. && -bv < -3. * vt)?
     {
         let arg = v.clone().offset(bv).scale(-vbr.recip());
         let value = -sat * (-(bv + v.value()) / vbr).exp();
@@ -95,7 +101,7 @@ fn characteristic(
     if sat == 0. {
         return Ok(Law::zero(v));
     }
-    if below(v, -3. * vt) {
+    if !forward {
         let (value, derivative) = cubic_reverse_junction(v.value(), vt, sat);
         // The slope varies as v^-4. Normalize around the expansion point,
         // avoiding powers of a small dimensional voltage or of saturation current.
@@ -107,11 +113,17 @@ fn characteristic(
     }
 }
 
-fn depletion(v: &Jet, law: DepletionLaw, cz: Real) -> SpiceResult<Law> {
+fn depletion(
+    v: &Jet,
+    law: DepletionLaw,
+    cz: Real,
+    guards: &mut ConstitutiveGuards<'_>,
+    site: usize,
+) -> SpiceResult<Law> {
     let (value, derivative) = law.charge(v.value(), cz, None);
     let slope = if cz == 0. {
         Jet::constant(v.order(), 0.)
-    } else if below(v, law.threshold) {
+    } else if guards.below(site, v, law.threshold, law.grading != 0.)? {
         let argument = v.clone().scale(-law.potential.recip()).offset(1.);
         let relative = argument
             .clone()
@@ -134,8 +146,11 @@ pub(in crate::devices) fn junction_differential<const N: usize>(
     v: &crate::maths::taylor::differential::Differential<N>,
     vt: Real,
     sat: Real,
+    guards: &mut ConstitutiveGuards<'_>,
+    site: usize,
 ) -> SpiceResult<crate::maths::taylor::differential::Differential<N>> {
-    let law = characteristic(&v.value, vt, sat, None)?;
+    let forward = !guards.below(site, &v.value, -3. * vt, sat != 0.)?;
+    let law = characteristic(&v.value, vt, sat, None, forward, guards, site)?;
     Ok(v.clone().lift(law.value, &law.slope))
 }
 
@@ -143,8 +158,10 @@ pub(in crate::devices) fn depletion_differential<const N: usize>(
     v: &crate::maths::taylor::differential::Differential<N>,
     material: DepletionLaw,
     cap: Real,
+    guards: &mut ConstitutiveGuards<'_>,
+    site: usize,
 ) -> SpiceResult<crate::maths::taylor::differential::Differential<N>> {
-    let law = depletion(&v.value, material, cap)?;
+    let law = depletion(&v.value, material, cap, guards, site)?;
     Ok(v.clone().lift(law.value, &law.slope))
 }
 
@@ -211,8 +228,17 @@ impl Thermal {
         v: &Jet,
         forward: bool,
         breakdown: Option<(Real, Real)>,
+        guards: &mut ConstitutiveGuards<'_>,
     ) -> SpiceResult<Law> {
-        let mut bottom = characteristic(v, self.n * self.vt, self.csat, breakdown)?;
+        let mut bottom = characteristic(
+            v,
+            self.n * self.vt,
+            self.csat,
+            breakdown,
+            forward,
+            guards,
+            BOTTOM_BREAKDOWN,
+        )?;
         if let Some((sat, nr)) = self.recombination {
             bottom = bottom.add(&recombination(self, v, sat, nr, forward)?);
         }
@@ -220,10 +246,14 @@ impl Thermal {
             bottom = bottom.add(&tunnel(v, self.ntun * self.vt, sat));
         }
         if forward {
-            if let Some(knee) = self.ikf.filter(|_| above(&bottom.value, 1e-18)) {
+            if let Some(knee) = self.ikf
+                && guards.above(BOTTOM_FORWARD_KNEE, &bottom.value, 1e-18, true)?
+            {
                 bottom = injection(&bottom, knee, true)?;
             }
-        } else if let Some(knee) = self.ikr.filter(|_| below(&bottom.value, -1e-18)) {
+        } else if let Some(knee) = self.ikr
+            && guards.below(BOTTOM_REVERSE_KNEE, &bottom.value, -1e-18, true)?
+        {
             bottom = injection(&bottom, knee, false)?;
         }
         bottom.checked()
@@ -234,14 +264,27 @@ impl Thermal {
         v: &Jet,
         forward: bool,
         breakdown: Option<(Real, Real)>,
+        guards: &mut ConstitutiveGuards<'_>,
     ) -> SpiceResult<Law> {
         let mut sidewall = if let Some(sat) = self.csatsw {
-            match self.ns {
-                Some(ns) => characteristic(v, ns * self.vt, sat, breakdown)?,
-                None if forward || breakdown.is_none_or(|(bv, _)| !below(v, -bv)) => {
-                    characteristic(v, self.n * self.vt, sat, None)?
+            if let Some(ns) = self.ns {
+                let vt = ns * self.vt;
+                let forward = !guards.below(SIDEWALL_REGION, v, -3. * vt, sat != 0.)?;
+                characteristic(v, vt, sat, breakdown, forward, guards, SIDEWALL_BREAKDOWN)?
+            } else {
+                let vt = self.n * self.vt;
+                let blocked = if let Some((bv, _)) = breakdown
+                    && !forward
+                {
+                    guards.below(SIDEWALL_BREAKDOWN, v, -bv, sat != 0. && -bv < -3. * vt)?
+                } else {
+                    false
+                };
+                if blocked {
+                    Law::zero(v)
+                } else {
+                    characteristic(v, vt, sat, None, forward, guards, SIDEWALL_BREAKDOWN)?
                 }
-                None => Law::zero(v),
             }
         } else {
             Law::zero(v)
@@ -249,17 +292,30 @@ impl Thermal {
         if let Some(sat) = self.tunnel_sidewall {
             sidewall = sidewall.add(&tunnel(v, self.ntun * self.vt, sat));
         }
-        if let Some(knee) = self.ikp.filter(|_| above(&sidewall.value, 1e-18)) {
+        if let Some(knee) = self.ikp
+            && guards.above(SIDEWALL_KNEE, &sidewall.value, 1e-18, true)?
+        {
             sidewall = injection(&sidewall, knee, true)?;
         }
         sidewall.checked()
     }
 
-    pub(super) fn taylor(&self, v: &Jet, gmin: Real, recovery: bool) -> SpiceResult<(Law, Law)> {
-        let forward = !below(v, -3. * (self.n * self.vt));
+    pub(super) fn taylor(
+        &self,
+        v: &Jet,
+        gmin: Real,
+        recovery: bool,
+        guards: &mut ConstitutiveGuards<'_>,
+    ) -> SpiceResult<(Law, Law)> {
+        let active = self.csat != 0.
+            || self.recombination.is_some_and(|(sat, _)| sat != 0.)
+            || (self.ns.is_none() && self.csatsw.is_some_and(|sat| sat != 0.))
+            || ((self.ikf.is_some() || self.ikr.is_some())
+                && self.tunnel.is_some_and(|sat| sat != 0.));
+        let forward = !guards.below(BOTTOM_REGION, v, -3. * (self.n * self.vt), active)?;
         let breakdown = self.breakdown.map(|bv| (bv, self.nbv * self.vt));
-        let bottom = self.bottom_taylor(v, forward, breakdown)?;
-        let sidewall = self.sidewall_taylor(v, forward, breakdown)?;
+        let bottom = self.bottom_taylor(v, forward, breakdown, guards)?;
+        let sidewall = self.sidewall_taylor(v, forward, breakdown, guards)?;
         let current = bottom.add(&sidewall).add(&Law {
             value: v.clone().scale(gmin),
             slope: Jet::constant(v.order(), gmin),
@@ -274,8 +330,20 @@ impl Thermal {
             .scale(self.tt)
         };
         let charge = diffusion
-            .add(&depletion(v, self.bottom, self.cjo)?)
-            .add(&depletion(v, self.sidewall, self.cjsw)?);
+            .add(&depletion(
+                v,
+                self.bottom,
+                self.cjo,
+                guards,
+                BOTTOM_DEPLETION,
+            )?)
+            .add(&depletion(
+                v,
+                self.sidewall,
+                self.cjsw,
+                guards,
+                SIDEWALL_DEPLETION,
+            )?);
         Ok((current.checked()?, charge.checked()?))
     }
 }
@@ -288,7 +356,12 @@ impl Diode {
             .variable(rows[0])?
             .add(&context.variable(rows[1])?.scale(-1.));
         let recovery = self.recovery(&thermal);
-        let (current, charge) = thermal.taylor(&v, context.model.gmin, recovery.is_some())?;
+        let (current, charge) = thermal.taylor(
+            &v,
+            context.model.gmin,
+            recovery.is_some(),
+            &mut context.constitutive_guards(),
+        )?;
         context.branch_taylor(rows, rows, &current.value, &current.slope, false)?;
         context.branch_taylor(rows, rows, &charge.value, &charge.slope, true)?;
         let gradients = if rows[0] == rows[1] {

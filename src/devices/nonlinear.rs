@@ -2434,7 +2434,12 @@ mod tests {
                             .fold(1e-4_f64, |step, distance| step.min(distance * 0.5));
                         let slope = step * direction;
                         let v = Jet::affine(12, voltage, slope);
-                        let (current, charge) = thermal.taylor(&v, 1e-12, false)?;
+                        let (current, charge) = thermal.taylor(
+                            &v,
+                            1e-12,
+                            false,
+                            &mut crate::devices::physical_dae::ConstitutiveGuards::default(),
+                        )?;
                         for t in [0., 0.25, 0.5] {
                             let expected =
                                 thermal.point(slope.mul_add(t, voltage), 1e-12)?.junction;

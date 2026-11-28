@@ -47,6 +47,15 @@ pub(crate) struct BranchTrace {
     coefficients: usize,
 }
 
+/// Device-local constitutive branch selection, using the same trace budget
+/// as compiled expressions. A non-collecting Newton load performs only the
+/// comparison; it never allocates or clones a guard.
+#[derive(Default)]
+pub(crate) struct ConstitutiveGuards<'a> {
+    trace: Option<&'a mut BranchTrace>,
+    device: usize,
+}
+
 /// Exact physical residuals and their Jacobians with respect to the state.
 pub struct PhysicalDaePoint {
     /// Static physical residual, including independent time forcing.
@@ -466,6 +475,13 @@ pub struct TaylorContext<'a> {
 }
 
 impl TaylorContext<'_> {
+    pub(crate) fn constitutive_guards(&mut self) -> ConstitutiveGuards<'_> {
+        ConstitutiveGuards {
+            trace: self.output.guards.as_mut(),
+            device: self.device,
+        }
+    }
+
     /// Retain the value chosen by the physical germ, not the scalar value
     /// at an isolated branch boundary.
     pub(crate) fn candidate_state(&mut self, slot: usize, value: Real) -> SpiceResult<()> {

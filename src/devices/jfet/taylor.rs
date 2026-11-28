@@ -1,30 +1,39 @@
 //! Analytic level-one channel and gate-junction Taylor equations.
 use super::{Jfet, Model, Operating, slot};
 use crate::devices::nonlinear::taylor::{depletion_differential, junction_differential};
-use crate::devices::physical_dae::{TaylorContext, TaylorControl};
+use crate::devices::physical_dae::{ConstitutiveGuards, TaylorContext, TaylorControl};
 use crate::maths::taylor::differential::Differential;
 use crate::primitives::SpiceResult;
-use std::cmp::Ordering;
 
 type Law = Differential<2>;
+const CHANNEL_DIRECTION: usize = 4;
+const CHANNEL_CUTOFF: usize = 5;
+const CHANNEL_SATURATION: usize = 6;
 
 impl Model {
     /// The Sydney channel polynomial, evaluated in the active direction.
     /// The same local differential arithmetic propagates its partials.
-    fn channel_germ(&self, op: &Operating, vgs: &Law, vgd: &Law) -> Law {
+    fn channel_germ(
+        &self,
+        op: &Operating,
+        vgs: &Law,
+        vgd: &Law,
+        guards: &mut ConstitutiveGuards<'_>,
+    ) -> SpiceResult<Law> {
         let vds = vgs.clone().add(&vgd.clone().scale(-1.));
-        let (gate, drain, direction) = if vds.value.sign() == Ordering::Less {
+        let active = op.beta != 0.;
+        let (gate, drain, direction) = if guards.below(CHANNEL_DIRECTION, &vds.value, 0., active)? {
             (vgd, vds.scale(-1.), -1.)
         } else {
             (vgs, vds, 1.)
         };
         let overdrive = gate.clone().offset(-op.vto);
-        if overdrive.value.sign() != Ordering::Greater {
-            return Law::constant(overdrive.value.order(), 0.);
+        if !guards.above(CHANNEL_CUTOFF, &overdrive.value, 0., active)? {
+            return Ok(Law::constant(overdrive.value.order(), 0.));
         }
         let beta = drain.clone().scale(self.lambda).offset(1.).scale(op.beta);
         let remaining = overdrive.clone().add(&drain.clone().scale(-1.));
-        let part = if remaining.value.sign() == Ordering::Less {
+        let part = if guards.below(CHANNEL_SATURATION, &remaining.value, 0., active)? {
             let shape = overdrive.clone().scale(op.bfac).offset(self.b);
             overdrive.clone().multiply(&overdrive).multiply(&shape)
         } else {
@@ -34,7 +43,7 @@ impl Model {
                 .clone()
                 .multiply(&drain.multiply(&shape).add(&overdrive.multiply(&apart)))
         };
-        beta.multiply(&part).scale(direction)
+        Ok(beta.multiply(&part).scale(direction))
     }
 }
 
@@ -60,10 +69,22 @@ impl Jfet {
         ];
         for (index, cap, charge_slot) in [(0, op.czgs, slot::QGS), (1, op.czgd, slot::QGD)] {
             let v = &voltage[index];
-            let current = junction_differential(v, op.vt_n, op.csat)?
-                .add(&v.clone().scale(context.model.gmin));
+            let current = junction_differential(
+                v,
+                op.vt_n,
+                op.csat,
+                &mut context.constitutive_guards(),
+                index * 2,
+            )?
+            .add(&v.clone().scale(context.model.gmin));
             context.local_law(controls[index].rows, &current, &controls, pol * m, None)?;
-            let charge = depletion_differential(v, op.gate_law, cap)?;
+            let charge = depletion_differential(
+                v,
+                op.gate_law,
+                cap,
+                &mut context.constitutive_guards(),
+                index * 2 + 1,
+            )?;
             // History is normalized and per-unit M, unlike physical KCL.
             context.local_law(
                 controls[index].rows,
@@ -73,7 +94,12 @@ impl Jfet {
                 Some(charge_slot),
             )?;
         }
-        let channel = self.model.channel_germ(&op, &voltage[0], &voltage[1]);
+        let channel = self.model.channel_germ(
+            &op,
+            &voltage[0],
+            &voltage[1],
+            &mut context.constitutive_guards(),
+        )?;
         context.local_law([drain, source], &channel, &controls, pol * m, None)?;
         for (outer, inner, conductance) in [
             (self.terminals[0], drain, op.gdpr),
