@@ -19,7 +19,7 @@ mod constraints;
 pub use constraints::{ApertureResult, Certainty, ConstraintResult};
 mod delivery;
 mod queue;
-pub use queue::EventDelta;
+pub use queue::{EventDelta, GuardedFrontier, Scheduled, SymbolicQueue};
 mod waveform;
 mod waveform_execution;
 pub(super) use delivery::phase_between;

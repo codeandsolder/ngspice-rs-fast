@@ -361,7 +361,7 @@ impl GuardedWaveform {
 mod tests {
     use super::*;
     use crate::analysis::digital::timing::TimingRelation;
-    use crate::devices::code_model::{GateKind, Logic, Strength};
+    use crate::devices::code_model::{Logic, Strength};
     use crate::primitives::Real;
     use std::collections::BTreeMap;
 
@@ -380,7 +380,11 @@ mod tests {
             ],
         )?));
         let result = GuardedWaveform::combine(&[input.clone(), input], 1_000_000, |drives| {
-            Drive::strong(GateKind::Xor.evaluate(drives))
+            Drive::strong(if drives[0].logic == drives[1].logic {
+                Logic::Zero
+            } else {
+                Logic::One
+            })
         })?;
         assert_eq!(result.project(1_000_000)?.changes().len(), 1);
         assert!(
