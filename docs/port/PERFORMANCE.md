@@ -111,6 +111,11 @@ The first three rows and the refactor row exclude initial storage growth.
 Whole-circuit allocation counts include the complete analysis after circuit
 construction; output collection, device and state preparation still allocate.
 
+A separate rejected-step RC run on `428828a` exercised 100 analyses per
+trial, with 30 accepted steps, two rejected steps and two breakpoints in every
+analysis. Allocations dropped from 308 to 207 and allocated bytes from 19,074
+to 16,074 per analysis. All six trial checksums were `3cf7c32dc7f82248`.
+
 Five alternating native runs under `perf stat` gave median instruction counts
 of 5.596 billion versus 5.621 billion for the combined linear/nonlinear/RC
 workload, and 2.075 billion versus 2.094 billion for the candidate ensemble.
