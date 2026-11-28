@@ -133,17 +133,13 @@ impl Sampler<'_> {
         let (invocation, law) = Invocation::decode(name, args)
             .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))?;
         invocation
-            .sample(
-                law,
-                Site {
-                    expression: expression.bytes(),
-                    occurrence: site.occurrence.bytes(),
-                    lot: site
-                        .lot
-                        .as_ref()
-                        .map(|identity| identity.bytes().as_slice()),
-                },
-            )
+            .bind(Site {
+                expression,
+                occurrence: site.occurrence,
+                lot: site.lot,
+            })
+            .and_then(|bound| bound.prepare(law))
+            .and_then(|distribution| distribution.sample(invocation.realization))
             .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))
     }
 
