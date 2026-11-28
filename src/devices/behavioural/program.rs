@@ -1257,6 +1257,7 @@ mod tests {
             text: "unresolved".into(),
             braced: true,
             quoted: false,
+            behavioural_alternative: None,
             span: source_expr(BExprKind::Name(String::new()), 2).span,
             root: Expr {
                 kind: ExprKind::Identifier("unresolved".into()),

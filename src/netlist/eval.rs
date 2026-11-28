@@ -46,8 +46,9 @@
 //! A [`FunctionScope`] holds the `.func` definitions of one lexical scope
 //! (deck or `.subckt` body) and is attached to a [`ParamScope`]; calls
 //! ([`ExprKind::UserCall`], or a built-in name a `.func` redefines) are
-//! evaluated by value, with the body's free names resolved at the call site,
-//! as C's textual expansion (`inpcom.c` `inp_expand_macro_in_str()`) implies.
+//! evaluated through lazily memoized actual arguments in the caller's
+//! environment. The body's free names resolve at the call site, as C's
+//! textual expansion (`inpcom.c` `inp_expand_macro_in_str()`) implies.
 //! Recursion is rejected with the cycle (iterative petgraph SCC) instead of C's
 //! unbounded expansion. [`ParamScope::for_netlist`] is the entry point for
 //! evaluating anything against a deck's top-level parameters and functions.
@@ -60,6 +61,7 @@ pub use plan::{
 };
 use statistics::{PreparedSite, Realization, Sampler};
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -72,7 +74,8 @@ use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::netlist::ast::{FuncCard, Netlist, ParamCard};
 use crate::netlist::expr::{
-    BinaryOp, EXCLUDED_FUNCTIONS, Expr, ExprKind, Function, ParameterExpression, UnaryOp,
+    BinaryOp, EXCLUDED_FUNCTIONS, Expr, ExprKind, Function, FunctionBody, ParameterExpression,
+    SourceSpan,
 };
 
 /// C reference used in diagnostics.
@@ -938,8 +941,9 @@ impl ParamScope {
                     .and_then(|scope| scope.get(name))
                     .or_else(|| self.functions.as_deref().and_then(|scope| scope.get(name)))
                     && visited.insert(std::ptr::from_ref(definition))
+                    && let Ok(body) = &definition.body.scalar
                 {
-                    pending.push((&definition.body.root, Some(owner)));
+                    pending.push((body, Some(owner)));
                 }
             }
         }
@@ -1048,6 +1052,7 @@ impl ParamScope {
             text: name.to_owned(),
             braced: false,
             quoted: false,
+            behavioural_alternative: None,
             span: span.clone(),
             root: Expr {
                 kind: ExprKind::UserCall {
@@ -1081,7 +1086,7 @@ pub struct FunctionDef {
     /// Lowercased formal parameters, in order.
     pub parameters: Vec<String>,
     /// The body expression.
-    pub body: ParameterExpression,
+    pub body: FunctionBody,
     /// Where the `.func` card was written.
     pub location: SourceLoc,
 }
@@ -1177,7 +1182,7 @@ impl FunctionScope {
         let mut graph = DependencyGraph::new(self.definitions.len(), &live);
         for &i in &live {
             let def = &self.definitions[i];
-            for (name, arguments, location) in collect_calls(&def.body.root) {
+            for (name, arguments, location) in function_body_calls(&def.body) {
                 let local = self.active.get(name).copied();
                 let callee = local.map_or_else(
                     || {
@@ -1260,6 +1265,35 @@ fn collect_calls(expr: &Expr) -> impl Iterator<Item = (&str, usize, &SourceLoc)>
         }
         _ => None,
     })
+}
+
+/// Call descriptors from both phase trees. A repeated native conditional
+/// operator can discard a scalar operand, but macro expansion precedes that
+/// reduction in C; retain calls visible in the behavioural interpretation.
+fn function_body_calls(body: &FunctionBody) -> Vec<(&str, usize, &SourceLoc)> {
+    let mut calls: Vec<_> = body
+        .scalar
+        .as_ref()
+        .ok()
+        .into_iter()
+        .flat_map(collect_calls)
+        .collect();
+    if let Ok(root) = &body.behavioural {
+        use crate::netlist::bexpr::BExprKind;
+        root.visit(&mut |node| match &node.kind {
+            BExprKind::Call { name, arguments } => {
+                calls.push((name.as_str(), arguments.len(), &node.span.start));
+            }
+            BExprKind::Voltage { negative, .. } => {
+                calls.push(("v", 1 + usize::from(negative.is_some()), &node.span.start));
+            }
+            BExprKind::Current(_) => calls.push(("i", 1, &node.span.start)),
+            _ => {}
+        });
+    }
+    calls.sort_by_key(|&(name, arity, location)| (location.line, location.column, name, arity));
+    calls.dedup();
+    calls
 }
 
 /// First-use order of a function's free names. Its formals are already
@@ -1367,6 +1401,15 @@ impl<'a> RefScan<'a, '_> {
                 self.refs(lhs, depth + 1, out)?;
                 self.refs(rhs, depth + 1, out)?;
             }
+            ExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => {
+                self.refs(condition, depth + 1, out)?;
+                self.refs(then, depth + 1, out)?;
+                self.refs(otherwise, depth + 1, out)?;
+            }
             ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
                 for a in arguments {
                     self.refs(a, depth + 1, out)?;
@@ -1410,7 +1453,12 @@ impl<'a> RefScan<'a, '_> {
         let cuts = self.cuts;
         self.stack.push(key);
         let mut names = FreeNames::new(&def.parameters);
-        let result = self.body_names(&def.body.root, scope, depth + CALL_DEPTH, &mut names);
+        let result = def
+            .body
+            .scalar
+            .as_ref()
+            .map_err(|error| phase_failure(error, &def.body.span))
+            .and_then(|body| self.body_names(body, scope, depth + CALL_DEPTH, &mut names));
         self.stack.pop();
         result?;
         let free: Arc<[&str]> = names.ordered.into();
@@ -1437,6 +1485,15 @@ impl<'a> RefScan<'a, '_> {
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.body_names(lhs, scope, depth + 1, out)?;
                 self.body_names(rhs, scope, depth + 1, out)?;
+            }
+            ExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => {
+                self.body_names(condition, scope, depth + 1, out)?;
+                self.body_names(then, scope, depth + 1, out)?;
+                self.body_names(otherwise, scope, depth + 1, out)?;
             }
             ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
                 for a in arguments {
@@ -1511,11 +1568,14 @@ const CALL_DEPTH: usize = 4;
 const CALL_DEPTH_NOTE: &str = " (each nested .func call counts as 4 levels)";
 
 /// One active `.func` call: the definition, the scope it was defined in and
-/// its argument values, linked to the enclosing call.
+/// its lazily bound argument values, linked to the enclosing call.
 struct Frame<'a> {
     def: &'a FunctionDef,
     scope: &'a FunctionScope,
-    args: Vec<Real>,
+    args: &'a [Expr],
+    values: Vec<Cell<Option<Real>>>,
+    caller: Env<'a>,
+    source: ExprSource<'a>,
     call: SourceLoc,
     call_offset: Option<u64>,
     outer: Option<&'a Self>,
@@ -1556,15 +1616,28 @@ impl<'a> Env<'a> {
     /// A name: the formals of the active calls, innermost first (C's textual
     /// expansion lets an enclosing call's formal capture a callee's free
     /// name), then the site's parameters.
-    fn value(&self, name: &str) -> Option<Real> {
+    fn value(
+        &self,
+        name: &str,
+        budget: &mut EvalBudget,
+        depth: usize,
+    ) -> Result<Option<Real>, Failure> {
         let mut frame = self.frame;
         while let Some(f) = frame {
             if let Some(i) = f.def.parameters.iter().position(|p| p == name) {
-                return Some(f.args[i]);
+                if let Some(value) = f.values[i].get() {
+                    return Ok(Some(value));
+                }
+                // Evaluate in the argument's caller environment, not the
+                // callee's shadowing formals. Cache once per invocation so
+                // a reused stochastic argument still has one realization.
+                let value = eval(&f.args[i], f.source, f.caller, budget, depth + CALL_DEPTH)?;
+                f.values[i].set(Some(value));
+                return Ok(Some(value));
             }
             frame = f.outer;
         }
-        (self.lookup)(name)
+        Ok((self.lookup)(name))
     }
 
     /// A user function: looked up where the calling body was defined (or at
@@ -1605,7 +1678,16 @@ fn evaluate_sampled_root(
         sampler,
         expression_identity,
     };
-    eval(&root.root, root, env, budget, 0)
+    eval(
+        &root.root,
+        ExprSource {
+            text: &root.text,
+            span: &root.span,
+        },
+        env,
+        budget,
+        0,
+    )
 }
 
 fn evaluate_definition(
@@ -1631,14 +1713,36 @@ fn evaluate_definition(
     })
 }
 
-fn snippet<'a>(root: &'a ParameterExpression, node: &Expr) -> &'a str {
-    node.span
-        .relative_to(&root.span)
-        .and_then(|range| root.text.get(range))
-        .unwrap_or(root.text.as_str())
+#[derive(Clone, Copy)]
+struct ExprSource<'a> {
+    text: &'a str,
+    span: &'a SourceSpan,
 }
 
-fn fail(node: &Expr, root: &ParameterExpression, message: impl std::fmt::Display) -> Failure {
+fn phase_failure(error: &SpiceError, span: &SourceSpan) -> Failure {
+    if let SpiceError::Parse { location, message } = error {
+        Failure {
+            location: location.clone(),
+            message: message.clone(),
+            unsupported: false,
+        }
+    } else {
+        Failure {
+            location: span.start.clone(),
+            message: error.to_string(),
+            unsupported: error.is_not_yet_ported(),
+        }
+    }
+}
+
+fn snippet<'a>(root: ExprSource<'a>, node: &Expr) -> &'a str {
+    node.span
+        .relative_to(root.span)
+        .and_then(|range| root.text.get(range))
+        .unwrap_or(root.text)
+}
+
+fn fail(node: &Expr, root: ExprSource<'_>, message: impl std::fmt::Display) -> Failure {
     Failure {
         location: node.span.start.clone(),
         message: format!("{message} in `{}`", snippet(root, node)),
@@ -1649,7 +1753,7 @@ fn fail(node: &Expr, root: &ParameterExpression, message: impl std::fmt::Display
 fn checked(
     value: Real,
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     what: impl FnOnce() -> String,
 ) -> Result<Real, Failure> {
     if value.is_finite() {
@@ -1670,7 +1774,7 @@ fn checked(
 /// levels must fit a 2 MiB thread stack.
 fn eval(
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     env: Env<'_>,
     budget: &mut EvalBudget,
     depth: usize,
@@ -1685,20 +1789,34 @@ fn eval(
     match &node.kind {
         ExprKind::Number { value, .. } => Ok(*value),
         ExprKind::Identifier(name) => env
-            .value(name)
+            .value(name, budget, depth)?
             .ok_or_else(|| undefined_parameter(node, name)),
         ExprKind::Group(inner) => eval(inner, root, env, budget, depth + 1),
         ExprKind::Unary { op, operand } => {
             let v = eval(operand, root, env, budget, depth + 1)?;
-            Ok(match op {
-                UnaryOp::Plus => v,
-                UnaryOp::Minus => -v,
-            })
+            Ok(op.evaluate(v))
         }
         ExprKind::Binary { op, lhs, rhs } => {
             let x = eval(lhs, root, env, budget, depth + 1)?;
+            if let Some(value) = op.short_circuit(x) {
+                return Ok(value);
+            }
             let y = eval(rhs, root, env, budget, depth + 1)?;
             binary(*op, x, y, node, rhs, root)
+        }
+        ExprKind::Ternary {
+            condition,
+            then,
+            otherwise,
+        } => {
+            let condition = eval(condition, root, env, budget, depth + 1)?;
+            eval(
+                if condition == 0.0 { otherwise } else { then },
+                root,
+                env,
+                budget,
+                depth + 1,
+            )
         }
         ExprKind::Call {
             function,
@@ -1712,7 +1830,7 @@ fn eval(
 
 #[inline(never)]
 #[cold]
-fn too_deep(node: &Expr, root: &ParameterExpression, env: Env<'_>, max: usize) -> Failure {
+fn too_deep(node: &Expr, root: ExprSource<'_>, env: Env<'_>, max: usize) -> Failure {
     let call_depth_note = if env.frame.is_some() {
         CALL_DEPTH_NOTE
     } else {
@@ -1727,7 +1845,7 @@ fn too_deep(node: &Expr, root: &ParameterExpression, env: Env<'_>, max: usize) -
 
 #[inline(never)]
 #[cold]
-fn over_budget(node: &Expr, root: &ParameterExpression, max: usize) -> Failure {
+fn over_budget(node: &Expr, root: ExprSource<'_>, max: usize) -> Failure {
     fail(
         node,
         root,
@@ -1753,31 +1871,26 @@ fn binary(
     y: Real,
     node: &Expr,
     rhs: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
 ) -> Result<Real, Failure> {
-    let result = match op {
-        BinaryOp::Add => x + y,
-        BinaryOp::Sub => x - y,
-        BinaryOp::Mul => x * y,
-        BinaryOp::Div => {
-            if y == 0.0 {
-                return Err(Failure {
-                    location: rhs.span.start.clone(),
-                    message: format!("division by zero ({x} / {y}) in `{}`", snippet(root, node)),
-                    unsupported: false,
-                });
-            }
-            x / y
+    if y == 0.0 && matches!(op, BinaryOp::Div | BinaryOp::Rem | BinaryOp::IntDiv) {
+        if op == BinaryOp::Div {
+            return Err(Failure {
+                location: rhs.span.start.clone(),
+                message: format!("division by zero ({x} / {y}) in `{}`", snippet(root, node)),
+                unsupported: false,
+            });
         }
-        // xpressn.c operate(), default compatibility.
-        BinaryOp::Pow => x.abs().powf(y),
-    };
+        return Err(fail(rhs, root, "division by zero"));
+    }
+    let result = op.evaluate(x, y);
     checked(result, node, root, || match op {
         BinaryOp::Add => format!("{x} + {y}"),
         BinaryOp::Sub => format!("{x} - {y}"),
         BinaryOp::Mul => format!("{x} * {y}"),
         BinaryOp::Div => format!("{x} / {y}"),
         BinaryOp::Pow => format!("pow(fabs({x}), {y})"),
+        other => format!("{x} {other:?} {y}"),
     })
 }
 
@@ -1785,23 +1898,38 @@ fn binary(
 #[inline(never)]
 fn builtin_call(
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     env: Env<'_>,
     budget: &mut EvalBudget,
     depth: usize,
     function: Function,
     arguments: &[Expr],
 ) -> Result<Real, Failure> {
+    // A `.func` of the same name replaces the built-in before intrinsic dispatch.
+    let definition = env.function(function.name());
+    if definition.is_none() && function == Function::Ternary {
+        let [condition, then, otherwise] = arguments else {
+            return Err(fail(node, root, "ternary_fcn requires three arguments"));
+        };
+        let condition = eval(condition, root, env, budget, depth + 1)?;
+        return eval(
+            if condition == 0.0 { otherwise } else { then },
+            root,
+            env,
+            budget,
+            depth + 1,
+        );
+    }
+    if let Some((def, scope)) = definition {
+        return call(node, root, env, budget, depth, def, scope, arguments);
+    }
     let mut args = Vec::with_capacity(arguments.len());
     for a in arguments {
         args.push(eval(a, root, env, budget, depth + 1)?);
     }
-    // A `.func` of the same name replaces the built-in, as C's textual
-    // expansion does before numparam sees the call.
-    if let Some((def, scope)) = env.function(function.name()) {
-        return call(node, root, env, budget, depth, def, scope, args);
-    }
-    let result = apply(function, &args);
+    let result = function
+        .evaluate(&args)
+        .ok_or_else(|| fail(node, root, "incorrect intrinsic arity"))?;
     checked(result, node, root, || {
         let list: Vec<String> = args.iter().map(ToString::to_string).collect();
         format!("{}({})", function.name(), list.join(", "))
@@ -1818,7 +1946,7 @@ const PROBE_FUNCTIONS: &[&str] = &["v", "i"];
 #[inline(never)]
 fn user_call(
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     env: Env<'_>,
     budget: &mut EvalBudget,
     depth: usize,
@@ -1880,27 +2008,23 @@ fn user_call(
             format_args!("undefined function '{name}' (no .func definition is in scope)"),
         ));
     };
-    let mut args = Vec::with_capacity(arguments.len());
-    for a in arguments {
-        args.push(eval(a, root, env, budget, depth + 1)?);
-    }
-    call(node, root, env, budget, depth, def, scope, args)
+    call(node, root, env, budget, depth, def, scope, arguments)
 }
 
-/// Evaluates one `.func` call with already evaluated arguments.
+/// Evaluates one `.func` call with lazily memoized argument values.
 #[expect(
     clippy::too_many_arguments,
     reason = "keeps the positional interface explicit at the reference solver or device boundary"
 )]
 fn call(
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     env: Env<'_>,
     budget: &mut EvalBudget,
     depth: usize,
     def: &FunctionDef,
     scope: &FunctionScope,
-    args: Vec<Real>,
+    args: &[Expr],
 ) -> Result<Real, Failure> {
     if args.len() != def.parameters.len() {
         return Err(fail(
@@ -1935,10 +2059,13 @@ fn call(
         def,
         scope,
         args,
+        values: vec![Cell::new(None); args.len()],
+        caller: env,
+        source: root,
         call: node.span.start.clone(),
         call_offset: node
             .span
-            .relative_to(&root.span)
+            .relative_to(root.span)
             .map(|span| span.start as u64),
         outer: env.frame,
     };
@@ -1949,8 +2076,24 @@ fn call(
         sampler: env.sampler,
         expression_identity: env.expression_identity,
     };
-    let value =
-        eval(&def.body.root, &def.body, inner, budget, depth + CALL_DEPTH).map_err(|f| {
+    let value = def
+        .body
+        .scalar
+        .as_ref()
+        .map_err(|error| phase_failure(error, &def.body.span))
+        .and_then(|body| {
+            eval(
+                body,
+                ExprSource {
+                    text: &def.body.text,
+                    span: &def.body.span,
+                },
+                inner,
+                budget,
+                depth + CALL_DEPTH,
+            )
+        })
+        .map_err(|f| {
             f.context(|| {
                 format!(
                     "in function '{}' (defined at {}) called at {}",
@@ -1959,61 +2102,6 @@ fn call(
             })
         })?;
     checked(value, node, root, || format!("{}(...)", def.name))
-}
-
-/// xpressn.c `mathfunction(f, z, x)`: `z` is the first argument of two.
-fn apply(function: Function, args: &[Real]) -> Real {
-    let x = args[args.len() - 1];
-    let z = args[0];
-    match function {
-        Function::Sqr => x * x,
-        Function::Sqrt => x.sqrt(),
-        Function::Sin => x.sin(),
-        Function::Cos => x.cos(),
-        Function::Exp => x.exp(),
-        Function::Ln | Function::Log => x.ln(),
-        Function::Arctan | Function::Atan => x.atan(),
-        Function::Abs => x.abs(),
-        Function::Pow => z.powf(x),
-        Function::Pwr => z.abs().powf(x),
-        Function::Max => {
-            if x > z {
-                x
-            } else {
-                z
-            }
-        }
-        Function::Min => {
-            if x < z {
-                x
-            } else {
-                z
-            }
-        }
-        Function::Int => x.trunc(),
-        Function::Nint => x.round_ties_even(),
-        Function::Log10 => x.log10(),
-        Function::Sinh => x.sinh(),
-        Function::Cosh => x.cosh(),
-        Function::Tanh => x.tanh(),
-        Function::Sgn => {
-            if x > 0.0 {
-                1.0
-            } else if x == 0.0 {
-                0.0
-            } else {
-                -1.0
-            }
-        }
-        Function::Ceil => x.ceil(),
-        Function::Floor => x.floor(),
-        Function::Asin => x.asin(),
-        Function::Acos => x.acos(),
-        Function::Asinh => x.asinh(),
-        Function::Acosh => x.acosh(),
-        Function::Atanh => x.atanh(),
-        Function::Tan => x.tan(),
-    }
 }
 
 #[cfg(test)]
