@@ -267,6 +267,32 @@ A lexically shadowed probe or an unused macro argument does not allocate a
 measurement branch. Ordinary F/H/W controls retain their voltage-source
 semantics.
 
+### Accepted-point current sampling
+
+The source-neutral operator `sampled_current(i(instance))` selects a history
+policy for a resolved current expression occurrence, independently of the
+physical current coordinate and the output reporting law. In DC operating
+points and sweeps it reads the selected physical current. In AC and noise the
+DC bias value is retained in the surrounding expression, but the sampled
+quantity has zero small-signal tangent. During companion transient analysis
+it holds the current from the preceding accepted point, including the initial
+point. Newton iterations and rejected timesteps cannot change the held value.
+Ordinary `i(instance)` retains instantaneous control semantics.
+
+The lowering runs after lexical function and hierarchy expansion. Both forms
+share existing physical branch coordinates or a single ideal sensing branch.
+A prepared passive network can select the port coordinate with `pn_control=1`;
+this is independent of `pn_report_*` and the intrinsic storage branch. A
+resolved zero-multiplicity removed network contributes constant zero to its
+current expressions. The sampled signal itself is a private algebraic
+coordinate without electrical incidence. Its device-local state is updated
+transactionally from the final solved control row at point acceptance, not
+from the preceding load's Newton guess.
+
+This policy is not a continuous-time constitutive relation. Memoryless
+physical DAE/Taylor analysis and periodic orbit restarts reject sampled
+currents rather than silently replacing them with an instantaneous law.
+
 Internal measurement node and source names are not a source-level API.
 The C conformance fixtures compare every physical quantity including
 redundant C measurement columns and renamed polynomial source branches,
