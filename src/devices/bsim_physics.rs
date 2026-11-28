@@ -1210,13 +1210,12 @@ pub(super) fn cap_zero<S: Constitutive>(
     }
 
     let saturation = overdrive.clone().divide(&bias.bulk_factor)?;
-    if bias
-        .drain
+    let gap = bias
+        .bulk_factor
         .clone()
-        .add(&saturation.clone().scale(-1.))
-        .compare(0.)
-        != Some(Ordering::Less)
-    {
+        .scale(-1.)
+        .mul_add(&bias.drain, &overdrive);
+    if gap.compare(0.) != Some(Ordering::Greater) {
         return cap_zero_saturation(bias, parameters, &overdrive, &saturation);
     }
 
@@ -1251,8 +1250,49 @@ pub(super) fn cap_zero<S: Constitutive>(
     };
     let bulk = bulk.add(&surface.scaled(-1.));
     let gate = inversion.add(&bulk.scaled(-1.));
-    let drain = inversion.add(&source).scaled(-1.);
+    let drain = if partition > 0.5 {
+        // For 0/100 partition the drain charge vanishes quadratically
+        // at saturation. Compute that small charge directly instead of
+        // subtracting the almost equal source and inversion charges.
+        cap_zero_drain_tail(bias, &overdrive, gap, oxide_area)?
+    } else {
+        inversion.add(&source).scaled(-1.)
+    };
     Ok([gate, bulk, drain])
+}
+
+/// Rationalized 0/100 drain charge in the linear region.
+fn cap_zero_drain_tail<S: Constitutive>(
+    bias: &CapZeroBias<S>,
+    overdrive: &S,
+    gap: S,
+    oxide_area: Real,
+) -> SpiceResult<LocalPart<S, 5>> {
+    let width = gap.clone().midpoint(overdrive);
+    let ratio = gap.clone().divide(&width)?;
+    let value = gap.scale(-0.5 * oxide_area).multiply(&ratio);
+    let gate_partial = ratio
+        .clone()
+        .scale(0.5)
+        .offset(-1.)
+        .multiply(&ratio)
+        .scale(oxide_area);
+    let weighted_partial = ratio
+        .clone()
+        .scale(-0.25)
+        .offset(1.)
+        .multiply(&ratio)
+        .scale(oxide_area);
+    Ok(LocalPart {
+        value,
+        partials: [
+            gate_partial.clone(),
+            overdrive.constant(0.),
+            gate_partial.scale(-1.),
+            weighted_partial.clone().multiply(&bias.bulk_factor),
+            weighted_partial.multiply(&bias.drain),
+        ],
+    })
 }
 
 /// The saturation endpoint is evaluated directly: the 0/100 drain
@@ -1943,6 +1983,56 @@ mod tests {
         };
         let inversion = 2. * factor * (sum + correction);
         [gate_charge, inversion - gate_charge, drain_charge]
+    }
+
+    #[test]
+    fn abrupt_zero_hundred_drain_charge_retains_quadratic_saturation_tail() -> SpiceResult<()> {
+        type Local = Differential<2>;
+        let area = 2e-12;
+        let gate = 0.875;
+        let surface = 0.375;
+        let drive = gate - surface;
+        let gap = 2.0_f64.powi(-40);
+        let drain = drive - gap;
+        let rate = gap * 0.25;
+        let gate_jet = Local::variable(0, Jet::constant(ORDER, gate))?;
+        let drain_jet = Local::variable(1, Jet::affine(ORDER, drain, rate))?;
+        let [_, _, charge] = cap_zero(
+            &CapZeroBias {
+                gate: gate_jet,
+                body_cv: Local::constant(ORDER, 0.),
+                surface: Local::constant(ORDER, surface),
+                drain: drain_jet,
+                bulk_factor: Local::constant(ORDER, 1.),
+            },
+            CapZeroParameters {
+                flatband: -0.5,
+                phi: 0.5,
+                body_effect: 0.75,
+                oxide_area: area,
+                partition: 1.,
+            },
+        )?;
+        // Use the independently known gap rather than subtracting two
+        // nearly equal sampled voltages in the reference calculation.
+        for time in [0., 0.01, 0.025] {
+            let g = (-rate).mul_add(time, gap);
+            let width = 0.5 * (drive + g);
+            let reference = -0.5 * area * g * g / width;
+            close(value_at(&charge.value.value, time), reference, 0.);
+        }
+        for (coordinate, partial) in [(0, &charge.partials[0]), (1, &charge.partials[3])] {
+            for (&actual, &expected) in charge.value.gradient[coordinate]
+                .as_ref()
+                .unwrap()
+                .coefficients()
+                .iter()
+                .zip(partial.value.coefficients())
+            {
+                close(actual, expected, 1e-300);
+            }
+        }
+        Ok(())
     }
 
     #[test]
