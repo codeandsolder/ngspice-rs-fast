@@ -4886,20 +4886,30 @@ impl Circuit {
                 nodes.len() - first_node,
                 Self::declared_state_slots(&staged[first_device..], at)?,
             );
-            if exact && actual != expected {
-                return Err(SpiceError::parse(
-                    instance.location.clone(),
-                    format!(
-                        "{}: prepared expansion size {expected:?} differs from materialized {actual:?}",
-                        instance.name
-                    ),
-                ));
-            }
+            Self::check_expansion_size(instance, exact, expected, actual)?;
             usage = usage.checked_add(actual, at)?;
             limits.check(usage, at)?;
         }
         Self::check_private_nodes(nodes, mark, &plan.deck_nodes)?;
         Ok(staged)
+    }
+
+    fn check_expansion_size(
+        instance: &crate::netlist::ast::DeviceInstance,
+        exact: bool,
+        expected: ElaborationSize,
+        actual: ElaborationSize,
+    ) -> SpiceResult<()> {
+        if exact && actual != expected {
+            return Err(SpiceError::parse(
+                instance.location.clone(),
+                format!(
+                    "{}: prepared expansion size {expected:?} differs from materialized {actual:?}",
+                    instance.name
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn check_private_nodes(
