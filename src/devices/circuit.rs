@@ -1607,6 +1607,19 @@ impl Circuit {
                 .any(|device| device.requires_analysis_context())
     }
 
+    pub(crate) fn has_explicit_bias_constraints(
+        &self,
+        analysis: crate::primitives::AnalysisKind,
+    ) -> bool {
+        self.prepared_node_initializations
+            .values()
+            .any(|policy| policy.constrains(analysis))
+            || self
+                .devices
+                .iter()
+                .any(|device| device.has_active_passive_bias(analysis))
+    }
+
     pub(crate) fn prepared_node_hints(
         &self,
     ) -> impl Iterator<Item = (NodeId, &crate::devices::passive_bias::NodeInitialization)> {
