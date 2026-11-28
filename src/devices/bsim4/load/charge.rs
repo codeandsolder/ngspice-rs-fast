@@ -42,14 +42,13 @@
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
     DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model, SizeParam,
-    depletion_charge, exp, fabs, log, mode, positive_half_sum, smooth_drain, smooth_positive, sqrt,
-    state,
+    depletion_charge, exp, fabs, log, mode, smooth_drain, smooth_positive, sqrt, state,
 };
 use super::{
     bias::LoadBias,
     channel::{Electrostatics, Transport},
 };
-use crate::devices::bsim_physics::{ChargeChain, channel_inversion};
+use crate::devices::bsim_physics::{ChargeChain, channel_inversion, charge_overdrive};
 use crate::primitives::SpiceResult;
 
 /// Intrinsic terminal charges before extrinsic overlap and junction assembly.
@@ -127,8 +126,6 @@ pub(super) fn intrinsic(
     let mut CoxWLcen: f64;
     let mut QovCox: f64;
     let mut LINK: f64;
-    let mut DeltaPhi: f64;
-    let mut dDeltaPhi_dVg: f64;
     let mut VgDP: f64;
     let mut dVgDP_dVg: f64;
     let mut Cox: f64;
@@ -141,7 +138,6 @@ pub(super) fn intrinsic(
     let mut dCoxeff_dVd: f64;
     let mut dCoxeff_dVg: f64;
     let mut dCoxeff_dVb: f64;
-    let mut Denomi: f64;
     let mut Vdsat: f64;
     let mut dVdsat_dVg: f64;
     let mut dVdsat_dVb: f64;
@@ -671,21 +667,8 @@ pub(super) fn intrinsic(
             dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg) + QovCox * dCoxeff_dVg;
             dQsub0_dVd = -T2 * dVgsteff_dVd;
             dQsub0_dVb = -T2 * (dVfbeff_dVb + dVbseffCV_dVb + dVgsteff_dVb) + QovCox * dCoxeff_dVb;
-            if pParam.k1ox <= 0.0 {
-                Denomi = 0.25 * pParam.moin * Vtm;
-                T0 = 0.5 * pParam.sqrtPhi;
-            } else {
-                Denomi = pParam.moin * Vtm * pParam.k1ox * pParam.k1ox;
-                T0 = pParam.k1ox * pParam.sqrtPhi;
-            }
-            T1 = 2.0 * T0 + Vgsteff;
-            DeltaPhi = Vtm * (T1 * Vgsteff / Denomi).ln_1p();
-            dDeltaPhi_dVg = 2.0 * Vtm * (T1 - T0) / (Denomi + T1 * Vgsteff);
-            T0 = Vgsteff - DeltaPhi - 0.001;
-            dT0_dVg = 1.0 - dDeltaPhi_dVg;
-            T1 = sqrt(T0 * T0 + Vgsteff * 0.004);
-            VgDP = positive_half_sum(T0, T1, 0.001 * Vgsteff)?;
-            dVgDP_dVg = dT0_dVg.mul_add(VgDP, 0.001) / T1;
+            (VgDP, dVgDP_dVg) =
+                charge_overdrive(Vgsteff, pParam.k1ox, pParam.moin, Vtm, pParam.sqrtPhi)?;
             Tox += Tox;
             T0 = (Vgsteff + here.vtfbphi2) / Tox;
             tmp = exp(model.bdos * 0.7 * log(T0));
