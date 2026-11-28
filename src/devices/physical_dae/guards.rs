@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn constitutive_comparisons_select_exact_germs_and_filter_inactive_sites() {
+    fn physical_constitutive_comparisons_select_exact_germs_and_filter_inactive_sites() {
         let mut up = BranchTrace::default();
         let mut down = BranchTrace::default();
         let rising = Jet::affine(2, 0.5, 1.);

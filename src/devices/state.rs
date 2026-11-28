@@ -1221,6 +1221,7 @@ impl<'a> DeviceState<'a> {
 #[cfg(test)]
 mod tests {
     use super::{ACCEPTED_DEPTH, DeviceState, IterationPhase, StateHistory};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     #[test]
