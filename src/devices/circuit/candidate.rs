@@ -12,18 +12,30 @@ use super::{CandidateNumericOverride, Circuit, ModelContext};
 #[derive(Clone, Copy, Debug)]
 pub enum CandidateEdit<'a> {
     /// Independent voltage or current source DC value.
-    Source { name: &'a str, value: Real },
+    Source {
+        /// Expanded native source name.
+        name: &'a str,
+        /// DC value in the source's native unit.
+        value: Real,
+    },
     /// A native parameter of a specific expanded device occurrence.
     Instance {
+        /// Expanded native instance name.
         name: &'a str,
+        /// Native scalar setter name.
         parameter: &'a str,
+        /// Value in native card units.
         value: Real,
     },
     /// A native model parameter of a lexical declaration, shared by its uses.
     Model {
+        /// Lexical declaration path, empty for root.
         scope: &'a [String],
+        /// Native model declaration name.
         name: &'a str,
+        /// Native scalar setter name.
         parameter: &'a str,
+        /// Value in native card units.
         value: Real,
     },
 }
