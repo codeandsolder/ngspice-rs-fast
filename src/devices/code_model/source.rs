@@ -10,6 +10,8 @@ use crate::primitives::{Real, SpiceError, SpiceResult, parse_spice_number};
 pub enum SourceModel {
     /// Rational voltage/current transfer.
     RationalTransfer,
+    /// Tabulated complex AC transfer.
+    FrequencyTransfer,
     /// Qualified analog receivers with event logic output.
     LogicEvent,
     /// Ideal digital-to-voltage bridge.
@@ -95,6 +97,8 @@ impl SourceModel {
     pub const fn from_base(base: &str) -> Option<Self> {
         if base.eq_ignore_ascii_case("s_xfer") {
             Some(Self::RationalTransfer)
+        } else if base.eq_ignore_ascii_case("xfer") {
+            Some(Self::FrequencyTransfer)
         } else if base.eq_ignore_ascii_case("preprocess_logic_event") {
             Some(Self::LogicEvent)
         } else if base.eq_ignore_ascii_case("preprocess_logic_voltage") {
@@ -126,7 +130,7 @@ impl SourceModel {
             PortSpec::new(ConductanceDifferential, BRANCH, false, false),
         ];
         match self {
-            Self::RationalTransfer => TRANSFER_PORTS,
+            Self::RationalTransfer | Self::FrequencyTransfer => TRANSFER_PORTS,
             Self::LogicEvent => LOGIC_PORTS,
             Self::LogicVoltage => VOLTAGE_PORTS,
             Self::TimedSwitch => SWITCH_PORTS,
@@ -142,6 +146,12 @@ impl SourceModel {
             Self::RationalTransfer => match name {
                 "num_coeff" | "den_coeff" | "int_ic" => Some(RealVector),
                 "gain" | "denormalized_freq" | "in_offset" => Some(Real),
+                _ => None,
+            },
+            Self::FrequencyTransfer => match name {
+                "table" => Some(RealVector),
+                "r_i" | "db" | "rad" => Some(Boolean),
+                "span" | "offset" => Some(Integer),
                 _ => None,
             },
             Self::LogicEvent => match name {
@@ -537,6 +547,7 @@ pub(in crate::devices) fn instantiate(
             }))
         }
         SourceModel::RationalTransfer => super::rational::instantiate(instance, nodes, model),
+        SourceModel::FrequencyTransfer => super::frequency::instantiate(instance, nodes, model),
         SourceModel::TimedSwitch => {
             let material = model.prepare(PreparationKey::Inputs, || {
                 super::timed_switch_device::compile(model.card())
