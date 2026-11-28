@@ -48,13 +48,15 @@ lanes. Existing numerical regressions exercise singular-lane isolation,
 zero-pivot recovery, range extremes, transposed solves, and a parsed RC
 ladder against the ordinary scalar AC analysis.
 
-The isolated `experiments/fp64-gpu-solver` crate supplements those tests
+The non-published `experiments/fp64-gpu-solver` workspace member supplements those tests
 with a CPU baseline for parsed RLC ladders and meshes, including inductive
 and ideal voltage-source branch-current constraints and nonsymmetric
 controlled-source stamps. It uses the actual DC bias and small-signal
 operators, not a synthetic diagonally dominant matrix. Its dependency
-points toward the simulator only; the production workspace does not
-depend on the experiment. There are no additional registry dependencies.
+points toward the simulator only; production packages do not
+depend on the experiment. It shares the workspace lockfile and is covered
+by workspace CI, but is excluded from default-member builds. There are no
+additional registry dependencies.
 
 The benchmark assembles matrices outside the timed region, sweeps independent
 frequencies from 100 Hz to below 10 MHz, and compares independent scalar
@@ -69,8 +71,8 @@ Run with the pinned nightly and the existing managed compiler cache,
 using an external target directory:
 
 ```sh
-cargo +nightly test --locked --manifest-path experiments/fp64-gpu-solver/Cargo.toml
-cargo +nightly run --release --locked --manifest-path experiments/fp64-gpu-solver/Cargo.toml
+cargo +nightly test --locked -p ngspice-ac-ensemble-experiment
+cargo +nightly run --release --locked -p ngspice-ac-ensemble-experiment
 cargo +nightly test --locked --lib independent_
 ```
 

@@ -74,7 +74,7 @@ generated-lint-boundaries = ["src/devices/bsim4/fields.rs"]
 
 [workspace]
 resolver = "3"
-members = ["xtask", "conformance/support"]
+members = ["xtask", "conformance/support", "experiments/fp64-gpu-solver"]
 
 [workspace.package]
 version = "0.4.0"
@@ -103,7 +103,7 @@ winnow = { version = "1.0.4", default-features = false, features = ["std", "pars
 # circuit connectivity need not be a DC path, and graph connectivity alone
 # does not establish solvability. Analysis-specific validation remains future
 # work.
-petgraph = "0.8.3"
+petgraph = { version = "0.8.3", default-features = false, features = ["std", "graphmap"] }
 
 [dependencies]
 winnow.workspace = true
