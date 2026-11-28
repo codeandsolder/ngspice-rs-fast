@@ -21,9 +21,9 @@
 )] // C's if nesting.
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{LoadCkt, mode, state};
-use crate::devices::bsim_physics::{
-    SaturationRoot, depletion_charge, smooth_drain, smooth_positive,
-};
+#[cfg(test)]
+use crate::devices::bsim_physics::SaturationRoot;
+use crate::devices::bsim_physics::{depletion_charge, smooth_drain, smooth_positive};
 use crate::maths::taylor::Constitutive;
 use crate::primitives::SpiceResult;
 
