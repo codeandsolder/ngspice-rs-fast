@@ -137,7 +137,7 @@ impl CircuitParameterPlan {
                 .clone(),
         );
         let elaborated = elaborate::literalize_with(&source, Arc::clone(&scope), &mut budget)?;
-        let config = RunConfig::from_netlist(&source)?;
+        let config = RunConfig::from_netlist_with_scope(&source, Arc::clone(&scope))?;
         let baseline = config.prepared_circuit(&source, declarations)?;
         let mut sites = Vec::new();
         for site in &elaborated.sites {
@@ -519,6 +519,27 @@ impl CircuitCandidate<'_> {
         let scope = self.parameters.resolved_scope(self.plan.root)?;
         let context = self.config().context().model_context();
         self.plan.elaborate(&context, scope)
+    }
+
+    /// Materialize an independent analysis circuit at a selected temperature
+    /// using the candidate's actual lexical scope. Model setup and topology
+    /// are revalidated together; no previous solver state is carried.
+    ///
+    /// # Errors
+    /// Invalid candidate temperature, scope, model or device preparation.
+    pub fn independent_circuit(
+        &self,
+        temperature: Option<Real>,
+    ) -> SpiceResult<(Circuit, RunConfig)> {
+        let scope = self.parameters.resolved_scope(self.plan.root)?;
+        let mut config = RunConfig::from_netlist_with_scope(&self.plan.source, Arc::clone(&scope))?;
+        if let Some(value) = temperature {
+            config = config.at_temperature(value, &self.plan.source.location)?;
+        }
+        let circuit = self
+            .plan
+            .elaborate(&config.context().model_context(), scope)?;
+        Ok((circuit, config))
     }
 
     /// Stable name of one independent root coordinate in plan order.

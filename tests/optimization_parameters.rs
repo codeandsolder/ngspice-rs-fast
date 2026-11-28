@@ -610,3 +610,40 @@ fn sparse_polynomial_candidate_retains_initially_zero_parameter_terms() {
         close(plot.value("v(out)", 0).unwrap().re, 1. - gain);
     }
 }
+
+#[test]
+fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() {
+    let source = deck(
+        ".param r=1k analysis=2\n.func delay(x) {x*analysis}\nV1 in 0 2\nR1 in 0 {r} tc1=0.01\n.temp 27\n",
+    );
+    let location = source.location.clone();
+    let plan = CircuitParameterPlan::new(source, &["r", "analysis"]).unwrap();
+    let mut candidate = plan.session().unwrap();
+    let mut budget = EvalBudget::default();
+    for (r, analysis, temp) in [
+        (1e3, 2., 27.),
+        (2e3, 3., 77.),
+        (1e3, 2., -23.),
+        (1e3, 2., 27.),
+    ] {
+        candidate.update(&[r, analysis], &mut budget).unwrap();
+        let (mut circuit, config) = candidate.independent_circuit(Some(temp)).unwrap();
+        close(
+            config
+                .prepared_scalar("{delay(1u)}", &location, &mut budget)
+                .unwrap(),
+            analysis * 1e-6,
+        );
+        close(config.context().nominal_temperature, 27.);
+        let request = config
+            .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+            .unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
+        close(
+            plot.value("i(v1)", 0).unwrap().re,
+            -2. / (r * (1. + 0.01 * (temp - 27.))),
+        );
+    }
+    assert!(candidate.independent_circuit(Some(-273.15)).is_err());
+    close(candidate.config().context().temperature, 27.);
+}

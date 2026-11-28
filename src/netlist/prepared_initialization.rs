@@ -268,15 +268,18 @@ const fn source_analysis(kind: AnalysisKind, uic: bool) -> Option<Analysis> {
 /// already-bound native lexical scope.
 struct ExpressionContext<'a> {
     scope: &'a ParamScope,
-    analysis: Analysis,
+    analysis: Option<Analysis>,
     location: &'a SourceLoc,
     budget: &'a mut EvalBudget,
 }
 
 impl SpiceExpressionContext for ExpressionContext<'_> {
     fn symbol(&mut self, name: &str) -> anyhow::Result<Real> {
-        if name.eq_ignore_ascii_case("analysis") {
-            Ok(self.analysis.source_code())
+        if let Some(analysis) = self
+            .analysis
+            .filter(|_| name.eq_ignore_ascii_case("analysis"))
+        {
+            Ok(analysis.source_code())
         } else {
             self.scope
                 .get(name)
@@ -289,24 +292,24 @@ impl SpiceExpressionContext for ExpressionContext<'_> {
             .iter()
             .map(|argument| argument.evaluate_with(self))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let code = self.analysis.source_code();
+        let code = self.analysis.map(Analysis::source_code);
         self.scope
             .evaluate_prepared_call(
                 name,
                 &args,
                 self.location,
-                |symbol| symbol.eq_ignore_ascii_case("analysis").then_some(code),
+                |symbol| code.filter(|_| symbol.eq_ignore_ascii_case("analysis")),
                 self.budget,
             )
             .map_err(Into::into)
     }
 }
 
-fn evaluate(
+pub(crate) fn evaluate_scalar(
     text: &str,
     location: &SourceLoc,
     scope: &ParamScope,
-    analysis: Analysis,
+    analysis: Option<Analysis>,
     budget: &mut EvalBudget,
 ) -> SpiceResult<Real> {
     budget.charge_prepared(text.len(), location)?;
@@ -380,7 +383,8 @@ impl<'a> Binder<'a> {
             let defaults = policy
                 .source
                 .resolve_defaults(|text| {
-                    evaluate(text, &netlist.location, root, analysis, budget).map_err(Into::into)
+                    evaluate_scalar(text, &netlist.location, root, Some(analysis), budget)
+                        .map_err(Into::into)
                 })
                 .map_err(|error| SpiceError::parse(netlist.location.clone(), error.to_string()))?;
             let job = Job {
@@ -442,7 +446,8 @@ impl<'a> Binder<'a> {
         for job in &self.jobs {
             let resolved = d
                 .resolve(job.analysis, job.defaults, |text| {
-                    evaluate(text, location, scope, job.analysis, budget).map_err(Into::into)
+                    evaluate_scalar(text, location, scope, Some(job.analysis), budget)
+                        .map_err(Into::into)
                 })
                 .map_err(|e| SpiceError::parse(location.clone(), e.to_string()))?;
             if let Some(bias) = physical_constraint(resolved.bias)? {
@@ -452,7 +457,8 @@ impl<'a> Binder<'a> {
         if let Some(job) = &self.uic {
             storage_ic = d
                 .resolve(job.analysis, job.defaults, |text| {
-                    evaluate(text, location, scope, job.analysis, budget).map_err(Into::into)
+                    evaluate_scalar(text, location, scope, Some(job.analysis), budget)
+                        .map_err(Into::into)
                 })
                 .map_err(|e| SpiceError::parse(location.clone(), e.to_string()))?
                 .storage_ic;
@@ -489,7 +495,8 @@ impl<'a> Binder<'a> {
             for job in &self.jobs {
                 let (_, bias) = n
                     .resolve(job.analysis, job.defaults, |text| {
-                        evaluate(text, &location, scope, job.analysis, budget).map_err(Into::into)
+                        evaluate_scalar(text, &location, scope, Some(job.analysis), budget)
+                            .map_err(Into::into)
                     })
                     .map_err(|e| SpiceError::parse(location.clone(), e.to_string()))?;
                 match bias {
@@ -509,7 +516,8 @@ impl<'a> Binder<'a> {
             if let Some(job) = &self.uic {
                 hint = n
                     .resolve(job.analysis, job.defaults, |text| {
-                        evaluate(text, &location, scope, job.analysis, budget).map_err(Into::into)
+                        evaluate_scalar(text, &location, scope, Some(job.analysis), budget)
+                            .map_err(Into::into)
                     })
                     .map_err(|e| SpiceError::parse(location.clone(), e.to_string()))?
                     .0;
