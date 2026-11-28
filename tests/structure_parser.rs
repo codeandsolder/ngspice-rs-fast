@@ -1,13 +1,13 @@
-//! #12/#13 parse structure without flattening; #18 elaborates top-level `.subckt`
-//! definitions deliberately. Decks that still need preprocessing (`.include`,
-//! `.lib`) stay explicitly unavailable.
+//! Structure parsing and elaboration preserve hierarchical identity, including
+//! definitions and models obtained through source-relative include/library cards.
+use ngspice_rs::analysis::RunConfig;
 use ngspice_rs::devices::{Circuit, ModelContext, ModelResolver};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::path::Path;
 
 #[test]
-fn the_committed_subcircuit_deck_now_elaborates_and_includes_stay_explicit() {
+fn committed_subcircuit_and_source_relative_library_decks_elaborate() {
     let root = ngspice_conformance::fixtures::workspace_root()
         .unwrap()
         .join("conformance");
@@ -23,15 +23,27 @@ fn the_committed_subcircuit_deck_now_elaborates_and_includes_stay_explicit() {
             .collect::<Vec<_>>(),
         ["v1", "r.x1.r1", "r2"]
     );
-    // A deck whose devices only exist after include/lib resolution is still an
-    // explicit error, never a partial circuit.
+    // The included divider uses the typical section's 1 kΩ sheet resistor,
+    // not the fast section's 500 Ω model. Solve the actual elaborated deck.
     let n = Parser::new()
         .parse_file(root.join("parser/sources/main.cir"))
         .unwrap();
-    assert!(matches!(
-        Circuit::from_netlist(&n),
-        Err(ngspice_rs::primitives::SpiceError::Unsupported { .. })
-    ));
+    let config = RunConfig::from_netlist(&n).unwrap();
+    let mut circuit = config.circuit(&n).unwrap();
+    assert_eq!(
+        circuit
+            .devices()
+            .iter()
+            .map(|device| device.name())
+            .collect::<Vec<_>>(),
+        ["v1", "r.x1.r1", "r2"]
+    );
+    let plot = config
+        .plan_for(&n.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    assert!((plot.column("v(out)").unwrap()[0].re - 5.).abs() < 1e-12);
 }
 
 #[test]
