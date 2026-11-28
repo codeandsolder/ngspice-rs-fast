@@ -29,6 +29,7 @@ use super::dc::{Bias, DcEvaluation};
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
+use crate::devices::bsim_physics::{JunctionCapacitance, depletion, overlap};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 const EXP_THRESHOLD: Real = 34.0;
@@ -36,8 +37,6 @@ const MIN_EXP: Real = 1.713_908_431e-15;
 const MAX_EXP: Real = 5.834_617_425e14;
 /// `b3ld.c` `EPSSI` (rounded, not the platform's permittivity).
 const EPS_SI: Real = 1.035_94e-10;
-/// `b3ld.c` `DELTA_1`.
-const DELTA_1: Real = 0.02;
 /// `b3ld.c` `DELTA_3`.
 const DELTA_3: Real = 0.02;
 /// `b3ld.c` `DELTA_4`.
@@ -600,8 +599,8 @@ impl ChargeModel<'_> {
         let ck = p.binned.ckappa;
         let vgd = vgs - vds;
 
-        let (cgdo, qgdo) = overlap_cv(vgd, cgdo_param, p.weff_cv * p.binned.cgdl, ck);
-        let (cgso, qgso) = overlap_cv(vgs, cgso_param, p.weff_cv * p.binned.cgsl, ck);
+        let (cgdo, qgdo) = overlap(vgd, cgdo_param, p.weff_cv * p.binned.cgdl, ck)?;
+        let (cgso, qgso) = overlap(vgs, cgso_param, p.weff_cv * p.binned.cgsl, ck)?;
 
         let cgbo = p.derived.cgbo;
 
@@ -609,24 +608,10 @@ impl ChargeModel<'_> {
         // capacitances"). C uses the un-temperature-scaled gate-sidewall field
         // (`BSIM3unitLengthGateSidewallJctCap`, not `...TempJctCap`); that
         // quirk is reproduced.
-        let (czbd, czbdsw, czbdswg) =
-            junction_zero_bias(t, m, p.drain_area, p.drain_perimeter, p.weff);
-        let (czbs, czbssw, czbsswg) =
-            junction_zero_bias(t, m, p.source_area, p.source_perimeter, p.weff);
-        let mj = m.values.mj.value;
-        let mjsw = m.values.mjsw.value;
-        let mjswg = m.values.mjswg.value;
-        let phib = t.phi_b;
-        let phibsw = t.phi_bsw;
-        let phibswg = t.phi_bswg;
-
-        let vbd = vbs - vds;
-        let (qbs, capbs) = junction_cv(
-            vbs, czbs, czbssw, czbsswg, mj, mjsw, mjswg, phib, phibsw, phibswg,
-        );
-        let (qbd, capbd) = junction_cv(
-            vbd, czbd, czbdsw, czbdswg, mj, mjsw, mjswg, phib, phibsw, phibswg,
-        );
+        let source = junction_parts(t, m, p.source_area, p.source_perimeter, p.weff);
+        let drain = junction_parts(t, m, p.drain_area, p.drain_perimeter, p.weff);
+        let (qbs, capbs) = depletion(vbs, source)?;
+        let (qbd, capbd) = depletion(vbs - vds, drain)?;
 
         let result = ChargeEvaluation {
             qgate,
@@ -687,94 +672,37 @@ impl ChargeModel<'_> {
 
 /// `b3ld.c`'s zero-bias junction capacitances for one junction, split into the
 /// bottom, sidewall and gate-sidewall parts.
-fn junction_zero_bias(
+fn junction_parts(
     temperature: &TemperatureModel,
     model: &ModelDefaults,
     area: Real,
     perimeter: Real,
     weff: Real,
-) -> (Real, Real, Real) {
-    let czb = temperature.unit_area_temp_jct_cap * area;
+) -> [JunctionCapacitance; 3] {
+    let bottom = temperature.unit_area_temp_jct_cap * area;
     let sidewall = temperature.unit_length_sidewall_temp_jct_cap;
     // C reads the *model* field here (no CJSWG temperature scaling).
     let gate_sidewall = model.values.cjswg.value;
-    if perimeter < weff {
-        (czb, 0.0, gate_sidewall * perimeter)
+    let (side, gate) = if perimeter < weff {
+        (0., gate_sidewall * perimeter)
     } else {
-        (czb, sidewall * (perimeter - weff), gate_sidewall * weff)
-    }
-}
-
-/// Bias-dependent overlap charge and its derivative. Rationalized
-/// square-root offsets retain the small correction for large positive bias.
-fn overlap_cv(v: Real, base: Real, extra: Real, kappa: Real) -> (Real, Real) {
-    let offset = v + DELTA_1;
-    let root = offset.mul_add(offset, 4.0 * DELTA_1).sqrt();
-    let negative_half = if offset > 0.0 {
-        -2.0 * DELTA_1 / (offset + root)
-    } else {
-        0.5 * (offset - root)
+        (sidewall * (perimeter - weff), gate_sidewall * weff)
     };
-    let ratio = -4.0 * negative_half / kappa;
-    let secondary = (1.0 + ratio).sqrt();
-    let secondary_offset = ratio / (secondary + 1.0);
-    let correction = secondary_offset / secondary * (-negative_half / root);
-    let capacitance = extra.mul_add(-correction, base + extra);
-    let charge = extra.mul_add(
-        -negative_half * (secondary_offset / (secondary + 1.0)),
-        (base + extra) * v,
-    );
-    (capacitance, charge)
-}
-
-/// `b3ld.c`'s source/drain bulk junction C-V for one junction, returning
-/// `(charge, capacitance)`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps the positional interface explicit at the reference solver or device boundary"
-)] // C's three junction regions.
-fn junction_cv(
-    v: Real,
-    czb: Real,
-    czsw: Real,
-    czswg: Real,
-    mj: Real,
-    mjsw: Real,
-    mjswg: Real,
-    phib: Real,
-    phibsw: Real,
-    phibswg: Real,
-) -> (Real, Real) {
-    if v == 0.0 {
-        (0.0, czb + czsw + czswg)
-    } else if v < 0.0 {
-        let mut charge = 0.0;
-        let mut cap = 0.0;
-        for (cz, m, phi) in [
-            (czb, mj, phib),
-            (czsw, mjsw, phibsw),
-            (czswg, mjswg, phibswg),
-        ] {
-            if cz > 0.0 {
-                let relative = -v / phi;
-                let arg = 1.0 + relative;
-                let (sarg, integral) = if m == 0.5 {
-                    let root = arg.sqrt();
-                    // 2*(1 - sqrt(1+x)) = -2*x/(1 + sqrt(1+x)).
-                    (1.0 / root, -2.0 * (relative / (1.0 + root)))
-                } else {
-                    let log = relative.ln_1p();
-                    let exponent = 1.0 - m;
-                    ((-m * log).exp(), -(exponent * log).exp_m1() / exponent)
-                };
-                charge = f64::mul_add(phi * cz, integral, charge);
-                cap = cz.mul_add(sarg, cap);
-            }
-        }
-        (charge, cap)
-    } else {
-        let t0 = czb + czsw + czswg;
-        let t1 = v * (czb * mj / phib + czsw * mjsw / phibsw + czswg * mjswg / phibswg);
-        (v * 0.5f64.mul_add(t1, t0), t0 + t1)
-    }
+    [
+        JunctionCapacitance {
+            zero: bottom,
+            potential: temperature.phi_b,
+            grading: model.values.mj.value,
+        },
+        JunctionCapacitance {
+            zero: side,
+            potential: temperature.phi_bsw,
+            grading: model.values.mjsw.value,
+        },
+        JunctionCapacitance {
+            zero: gate,
+            potential: temperature.phi_bswg,
+            grading: model.values.mjswg.value,
+        },
+    ]
 }

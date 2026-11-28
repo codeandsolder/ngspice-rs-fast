@@ -41,9 +41,9 @@
 )]
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
-    DELTA_1, DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model,
-    SizeParam, depletion_charge, exp, fabs, log, mode, positive_half_sum, smooth_drain,
-    smooth_positive, sqrt, state,
+    DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model, SizeParam,
+    depletion_charge, exp, fabs, log, mode, positive_half_sum, smooth_drain, smooth_positive, sqrt,
+    state,
 };
 use super::{
     bias::LoadBias,
@@ -1079,20 +1079,18 @@ pub(super) fn companion(
             cgso = pParam.cgso;
             qgso = pParam.cgso * vgsx;
         } else {
-            T0 = vgdx + DELTA_1;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_1);
-            T2 = 0.5 * (T0 - T1);
-            T3 = pParam.weffCV * pParam.cgdl;
-            T4 = sqrt(1.0 - 4.0 * T2 / pParam.ckappad);
-            cgdo = pParam.cgdo + T3 - T3 * (1.0 - 1.0 / T4) * (0.5 - 0.5 * T0 / T1);
-            qgdo = (pParam.cgdo + T3) * vgdx - T3 * (T2 + 0.5 * pParam.ckappad * (T4 - 1.0));
-            T0 = vgsx + DELTA_1;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_1);
-            T2 = 0.5 * (T0 - T1);
-            T3 = pParam.weffCV * pParam.cgsl;
-            T4 = sqrt(1.0 - 4.0 * T2 / pParam.ckappas);
-            cgso = pParam.cgso + T3 - T3 * (1.0 - 1.0 / T4) * (0.5 - 0.5 * T0 / T1);
-            qgso = (pParam.cgso + T3) * vgsx - T3 * (T2 + 0.5 * pParam.ckappas * (T4 - 1.0));
+            (cgdo, qgdo) = crate::devices::bsim_physics::overlap(
+                vgdx,
+                pParam.cgdo,
+                pParam.weffCV * pParam.cgdl,
+                pParam.ckappad,
+            )?;
+            (cgso, qgso) = crate::devices::bsim_physics::overlap(
+                vgsx,
+                pParam.cgso,
+                pParam.weffCV * pParam.cgsl,
+                pParam.ckappas,
+            )?;
         }
         if here.nf != 1.0 {
             cgdo *= here.nf;

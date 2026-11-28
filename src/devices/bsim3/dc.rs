@@ -21,6 +21,7 @@
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
+use crate::devices::bsim_physics::bsim3_junction;
 use crate::primitives::{Real, SpiceResult};
 
 const EXP_THRESHOLD: Real = 34.0;
@@ -200,34 +201,12 @@ impl DcModel<'_> {
         let drain_sat_current = p.drain_sat_current;
         let vbd_in = bias.vbs - bias.vds;
 
-        let junction = |sat: Real, v: Real, vjsm: Real, isevjsm: Real| {
-            if sat <= 0.0 {
-                return (gmin, gmin * v);
-            }
-            // IJTH==0 and below-breakdown share C's exponential branch.
-            if m.values.ijth.value == 0.0 || v < vjsm {
-                let argument = v / nvtm;
-                // Near zero, exp(x) - 1 loses the entire junction current.
-                // Away from zero keep exp itself: exp_m1(x) + 1 would erase
-                // a small but nonzero reverse-bias differential conductance.
-                let (ev, excess) = if argument.abs() <= std::f64::consts::LN_2 {
-                    let excess = argument.exp_m1();
-                    (1.0 + excess, excess)
-                } else {
-                    let ev = argument.exp();
-                    (ev, ev - 1.0)
-                };
-                (sat * ev / nvtm + gmin, gmin.mul_add(v, sat * excess))
-            } else {
-                let t0 = isevjsm / nvtm;
-                (
-                    t0 + gmin,
-                    gmin.mul_add(v, t0.mul_add(v - vjsm, isevjsm - sat)),
-                )
-            }
+        let junction = |sat, v, vjsm, isevjsm| {
+            let continuation = (m.values.ijth.value != 0.).then_some((vjsm, isevjsm));
+            bsim3_junction(v, sat, nvtm, continuation, gmin)
         };
-        let (gbs, cbs) = junction(source_sat_current, bias.vbs, p.vjsm, p.isevjsm);
-        let (gbd, cbd) = junction(drain_sat_current, vbd_in, p.vjdm, p.isevjdm);
+        let (cbs, gbs) = junction(source_sat_current, bias.vbs, p.vjsm, p.isevjsm)?;
+        let (cbd, gbd) = junction(drain_sat_current, vbd_in, p.vjdm, p.isevjdm)?;
 
         // Normal versus inverse mode. The inverse case mirrors gate/drain.
         let (mode, vds, vgs, vbs) = if bias.vds >= 0.0 {

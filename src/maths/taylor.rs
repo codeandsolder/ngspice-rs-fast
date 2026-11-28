@@ -4,6 +4,7 @@
 //! physical time scale to the k-th power. Products and elementary functions
 //! use coefficient recurrences, not differences of nearly equal samples.
 
+pub(crate) mod arithmetic;
 pub mod differential;
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
