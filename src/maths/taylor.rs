@@ -4,6 +4,8 @@
 //! physical time scale to the k-th power. Products and elementary functions
 //! use coefficient recurrences, not differences of nearly equal samples.
 
+pub mod differential;
+
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// The resource ceiling for a single local Taylor expansion.
@@ -237,7 +239,14 @@ impl Jet {
 
     /// From `y' = x' y`, `n y_n = sum_(k=1..n) k x_k y_(n-k)`.
     pub(crate) fn exp(&self) -> Self {
-        let mut result = Self::constant(self.coefficients.len() - 1, self.coefficients[0].exp());
+        self.exp_with_value(self.value().exp())
+    }
+
+    /// Lift a scaled exponential using an already computed constant term.
+    /// This avoids an overflowing unscaled exponential or a rounded-away
+    /// prefactor. The supplied value must equal the scaled exponential.
+    pub(crate) fn exp_with_value(&self, value: Real) -> Self {
+        let mut result = Self::constant(self.order(), value);
         for n in 1..result.coefficients.len() {
             let mut weight = 0.;
             let sum = self.coefficients[1..=n]
