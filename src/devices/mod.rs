@@ -130,7 +130,7 @@ pub use controlled::{ControlledKind, ControlledSource};
 pub use elaboration::ElaborationLimits;
 pub use mutual::{MutualInductance, MutualLimits};
 pub use registry::{DeviceEntry, DeviceSupport, Registry};
-pub use rlc::{Capacitor, Inductor, Resistor, ResistorNoise};
+pub use rlc::{Capacitor, Inductor, Resistor, ResistorNoise, ThermalConductance};
 pub use state::{
     ACCEPTED_DEPTH, DeviceState, IterationPhase, StateHistory, StateSnapshot, TrialState,
 };
