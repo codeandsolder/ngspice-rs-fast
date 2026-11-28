@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn deep_shared_ancestry_cancels_with_constant_comparison_work() -> SpiceResult<()> {
-        let mut root = TimingWindow::exact(1.e12)?;
+        let mut root = TimingWindow::exact(1e12)?;
         for origin in 0..10_000 {
             root = root.after(DelayWindow::new(1., 2.)?, Origin(origin))?;
         }
