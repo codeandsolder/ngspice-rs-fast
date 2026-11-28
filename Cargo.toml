@@ -74,7 +74,7 @@ generated-lint-boundaries = ["src/devices/bsim4/fields.rs"]
 
 [workspace]
 resolver = "3"
-members = ["xtask", "conformance/support"]
+members = ["xtask", "conformance/support", "experiments/fp64-gpu-solver"]
 
 [workspace.package]
 version = "0.4.0"
@@ -103,7 +103,7 @@ winnow = { version = "1.0.4", default-features = false, features = ["std", "pars
 # circuit connectivity need not be a DC path, and graph connectivity alone
 # does not establish solvability. Analysis-specific validation remains future
 # work.
-petgraph = "0.8.3"
+petgraph = { version = "0.8.3", default-features = false, features = ["std", "graphmap"] }
 
 [dependencies]
 winnow.workspace = true
@@ -149,3 +149,7 @@ workspace = true
 # assertions and overflow checks; optimizing only dependencies does not help.
 [profile.dev]
 opt-level = 1
+
+[patch.crates-io]
+# Use the centrally maintained Petgraph patch to align Hashbrown with Indexmap.
+petgraph = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/js-redox-deps" }
