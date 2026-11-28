@@ -1052,6 +1052,7 @@ impl ParamScope {
             text: name.to_owned(),
             braced: false,
             quoted: false,
+            behavioural_alternative: None,
             span: span.clone(),
             root: Expr {
                 kind: ExprKind::UserCall {

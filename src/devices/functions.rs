@@ -526,37 +526,109 @@ impl Sine {
 }
 
 impl Exponential {
+    pub(super) fn from_prepared(
+        e: model_normalize_ngspice::waveform::ExponentialForcing,
+    ) -> SpiceResult<Self> {
+        if ![
+            e.initial,
+            e.pulsed,
+            e.rise_delay,
+            e.rise_tau,
+            e.fall_delay,
+            e.fall_tau,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            || e.rise_tau <= 0.
+            || e.fall_tau <= 0.
+        {
+            return Err(SpiceError::circuit(
+                "prepared waveform: invalid exponential coefficients",
+            ));
+        }
+        Ok(Self {
+            initial: e.initial,
+            pulsed: e.pulsed,
+            rise_delay: e.rise_delay,
+            rise_tau: e.rise_tau,
+            fall_delay: e.fall_delay,
+            fall_tau: e.fall_tau,
+        })
+    }
+
+    pub(super) const fn delays(self) -> [Real; 2] {
+        [self.rise_delay, self.fall_delay]
+    }
+
+    fn value_at(self, time: Real) -> Real {
+        // Native positional EXP retains the reference's rise gate.
+        if time <= self.rise_delay {
+            self.initial
+        } else {
+            self.independent_value_at(time)
+        }
+    }
+
     #[expect(
         clippy::float_cmp,
         reason = "only exactly matching time constants permit the shared-exponent identity"
     )]
-    fn value_at(self, time: Real) -> Real {
-        if time <= self.rise_delay {
-            return self.initial;
-        }
+    pub(super) fn independent_value_at(self, time: Real) -> Real {
         let rise = -(time - self.rise_delay) / self.rise_tau;
-        let weight = if time <= self.fall_delay {
-            -rise.exp_m1()
-        } else {
-            let fall = -(time - self.fall_delay) / self.fall_tau;
-            // After both edges, the two unit steps cancel analytically.
-            // Factoring the larger exponential avoids cancellation for
-            // nearby arguments and retains the late exponential tail.
-            let difference = if self.rise_tau == self.fall_tau {
-                // Equal time constants share the time term exactly.
-                (self.fall_delay - self.rise_delay) / self.rise_tau
-            } else {
-                fall - rise
-            };
-            if difference == 0. || (rise == Real::NEG_INFINITY && fall == Real::NEG_INFINITY) {
-                0.
-            } else if difference > 0. {
-                -fall.exp() * (-difference).exp_m1()
-            } else {
-                rise.exp() * difference.exp_m1()
+        let fall = -(time - self.fall_delay) / self.fall_tau;
+        let weight = match (time > self.rise_delay, time > self.fall_delay) {
+            (false, false) => 0.,
+            (true, false) => -rise.exp_m1(),
+            (false, true) => fall.exp_m1(),
+            (true, true) => {
+                // The two unit steps cancel. Factor the larger exponential
+                // to retain the late tail and nearby transition differences.
+                let difference = if self.rise_tau == self.fall_tau {
+                    (self.fall_delay - self.rise_delay) / self.rise_tau
+                } else {
+                    fall - rise
+                };
+                if difference == 0. || (rise == Real::NEG_INFINITY && fall == Real::NEG_INFINITY) {
+                    0.
+                } else if difference > 0. {
+                    -fall.exp() * (-difference).exp_m1()
+                } else {
+                    rise.exp() * difference.exp_m1()
+                }
             }
         };
         affine_value(self.initial, self.pulsed, weight)
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "select the exact one-sided transition derivative"
+    )]
+    pub(super) fn independent_jet(
+        self,
+        t: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> crate::maths::taylor::Jet {
+        use crate::maths::taylor::Jet;
+        let transition = |delay, tau| {
+            if t > delay || (t == delay && limit == Limit::Right) {
+                Jet::affine(order, -(t - delay) / tau, -scale / tau).exp()
+            } else {
+                Jet::constant(order, 1.)
+            }
+        };
+        let weight = transition(self.fall_delay, self.fall_tau)
+            .add(&transition(self.rise_delay, self.rise_tau).scale(-1.));
+        // Apply endpoint levels separately so their raw difference cannot
+        // overflow before a small local derivative is applied.
+        weight
+            .clone()
+            .scale(self.pulsed)
+            .add(&weight.scale(-self.initial))
+            .offset(self.initial)
+            .with_value(self.independent_value_at(t))
     }
 }
 
@@ -738,25 +810,7 @@ impl SourceFunction {
                     .scale(s.amplitude)
                     .offset(s.offset)
             }
-            Self::Exp(e) if active(e.rise_delay) => {
-                let rise =
-                    Jet::affine(order, -(t - e.rise_delay) / e.rise_tau, -scale / e.rise_tau).exp();
-                let weight = if active(e.fall_delay) {
-                    let fall =
-                        Jet::affine(order, -(t - e.fall_delay) / e.fall_tau, -scale / e.fall_tau)
-                            .exp();
-                    fall.add(&rise.scale(-1.))
-                } else {
-                    rise.scale(-1.).offset(1.)
-                };
-                // Apply the two endpoint levels separately: their raw
-                // difference can overflow despite a finite local derivative.
-                weight
-                    .clone()
-                    .scale(e.pulsed)
-                    .add(&weight.scale(-e.initial))
-                    .offset(e.initial)
-            }
+            Self::Exp(e) if active(e.rise_delay) => e.independent_jet(t, scale, order, limit),
             Self::Sffm(s) if active(s.delay) => {
                 let elapsed = t - s.delay;
                 let modulation = angle(s.signal, elapsed, s.signal_phase)
