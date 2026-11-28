@@ -69,7 +69,12 @@ fn has_native_current(
 ) -> SpiceResult<bool> {
     Ok(match instance.designator {
         'v' | 'e' | 'h' | 'l' => true,
-        'r' | 'c' => expressions(instance).next().is_some(),
+        'r' | 'c' => {
+            expressions(instance).next().is_some()
+                || models.resolve(instance)?.is_some_and(|model| {
+                    model.family() == crate::devices::ModelFamily::PolynomialCapacitor
+                })
+        }
         'b' => instance
             .parameters
             .iter()

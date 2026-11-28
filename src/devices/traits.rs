@@ -242,6 +242,35 @@ pub struct InitialCoordinate {
     pub history: InitialCoordinateHistory,
 }
 
+/// Physical history associated with a prescribed initial voltage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VoltageStorageHistory {
+    /// A signed linear storage coordinate.
+    Linear(Real),
+    /// Integrated nonlinear charge with a signed MNA evolution equation.
+    Polynomial {
+        /// Prepared physical charge law.
+        law: model_normalize_ngspice::passive_storage::PolynomialStorage,
+        /// Multiplier from the evolution equation residual to physical charge.
+        equation_scale: Real,
+    },
+}
+
+impl VoltageStorageHistory {
+    /// Evaluate the stored quantity and its derivative at a voltage.
+    /// # Errors
+    /// Nonfinite constitutive evaluation.
+    pub fn at(self, voltage: Real) -> SpiceResult<(Real, Real)> {
+        match self {
+            Self::Linear(scale) => Ok((scale * voltage, scale)),
+            Self::Polynomial { law, .. } => law
+                .evaluate(voltage)
+                .map(|point| (point.stored, point.differential))
+                .map_err(|error| SpiceError::circuit(error.to_string())),
+        }
+    }
+}
+
 /// A voltage-controlled storage coordinate at UIC. Scalar capacitors
 /// need a new free-current equation; implicit capacitors already have
 /// that current and specify the local evolution equation to replace.
@@ -251,8 +280,8 @@ pub struct InitialVoltageStorage {
     pub voltage: Option<Real>,
     /// Local history slot containing the signed integrated quantity.
     pub slot: usize,
-    /// Storage coordinate per volt (not necessarily a physical capacitance).
-    pub scale: Real,
+    /// Physical stored quantity as a function of voltage.
+    pub history: VoltageStorageHistory,
     /// Existing evolution row, or None to append a free-current constraint.
     pub equation: Option<usize>,
 }
@@ -1360,7 +1389,7 @@ pub trait Device: fmt::Debug + std::any::Any {
         Ok(Some(InitialVoltageStorage {
             voltage: storage.initial,
             slot,
-            scale: storage.value,
+            history: VoltageStorageHistory::Linear(storage.value),
             equation: None,
         }))
     }
@@ -1726,6 +1755,11 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// each replacement's physical validity, topology and state layout.
     fn model_candidate_setters_are_stable(&self) -> bool {
         false
+    }
+
+    /// Whether this device needs context preparation, independently of batching.
+    fn needs_context_preparation(&self) -> bool {
+        self.prepared_batch_key().is_some()
     }
 
     /// Reprepare immutable context-dependent data at a context transition.
