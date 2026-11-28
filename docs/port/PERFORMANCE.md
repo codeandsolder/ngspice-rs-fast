@@ -64,6 +64,75 @@ Future vectorization must show **whole-load** gains with C-reference fidelity
 before reinstating a batch planner. The regular diode physics tests, full C
 golden verification and ordered scalar stamps remain the regression gates.
 
+## Instantaneous rank-reduction storage (#299)
+
+The rank reducer keeps a reusable sparse accumulator with a column-to-slot
+index and a compact filled-coefficient vector. Removing an entry swaps in the
+last live coefficient and updates its index. The dense index is linear in the
+column count; coefficient storage is linear in actual fill, not in the square
+of the matrix dimension. Immutable pivot rows are stored in one contiguous
+arena, sorted by column, and referenced by ranges. A reusable min-heap with
+membership flags visits each pending pivot once in ascending ordinal order;
+previously queued but cancelled pivots still incur the original work charge.
+
+Higher Taylor degree, coefficient magnitude and greatest-column tie breaking
+are unchanged. Each individual wide arithmetic operation, propagated error,
+normalization, ascending-column back substitution and uncertainty bound is
+unchanged. The existing 67,108,864-operation work budget, physical row
+priority, gauge selection and outer mandatory equation checks remain intact.
+No alternate dense solver, approximation or tolerance change is introduced.
+The differential regression compares the exact pivot sequence, independent
+rows, remaining budget, binary64 solution and uncertainty on 544 generated
+systems with the original tree representation (digest `cefcb985a5d8faee`).
+
+### Reproduction and measurements
+
+Base `b7e7b6a296675fa2e9ee84604340bbfb483480fa`; identical benchmark test
+sources in both builds. AMD Ryzen 7 4700U, x86-64 Linux, pinned nightly
+2026-11-23, managed sccache, isolated generic release builds. All 18 rank
+unit tests/benchmarks passed in each build. Use the complete test names:
+
+~~~sh
+cargo +nightly test --release --locked --lib analysis::initial::system::rank:: -- --include-ignored --nocapture
+~~~
+
+- `storage_tests::benchmark_rank_reduction_workloads`: cyclic 32/256-column
+  sparse, 128-column intermediate fill and 64-column dense systems with
+  redundant equations and exact solution one.
+- `projected_tests::benchmark_high_index_rank_reduction`: derivative chains of
+  depths 8, 32 and 60 (99, 1,155 and 3,843 columns), requiring only the initial
+  coordinate prefix rather than inventing constraints on free high-order jets.
+- `storage_tests::benchmark_near_dependent_rank_reduction`: 256 columns,
+  binary-exact 2^-30 separations, row scales 2^-200 through 2^200, redundant
+  equations and nonzero propagated uncertainty.
+
+Run each release test executable under `perf stat -e instructions:u,cycles:u,task-clock`
+with its exact test name, `--exact --ignored --nocapture`, and separately
+under `valgrind --tool=dhat`. Three interleaved runs per variant, medians:
+
+| Workload | Instructions before | Instructions after | CPU ms before | CPU ms after |
+| --- | ---: | ---: | ---: | ---: |
+| Sparse-to-dense | 28,578,516,344 | 24,652,212,104 | 4,281.53 | 3,133.32 |
+| High-index | 412,398,360 | 259,175,173 | 81.72 | 41.94 |
+| Near-dependent | 277,355,319 | 179,275,015 | 43.84 | 27.45 |
+
+Process-wide DHAT measurements (including construction and test harness):
+
+| Workload | Allocations before | Allocations after | Total bytes before | Total bytes after | Peak live bytes before | Peak live bytes after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Sparse-to-dense | 309,211 | 14,231 | 94,210,184 | 24,521,065 | 450,886 | 399,623 |
+| High-index | 252,304 | 6,354 | 76,917,424 | 34,343,105 | 2,442,082 | 883,342 |
+| Near-dependent | 182,631 | 5,431 | 54,373,252 | 14,091,653 | 188,522 | 76,763 |
+
+The complete reduction workload executes 13.7% fewer instructions in the
+sparse-to-dense suite, 37.1% fewer in the high-index suite and 35.4% fewer in
+the near-dependent suite. CPU task-clock speedups are 1.37x, 1.95x and 1.60x.
+Sampling profiles show that B-tree operations disappear from the hot path;
+wide arithmetic dominates remaining work. Host wall time was substantially
+influenced by concurrent load, so the hardware counters and CPU time are the
+comparison, not the DHAT elapsed times. These are rank-reduction workloads,
+not entire transient analysis speedups.
+
 ## Measurements
 
 Records contain workload, phase, operation count and elapsed nanoseconds.
