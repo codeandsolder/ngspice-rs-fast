@@ -2232,7 +2232,7 @@ impl Circuit {
     }
 
     /// Accepted event work from the most recent successful native mixed analysis.
-    #[must_use]
+    #[must_use = "the returned statistics describe accepted event work from the last successful analysis"]
     pub const fn last_digital_stats(&self) -> Option<crate::analysis::digital::Stats> {
         self.runtime.last_digital_stats
     }

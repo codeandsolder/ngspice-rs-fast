@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use ngspice_rs::netlist::Parser;
-use ngspice_rs::netlist::ast::Netlist;
+use ngspice_rs::netlist::ast::{
+    Netlist, ParameterKind, ScopedCardKind, SourceWaveform, StochasticFunction,
+};
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, SpiceError};
 
@@ -259,10 +261,8 @@ fn unsupported_semantics_never_get_silently_dropped() {
         ("R1 a 0 4k7", "inp2r.c"),
         ("R1 a 0 1k sens_resist", "inp2r.c"),
         ("C1 a 0 1u bad=2", "inp2c.c"),
-        ("V1 a 0 trnoise(0 1n)", "inp2v.c"),
         ("I1 a 0 dc \"ival\"", "inp2i.c"),
         ("V1 a 0 ac \"gain\"", "inp2v.c"),
-        (".control\nquit\n.endc", "frontend/inp.c"),
         // `.save`/`.print` now parse into output requests; `.plot` (the ASCII
         // plotting card) is still outside the port's subset.
         (".model rm r(rsh=\"sheet\")", "inpdomod.c"),
@@ -271,4 +271,22 @@ fn unsupported_semantics_never_get_silently_dropped() {
         assert!(error.is_not_yet_ported(), "{body}: {error}");
         assert!(error.to_string().contains(reference), "{body}: {error}");
     }
+}
+
+#[test]
+fn implemented_stochastic_and_control_cards_are_retained() {
+    let deck = parse("V1 a 0 trnoise(0 1n)\n.control\nquit\n.endc").unwrap();
+    let source = deck.device("v1").unwrap();
+    assert!(matches!(
+        &source.parameters[0].kind,
+        ParameterKind::Waveform(SourceWaveform::Stochastic {
+            function: StochasticFunction::Noise,
+            values,
+        }) if values.len() == 2
+    ));
+    assert!(
+        deck.cards
+            .iter()
+            .any(|card| matches!(card.kind, ScopedCardKind::Control))
+    );
 }
