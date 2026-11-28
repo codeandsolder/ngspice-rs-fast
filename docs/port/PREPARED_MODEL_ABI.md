@@ -38,14 +38,25 @@ Newton evaluation. A candidate that changes the descriptor's topology must
 re-elaborate instead of reusing numerical rows or accepted state.
 
 Public terminal observations exclude hidden equations, while numerical
-coordinate bindings include them. The diode's intrinsic junction voltage
-has a solver-owned trial slot separate from the conservative charge pairs.
-Forward and avalanche limiting use the effective model/instance thermal
-scales and existing Newton history. Scalar and tile evaluation receive the
-same limited coordinates; the affine Newton source uses those coordinates,
-not the original iterate. Linear or electrothermal kernels that do not
-request a limiter keep their exact evaluation. Small-signal assembly always
-uses the exact converged bias, and no limited load is accepted as converged.
+coordinate bindings include them. ABI 4 independently declares ownership of
+cold-start initialization, limiting, and additional static convergence.
+The engine stores actual evaluated local coordinates and exactness in
+solver-owned trial slots separate from conservative charge pairs. The
+previous Newton load and accepted predictor reference are distinct, and
+discarded trials cannot mutate accepted history. Prepared diode families
+supply their own junction policy via the artifact; the engine does not
+duplicate model-specific junction equations or limiting scales.
+
+Scalar and tile evaluation receive the same local coordinates. The affine
+Newton source uses the actual evaluated coordinates, including the thermal
+rise obtained by subtracting circuit ambient from the returned absolute
+Kelvin coordinate. Integrated charge and its Jacobian use the same local
+point. Explicit initialization constraints, exact loads and small-signal
+assembly do not invoke limiting. An initialized or limited load marks the
+Newton pass nonconvergent; exact candidate evaluation and the declared
+family criterion supplement the global convergence check. Electrical rows
+use the engine current absolute tolerance; other row kinds use relative
+comparison until dimensioned absolute tolerances are available.
 
 ## Verification
 
@@ -55,10 +66,10 @@ and the public VDMOS artifact with hidden series nodes, DC, AC and noise.
 The live reference test independently compares three VDMOS operating-point
 currents at different multipliers against ngspice 47.
 
-The public ABI currently owns a tile's prepared lanes as a unit. Selective
-lane replacement and native-family SIMD implementations are separate
-performance improvements; the generic engine does not assume that grouped
-evaluation alone improves throughput.
+The public producer now supports transactional selective lane replacement
+and lane-local scalar evaluation. Solver ownership of scalar/tile
+preparation and selective lane replacement is addressed separately in
+[#250](https://github.com/codeandsolder/ngspice-rs-fast/issues/250).
 
 Prepared runs keep immutable tile recipes across candidate transitions.
 Frequency-only and source-only transitions with unchanged recipes reuse
@@ -73,10 +84,9 @@ rounds measured median 351.9 us/tiled load and 368.4 us/scalar load.
 The complete bound matrix and RHS were bit-identical. This is a host-local
 measurement, not a performance assertion or evidence of SIMD acceleration.
 
-The public producer follow-ups for selective lane replacement and optional
-family-specific trial limiting are
+The accepted public producer contracts are
 [preprocess#38](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/38)
 and [preprocess#39](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/39).
-The source-selected diode now supplies an engine-side junction policy. Other
-prepared model families continue to use generic Newton policy until a
-family-specific policy is available.
+The solver consumes ABI 4 trial capabilities directly, including the
+prepared SIMetrix diode. Families declaring engine-owned numerical policy
+retain exact prepared loads without extra per-instance trial storage.
