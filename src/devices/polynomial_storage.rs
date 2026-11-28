@@ -573,10 +573,6 @@ impl Device for PolynomialDevice {
     ) -> SpiceResult<DeviceNoise<'_>> {
         Ok(DeviceNoise::Noiseless)
     }
-
-    fn physical_terminal_current(&self, _: &[Real], branches: &[Real]) -> Option<Real> {
-        branches.first().copied()
-    }
 }
 
 pub(super) fn instantiate(

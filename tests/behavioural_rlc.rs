@@ -2280,3 +2280,47 @@ fn bjt_base_spreading_clamp_tracks_the_intrinsic_base_current() -> SpiceResult<(
         },
     )
 }
+
+#[test]
+fn polynomial_terminal_observations_follow_the_accepted_physical_germ() -> SpiceResult<()> {
+    // The branch-current coordinate and external terminal stamp must agree at
+    // both smooth points and the exact one-sided source corner.
+    let body = "vc a 0 PWL(0 -1 1u 1 2u -1)\nil 0 b PWL(0 -1 1u 1 2u -1)\nc1 a 0 cm 1p\nl1 b 0 lm 1u\n.model cm pspice_cap(vc1=0.2 vc2=0.3)\n.model lm pspice_ind(il1=0.2 il2=0.3)\nb1 out 0 v=1u*ddt(v(a))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "2u", "0", "0.1u", "uic", method],
+            &["@c1[i]", "@c1[p]", "@l1[i]", "@l1[p]"],
+        )?;
+        let mut crossed = false;
+        for index in 0..plot.point_count() {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let t = at("time");
+            if t == 0. || t == 2e-6 {
+                continue;
+            }
+            let x = if t < 1e-6 {
+                2e6_f64.mul_add(t, -1.)
+            } else {
+                (-2e6_f64).mul_add(t, 3.)
+            };
+            let rate = if t < 1e-6 { 2e6 } else { -2e6 };
+            let factor = 0.3_f64.mul_add(x * x, 0.2_f64.mul_add(x, 1.));
+            let current = 1e-12 * factor * rate;
+            let voltage = 1e-6 * factor * rate;
+            close(at("v(a)"), x, 1e-9);
+            close(at("v(b)"), voltage, 1e-8);
+            close(at("v(out)"), rate * 1e-6, 1e-8);
+            close(at("@c1[i]"), current, 1e-12);
+            close(at("i(vc)"), -current, 1e-12);
+            close(at("@c1[p]"), x * current, 1e-12);
+            close(at("@l1[i]"), x, 1e-9);
+            close(at("i(l1)"), x, 1e-9);
+            close(at("@l1[p]"), x * voltage, 1e-8);
+            crossed |= (t - 1e-6).abs() <= 1e-15;
+        }
+        assert!(crossed);
+    }
+    Ok(())
+}
