@@ -4,13 +4,13 @@
 //! physical time scale to the k-th power. Products and elementary functions
 //! use coefficient recurrences, not differences of nearly equal samples.
 
-pub(crate) mod arithmetic;
-pub(crate) mod local;
-pub(crate) use arithmetic::{BranchComparison, ObservedDifferential};
-pub(crate) use local::Local;
+mod arithmetic;
 pub mod differential;
+mod local;
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
+use differential::Differential;
+use std::cell::RefCell;
 
 /// Shared physical constitutive arithmetic for scalar and differential jets.
 /// The first partial and every time coefficient follow the same value law.
@@ -35,6 +35,29 @@ pub(crate) trait Constitutive: Clone {
     fn exp_m1(self) -> Self;
     fn ln_1p(self) -> SpiceResult<Self>;
     fn ln(self) -> SpiceResult<Self>;
+}
+
+/// An actual bias-dependent branch comparison in a constitutive evaluation.
+/// The caller publishes these in executed order as device-local guards.
+pub(crate) struct BranchComparison {
+    pub(crate) argument: Jet,
+    pub(crate) boundary: Real,
+}
+
+/// Differential arithmetic with a disposable branch observer. The scalar
+/// arithmetic and ordinary jet arithmetic retain their existing layouts.
+/// Numerical rationalization uses `primal()`, which does not record an event.
+#[derive(Clone)]
+pub(crate) struct ObservedDifferential<'a, const N: usize> {
+    pub(crate) inner: Differential<N>,
+    trace: Option<&'a RefCell<Vec<BranchComparison>>>,
+}
+
+/// Stack-only first partials in an independently chosen local basis.
+#[derive(Clone)]
+pub(crate) struct Local<S, const N: usize> {
+    pub(crate) value: S,
+    pub(crate) partials: [Real; N],
 }
 
 /// The resource ceiling for a single local Taylor expansion.

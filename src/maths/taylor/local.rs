@@ -3,15 +3,9 @@
 //! then retain the reference Newton stamp's local coordinate convention
 //! without allocating another series or replacing the physical derivative.
 
-use super::Constitutive;
+use super::{Constitutive, Local};
 use crate::primitives::{Real, SpiceResult};
 use std::cmp::Ordering;
-
-#[derive(Clone)]
-pub(crate) struct Local<S, const N: usize> {
-    pub(crate) value: S,
-    pub(crate) partials: [Real; N],
-}
 
 impl<S: Constitutive, const N: usize> Local<S, N> {
     pub(crate) const fn new(value: S, partials: [Real; N]) -> Self {

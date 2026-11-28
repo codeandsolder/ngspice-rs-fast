@@ -5,7 +5,7 @@
 //! jets; no finite differences or separately maintained value law are needed.
 use std::{cell::RefCell, cmp::Ordering};
 
-use super::{Constitutive, Jet, differential::Differential};
+use super::{BranchComparison, Constitutive, ObservedDifferential, differential::Differential};
 use crate::primitives::{Real, SpiceResult};
 
 impl Constitutive for Real {
@@ -191,22 +191,6 @@ impl<const N: usize> Constitutive for Differential<N> {
         let slope = self.value.reciprocal()?;
         Ok(self.lift(value, &slope))
     }
-}
-
-/// An actual bias-dependent branch comparison in a constitutive evaluation.
-/// The caller publishes these in executed order as device-local guards.
-pub(crate) struct BranchComparison {
-    pub(crate) argument: Jet,
-    pub(crate) boundary: Real,
-}
-
-/// Differential arithmetic with a disposable branch observer. The scalar
-/// arithmetic and ordinary jet arithmetic retain their existing layouts.
-/// Numerical rationalization uses `primal()`, which does not record an event.
-#[derive(Clone)]
-pub(crate) struct ObservedDifferential<'a, const N: usize> {
-    pub(crate) inner: Differential<N>,
-    trace: Option<&'a RefCell<Vec<BranchComparison>>>,
 }
 
 impl<'a, const N: usize> ObservedDifferential<'a, N> {
