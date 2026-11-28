@@ -491,7 +491,9 @@ pub(crate) fn classify_passive(
         runtime |= match &expr.kind {
             BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
             BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
-            BExprKind::Call { name, .. } => name == "ddt",
+            BExprKind::Call { name, .. } => {
+                crate::netlist::bexpr::DynamicOperator::from_name(name).is_some()
+            }
             _ => false,
         };
     });
@@ -534,7 +536,7 @@ fn statistical_argument(expr: &BExpr) -> SpiceResult<Real> {
             &node.kind,
             BExprKind::Voltage { .. } | BExprKind::Current(_)
         ) || matches!(&node.kind, BExprKind::Name(name) if !matches!(name.as_str(),"pi"|"e"))
-            || matches!(&node.kind, BExprKind::Call { name,.. } if name == "ddt");
+            || matches!(&node.kind, BExprKind::Call { name,.. } if crate::netlist::bexpr::DynamicOperator::from_name(name).is_some());
     });
     if dynamic {
         return Err(parse_error(

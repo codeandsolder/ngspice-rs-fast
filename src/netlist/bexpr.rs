@@ -268,9 +268,27 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "min",
     "max",
     "ddt",
+    "sampled_current",
     "ternary_fcn",
     "gauss",
 ];
+
+/// Operators lowered to solver-owned state after lexical resolution.
+#[derive(Clone, Copy)]
+pub(crate) enum DynamicOperator {
+    Derivative,
+    SampledCurrent,
+}
+
+impl DynamicOperator {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "ddt" => Some(Self::Derivative),
+            "sampled_current" => Some(Self::SampledCurrent),
+            _ => None,
+        }
+    }
+}
 
 /// Statistical functions expanded by the ngspice netlist front end.
 ///

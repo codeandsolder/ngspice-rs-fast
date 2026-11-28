@@ -267,6 +267,36 @@ A lexically shadowed probe or an unused macro argument does not allocate a
 measurement branch. Ordinary F/H/W controls retain their voltage-source
 semantics.
 
+### Phase-selected current sampling
+
+The source-neutral operator `sampled_current(i(instance))` selects a control
+policy for a resolved current expression occurrence, independently of physical
+current and output reporting. In DC operating points and sweeps it reads the
+exact selected physical current. In AC and noise the DC bias value remains in
+the surrounding expression, but the sampled quantity has zero small-signal
+tangent. Companion transient loads sample the current Newton iterate, with a
+frozen control tangent (Picard iteration). Convergence checks the sampled
+signal against the solved physical current. No separate history is advanced
+on load, acceptance, or rejection. Ordinary `i(instance)` retains its full
+instantaneous Jacobian.
+
+This interpretation is supported by independent LTspice 24.0.12 experiments:
+with feedback the sampled quantity is close to the present current, not the
+previous output point. Tightening reltol from 1e-3 to 1e-6 reduces present
+current errors by approximately three orders of magnitude, also for an
+isolated sine-driven network. The first tiny transient steps alone cannot
+establish a previous-accepted-point policy. The experiments qualify the
+converged residual and zero AC tangent, not LTspice's exact iteration count.
+
+Both forms share existing physical branch coordinates or a single ideal
+sensing branch after lexical and hierarchy expansion. `pn_control=1` selects
+the physical port of a prepared passive network independently of
+`pn_report_*` and the intrinsic storage branch. A resolved zero-multiplicity
+removed network contributes constant zero. The sampled signal itself is a
+private algebraic coordinate without electrical incidence. Physical DAE and
+Taylor evaluations use the exact converged algebraic residual (not the
+iteration-dependent linearization or AC tangent).
+
 Internal measurement node and source names are not a source-level API.
 The C conformance fixtures compare every physical quantity including
 redundant C measurement columns and renamed polynomial source branches,
