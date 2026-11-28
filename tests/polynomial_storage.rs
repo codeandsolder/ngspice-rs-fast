@@ -138,6 +138,32 @@ fn nonlinear_uic_uses_the_charge_at_the_prescribed_voltage() -> SpiceResult<()> 
             5e-4,
         );
     }
+    // Signed initial coordinates must not be interpreted as magnitudes.
+    // D(x)=B*(1+x/4), so (x+4)^2 starts at 9 and increases at 8000/s.
+    for (body, observed) in [
+        (
+            "i1 0 a 1m\nc1 a 0 cm 1u ic=-1\n.model cm pspice_cap(vc1=0.25)",
+            "v(a)",
+        ),
+        (
+            "v1 a 0 1\nl1 a 0 lm 1m ic=-1\n.model lm pspice_ind(il1=0.25)",
+            "i(l1)",
+        ),
+    ] {
+        let tran = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "1m", "0", "1u", "uic"],
+        )?;
+        for index in 0..tran.point_count() {
+            let time = tran.value("time", index).unwrap().re;
+            close(
+                tran.value(observed, index).unwrap().re,
+                (9. + 8000. * time).sqrt() - 4.,
+                5e-4,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -332,5 +358,19 @@ fn differential_crossings_are_signed_and_do_not_create_artificial_loading() -> S
         after |= t > 0.6e-3;
     }
     assert!(before && after);
+    Ok(())
+}
+
+#[test]
+fn physical_current_observers_share_the_native_storage_branch() -> SpiceResult<()> {
+    let ac = run(
+        "vc a 0 dc 2 ac 1\nc1 a 0 cm 1u\n.model cm pspice_cap(vc1=0.5)\nbmon obs 0 v=i(c1)",
+        AnalysisKind::Ac,
+        &["lin", "1", "1000", "1000"],
+    )?;
+    let expected = std::f64::consts::TAU * 1000. * 2e-6;
+    close(ac.value("i(c1)", 0).unwrap().im, expected, 1e-10);
+    close(ac.value("v(obs)", 0).unwrap().im, expected, 1e-10);
+    close(ac.value("i(vc)", 0).unwrap().im, -expected, 1e-10);
     Ok(())
 }
