@@ -1,0 +1,26 @@
+VDMOS P coupled electrothermal body-diode reverse recovery
+.options gmin=1e-20 reltol=1e-6 abstol=1e-14 method=trap temp=27
+Vgate g 0 0
+Vdrive vin 0 PWL(0 0.65 200u 0.65 200.5u -0.1 400u -0.1)
+Rdrive vin d 0.3
+Cdrain d 0 300p
+M1 d g 0 junction case dut thermal
+.model dut vdmosp(vto=-3 kp=10 is=1e-12 n=1 cjo=1n m=0.5 fc=0.5 tt=10u vp=0.4 rthjc=1 rthca=5 cthj=10u)
+.control
+tran 100n 400u 0 100n
+meas tran tj1 find v(junction) at=180u
+meas tran tc1 find v(case) at=180u
+meas tran tj2 find v(junction) at=202u
+meas tran tc2 find v(case) at=202u
+meas tran tj3 find v(junction) at=210u
+meas tran tc3 find v(case) at=210u
+meas tran tj4 find v(junction) at=240u
+meas tran tc4 find v(case) at=240u
+meas tran tj5 find v(junction) at=350u
+meas tran tc5 find v(case) at=350u
+meas tran i2 find i(vdrive) at=202u
+meas tran i3 find i(vdrive) at=210u
+meas tran i4 find i(vdrive) at=240u
+quit
+.endc
+.end

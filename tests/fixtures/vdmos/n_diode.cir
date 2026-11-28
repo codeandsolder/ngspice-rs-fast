@@ -1,0 +1,12 @@
+VDMOS N body diode circuit reference
+Vdd supply 0 -0.6
+Rload supply drain 0.1
+Vgate gate 0 0
+M1 drain gate 0 dut
+.model dut VDMOS(vto=3 kp=20 is=1e-12 rs=0.02 rb=0.04)
+.control
+op
+print v(drain) i(vdd) @m1[id] @m1[idio] @m1[gm]
+quit
+.endc
+.end
