@@ -192,3 +192,16 @@ fn lexical_macro_expansion_and_removed_networks() -> SpiceResult<()> {
     );
     Ok(())
 }
+
+#[test]
+fn malformed_sampling_is_not_silently_converted_to_a_static_expression() {
+    for expression in [
+        "sampled_current(0)",
+        "sampled_current(i(v1)+1)",
+        "sampled_current(i(v1),i(v1))",
+        "sampled_current(i(missing))",
+    ] {
+        let text = format!("invalid sample\nv1 a 0 1\nr1 a 0 1\nb1 b 0 v={expression}\n.end\n");
+        assert!(circuit(&text).is_err(), "accepted {expression}");
+    }
+}

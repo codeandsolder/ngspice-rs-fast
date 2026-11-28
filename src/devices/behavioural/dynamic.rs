@@ -35,7 +35,7 @@ use std::{
 };
 
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
-use crate::netlist::bexpr::{BExpr, BExprKind, BehaviouralExpression};
+use crate::netlist::bexpr::{BExpr, BExprKind, BehaviouralExpression, DynamicOperator};
 use crate::primitives::NodeTable;
 
 const DERIVATIVE: &str = "__dynamic_derivative";
@@ -60,18 +60,9 @@ fn expressions(instance: &DeviceInstance) -> impl Iterator<Item = &BehaviouralEx
 
 fn dynamic_operator(expr: &BExpr) -> Option<DynamicOperator> {
     match &expr.kind {
-        BExprKind::Call { name, .. } if name == "ddt" => Some(DynamicOperator::Derivative),
-        BExprKind::Call { name, .. } if name == "sampled_current" => {
-            Some(DynamicOperator::SampledCurrent)
-        }
+        BExprKind::Call { name, .. } => DynamicOperator::from_name(name),
         _ => None,
     }
-}
-
-#[derive(Clone, Copy)]
-enum DynamicOperator {
-    Derivative,
-    SampledCurrent,
 }
 
 #[derive(Default)]
