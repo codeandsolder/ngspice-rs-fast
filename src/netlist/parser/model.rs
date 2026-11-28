@@ -49,6 +49,10 @@ fn model_body(input: &mut Input<'_>) -> Result<ParsedCard> {
     let level = parameters
         .iter()
         .find(|parameter| parameter.name == "level")
+        .filter(|parameter| {
+            !base.text.eq_ignore_ascii_case("ltspice_diode")
+                || parameter.kind == ParameterKind::Scalar
+        })
         .map(|parameter| {
             crate::primitives::parse_spice_number(&parameter.value).ok_or_else(|| {
                 ErrMode::Cut(Failure(crate::primitives::SpiceError::parse(
@@ -88,7 +92,7 @@ fn parameters(input: &mut Input<'_>, base: &str) -> Result<Vec<ParameterAssignme
             (|input: &mut Input<'_>| code_boolean(input, base)).map(Some),
             (|input: &mut Input<'_>| super::flags::model(input, base)).map(Some),
             (|input: &mut Input<'_>| version_assignment(input, base)).map(Some),
-            scalar_assignment.map(Some),
+            (|input: &mut Input<'_>| scalar_assignment(input, base)).map(Some),
             invalid_parameter,
         )),
     )
@@ -130,7 +134,7 @@ fn version_assignment(input: &mut Input<'_>, base: &str) -> Result<ParameterAssi
     })
 }
 
-fn scalar_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
+fn scalar_assignment(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
     // A flag is not a scalar assignment, even when it is spelled as a word -
     // unless an `=` follows it. `d` is both: a bare `d` is a model-type flag
     // (`tests/flags_ic_parser.rs`), while `.model m nmf(d=0.24u)` is MESA's
@@ -186,6 +190,7 @@ fn scalar_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
     let name = token.text.to_ascii_lowercase();
     opt(equals).parse_next(input)?;
     if name == "level"
+        && !base.eq_ignore_ascii_case("ltspice_diode")
         && input
             .input
             .first()

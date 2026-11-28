@@ -269,18 +269,22 @@ impl Card<'_> {
     }
 
     fn expression(&mut self, expression: &ParameterExpression) -> SpiceResult<()> {
-        match (expression.braced, expression.quoted) {
+        self.expression_text(&expression.text, expression.braced, expression.quoted)
+    }
+
+    fn expression_text(&mut self, text: &str, braced: bool, quoted: bool) -> SpiceResult<()> {
+        match (braced, quoted) {
             (true, true) => {
                 self.push('\'')?;
-                self.push_str(&expression.text)?;
+                self.push_str(text)?;
                 self.push('\'')
             }
             (true, false) => {
                 self.push('{')?;
-                self.push_str(&expression.text)?;
+                self.push_str(text)?;
                 self.push('}')
             }
-            (false, false) => self.push_str(&expression.text),
+            (false, false) => self.push_str(text),
             (false, true) => Err(refuse(
                 "quoted expression without delimiters",
                 Some(self.location),
@@ -608,7 +612,7 @@ impl Writer<'_> {
         }
         parts.push(')')?;
         parts.push(delimiter)?;
-        parts.expression(&card.body)?;
+        parts.expression_text(&card.body.text, card.body.braced, card.body.quoted)?;
         let deck = parse_deck_text(location.path(), &format!("t\n{}\n", parts.text));
         let reparsed = Parser::new().parse_deck(&deck).map_err(|error| {
             refuse(
@@ -868,7 +872,9 @@ impl Writer<'_> {
                     }
                     append_named_value(&mut parts, parameter, true)?;
                 }
-                ParameterKind::Expression(_) if parameter.name == "level" => {
+                ParameterKind::Expression(_)
+                    if parameter.name == "level" && base != "ltspice_diode" =>
+                {
                     return Err(refuse("expression-valued model level", Some(location)));
                 }
                 _ => append_named_value(&mut parts, parameter, false)?,
@@ -2093,7 +2099,8 @@ fn transistor_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> Spice
     let designator = device.designator;
     let scalars: &[&str] = match designator {
         'd' => &[
-            "pj", "area", "w", "l", "m", "ic", "temp", "dtemp", "lm", "lp", "wm", "wp",
+            "pj", "perim", "area", "w", "l", "m", "n", "d", "ic", "temp", "dtemp", "lm", "lp",
+            "wm", "wp",
         ],
         'q' => &[
             "area", "areab", "areac", "m", "icvbe", "icvce", "temp", "dtemp",

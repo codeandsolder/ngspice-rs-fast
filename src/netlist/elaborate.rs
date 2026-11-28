@@ -293,6 +293,18 @@ impl ParameterOwner {
     }
 }
 
+// The LTspice source selector is an occurrence-resolved scalar, not the
+// native C frontend's literal-only first-level cache.
+fn refresh_source_level(model: &mut ModelCard) {
+    if model.base.eq_ignore_ascii_case("ltspice_diode") {
+        model.level = model
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name.eq_ignore_ascii_case("level"))
+            .and_then(|parameter| crate::primitives::parse_spice_number(&parameter.value));
+    }
+}
+
 fn literalize_device_models(
     devices: &mut [DeviceInstance],
     models: &mut [ModelCard],
@@ -339,6 +351,7 @@ fn literalize_device_models(
             sites.as_deref_mut(),
             (ParameterOwner::Model(mi), None),
         )?;
+        refresh_source_level(model);
     }
     Ok(())
 }
@@ -390,6 +403,7 @@ pub(crate) fn realize_model(
         None,
         (ParameterOwner::Model(0), Some(site)),
     )?;
+    refresh_source_level(&mut bound);
     Ok(bound)
 }
 

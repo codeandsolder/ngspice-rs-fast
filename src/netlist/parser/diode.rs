@@ -57,9 +57,8 @@ fn scalar_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
         .verify_map(|token: &Token| {
             let name = token.text.to_ascii_lowercase();
             let canonical = match name.as_str() {
-                "perim" => "pj",
-                "area" | "pj" | "w" | "l" | "m" | "n" | "ic" | "temp" | "dtemp" | "lm" | "lp"
-                | "wm" | "wp" => &name,
+                "area" | "perim" | "pj" | "w" | "l" | "m" | "n" | "d" | "ic" | "temp" | "dtemp"
+                | "lm" | "lp" | "wm" | "wp" => &name,
                 _ => return None,
             };
             Some((token, canonical.to_owned()))

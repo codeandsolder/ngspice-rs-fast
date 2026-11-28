@@ -87,7 +87,7 @@ fn independent_measured_dc_points() -> Result<()> {
     for (extra, points) in cases {
         for &(voltage, expected) in *points {
             let deck = parse(&format!(
-                "ideal diode\nV1 a 0 {voltage}\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE} {extra})\n.end\n"
+                "ideal diode\nV1 a 0 {voltage}\nD1 a 0 dm\n.model dm ltspice_diode({BASE} {extra})\n.end\n"
             ))?;
             let context = ModelContext::default().with_gmin(1e-12);
             let circuit = Circuit::from_netlist_with_context(&deck, &context)?;
@@ -117,7 +117,7 @@ fn small_signal_matches_the_tangent_and_has_no_storage() -> Result<()> {
         ),
     ] {
         let deck = parse(&format!(
-            "AC\nV1 a 0 DC {voltage} AC 1\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE} {extra})\n.end\n"
+            "AC\nV1 a 0 DC {voltage} AC 1\nD1 a 0 dm\n.model dm ltspice_diode({BASE} {extra})\n.end\n"
         ))?;
         let context = AnalysisContext {
             gmin: 1e-12,
@@ -142,7 +142,7 @@ fn source_family_and_geometry() -> Result<()> {
     let native = Circuit::from_netlist(&parse("native\nD1 a 0 dm\n.model dm D(IS=1p)\n.end\n")?)?;
     assert!((native.devices()[0].as_ref() as &dyn std::any::Any).is::<Diode>());
     let deck = parse(
-        "geometry\nV1 a 0 2\nV2 b 0 4\nV3 c 0 -3\nD1 a 0 dm m=3\nD2 b 0 dm m=3 n=2\nD3 c 0 other\n.model dm ltspice_ideal_diode(ron=2 roff=100 vfwd=1)\n.model other ltspice_ideal_diode(ron=2 roff=100 vrev=2)\n.end\n",
+        "geometry\nV1 a 0 2\nV2 b 0 4\nV3 c 0 -3\nD1 a 0 dm m=3\nD2 b 0 dm m=3 n=2\nD3 c 0 other\n.model dm ltspice_diode(ron=2 roff=100 vfwd=1)\n.model other ltspice_diode(ron=2 roff=100 vrev=2)\n.end\n",
     )?;
     let context = ModelContext::default();
     let circuit = Circuit::from_netlist_with_context(&deck, &context)?;
@@ -162,9 +162,8 @@ fn source_family_and_geometry() -> Result<()> {
 
 #[test]
 fn default_off_conductance_rebinds_with_gmin() -> Result<()> {
-    let deck = parse(
-        "default leakage\nV1 a 0 -1\nD1 a 0 dm\n.model dm ltspice_ideal_diode(ron=2)\n.end\n",
-    )?;
+    let deck =
+        parse("default leakage\nV1 a 0 -1\nD1 a 0 dm\n.model dm ltspice_diode(ron=2)\n.end\n")?;
     let context = ModelContext::default().with_gmin(1e-12);
     let circuit = Circuit::from_netlist_with_context(&deck, &context)?;
     // The independently measured parallel floor is Gmin/1000.
@@ -176,15 +175,15 @@ fn default_off_conductance_rebinds_with_gmin() -> Result<()> {
 
 #[test]
 fn invalid_model_and_instance_fields_are_not_ignored() -> Result<()> {
-    for parameters in ["level=2", "kf=-1p", "unknown_parameter=1p"] {
+    for parameters in ["ron=2 kf=-1p", "ron=2 unknown_parameter=1p"] {
         let deck = parse(&format!(
-            "bad\nD1 a 0 dm\n.model dm ltspice_ideal_diode({parameters})\n.end\n"
+            "bad\nD1 a 0 dm\n.model dm ltspice_diode({parameters})\n.end\n"
         ))?;
         assert!(Circuit::from_netlist(&deck).is_err(), "{parameters}");
     }
     for fields in ["area=-1", "n=0", "temp=-300", "dtemp=1"] {
         let deck = parse(&format!(
-            "bad\nD1 a 0 dm {fields}\n.model dm ltspice_ideal_diode(ron=2)\n.end\n"
+            "bad\nD1 a 0 dm {fields}\n.model dm ltspice_diode(ron=2)\n.end\n"
         ))?;
         assert!(Circuit::from_netlist(&deck).is_err(), "{fields}");
     }
@@ -194,7 +193,7 @@ fn invalid_model_and_instance_fields_are_not_ignored() -> Result<()> {
 #[test]
 fn transient_has_exact_memoryless_current_through_both_knees() -> Result<()> {
     let deck = parse(
-        "transient\nV1 a 0 PWL(0 -4 1u -4 3u 4 4u 4 6u -4)\nD1 a 0 dm\n.model dm ltspice_ideal_diode(ron=2 roff=100 vfwd=1 vrev=2 rrev=3 epsilon=0.4 revepsilon=0.6)\n.end\n",
+        "transient\nV1 a 0 PWL(0 -4 1u -4 3u 4 4u 4 6u -4)\nD1 a 0 dm\n.model dm ltspice_diode(ron=2 roff=100 vfwd=1 vrev=2 rrev=3 epsilon=0.4 revepsilon=0.6)\n.end\n",
     )?;
     let context = AnalysisContext {
         gmin: 1e-12,
@@ -241,7 +240,7 @@ fn transient_has_exact_memoryless_current_through_both_knees() -> Result<()> {
 #[test]
 fn independent_c_common_regions_dc_sweep() -> Result<()> {
     let deck = parse(&format!(
-        "common regions\nV1 a 0 0\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE})\n.end\n"
+        "common regions\nV1 a 0 0\nD1 a 0 dm\n.model dm ltspice_diode({BASE})\n.end\n"
     ))?;
     let context = AnalysisContext {
         gmin: 1e-12,
@@ -279,7 +278,7 @@ fn current_driven_limited_branches() -> Result<()> {
         (-0.25, 0.9_f64.mul_add(-(0.23_f64 / 0.3).atanh(), -2.)),
     ] {
         let deck = parse(&format!(
-            "current drive\nI1 0 a {current}\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE} ilimit=0.25 revilimit=0.3)\n.end\n"
+            "current drive\nI1 0 a {current}\nD1 a 0 dm\n.model dm ltspice_diode({BASE} ilimit=0.25 revilimit=0.3)\n.end\n"
         ))?;
         let context = AnalysisContext {
             gmin: 1e-12,
@@ -307,7 +306,7 @@ fn vendor_threshold_and_level_selection() -> Result<()> {
             return Err("invalid AC witness row".into());
         };
         let text = format!(
-            "{name}\nV1 a 0 DC {bias} AC 1\nD1 a 0 dm {instance}\n.model dm ltspice_ideal_diode({model})\n.options gmin={gmin}\n.ac lin 3 1k 1meg\n.end\n"
+            "{name}\nV1 a 0 DC {bias} AC 1\nD1 a 0 dm {instance}\n.model dm ltspice_diode({model})\n.options gmin={gmin}\n.ac lin 3 1k 1meg\n.end\n"
         );
         let deck = parse(&text)?;
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
@@ -334,7 +333,7 @@ fn vendor_parallel_floor_across_all_branches() -> Result<()> {
             return Err("invalid DC witness row".into());
         };
         let text = format!(
-            "{name}\nV1 a 0 0\nD1 a 0 dm {instance}\n.model dm ltspice_ideal_diode({model})\n.options gmin=1e-12 reltol=1e-10 abstol=1e-24 vntol=1e-12\n.dc V1 -4 4 0.5\n.end\n"
+            "{name}\nV1 a 0 0\nD1 a 0 dm {instance}\n.model dm ltspice_diode({model})\n.options gmin=1e-12 reltol=1e-10 abstol=1e-24 vntol=1e-12\n.dc V1 -4 4 0.5\n.end\n"
         );
         let deck = parse(&text)?;
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
@@ -394,7 +393,7 @@ fn vendor_noise_spectrum_and_geometry() -> Result<()> {
             ""
         };
         let text = format!(
-            "{name}\nI1 0 a DC {bias} AC 1\nD1 a 0 dm {instance}\n.model dm ltspice_ideal_diode({model})\n.options gmin={gmin} temp={temp} reltol=1e-10 abstol=1e-18 vntol=1e-12 {pivot}\n.op\n.ac lin 3 1k 1meg\n.noise V(a) I1 lin 3 1k 1meg 1\n.end\n"
+            "{name}\nI1 0 a DC {bias} AC 1\nD1 a 0 dm {instance}\n.model dm ltspice_diode({model})\n.options gmin={gmin} temp={temp} reltol=1e-10 abstol=1e-18 vntol=1e-12 {pivot}\n.op\n.ac lin 3 1k 1meg\n.noise V(a) I1 lin 3 1k 1meg 1\n.end\n"
         );
         let deck = parse(&text)?;
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
@@ -488,7 +487,7 @@ fn vendor_signed_parameters_defaults_and_unmatched_transitions() -> Result<()> {
         // regenerated floating-point sweep grid. This matters at a vendor
         // discontinuity: an ulp on either side can change current sharply.
         let mut text = format!(
-            "{name}\n.model dm ltspice_ideal_diode({model})\n.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12\n"
+            "{name}\n.model dm ltspice_diode({model})\n.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12\n"
         );
         for (index, (voltage, _)) in points.iter().enumerate() {
             writeln!(
@@ -565,7 +564,7 @@ fn vendor_signed_noise() -> Result<()> {
     ];
     for (model, bias, voltage, gain, thermal, shot, flicker_low, flicker_high) in rows {
         let deck = parse(&format!(
-            "signed noise\nV1 in 0 DC {bias} AC 1\nR1 in out 0.1\nD1 out 0 dm\n.model dm ltspice_ideal_diode({model})\n.options gmin=1e-12 temp=27 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.op\n.ac lin 3 1k 1meg\n.noise V(out) V1 lin 3 1k 1meg 1\n.end\n"
+            "signed noise\nV1 in 0 DC {bias} AC 1\nR1 in out 0.1\nD1 out 0 dm\n.model dm ltspice_diode({model})\n.options gmin=1e-12 temp=27 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.op\n.ac lin 3 1k 1meg\n.noise V(out) V1 lin 3 1k 1meg 1\n.end\n"
         ))?;
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
         let mut circuit = config.circuit(&deck)?;
@@ -619,7 +618,7 @@ fn vendor_instance_geometry_boundaries() -> Result<()> {
         ("n=.5", 1.510_000_000_000_004, 1.000_000_000_000_002),
     ] {
         let deck = parse(&format!(
-            "geometry boundary\nV1 a 0 DC 2 AC 1\nD1 a 0 dm {fields}\n.model dm ltspice_ideal_diode(ron=2 roff=100 vfwd=1 vrev=2 rrev=3)\n.options gmin=1e-12 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.op\n.ac lin 3 1k 1meg\n.noise V(a) V1 lin 3 1k 1meg 1\n.end\n"
+            "geometry boundary\nV1 a 0 DC 2 AC 1\nD1 a 0 dm {fields}\n.model dm ltspice_diode(ron=2 roff=100 vfwd=1 vrev=2 rrev=3)\n.options gmin=1e-12 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.op\n.ac lin 3 1k 1meg\n.noise V(a) V1 lin 3 1k 1meg 1\n.end\n"
         ))?;
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
         let mut circuit = config.circuit(&deck)?;

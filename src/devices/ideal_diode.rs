@@ -20,7 +20,6 @@ use super::{
 };
 use law::{Branch, Point};
 
-pub(super) const MODEL_FAMILY: &str = "ltspice_ideal_diode";
 const DEFAULT_RON: Real = 1e-3;
 
 #[derive(Clone, Copy, Debug)]

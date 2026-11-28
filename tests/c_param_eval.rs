@@ -56,6 +56,19 @@ fn rust_value(params: &str, probe: &str) -> Result<f64, String> {
 #[ignore = "requires NGSPICE_BIN; run cargo test -p ngspice-rs --test c_param_eval -- --ignored"]
 fn evaluator_agrees_with_c_numparam() {
     let cases: &[(&str, &str)] = &[
+        ("", "3>2+1||1&&0"),
+        ("", "2==3<1"),
+        ("", "1<-2^2"),
+        ("", "1?-2^2:0"),
+        ("", "1?0?3:4:5"),
+        ("", "0?0?3:4:5"),
+        ("", "!2^0"),
+        ("", "(-7)%3"),
+        ("", "(-7)\\3"),
+        ("", "1?2:3?4:5"),
+        ("", "0?2:3?4:5"),
+        ("", "1?(0?3:4):5"),
+        ("", "ternary_fcn(-1,3,4)"),
         // Redefinition: last wins, earlier dropped.
         (".param a=1\n.param a=2", "a"),
         (".param a=1 a=3 b={a}", "b"),

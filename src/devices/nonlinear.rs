@@ -695,7 +695,8 @@ impl Diode {
         let model_setters = canonical(model_side, MODEL_ALIASES, MODEL_PENDING, "model")?;
         let m = MODEL.validate(&model_setters, &card.location)?;
         let (initial, setters) = crate::devices::initial::split(&instance.parameters, &["ic"])?;
-        let instance_setters = canonical(&setters, &[], INSTANCE_PENDING, "instance")?;
+        let instance_setters =
+            canonical(&setters, &[("perim", "pj")], INSTANCE_PENDING, "instance")?;
         let i = crate::devices::schema::with_defaults(
             &INSTANCE,
             &model_defaults,
@@ -2336,7 +2337,7 @@ mod tests {
         )?;
         let m = MODEL.validate(&setters, &resolved.card().location)?;
         let (_, setters) = crate::devices::initial::split(&instance.parameters, &["ic"])?;
-        let setters = canonical(&setters, &[], INSTANCE_PENDING, "instance")?;
+        let setters = canonical(&setters, &[("perim", "pj")], INSTANCE_PENDING, "instance")?;
         let i = INSTANCE.validate(&setters, &instance.location)?;
         DiodeParameters::new(&m, &i, &instance.location)
     }
