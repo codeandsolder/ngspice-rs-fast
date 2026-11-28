@@ -94,6 +94,9 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Mos9 => {
             crate::devices::mos9::Mos9::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::Bsim1 | ModelBackend::Bsim2 => {
+            crate::devices::legacy_bsim::instantiate(instance, nodes, &model, context)
+        }
         ModelBackend::Bsim3 => crate::devices::bsim3::instantiate(instance, nodes, &model, context),
         ModelBackend::Bsim4 => crate::devices::bsim4::instantiate(instance, nodes, &model, context),
         ModelBackend::Jfet => {

@@ -188,8 +188,77 @@ pub(super) struct SourceBinding {
     pub parameters: &'static [SourceParameter],
     pub gmin_slot: Option<usize>,
     pub model_ambient: AmbientTemperature,
-    pub relative_temperature_slot: usize,
+    pub relative_temperature_slot: Option<usize>,
+    pub start: Option<SourceStart>,
     pub absolute_temperature_slot: Option<usize>,
+}
+
+/// Explicit source-level differential initial coordinates, independent of
+/// the compact model's constitutive equations and numerical trial policy.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SourceStart {
+    /// Public and intrinsic [drain, gate, source, bulk] coordinate ordinals.
+    pub external: [usize; 4],
+    pub intrinsic: [usize; 4],
+    /// Source-supplied VDS, VGS, VBS; unset components retain source defaults.
+    pub voltages: [Option<Real>; 3],
+    pub off: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceStartOutcome {
+    InitialHistory,
+    Junction,
+    HeldOff,
+}
+
+impl SourceStart {
+    fn has_settings(self) -> bool {
+        self.off || self.voltages.iter().any(Option::is_some)
+    }
+
+    fn apply(
+        self,
+        states: &DeviceState<'_>,
+        coordinates: &mut [Real],
+    ) -> Option<SourceStartOutcome> {
+        if states.prepared_exact() {
+            return None;
+        }
+        let outcome = if states.initial_conditions() {
+            SourceStartOutcome::InitialHistory
+        } else if states.device_limiting() {
+            match states.phase() {
+                IterationPhase::Junction if self.has_settings() => {
+                    if !self.off && self.voltages.iter().all(|value| value.unwrap_or(0.) == 0.) {
+                        return None;
+                    }
+                    SourceStartOutcome::Junction
+                }
+                IterationPhase::Fix if self.off => SourceStartOutcome::HeldOff,
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        let [d, g, s, b] = self.external.map(|row| coordinates[row]);
+        let supplied = if self.off {
+            [0.; 3]
+        } else {
+            let defaults = if outcome == SourceStartOutcome::InitialHistory {
+                [d - s, g - s, b - s]
+            } else {
+                [0.; 3]
+            };
+            std::array::from_fn(|index| self.voltages[index].unwrap_or(defaults[index]))
+        };
+        let [drain, gate, source, bulk] = self.intrinsic;
+        let reference = coordinates[source];
+        for (row, voltage) in [drain, gate, bulk].into_iter().zip(supplied) {
+            coordinates[row] = reference + voltage;
+        }
+        Some(outcome)
+    }
 }
 
 /// Native prepared model integrated through the normal device trial lifecycle.
@@ -645,8 +714,19 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.charge_state_count() + trial_state_count(self.artifact.descriptor())
     }
 
+    fn has_start_settings(&self) -> bool {
+        self.source
+            .as_ref()
+            .and_then(|source| source.start)
+            .is_some_and(SourceStart::has_settings)
+    }
+
     fn needs_prepared_linearization(&self) -> bool {
         self.trial_workspace.is_some()
+            || self
+                .source
+                .as_ref()
+                .is_some_and(|source| source.start.is_some())
     }
 
     fn linearize_prepared(
@@ -654,6 +734,33 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         states: &mut DeviceState<'_>,
         coordinates: &mut [Real],
     ) -> SpiceResult<()> {
+        if let Some(outcome) = self
+            .source
+            .as_ref()
+            .and_then(|source| source.start)
+            .and_then(|start| start.apply(states, coordinates))
+        {
+            if self.trial_workspace.is_some() {
+                let offset = self.charge_state_count();
+                for (index, &coordinate) in coordinates.iter().enumerate() {
+                    states.set(offset + index, coordinate)?;
+                }
+                // Initial history is seeded at the explicitly supplied
+                // physical coordinates, not accepted as a Newton iterate.
+                states.set(
+                    offset + coordinates.len(),
+                    if outcome == SourceStartOutcome::InitialHistory {
+                        1.
+                    } else {
+                        0.
+                    },
+                )?;
+            }
+            if outcome == SourceStartOutcome::Junction {
+                states.report_nonconvergence()?;
+            }
+            return Ok(());
+        }
         let Some(workspace) = &self.trial_workspace else {
             return Ok(());
         };
@@ -709,6 +816,17 @@ impl<K: Kernel> Device for PreparedDevice<K> {
     }
 
     fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        if context.phase == IterationPhase::Fix
+            && self
+                .source
+                .as_ref()
+                .and_then(|source| source.start)
+                .is_some_and(|start| start.off)
+        {
+            // Held-off devices do not veto leaving the initialization phase.
+            // Their next FLOAT load must evaluate the actual circuit point.
+            return Ok(false);
+        }
         let Some(workspace) = &self.trial_workspace else {
             return Ok(false);
         };
@@ -877,7 +995,11 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                 }
                 .ambient_kelvin();
                 let effective = source.absolute_temperature_slot.map_or_else(
-                    || base + self.values[source.relative_temperature_slot],
+                    || {
+                        base + source
+                            .relative_temperature_slot
+                            .map_or(0., |slot| self.values[slot])
+                    },
                     |slot| self.values[slot],
                 );
                 return Ok(Some(effective - CELSIUS_TO_KELVIN));

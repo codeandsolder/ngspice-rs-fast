@@ -177,9 +177,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "model-compact-intrinsic"
+version = "0.1.0"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=8d2d5f756dbd2566932789fc4bf73fdf4a6a4245#8d2d5f756dbd2566932789fc4bf73fdf4a6a4245"
+
+[[package]]
 name = "model-kernel-api"
 version = "0.1.0"
 source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=8d2d5f756dbd2566932789fc4bf73fdf4a6a4245#8d2d5f756dbd2566932789fc4bf73fdf4a6a4245"
+
+[[package]]
+name = "model-kernel-bsim"
+version = "0.1.0"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=8d2d5f756dbd2566932789fc4bf73fdf4a6a4245#8d2d5f756dbd2566932789fc4bf73fdf4a6a4245"
+dependencies = [
+ "model-compact-intrinsic",
+ "model-kernel-api",
+]
 
 [[package]]
 name = "model-kernel-diode"
@@ -271,7 +285,9 @@ name = "ngspice-rs"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "model-compact-intrinsic",
  "model-kernel-api",
+ "model-kernel-bsim",
  "model-kernel-diode",
  "model-kernel-vdmos",
  "model-normalize-ngspice",

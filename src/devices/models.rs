@@ -194,6 +194,10 @@ pub enum ModelBackend {
     Mos6,
     /// MOS9.
     Mos9,
+    /// Berkeley BSIM1, level 4.
+    Bsim1,
+    /// Berkeley BSIM2, level 5.
+    Bsim2,
     /// BSIM3v3.3.
     Bsim3,
     /// BSIM4.8.
@@ -293,6 +297,8 @@ impl ModelBackend {
                         BackendSpec::new(Self::Mos3, "MOS3", &[3]),
                         BackendSpec::new(Self::Mos6, "MOS6", &[6]),
                         BackendSpec::new(Self::Mos9, "MOS9", &[9]),
+                        BackendSpec::new(Self::Bsim1, "BSIM1", &[4]),
+                        BackendSpec::new(Self::Bsim2, "BSIM2", &[5]),
                         BackendSpec::new(Self::Bsim3, "BSIM3v3.3", &[8, 49]),
                         BackendSpec::new(Self::Bsim4, "BSIM4.8", &[14, 54]),
                     ]
@@ -403,6 +409,10 @@ pub(super) enum PreparationKey {
     Inputs,
     Scalar(usize),
     Nominal(u64),
+    LegacyBsimTopology {
+        drain_series: bool,
+        source_series: bool,
+    },
     PreparedTopology {
         series: bool,
         absolute_temperature: bool,
@@ -1214,8 +1224,6 @@ fn rounded_level(raw: Real, location: &SourceLoc) -> SpiceResult<u8> {
 /// level.
 const fn mos_level_reference(selector: u8) -> &'static str {
     match selector {
-        4 => "src/spicelib/devices/bsim1/",
-        5 => "src/spicelib/devices/bsim2/",
         10 | 58 => "src/spicelib/devices/bsimsoi/",
         55 => "src/spicelib/devices/bsim3soi_fd/",
         56 => "src/spicelib/devices/bsim3soi_dd/",

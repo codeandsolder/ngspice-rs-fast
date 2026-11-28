@@ -183,8 +183,8 @@ fn model_symbols_do_not_share_numeric_or_ground_node_namespaces() {
 #[test]
 fn every_validated_level_selects_exactly_one_concrete_backend() {
     use ModelBackend::{
-        Bjt, Bsim3, Bsim4, Capacitor, CurrentSwitch, Diode, Hfet1, Hfet2, Inductor, Jfet, Jfet2,
-        Ltra, Mesa, Mesfet, Mos1, Mos2, Mos3, Mos6, Mos9, Resistor, Switch, Txl, Urc,
+        Bjt, Bsim1, Bsim2, Bsim3, Bsim4, Capacitor, CurrentSwitch, Diode, Hfet1, Hfet2, Inductor,
+        Jfet, Jfet2, Ltra, Mesa, Mesfet, Mos1, Mos2, Mos3, Mos6, Mos9, Resistor, Switch, Txl, Urc,
     };
     type Entries = &'static [(ModelBackend, &'static [u8])];
     let cases: &[(char, &[&str], Entries)] = &[
@@ -203,6 +203,8 @@ fn every_validated_level_selects_exactly_one_concrete_backend() {
                 (Mos3, &[3]),
                 (Mos6, &[6]),
                 (Mos9, &[9]),
+                (Bsim1, &[4]),
+                (Bsim2, &[5]),
                 (Bsim3, &[8, 49]),
                 (Bsim4, &[14, 54]),
             ],
