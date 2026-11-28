@@ -42,7 +42,7 @@ use super::{
     Model, SaturationRoot, SizeParam, exp, log, smooth_drain, smooth_positive, sqrt,
 };
 
-use crate::devices::bsim_physics::poly_depletion;
+use crate::devices::bsim_physics::{poly_depletion, rational_floor, reciprocal_floor};
 use crate::primitives::SpiceResult;
 
 /// Body potential, threshold, effective gate bias and their independent derivatives.
@@ -239,26 +239,12 @@ pub(super) fn electrostatics(
     Vtm0 = model.vtm0;
     T3 = sqrt(Xdep);
     V0 = pParam.vbi - pParam.phi;
-    T0 = pParam.dvt2 * Vbseff;
-    if T0 >= -0.5 {
-        T1 = 1.0 + T0;
-        T2 = pParam.dvt2;
-    } else {
-        T4 = 1.0 / (3.0 + 8.0 * T0);
-        T1 = (1.0 + 3.0 * T0) * T4;
-        T2 = pParam.dvt2 * T4 * T4;
-    }
+    (T1, T2) = rational_floor(pParam.dvt2 * Vbseff, -0.5, 1., 8.)?;
+    T2 *= pParam.dvt2;
     lt1 = model.factor1 * T3 * T1;
     dlt1_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
-    T0 = pParam.dvt2w * Vbseff;
-    if T0 >= -0.5 {
-        T1 = 1.0 + T0;
-        T2 = pParam.dvt2w;
-    } else {
-        T4 = 1.0 / (3.0 + 8.0 * T0);
-        T1 = (1.0 + 3.0 * T0) * T4;
-        T2 = pParam.dvt2w * T4 * T4;
-    }
+    (T1, T2) = rational_floor(pParam.dvt2w * Vbseff, -0.5, 1., 8.)?;
+    T2 *= pParam.dvt2w;
     ltw = model.factor1 * T3 * T1;
     dltw_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
     T0 = pParam.dvt1 * Leff / lt1;
@@ -299,13 +285,7 @@ pub(super) fn electrostatics(
         + (pParam.kt1 + pParam.kt1l / Leff + pParam.kt2 * Vbseff) * TempRatio;
     Vth_NarrowW = toxe * pParam.phi / (pParam.weff + pParam.w0);
     T3 = here.eta0 + pParam.etab * Vbseff;
-    if T3 < 1.0e-4 {
-        T9 = 1.0 / (3.0 - 2.0e4 * T3);
-        T3 = (2.0e-4 - T3) * T9;
-        T4 = T9 * T9;
-    } else {
-        T4 = 1.0;
-    }
+    (T3, T4) = rational_floor(T3, 1e-4, 0., 2e4)?;
     dDIBL_Sft_dVd = T3 * pParam.theta0vb0;
     DIBL_Sft = dDIBL_Sft_dVd * Vds;
     Lpe_Vb = sqrt(1.0 + pParam.lpeb / Leff);
@@ -327,20 +307,10 @@ pub(super) fn electrostatics(
     tmp2 = pParam.nfactor * tmp1;
     tmp3 = pParam.cdsc + pParam.cdscb * Vbseff + pParam.cdscd * Vds;
     tmp4 = (tmp2 + tmp3 * Theta0 + pParam.cit) / model.coxe;
-    if tmp4 >= -0.5 {
-        n = 1.0 + tmp4;
-        dn_dVb =
-            (-tmp2 / Xdep * dXdep_dVb + tmp3 * dTheta0_dVb + pParam.cdscb * Theta0) / model.coxe;
-        dn_dVd = pParam.cdscd * Theta0 / model.coxe;
-    } else {
-        T0 = 1.0 / (3.0 + 8.0 * tmp4);
-        n = (1.0 + 3.0 * tmp4) * T0;
-        T0 *= T0;
-        dn_dVb = (-tmp2 / Xdep * dXdep_dVb + tmp3 * dTheta0_dVb + pParam.cdscb * Theta0)
-            / model.coxe
-            * T0;
-        dn_dVd = pParam.cdscd * Theta0 / model.coxe * T0;
-    }
+    (n, T0) = rational_floor(tmp4, -0.5, 1., 8.)?;
+    dn_dVb =
+        (-tmp2 / Xdep * dXdep_dVb + tmp3 * dTheta0_dVb + pParam.cdscb * Theta0) / model.coxe * T0;
+    dn_dVd = pParam.cdscd * Theta0 / model.coxe * T0;
     if pParam.dvtp0 > 0.0 {
         T0 = -pParam.dvtp1 * Vds;
         if T0 < -EXP_THRESHOLD {
@@ -722,14 +692,9 @@ pub(super) fn transport(
     Weff = pParam.weff - 2.0 * (pParam.dwg * Vgsteff + pParam.dwb * T9);
     dWeff_dVg = -2.0 * pParam.dwg;
     dWeff_dVb = -2.0 * pParam.dwb * dsqrtPhis_dVb;
-    if Weff < 2.0e-8 {
-        T0 = 1.0 / (6.0e-8 - 2.0 * Weff);
-        Weff = 2.0e-8 * (4.0e-8 - Weff) * T0;
-        let correction = T0 * 4.0e-16;
-        T0 *= correction;
-        dWeff_dVg *= T0;
-        dWeff_dVb *= T0;
-    }
+    (Weff, T0) = rational_floor(Weff, 2e-8, 0., 1e8)?;
+    dWeff_dVg *= T0;
+    dWeff_dVb *= T0;
     if model.rdsMod == 1 {
         dRds_dVb = 0.0;
         dRds_dVg = dRds_dVb;
@@ -774,28 +739,14 @@ pub(super) fn transport(
     dAbulk_dVg = -T1 * T8;
     Abulk = Abulk0 + dAbulk_dVg * Vgsteff;
     dAbulk_dVb = dAbulk0_dVb - T8 * Vgsteff * (dT1_dVb + 3.0 * T1 * dT2_dVb);
-    if Abulk0 < 0.1 {
-        T9 = 1.0 / (3.0 - 20.0 * Abulk0);
-        Abulk0 = (0.2 - Abulk0) * T9;
-        dAbulk0_dVb *= T9 * T9;
-    }
-    if Abulk < 0.1 {
-        T9 = 1.0 / (3.0 - 20.0 * Abulk);
-        Abulk = (0.2 - Abulk) * T9;
-        T10 = T9 * T9;
-        dAbulk_dVb *= T10;
-        dAbulk_dVg *= T10;
-    }
+    (Abulk0, T9) = rational_floor(Abulk0, 0.1, 0., 20.)?;
+    dAbulk0_dVb *= T9;
+    (Abulk, T10) = rational_floor(Abulk, 0.1, 0., 20.)?;
+    dAbulk_dVb *= T10;
+    dAbulk_dVg *= T10;
     here.Abulk = Abulk;
-    T2 = pParam.keta * Vbseff;
-    if T2 >= -0.9 {
-        T0 = 1.0 / (1.0 + T2);
-        dT0_dVb = -pParam.keta * T0 * T0;
-    } else {
-        T1 = 1.0 / (0.8 + T2);
-        T0 = (17.0 + 20.0 * T2) * T1;
-        dT0_dVb = -pParam.keta * T1 * T1;
-    }
+    (T0, dT0_dVb) = reciprocal_floor(pParam.keta * Vbseff, -0.9, 20.)?;
+    dT0_dVb *= pParam.keta;
     dAbulk_dVg *= T0;
     dAbulk_dVb = dAbulk_dVb * T0 + Abulk * dT0_dVb;
     dAbulk0_Q_dVb = dAbulk0_dVb;
@@ -807,15 +758,8 @@ pub(super) fn transport(
         dAbulk0_Q_dVb = dAbulk0_dVb;
         Abulk0_Q = Abulk0;
     } else {
-        T2 = pParam.ketac * Vbseff;
-        if T2 >= -0.9 {
-            T0 = 1.0 / (1.0 + T2);
-            dT0_dVb = -pParam.ketac * T0 * T0;
-        } else {
-            T1 = 1.0 / (0.8 + T2);
-            T0 = (17.0 + 20.0 * T2) * T1;
-            dT0_dVb = -pParam.ketac * T1 * T1;
-        }
+        (T0, dT0_dVb) = reciprocal_floor(pParam.ketac * Vbseff, -0.9, 20.)?;
+        dT0_dVb *= pParam.ketac;
         dAbulk0_Q_dVb = dAbulk0_Q_dVb * T0 + Abulk0_Q * dT0_dVb;
         Abulk0_Q *= T0;
     }
@@ -936,16 +880,10 @@ pub(super) fn transport(
         dDenomi_dVb = T1 * pParam.uc;
         T5 = T1 * T2 + T11;
     }
-    if T5 >= -0.8 {
-        Denomi = 1.0 + T5;
-    } else {
-        T9 = 1.0 / (7.0 + 10.0 * T5);
-        Denomi = (0.6 + T5) * T9;
-        T9 *= T9;
-        dDenomi_dVg *= T9;
-        dDenomi_dVd *= T9;
-        dDenomi_dVb *= T9;
-    }
+    (Denomi, T9) = rational_floor(T5, -0.8, 1., 10.)?;
+    dDenomi_dVg *= T9;
+    dDenomi_dVd *= T9;
+    dDenomi_dVb *= T9;
     ueff = here.u0temp / Denomi;
     here.ueff = ueff;
     T9 = -ueff / Denomi;
@@ -1021,7 +959,7 @@ pub(super) fn transport(
         dT2_dVg = EsatL + Vgst2Vtm * dEsatL_dVg + T6 * (4.0 + 2.0 * Vgst2Vtm * tmp2);
         dT2_dVb = Vgst2Vtm * (dEsatL_dVb + 2.0 * T6 * tmp3);
         dT2_dVd = Vgst2Vtm * dEsatL_dVd;
-        let root = SaturationRoot::new(T0, T1, T2)?;
+        let root = SaturationRoot::new(&T0, T1, T2)?;
         Vdsat = root.value;
         dVdsat_dVg = root.derivative(&dT0_dVg, &dT1_dVg, &dT2_dVg)?;
         dVdsat_dVd = root.derivative(&dT0_dVd, &dT1_dVd, &dT2_dVd)?;
@@ -1150,20 +1088,10 @@ pub(super) fn transport(
     }
     T8 = pParam.pvag / EsatL;
     T9 = T8 * Vgsteff;
-    if T9 > -0.9 {
-        PvagTerm = 1.0 + T9;
-        dPvagTerm_dVg = T8 * (1.0 - Vgsteff * dEsatL_dVg / EsatL);
-        dPvagTerm_dVb = -T9 * dEsatL_dVb / EsatL;
-        dPvagTerm_dVd = -T9 * dEsatL_dVd / EsatL;
-    } else {
-        T4 = 1.0 / (17.0 + 20.0 * T9);
-        PvagTerm = (0.8 + T9) * T4;
-        T4 *= T4;
-        dPvagTerm_dVg = T8 * (1.0 - Vgsteff * dEsatL_dVg / EsatL) * T4;
-        T9 *= T4 / EsatL;
-        dPvagTerm_dVb = -T9 * dEsatL_dVb;
-        dPvagTerm_dVd = -T9 * dEsatL_dVd;
-    }
+    (PvagTerm, T4) = rational_floor(T9, -0.9, 1., 20.)?;
+    dPvagTerm_dVg = T8 * (1.0 - Vgsteff * dEsatL_dVg / EsatL) * T4;
+    dPvagTerm_dVb = -T9 * dEsatL_dVb / EsatL * T4;
+    dPvagTerm_dVd = -T9 * dEsatL_dVd / EsatL * T4;
     if (pParam.pclm > MIN_EXP) && (diffVds > 1.0e-10) {
         T0 = 1.0 + Rds * Idl;
         dT0_dVg = dRds_dVg * Idl + Rds * dIdl_dVg;
@@ -1208,21 +1136,11 @@ pub(super) fn transport(
         dVADIBL_dVg = (1.0 - dT0_dVg / T1 + T0 * dT1_dVg / T9) / T2;
         dVADIBL_dVb = (-dT0_dVb / T1 + T0 * dT1_dVb / T9) / T2;
         dVADIBL_dVd = (-dT0_dVd / T1 + T0 * dT1_dVd / T9) / T2;
-        T7 = pParam.pdiblb * Vbseff;
-        if T7 >= -0.9 {
-            T3 = 1.0 / (1.0 + T7);
-            VADIBL *= T3;
-            dVADIBL_dVg *= T3;
-            dVADIBL_dVb = (dVADIBL_dVb - VADIBL * pParam.pdiblb) * T3;
-            dVADIBL_dVd *= T3;
-        } else {
-            T4 = 1.0 / (0.8 + T7);
-            T3 = (17.0 + 20.0 * T7) * T4;
-            dVADIBL_dVg *= T3;
-            dVADIBL_dVb = dVADIBL_dVb * T3 - VADIBL * pParam.pdiblb * T4 * T4;
-            dVADIBL_dVd *= T3;
-            VADIBL *= T3;
-        }
+        (T3, T4) = reciprocal_floor(pParam.pdiblb * Vbseff, -0.9, 20.)?;
+        dVADIBL_dVg *= T3;
+        dVADIBL_dVb = dVADIBL_dVb * T3 + VADIBL * pParam.pdiblb * T4;
+        dVADIBL_dVd *= T3;
+        VADIBL *= T3;
         dVADIBL_dVg = dVADIBL_dVg * PvagTerm + VADIBL * dPvagTerm_dVg;
         dVADIBL_dVb = dVADIBL_dVb * PvagTerm + VADIBL * dPvagTerm_dVb;
         dVADIBL_dVd = dVADIBL_dVd * PvagTerm + VADIBL * dPvagTerm_dVd;

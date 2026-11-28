@@ -5,27 +5,8 @@
 //! jets; no finite differences or separately maintained value law are needed.
 use std::cmp::Ordering;
 
-use super::differential::Differential;
+use super::{Constitutive, differential::Differential};
 use crate::primitives::{Real, SpiceResult};
-
-pub trait Constitutive: Clone {
-    fn constant(&self, value: Real) -> Self;
-    fn primal(&self) -> Real;
-    fn compare(&self, boundary: Real) -> Option<Ordering>;
-    fn add(self, rhs: &Self) -> Self;
-    fn midpoint(self, rhs: &Self) -> Self;
-    fn multiply(self, rhs: &Self) -> Self;
-    fn divide(self, rhs: &Self) -> SpiceResult<Self>;
-    fn scale(self, factor: Real) -> Self;
-    fn offset(self, value: Real) -> Self;
-    fn mul_add(self, rhs: &Self, add: &Self) -> Self;
-    fn sqrt(self) -> SpiceResult<Self>;
-    fn exp(self) -> Self;
-    fn exp_with_primal(self, value: Real) -> Self;
-    fn compose_derivative(self, value: Real, slope: &Self) -> Self;
-    fn exp_m1(self) -> Self;
-    fn ln_1p(self) -> SpiceResult<Self>;
-}
 
 impl Constitutive for Real {
     #[inline]

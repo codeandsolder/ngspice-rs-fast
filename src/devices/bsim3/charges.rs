@@ -354,7 +354,20 @@ impl ChargeModel<'_> {
         let vdseff_cv = smoothing.effective;
         let dvdseff_cv_dvg = smoothing.saturation_partial * dvgdp_dvg / abulk_cv;
         let dvdseff_cv_dvd = smoothing.drain_partial;
-        let dvdseff_cv_dvb = -smoothing.saturation_partial * vdsat_cv * dabulk_cv_dvb / abulk_cv;
+        // The BSIM3 capMod=3 scalar load uses (1 - T5) instead of
+        // (T4 - T5) in the body derivative of the negative-root branch.
+        // Its published capacitance/stamp convention therefore differs
+        // from the exact derivative of its charge by the saturation gap.
+        // Keep this discrepancy at the scalar load boundary; the shared
+        // smoothing law itself returns the actual physical partials.
+        let saturation_factor = if vdsat_cv - vds_mode - DELTA_4 < 0. && vds_mode.abs() > 0. {
+            smoothing
+                .saturation_partial
+                .mul_add(vdsat_cv, smoothing.saturation_excess)
+        } else {
+            smoothing.saturation_partial * vdsat_cv
+        };
+        let dvdseff_cv_dvb = -saturation_factor * dabulk_cv_dvb / abulk_cv;
 
         let [inversion, bulk, source] = channel_inversion(
             &vgdp,

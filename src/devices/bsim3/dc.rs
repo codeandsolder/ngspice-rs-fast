@@ -21,7 +21,9 @@
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
-use crate::devices::bsim_physics::{SaturationRoot, bsim3_junction, poly_depletion, smooth_drain};
+use crate::devices::bsim_physics::{
+    SaturationRoot, bsim3_junction, poly_depletion, rational_floor, reciprocal_floor, smooth_drain,
+};
 use crate::primitives::{Real, SpiceResult};
 
 const EXP_THRESHOLD: Real = 34.0;
@@ -244,26 +246,12 @@ impl DcModel<'_> {
         let t3 = xdep.sqrt();
 
         // dvt2 body-bias dependence of the threshold.
-        let (t1, t2) = {
-            let t0 = p.binned.dvt2 * vbseff;
-            if t0 >= -0.5 {
-                (1.0 + t0, p.binned.dvt2)
-            } else {
-                let t4 = 1.0 / 8.0f64.mul_add(t0, 3.0);
-                (3.0f64.mul_add(t0, 1.0) * t4, p.binned.dvt2 * t4 * t4)
-            }
-        };
+        let (t1, slope) = rational_floor(p.binned.dvt2 * vbseff, -0.5, 1., 8.)?;
+        let t2 = p.binned.dvt2 * slope;
         let lt1 = factor1 * t3 * t1;
         let dlt1_dvb = factor1 * t3.mul_add(t2, 0.5 / t3 * t1 * dxdep_dvb);
-        let (t1, t2) = {
-            let t0 = p.binned.dvt2w * vbseff;
-            if t0 >= -0.5 {
-                (1.0 + t0, p.binned.dvt2w)
-            } else {
-                let t4 = 1.0 / 8.0f64.mul_add(t0, 3.0);
-                (3.0f64.mul_add(t0, 1.0) * t4, p.binned.dvt2w * t4 * t4)
-            }
-        };
+        let (t1, slope) = rational_floor(p.binned.dvt2w * vbseff, -0.5, 1., 8.)?;
+        let t2 = p.binned.dvt2w * slope;
         let ltw = factor1 * t3 * t1;
         let dltw_dvb = factor1 * t3.mul_add(t2, 0.5 / t3 * t1 * dxdep_dvb);
 
@@ -316,12 +304,7 @@ impl DcModel<'_> {
         let tmp2 = tox * phi / effective_width_offset;
 
         let t3eta = p.binned.etab.mul_add(vbseff, p.binned.eta0);
-        let (t3eta, t4) = if t3eta < 1.0e-4 {
-            let t9 = 1.0 / 2.0e4f64.mul_add(-t3eta, 3.0);
-            ((2.0e-4 - t3eta) * t9, t9 * t9)
-        } else {
-            (t3eta, 1.0)
-        };
+        let (t3eta, t4) = rational_floor(t3eta, 1e-4, 0., 2e4)?;
         let ddibl_sft_dvd = t3eta * p.derived.theta0vb0;
         let dibl_sft = ddibl_sft_dvd * vds;
 
@@ -360,28 +343,13 @@ impl DcModel<'_> {
             .cdscd
             .mul_add(vds, p.binned.cdscb.mul_add(vbseff, p.binned.cdsc));
         let tmp4 = (tmp3n.mul_add(theta0, tmp2n) + p.binned.cit) / cox;
-        let (n, dn_dvb, dn_dvd) = if tmp4 >= -0.5 {
-            (
-                1.0 + tmp4,
-                p.binned.cdscb.mul_add(
-                    theta0,
-                    tmp3n.mul_add(dtheta0_dvb, -tmp2n / xdep * dxdep_dvb),
-                ) / cox,
-                p.binned.cdscd * theta0 / cox,
-            )
-        } else {
-            let t0 = 1.0 / 8.0f64.mul_add(tmp4, 3.0);
-            let factor = t0 * t0;
-            (
-                3.0f64.mul_add(tmp4, 1.0) * t0,
-                p.binned.cdscb.mul_add(
-                    theta0,
-                    tmp3n.mul_add(dtheta0_dvb, -tmp2n / xdep * dxdep_dvb),
-                ) / cox
-                    * factor,
-                p.binned.cdscd * theta0 / cox * factor,
-            )
-        };
+        let (n, slope) = rational_floor(tmp4, -0.5, 1., 8.)?;
+        let dn_dvb = p.binned.cdscb.mul_add(
+            theta0,
+            tmp3n.mul_add(dtheta0_dvb, -tmp2n / xdep * dxdep_dvb),
+        ) / cox
+            * slope;
+        let dn_dvd = p.binned.cdscd * theta0 / cox * slope;
 
         let (vgs_eff, dvgseff_dvg) =
             poly_depletion(vgs, p.vfb + phi, p.binned.ngate, EPS_SI, cox, CHARGE_Q)?;
@@ -432,34 +400,17 @@ impl DcModel<'_> {
 
         // Effective channel width.
         let t9 = sqrt_phis - p.derived.sqrtphi;
-        let mut weff = 2.0f64.mul_add(-p.binned.dwb.mul_add(t9, p.binned.dwg * vgsteff), p.weff);
-        let mut dweff_dvg = -2.0 * p.binned.dwg;
-        let mut dweff_dvb = -2.0 * p.binned.dwb * dsqrt_phis_dvb;
-        if weff < 2.0e-8 {
-            let t0 = 1.0 / 2.0f64.mul_add(-weff, 6.0e-8);
-            weff = 2.0e-8 * (4.0e-8 - weff) * t0;
-            let factor = t0 * t0 * 4.0e-16;
-            dweff_dvg *= factor;
-            dweff_dvb *= factor;
-        }
+        let raw_width = 2.0f64.mul_add(-p.binned.dwb.mul_add(t9, p.binned.dwg * vgsteff), p.weff);
+        let (weff, slope) = rational_floor(raw_width, 2e-8, 0., 1e8)?;
+        let dweff_dvg = -2.0 * p.binned.dwg * slope;
+        let dweff_dvb = -2.0 * p.binned.dwb * dsqrt_phis_dvb * slope;
 
         // Series resistance.
         let t0 = p.binned.prwb.mul_add(t9, p.binned.prwg * vgsteff);
-        let (rds, drds_dvg, drds_dvb) = if t0 >= -0.9 {
-            (
-                p.thermal.rds0 * (1.0 + t0),
-                p.thermal.rds0 * p.binned.prwg,
-                p.thermal.rds0 * p.binned.prwb * dsqrt_phis_dvb,
-            )
-        } else {
-            let t1 = 1.0 / 20.0f64.mul_add(t0, 17.0);
-            let t1s = t1 * t1;
-            (
-                p.thermal.rds0 * (0.8 + t0) * t1,
-                p.thermal.rds0 * p.binned.prwg * t1s,
-                p.thermal.rds0 * p.binned.prwb * dsqrt_phis_dvb * t1s,
-            )
-        };
+        let (resistance_factor, slope) = rational_floor(t0, -0.9, 1., 20.)?;
+        let rds = p.thermal.rds0 * resistance_factor;
+        let drds_dvg = p.thermal.rds0 * p.binned.prwg * slope;
+        let drds_dvb = p.thermal.rds0 * p.binned.prwb * dsqrt_phis_dvb * slope;
 
         // Bulk-charge factor.
         let t1 = 0.5 * p.derived.k1ox / sqrt_phis;
@@ -481,26 +432,15 @@ impl DcModel<'_> {
         let mut abulk = dabulk_dvg.mul_add(vgsteff, abulk0);
         let mut dabulk_dvb =
             (t8 * vgsteff).mul_add(-(3.0 * t1).mul_add(dt2_dvb, dt1_dvb), dabulk0_dvb);
-        if abulk0 < 0.1 {
-            let t9c = 1.0 / 20.0f64.mul_add(-abulk0, 3.0);
-            abulk0 = (0.2 - abulk0) * t9c;
-            dabulk0_dvb *= t9c * t9c;
-        }
-        if abulk < 0.1 {
-            let t9c = 1.0 / 20.0f64.mul_add(-abulk, 3.0);
-            abulk = (0.2 - abulk) * t9c;
-            let t10c = t9c * t9c;
-            dabulk_dvb *= t10c;
-            dabulk_dvg *= t10c;
-        }
-        let t2k = p.binned.keta * vbseff;
-        let (t0k, dt0_dvb) = if t2k >= -0.9 {
-            let t0k = 1.0 / (1.0 + t2k);
-            (t0k, -p.binned.keta * t0k * t0k)
-        } else {
-            let t1k = 1.0 / (0.8 + t2k);
-            (20.0f64.mul_add(t2k, 17.0) * t1k, -p.binned.keta * t1k * t1k)
-        };
+        let slope;
+        (abulk0, slope) = rational_floor(abulk0, 0.1, 0., 20.)?;
+        dabulk0_dvb *= slope;
+        let slope;
+        (abulk, slope) = rational_floor(abulk, 0.1, 0., 20.)?;
+        dabulk_dvb *= slope;
+        dabulk_dvg *= slope;
+        let (t0k, slope) = reciprocal_floor(p.binned.keta * vbseff, -0.9, 20.)?;
+        let dt0_dvb = p.binned.keta * slope;
         dabulk_dvg *= t0k;
         dabulk_dvb = abulk.mul_add(dt0_dvb, dabulk_dvb * t0k);
         dabulk0_dvb = abulk0.mul_add(dt0_dvb, dabulk0_dvb * t0k);
@@ -538,16 +478,10 @@ impl DcModel<'_> {
             denomi_dvd = denomi_dvg * 2.0 * dvth_dvd;
             denomi_dvb = p.binned.uc.mul_add(t4, denomi_dvg * 2.0 * dvth_dvb);
         }
-        let denomi = if t5m >= -0.8 {
-            1.0 + t5m
-        } else {
-            let t9c = 1.0 / 10.0f64.mul_add(t5m, 7.0);
-            let factor = t9c * t9c;
-            denomi_dvg *= factor;
-            denomi_dvd *= factor;
-            denomi_dvb *= factor;
-            (0.6 + t5m) * t9c
-        };
+        let (denomi, slope) = rational_floor(t5m, -0.8, 1., 10.)?;
+        denomi_dvg *= slope;
+        denomi_dvd *= slope;
+        denomi_dvb *= slope;
         let u0temp = p.u0temp;
         let ueff = u0temp / denomi;
         let t9c = -ueff / denomi;
@@ -647,7 +581,7 @@ impl DcModel<'_> {
             );
             let dt2_dvb = vgst2vtm * (2.0 * t6).mul_add(tmp3v, desatl_dvb);
             let dt2_dvd = vgst2vtm * desatl_dvd;
-            let root = SaturationRoot::new(t0, t1v, t2v)?;
+            let root = SaturationRoot::new(&t0, t1v, t2v)?;
             vdsat = root.value;
             dvdsat_dvg = root.derivative(&dt0_dvg, &dt1_dvg, &dt2_dvg)?;
             dvdsat_dvb = root.derivative(&dt0_dvb, &dt1_dvb, &dt2_dvb)?;
@@ -736,21 +670,11 @@ impl DcModel<'_> {
             let mut dvadibl_dvg = (1.0 - dt0_dvg / t1 + t0 * dt1_dvg / t9) / t2;
             let mut dvadibl_dvb = (-dt0_dvb / t1 + t0 * dt1_dvb / t9) / t2;
             let mut dvadibl_dvd = (-dt0_dvd / t1 + t0 * dt1_dvd / t9) / t2;
-            let t7 = p.binned.pdiblcb * vbseff;
-            if t7 >= -0.9 {
-                let t3 = 1.0 / (1.0 + t7);
-                vadibl *= t3;
-                dvadibl_dvg *= t3;
-                dvadibl_dvb = vadibl.mul_add(-p.binned.pdiblcb, dvadibl_dvb) * t3;
-                dvadibl_dvd *= t3;
-            } else {
-                let t4 = 1.0 / (0.8 + t7);
-                let t3 = 20.0f64.mul_add(t7, 17.0) * t4;
-                dvadibl_dvg *= t3;
-                dvadibl_dvb = (vadibl * p.binned.pdiblcb * t4).mul_add(-t4, dvadibl_dvb * t3);
-                dvadibl_dvd *= t3;
-                vadibl *= t3;
-            }
+            let (factor, slope) = reciprocal_floor(p.binned.pdiblcb * vbseff, -0.9, 20.)?;
+            dvadibl_dvb = (vadibl * p.binned.pdiblcb).mul_add(slope, dvadibl_dvb * factor);
+            dvadibl_dvg *= factor;
+            dvadibl_dvd *= factor;
+            vadibl *= factor;
             (vadibl, dvadibl_dvg, dvadibl_dvd, dvadibl_dvb)
         } else {
             (MAX_EXP, 0.0, 0.0, 0.0)
@@ -758,21 +682,10 @@ impl DcModel<'_> {
 
         let t8a = p.binned.pvag / esatl;
         let t9a = t8a * vgsteff;
-        let (t0a, dt0_dvg, dt0_dvd, dt0_dvb);
-        if t9a > -0.9 {
-            t0a = 1.0 + t9a;
-            dt0_dvg = t8a * (1.0 - vgsteff * desatl_dvg / esatl);
-            dt0_dvb = -t9a * desatl_dvb / esatl;
-            dt0_dvd = -t9a * desatl_dvd / esatl;
-        } else {
-            let mut t1a = 1.0 / 20.0f64.mul_add(t9a, 17.0);
-            t0a = (0.8 + t9a) * t1a;
-            t1a *= t1a;
-            dt0_dvg = t8a * (1.0 - vgsteff * desatl_dvg / esatl) * t1a;
-            let t9b = t9a * t1a / esatl;
-            dt0_dvb = -t9b * desatl_dvb;
-            dt0_dvd = -t9b * desatl_dvd;
-        }
+        let (t0a, slope) = rational_floor(t9a, -0.9, 1., 20.)?;
+        let dt0_dvg = t8a * (1.0 - vgsteff * desatl_dvg / esatl) * slope;
+        let dt0_dvb = -t9a * desatl_dvb / esatl * slope;
+        let dt0_dvd = -t9a * desatl_dvd / esatl * slope;
 
         let tmp1a = vaclm * vaclm;
         let tmp2a2 = vadibl * vadibl;

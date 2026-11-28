@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use super::{DEXP, EXP_THRESHOLD, Instance, LoadCkt, MIN_EXP, Model, SizeParam, state};
 use crate::devices::bsim_physics::{JunctionCapacitance, depletion};
 use crate::devices::nonlinear::exponential_junction_at_argument;
-use crate::maths::taylor::arithmetic::Constitutive;
+use crate::maths::taylor::Constitutive;
 use crate::primitives::SpiceResult;
 
 /// Body-source and body-drain voltage, selecting bulk-resistance internal

@@ -3,7 +3,7 @@
 //! continuations select by the entire one-sided germ.
 use std::cmp::Ordering;
 
-use crate::maths::taylor::arithmetic::Constitutive;
+use crate::maths::taylor::Constitutive;
 use crate::primitives::{Real, SpiceResult};
 
 /// Bias-dependent overlap charge and capacitance. The two rationalized
@@ -121,6 +121,47 @@ pub(super) fn depletion<S: Constitutive>(
     }
 }
 
+/// Tangent-matched rational continuation of a linear constitutive factor.
+/// Below the join, the displacement is compressed toward -1/stiffness;
+/// both value and first partial match the linear law at the join.
+pub(super) fn rational_floor<S: Constitutive>(
+    x: S,
+    join: Real,
+    offset: Real,
+    stiffness: Real,
+) -> SpiceResult<(S, S)> {
+    if x.compare(join) == Some(Ordering::Less) {
+        let displacement = x.offset(-join);
+        let one = displacement.constant(1.);
+        let inverse = one
+            .clone()
+            .divide(&displacement.scale(-stiffness).add(&one))?;
+        let limit = join + offset - stiffness.recip();
+        let value = inverse
+            .constant(stiffness.recip())
+            .mul_add(&inverse, &inverse.constant(limit));
+        let slope = inverse.clone().multiply(&inverse);
+        Ok((value, slope))
+    } else {
+        let one = x.constant(1.);
+        Ok((x.offset(offset), one))
+    }
+}
+
+/// Reciprocal of the same continued resistance/body-bias factor.
+pub(super) fn reciprocal_floor<S: Constitutive>(
+    x: S,
+    join: Real,
+    stiffness: Real,
+) -> SpiceResult<(S, S)> {
+    let (value, slope) = rational_floor(x, join, 1., stiffness)?;
+    let reciprocal = value.constant(1.).divide(&value)?;
+    let derivative = slope
+        .scale(-1.)
+        .multiply(&reciprocal.clone().multiply(&reciprocal));
+    Ok((reciprocal, derivative))
+}
+
 /// Smooth positive half-root, evaluated using its conjugate on the small
 /// negative tail. The selection is numerical, not a physical branch.
 pub(super) fn positive_half_sum<S: Constitutive>(x: S, root: S, product: S) -> SpiceResult<S> {
@@ -162,6 +203,7 @@ pub(super) fn smooth_positive<S: Constitutive>(
 pub(super) struct DrainSmoothing<S> {
     pub(super) effective: S,
     pub(super) drain_excess: S,
+    pub(super) saturation_excess: S,
     pub(super) saturation_partial: S,
     pub(super) drain_partial: S,
 }
@@ -205,8 +247,9 @@ pub(super) fn smooth_drain<S: Constitutive>(
     Ok(DrainSmoothing {
         effective,
         saturation_partial: drain_excess.clone().divide(&root)?,
-        drain_partial: saturation_excess.divide(&root)?,
+        drain_partial: saturation_excess.clone().divide(&root)?,
         drain_excess,
+        saturation_excess,
     })
 }
 
@@ -217,7 +260,7 @@ pub(super) struct SaturationRoot<S> {
 }
 
 impl<S: Constitutive> SaturationRoot<S> {
-    pub(super) fn new(a: S, b: S, c: S) -> SpiceResult<Self> {
+    pub(super) fn new(a: &S, b: S, c: S) -> SpiceResult<Self> {
         let discriminant = a
             .clone()
             .scale(-2.)
@@ -226,7 +269,7 @@ impl<S: Constitutive> SaturationRoot<S> {
         let value = if b.primal() > 0. {
             c.divide(&b.add(&discriminant))?.scale(2.)
         } else {
-            b.add(&discriminant.clone().scale(-1.)).divide(&a)?
+            b.add(&discriminant.clone().scale(-1.)).divide(a)?
         };
         Ok(Self {
             value,
@@ -365,8 +408,8 @@ pub(super) fn channel_inversion<S: Constitutive>(
     let edge = fraction.clone().scale(-1.).offset(0.5);
     // weighted_drain * d(fraction)/d(weighted_drain).
     let weighted_fraction_partial = fraction.clone().multiply(&normalized_sum);
-    let inversion_du = ratio.clone().scale(-1.).mul_add(&fraction, &one);
-    let inversion_dt = weighted_fraction_partial
+    let inversion_gate_partial = ratio.clone().scale(-1.).mul_add(&fraction, &one);
+    let inversion_weighted_partial = weighted_fraction_partial
         .clone()
         .add(&edge.clone().scale(-1.));
     let inversion_value = weighted_drain.clone().scale(-1.).mul_add(&edge, overdrive);
@@ -376,20 +419,20 @@ pub(super) fn channel_inversion<S: Constitutive>(
     };
     let inversion = part(
         inversion_value.clone(),
-        inversion_du.clone(),
-        inversion_dt.clone().multiply(bulk),
-        inversion_dt.clone().multiply(drain),
+        inversion_gate_partial.clone(),
+        inversion_weighted_partial.clone().multiply(bulk),
+        inversion_weighted_partial.clone().multiply(drain),
     );
     let complement = bulk.clone().scale(-1.).offset(1.);
     let normalized_drain = drain.clone().divide(&width)?;
-    let bulk_du = complement
+    let bulk_gate_partial = complement
         .clone()
         .multiply(&normalized_drain)
         .multiply(&fraction);
-    let bulk_dd = complement
+    let bulk_drain_partial = complement
         .clone()
-        .multiply(&inversion_dt.clone().scale(-1.));
-    let bulk_da = complement
+        .multiply(&inversion_weighted_partial.clone().scale(-1.));
+    let bulk_factor_partial = complement
         .clone()
         .multiply(&normalized_drain)
         .multiply(&normalized_sum)
@@ -399,18 +442,17 @@ pub(super) fn channel_inversion<S: Constitutive>(
         .scale(-1.);
     let bulk_charge = part(
         complement.multiply(drain).multiply(&edge),
-        bulk_du,
-        bulk_dd,
-        bulk_da,
+        bulk_gate_partial,
+        bulk_drain_partial,
+        bulk_factor_partial,
     );
-    let (source_value, source_du, source_dt) = if partition > 0.5 {
+    let (source_value, source_gate_partial, source_weighted_partial) = if partition > 0.5 {
         (
-            weighted_drain.clone().mul_add(
+            weighted_drain.mul_add(
                 &fraction.clone().scale(0.5).offset(-0.25),
                 &overdrive.clone().scale(-0.5),
             ),
             ratio
-                .clone()
                 .scale(-0.5)
                 .mul_add(&fraction, &overdrive.constant(-0.5)),
             fraction
@@ -424,15 +466,15 @@ pub(super) fn channel_inversion<S: Constitutive>(
     } else {
         (
             inversion_value.scale(-0.5),
-            inversion_du.scale(-0.5),
-            inversion_dt.scale(-0.5),
+            inversion_gate_partial.scale(-0.5),
+            inversion_weighted_partial.scale(-0.5),
         )
     };
     let source = part(
         source_value,
-        source_du,
-        source_dt.clone().multiply(bulk),
-        source_dt.multiply(drain),
+        source_gate_partial,
+        source_weighted_partial.clone().multiply(bulk),
+        source_weighted_partial.multiply(drain),
     );
     Ok([inversion, bulk_charge, source])
 }
@@ -611,6 +653,53 @@ mod tests {
     }
 
     #[test]
+    fn rational_continuations_match_reference_and_one_sided_partials() -> SpiceResult<()> {
+        // Original C rational factors, parameterized here only to share
+        // the independent verification of their linear and continued sides.
+        for (join, offset, stiffness, numerator, denominator) in [
+            (-0.5, 1., 8., [1., 3.], [3., 8.]),
+            (1e-4, 0., 2e4, [2e-4, -1.], [3., -2e4]),
+            (2e-8, 0., 1e8, [8e-16, -2e-8], [6e-8, -2.]),
+            (0.1, 0., 20., [0.2, -1.], [3., -20.]),
+            (-0.9, 1., 20., [0.8, 1.], [17., 20.]),
+            (-0.8, 1., 10., [0.6, 1.], [7., 10.]),
+        ] {
+            let reference = |x: Real| {
+                if x < join {
+                    (numerator[1] * x + numerator[0]) / (denominator[1] * x + denominator[0])
+                } else {
+                    x + offset
+                }
+            };
+            for (shift, direction) in [(-0.2, -1.), (0., -1.), (0., 1.), (0.2, 1.)] {
+                let bias = join + shift / stiffness;
+                let rate = direction / (8. * stiffness);
+                let (value, slope) =
+                    rational_floor(variable(bias, rate)?, join, offset, stiffness)?;
+                check_charge_gradient(&value, &slope);
+                for time in [0., 1e-3, 0.02] {
+                    let x = rate.mul_add(time, bias);
+                    close(value_at(&value.value, time), reference(x), 2e-26);
+                }
+            }
+        }
+        for (bias, rate) in [(-1.2, 0.01), (-0.9, -0.01), (-0.9, 0.01), (0., -0.01)] {
+            let (value, slope) = reciprocal_floor(variable(bias, rate)?, -0.9, 20.)?;
+            check_charge_gradient(&value, &slope);
+            for time in [0., 1e-3, 0.02] {
+                let x = rate.mul_add(time, bias);
+                let reference = if x < -0.9 {
+                    20.0f64.mul_add(x, 17.) / (0.8 + x)
+                } else {
+                    1. / (1. + x)
+                };
+                close(value_at(&value.value, time), reference, 2e-26);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mixed_junction_depletion_has_exact_one_sided_charge_and_partial_series() -> SpiceResult<()> {
         let parts = [
             JunctionCapacitance {
@@ -708,7 +797,7 @@ mod tests {
             let b = 1.;
             let c = 0.125;
             let root = SaturationRoot::new(
-                Local::variable(0, Jet::affine(ORDER, a, rates[0]))?,
+                &Local::variable(0, Jet::affine(ORDER, a, rates[0]))?,
                 Local::variable(1, Jet::affine(ORDER, b, rates[1]))?,
                 Local::variable(2, Jet::affine(ORDER, c, rates[2]))?,
             )?;

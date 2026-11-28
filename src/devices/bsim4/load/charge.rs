@@ -42,7 +42,7 @@
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
     DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model, SizeParam,
-    depletion_charge, exp, fabs, log, mode, smooth_drain, smooth_positive, sqrt, state,
+    depletion_charge, exp, fabs, log, mode, smooth_drain, smooth_positive, state,
 };
 use super::{
     bias::LoadBias,

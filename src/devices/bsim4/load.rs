@@ -24,7 +24,7 @@ use super::host::{LoadCkt, mode, state};
 use crate::devices::bsim_physics::{
     SaturationRoot, depletion_charge, smooth_drain, smooth_positive,
 };
-use crate::maths::taylor::arithmetic::Constitutive;
+use crate::maths::taylor::Constitutive;
 use crate::primitives::SpiceResult;
 
 mod bias;
