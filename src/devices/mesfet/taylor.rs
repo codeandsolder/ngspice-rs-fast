@@ -37,18 +37,27 @@ fn smooth_high(a: &Law, b: &Law, width: Real) -> SpiceResult<(Law, [Law; 2])> {
 }
 
 impl Model {
-    fn channel_germ(&self, op: &Operating, vgs: &Law, vgd: &Law) -> SpiceResult<Law> {
+    fn channel_germ(
+        &self,
+        op: &Operating,
+        vgs: &Law,
+        vgd: &Law,
+        context: &mut TaylorContext<'_>,
+    ) -> SpiceResult<Law> {
         let vds = vgs.clone().add(&vgd.clone().scale(-1.));
+        context.guard(0, &vds.value, 0.)?;
         let (gate, drain, direction) = if vds.value.sign() == Ordering::Less {
             (vgd, vds.scale(-1.), -1.)
         } else {
             (vgs, vds, 1.)
         };
         let overdrive = gate.clone().offset(-self.vto);
+        context.guard(1, &overdrive.value, 0.)?;
         if overdrive.value.sign() != Ordering::Greater {
             return Ok(Law::constant(overdrive.value.order(), 0.));
         }
         let fraction = drain.clone().scale(self.alpha / 3.);
+        context.guard(2, &fraction.value, 1.)?;
         let shape = if fraction.value.compare(1.) == Some(Ordering::Less) {
             let complement = fraction.clone().scale(-1.).offset(1.);
             fraction.multiply(
@@ -75,13 +84,20 @@ impl Model {
             .scale(direction * op.beta))
     }
 
-    fn capacitance_germs(&self, op: &Operating, vgs: &Law, vgd: &Law) -> SpiceResult<[Law; 2]> {
+    fn capacitance_germs(
+        &self,
+        op: &Operating,
+        vgs: &Law,
+        vgd: &Law,
+        context: &mut TaylorContext<'_>,
+    ) -> SpiceResult<[Law; 2]> {
         let order = vgs.value.order();
         if op.czgs == 0. && op.czgd == 0. {
             return Ok(std::array::from_fn(|_| Law::constant(order, 0.)));
         }
         let (gate, [plus, minus]) = smooth_high(vgs, vgd, 1. / self.alpha)?;
         let (bounded, [weight, _]) = smooth_high(&gate, &Law::constant(order, self.vto), DEL)?;
+        context.guard(3, &bounded.value, VMAX)?;
         let voltage = if bounded.value.compare(VMAX) == Some(Ordering::Less) {
             bounded
         } else {
@@ -125,9 +141,10 @@ impl Mesfet {
         ];
         let caps = self
             .model
-            .capacitance_germs(&op, &voltage[0], &voltage[1])?;
+            .capacitance_germs(&op, &voltage[0], &voltage[1], context)?;
         for (index, charge_slot) in [(0, slot::QGS), (1, slot::QGD)] {
             let v = &voltage[index];
+            context.guard(4 + index, &v.value, -3. * VT0)?;
             let current =
                 junction_differential(v, VT0, op.csat)?.add(&v.clone().scale(context.model.gmin));
             context.local_law(controls[index].rows, &current, &controls, pol * m, None)?;
@@ -141,7 +158,9 @@ impl Mesfet {
                 )?;
             }
         }
-        let channel = self.model.channel_germ(&op, &voltage[0], &voltage[1])?;
+        let channel = self
+            .model
+            .channel_germ(&op, &voltage[0], &voltage[1], context)?;
         context.local_law([drain, source], &channel, &controls, pol * m, None)?;
         let [gd, gs] = jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs);
         for (outer, inner, conductance) in [

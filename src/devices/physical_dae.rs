@@ -526,6 +526,22 @@ pub struct TaylorContext<'a> {
 }
 
 impl TaylorContext<'_> {
+    /// Record a constitutive branch boundary when tracing one-sided events.
+    pub(crate) fn guard(
+        &mut self,
+        slot: usize,
+        argument: &crate::maths::taylor::Jet,
+        boundary: Real,
+    ) -> SpiceResult<()> {
+        if let Some(trace) = &mut self.output.guards {
+            trace.extend(
+                self.device,
+                vec![LocalGuard::sign(slot, 0, argument.clone(), boundary)],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Retain the value chosen by the physical germ, not the scalar value
     /// at an isolated branch boundary.
     pub(crate) fn candidate_state(&mut self, slot: usize, value: Real) -> SpiceResult<()> {

@@ -898,6 +898,11 @@ fn physical_seed(
     original: &Vector,
     storage: &ImpulseStorage,
 ) -> SpiceResult<Vector> {
+    if original.len() != dae.original_width()
+        || storage.local_charges.len() != dae.storage_bindings().len()
+    {
+        return Err(failure("inconsistent physical history seed dimensions"));
+    }
     let mut values = original.as_slice().to_vec();
     values.resize(dae.state_width(), 0.);
     for (binding, charge) in dae.storage_bindings().iter().zip(&storage.local_charges) {

@@ -1034,22 +1034,26 @@ fn physical_statz_ramp_currents_match_continuous_partition() -> Result<(), Spice
     for (family, pol) in [("nmf", 1.), ("pmf", -1.)] {
         for method in ["gear", "trap"] {
             let plots = FIXTURE.run_all(&format!(
-                "vd d 0 PWL(0 {} 1m {})\nvg g 0 PWL(0 {} 1m {})\nz1 d g 0 zm area=2 m=3\n.model zm {family}(vto=-1.8 beta=3m lambda=0.05 alpha=2.5 b=0.4 is=1p cgs=20p cgd=5p pb=0.8)\nb1 first 0 v=1m*ddt(v(g))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 20u 0 1u uic",
+                "vd d 0 PWL(0 {} 40u {})\nvg g 0 PWL(0 {} 40u {})\nz1 d g 0 zm area=2 m=3\n.model zm {family}(vto=-1.8 beta=3m lambda=0.05 alpha=2.5 b=0.4 is=1p cgs=20p cgd=5p pb=0.8)\nb1 first 0 v=1m*ddt(v(g))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 20u 0 1u uic",
                 pol*0.3,pol*(-0.2),pol*(-0.7),pol*(-0.5)
             ))?;
             let p = &plots[0];
             for index in 0..p.point_count() {
                 let t = value(p, "time", index);
-                let gs = -0.7 + 200. * t;
-                let ds = 0.3 - 500. * t;
+                let gs = -0.7 + 10000. * t;
+                let ds = 0.3 - 25000. * t;
                 let gd = gs - ds;
                 let q = |a, b| qggnew(a, b, 0.8, 1. / 2.5, -1.8, 40e-12, 10e-12);
                 let delta = 1e-5;
                 let cgs = (q(gs + delta, gd) - q(gs - delta, gd)) / (2. * delta);
                 let cgd = (q(gs, gd + delta) - q(gs, gd - delta)) / (2. * delta);
-                let gate_source = reverse_leakage(2e-12, gs) + 200. * cgs;
-                let gate_drain = reverse_leakage(2e-12, gd) + 700. * cgd;
-                let channel = statz(6e-3, 0.05, 0.4, 2.5, -1.8, gs, ds);
+                let gate_source = reverse_leakage(2e-12, gs) + 10000. * cgs;
+                let gate_drain = reverse_leakage(2e-12, gd) + 35000. * cgd;
+                let channel = if ds >= 0. {
+                    statz(6e-3, 0.05, 0.4, 2.5, -1.8, gs, ds)
+                } else {
+                    -statz(6e-3, 0.05, 0.4, 2.5, -1.8, gd, -ds)
+                };
                 close(
                     value(p, "i(vg)", index),
                     -pol * 3. * (gate_source + gate_drain),
@@ -1062,10 +1066,141 @@ fn physical_statz_ramp_currents_match_continuous_partition() -> Result<(), Spice
                     1e-7,
                     1e-13,
                 );
-                close(value(p, "v(first)", index), pol * 0.2, 1e-8, 1e-10);
+                close(value(p, "v(first)", index), pol * 10., 1e-8, 1e-10);
                 close(value(p, "v(out)", index), 0., 0., 1e-9);
             }
         }
     }
     Ok(())
+}
+
+#[test]
+fn closed_statz_path_matches_incremental_companion_and_retains_partition() -> Result<(), SpiceError>
+{
+    use ngspice_rs::devices::{Forcing, Limit, TransientTiming};
+    use ngspice_rs::maths::integrator::{DEFAULT_XMU, IntegrationMethod, StepHistory};
+    let mut c = circuit(
+        "z1 d g 0 zm area=2 m=3\n.model zm nmf(vto=-1.8 beta=3m lambda=0.05 alpha=2.5 b=0.4 is=1p cgs=20p cgd=5p pb=0.8)",
+    )?;
+    c.finalize()?;
+    let width = c.unknown_count();
+    let [drain, gate] = ["d", "g"].map(|name| mos_jfet::row(&c, name));
+    let context = ModelContext::default();
+    let timing = TransientTiming::new(1e-6, 1e-3)?;
+    let prepared = c.prepare_run();
+    let dae = prepared.prepare_physical_dae(&context, timing)?;
+    let q = |a, b| qggnew(a, b, 0.8, 1. / 2.5, -1.8, 40e-12, 10e-12);
+    // Closed rectangle in the two normalized junction voltages. Each leg
+    // has an exact C charge increment; the net partition change is nonzero.
+    // The total charge returns to its starting value, not each branch.
+    let corners = [
+        [-1.2, -1.5],
+        [-0.4, -1.5],
+        [-0.4, -0.6],
+        [-1.2, -0.6],
+        [-1.2, -1.5],
+    ];
+    let expected = q(-0.4, -1.5) - q(-1.2, -1.5) + q(-1.2, -0.6) - q(-0.4, -0.6);
+    assert!(expected.abs() > 1e-12);
+    let point = |[gs, gd]: [f64; 2]| -> Result<Vector, SpiceError> {
+        let mut state = Vector::zeros(width);
+        state.set(gate, gs)?;
+        state.set(drain, gs - gd)?;
+        Ok(state)
+    };
+    let mut history = c.state_history()?;
+    let mut initial = history.trial();
+    let mut matrix = SparseMatrix::new(width, width);
+    let mut rhs = Vector::zeros(width);
+    c.load(
+        &LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &point(corners[0])?,
+            model_context: &context,
+            integration: None,
+            history: &history,
+            forcing: None,
+        },
+        &mut matrix,
+        &mut rhs,
+        &mut initial,
+    )?;
+    history.initialize(initial)?;
+    // MES's state layout includes QGS,CQGS,QGD,CQGD at offsets 9..13.
+    let charge_slots = [9, 11];
+    let start = charge_slots.map(|slot| history.accepted(1).unwrap()[slot]);
+    let mut integrated = [0.; 2];
+    let mut steps = StepHistory::new();
+    let dt = 1e-6;
+    let subdivisions = 128;
+    for (leg, pair) in corners.windows(2).enumerate() {
+        let a = pair[0];
+        let b = pair[1];
+        let delta = [
+            (b[0] - a[0]) / f64::from(subdivisions),
+            (b[1] - a[1]) / f64::from(subdivisions),
+        ];
+        for step in 0..subdivisions {
+            let time = (leg as f64 * f64::from(subdivisions) + f64::from(step + 1)) * dt;
+            let mid = std::array::from_fn(|i| (f64::from(step) + 0.5).mul_add(delta[i], a[i]));
+            let next = std::array::from_fn(|i| f64::from(step + 1).mul_add(delta[i], a[i]));
+            let mut jet = vec![Vector::zeros(dae.state_width()); 2];
+            jet[0].as_mut_slice()[..width].copy_from_slice(point(mid)?.as_slice());
+            jet[1].set(gate, delta[0])?;
+            jet[1].set(drain, delta[0] - delta[1])?;
+            let physical = dae.evaluate_taylor(&jet, time - dt / 2., dt, Limit::Right)?;
+            for (offset, value) in integrated.iter_mut().enumerate() {
+                *value -= dt
+                    * physical.rate.as_ref().unwrap().values[0]
+                        .get(width + offset)
+                        .unwrap();
+            }
+            let coefficients = steps.trial(IntegrationMethod::Trapezoidal, 1, dt, DEFAULT_XMU)?;
+            let mut trial = history.trial();
+            matrix.clear();
+            rhs.clear();
+            c.load(
+                &LoadRequest {
+                    mode: AnalysisMode::Transient { time, dt },
+                    solution: &point(next)?,
+                    model_context: &context,
+                    integration: Some(&coefficients),
+                    history: &history,
+                    forcing: Some(Forcing {
+                        limit: Limit::Right,
+                        timing,
+                    }),
+                },
+                &mut matrix,
+                &mut rhs,
+                &mut trial,
+            )?;
+            history.commit(trial)?;
+            steps.accept(&coefficients);
+        }
+    }
+    let final_charge = charge_slots.map(|slot| history.accepted(1).unwrap()[slot]);
+    for (index, sign) in [1., -1.].into_iter().enumerate() {
+        close(
+            final_charge[index] - start[index],
+            sign * expected,
+            1e-10,
+            1e-24,
+        );
+        close(integrated[index], sign * expected, 2e-5, 1e-20);
+    }
+    Ok(())
+}
+
+#[test]
+fn statz_control_jump_is_not_a_classical_charge_path() {
+    // The high-index branch selects the physical solver, but observes an
+    // unrelated smooth voltage so the error must be the Statz path itself.
+    let result = FIXTURE.run_all(
+        "vd d 0 0.3\nvg g 0 PWL(0 -0.7 5u -0.7 5u -0.5 20u -0.5)\nz1 d g 0 zm\n.model zm nmf(cgs=20p cgd=5p)\nvr r 0 PWL(0 0 20u 1)\nb1 out 0 v=1u*ddt(v(r))\nr1 out 0 1k\n.tran 1u 20u 0 1u uic"
+    );
+    let error = result
+        .expect_err("an undefined Statz impulse path must not be silently selected")
+        .to_string();
+    assert!(error.contains("z1") && error.contains("impulse"), "{error}");
 }

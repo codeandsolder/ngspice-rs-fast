@@ -726,6 +726,23 @@ impl Device for Mesfet {
         }
         .finish(context, start, &l)
     }
+    fn assemble_nonlinear_charge(
+        &self,
+        _context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        if self.model.cgs == 0. && self.model.cgd == 0. {
+            Ok(())
+        } else {
+            Err(SpiceError::Unsupported {
+                feature: format!(
+                    "memoryless physical charge for path-dependent MESFET {}",
+                    self.name
+                ),
+                location: None,
+            })
+        }
+    }
+
     fn physical_charge_histories(
         &self,
         visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
