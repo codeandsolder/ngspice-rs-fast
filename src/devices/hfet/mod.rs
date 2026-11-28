@@ -994,9 +994,42 @@ mod tests {
         assert_eq!(actual.a.triplets(), reference.a.triplets());
         assert_eq!(actual.e.triplets(), reference.e.triplets());
         assert_eq!(actual.e_groups, reference.e_groups);
-        for (actual, reference) in actual.e.triplets().iter().zip(reference.e.triplets()) {
-            assert_eq!(actual.value.to_bits(), reference.value.to_bits());
-        }
+        // The owned and borrowed paths share the assembler; check the
+        // independently specified contribution sequence as well. Ground
+        // and zero entries are omitted by the sparse storage, not reordered.
+        let row_a = unknowns.node_row(a).unwrap();
+        let row_b = unknowns.node_row(b).unwrap();
+        let ordered = |matrix: &crate::maths::SparseMatrix| {
+            matrix
+                .triplets()
+                .iter()
+                .map(|term| (term.row, term.col, term.value.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ordered(&actual.a),
+            [
+                (row_a, row_a, 1e16_f64.to_bits()),
+                (row_a, row_a, (-1e16_f64).to_bits()),
+                (row_a, row_a, 1_f64.to_bits()),
+                (row_a, row_b, (-2_f64).to_bits()),
+            ]
+        );
+        assert_eq!(
+            ordered(&actual.e),
+            [
+                (row_a, row_b, 3_f64.to_bits()),
+                (row_a, row_b, (-4_f64).to_bits()),
+            ]
+        );
+        assert_eq!(
+            node_stamps(&imaginary, StampPart::Imaginary)
+                .nth(2)
+                .unwrap()
+                .value
+                .to_bits(),
+            (-0_f64).to_bits()
+        );
     }
 
     #[test]

@@ -1330,6 +1330,41 @@ mod tests {
     }
 
     #[test]
+    fn temperature_defaults_preserve_every_given_flag() {
+        for model_given in [false, true] {
+            for delta_given in [false, true] {
+                for temp_given in [false, true] {
+                    let mut model =
+                        SensitivityRecord::new(SensitivityFamily::Jfet, ParameterScope::Model)
+                            .with("tnom", 320., model_given)
+                            .unwrap();
+                    let mut instance =
+                        SensitivityRecord::new(SensitivityFamily::Jfet, ParameterScope::Instance)
+                            .with("dtemp", -12., delta_given)
+                            .unwrap()
+                            .with("temp", 351., temp_given)
+                            .unwrap();
+                    super::junction_temperature_defaults(&mut model, &mut instance, 300., 310.)
+                        .unwrap();
+                    let delta = if delta_given { -12. } else { 0. };
+                    assert_eq!(
+                        model.value("tnom").unwrap(),
+                        if model_given { 320. } else { 300. }
+                    );
+                    assert_eq!(instance.value("dtemp").unwrap(), delta);
+                    assert_eq!(
+                        instance.value("temp").unwrap(),
+                        if temp_given { 351. } else { 310. + delta }
+                    );
+                    assert_eq!(model.given("tnom"), model_given);
+                    assert_eq!(instance.given("dtemp"), delta_given);
+                    assert_eq!(instance.given("temp"), temp_given);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scalar_layout_checks_identity_order_length_and_types() {
         let record = || SensitivityRecord::new(SensitivityFamily::Mutual, ParameterScope::Instance);
         let canonical = record()

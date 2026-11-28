@@ -109,7 +109,12 @@ own `AcSensitivityStamp`). Neither specialized reset stamps nor passive AC
 stamps are DC devices. The reset stamps reproduce the C load's elements in
 their original order, with all addends validated before a stamp group is
 written. Fixed-size stamp lists and borrowed iterators do not allocate temporary
-vectors or copy device metadata. Two fields escape the reset: MOS
+vectors or copy device metadata. Families with ordinary DC reconstruction
+and two-snapshot historical AC replay share the reconstruction protocol:
+`ResetAcDevice` defines only the family-specific ordered AC assembly,
+while `ResetDevicePair` owns the reset and current snapshots. Frequency,
+thermal defaults and record identities retain their original semantics.
+Two fields escape the reset: MOS
 `capbd`/`capbs` are instance fields written only by `MODEINITSMSIG` or
 transient loads, so they hold whatever an earlier `.op`, `.ac`, `.tran`,
 `.pz`, `.disto` or `.noise` of the deck left (measured: a `.op` before the
