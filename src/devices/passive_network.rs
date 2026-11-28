@@ -10,6 +10,7 @@ mod bias;
 mod damping;
 pub(super) use absent::AbsentStorage;
 mod report;
+pub(in crate::devices) mod topology;
 use bias::TerminalBias;
 use damping::DampingShunt;
 pub use damping::{AnalysisDamping, ConductanceLaw};
@@ -746,7 +747,10 @@ pub(super) enum NetworkPlan {
 
 impl NetworkPlan {
     /// Detect a resolved zero-copy prepared network before dynamic expansion.
-    pub(super) fn is_removed(instance: &crate::netlist::ast::DeviceInstance) -> SpiceResult<bool> {
+    pub(super) fn is_removed(
+        instance: &crate::netlist::ast::DeviceInstance,
+        graph: &topology::ReferenceGraph,
+    ) -> SpiceResult<bool> {
         if !matches!(instance.designator, 'c' | 'l')
             || !instance
                 .parameters
@@ -762,13 +766,14 @@ impl NetworkPlan {
             return Ok(false);
         }
         Ok(matches!(
-            Self::prepare(instance)?,
+            Self::prepare(instance, graph)?,
             Some(Self::Storage(None))
         ))
     }
 
     pub(super) fn prepare(
         instance: &crate::netlist::ast::DeviceInstance,
+        graph: &topology::ReferenceGraph,
     ) -> SpiceResult<Option<Self>> {
         use crate::netlist::ast::ParameterKind;
 
@@ -804,6 +809,7 @@ impl NetworkPlan {
                 ordinary.parameters.push(p.clone());
             }
         }
+        graph.select(instance, &mut values)?;
         let get = |key| values.get(key).copied();
         let zero = |key| get(key).unwrap_or(0.);
         if instance.designator == 'v' {

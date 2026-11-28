@@ -163,6 +163,7 @@ pub struct Circuit {
     devices: Vec<ElaboratedDevice>,
     absent_storage: super::passive_network::AbsentStorage,
     bindings: TopologyBindings,
+    deferred_topology: super::passive_network::topology::TopologyChoices,
     mutual_limits: MutualLimits,
     elaboration_limits: ElaborationLimits,
     binned_deck: Option<Arc<BinnedDeck>>,
@@ -1495,11 +1496,13 @@ impl Circuit {
     /// # Errors
     /// Unknown ordinal, or replacement of a generated/private-node device.
     pub fn replace_device(&mut self, index: usize, device: Box<dyn Device>) -> SpiceResult<()> {
-        let origin = &self
+        let previous = self
             .devices
             .get(index)
-            .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?
-            .origin;
+            .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?;
+        self.deferred_topology
+            .check_replacement(previous.as_ref(), device.as_ref())?;
+        let origin = &previous.origin;
         if origin.prepared_storage
             || !origin.internal_nodes.is_empty()
             || origin.generated_by.is_some()
@@ -2864,6 +2867,7 @@ impl Circuit {
     ///
     /// [`SpiceError::Circuit`] on a dangling terminal or a duplicate name.
     pub fn add_device(&mut self, device: Box<dyn Device>) -> SpiceResult<()> {
+        self.deferred_topology.check_device(device.as_ref())?;
         for terminal in device.terminals() {
             if self.nodes.node(*terminal).is_none() {
                 return Err(SpiceError::circuit(format!(
@@ -2930,6 +2934,7 @@ impl Circuit {
             let mut staged = Vec::new();
             reserve(&mut staged, generated.len(), None)?;
             for device in generated {
+                self.deferred_topology.check_device(device.as_ref())?;
                 if !seen.insert(device.name().to_lowercase()) {
                     return Err(SpiceError::circuit(format!(
                         "duplicate instance name '{}'",
@@ -4930,8 +4935,21 @@ impl Circuit {
     ) -> SpiceResult<()> {
         let existing = self.physical_elaboration_size()?;
         let limits = self.elaboration_limits;
+        use super::passive_network::topology::ReferenceGraph;
+        let new_selectors = ReferenceGraph::has_selectors(instances);
+        let mut graph = ReferenceGraph::collect(
+            instances,
+            new_selectors || !self.deferred_topology.is_empty(),
+        );
+        self.deferred_topology.check_append(&graph)?;
+        if new_selectors {
+            for device in &self.devices {
+                graph.include_device(device.as_ref());
+            }
+        }
+        let choices = graph.choices(instances);
         let mut absent = self.absent_storage.clone();
-        let present = absent.partition(instances, &self.nodes)?;
+        let present = absent.partition(instances, &self.nodes, &graph)?;
         let mut seen: BTreeSet<String> = self
             .devices
             .iter()
@@ -4963,8 +4981,15 @@ impl Circuit {
         let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
-        let mut plan =
-            PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
+        let mut plan = PlannedBatch::prepare(
+            instances,
+            models,
+            context,
+            &self.nodes,
+            existing,
+            limits,
+            &graph,
+        )?;
         plan.resistors = (!resistors.is_empty()).then_some(resistors);
         plan.deck_nodes.extend(absent.terminals.iter().cloned());
         let devices = &mut self.devices;
@@ -5011,6 +5036,7 @@ impl Circuit {
         }
         self.absent_storage = absent;
         self.devices.extend(staged);
+        self.deferred_topology.extend(choices);
         Ok(())
     }
 

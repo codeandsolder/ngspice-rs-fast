@@ -829,14 +829,11 @@ impl<'a> Expander<'a> {
                     }
                 }
                 RequestedVector::Current { device } => {
-                    *device = device_name(device, device.chars().next().unwrap_or_default(), path);
+                    *device = reference_name(device, path);
                 }
                 RequestedVector::Named { name, .. } if name.starts_with('@') => {
                     if let Some((device, parameter)) = name[1..].split_once('[') {
-                        *name = format!(
-                            "@{}[{parameter}",
-                            device_name(device, device.chars().next().unwrap_or_default(), path)
-                        );
+                        *name = format!("@{}[{parameter}", reference_name(device, path));
                     }
                 }
                 RequestedVector::All | RequestedVector::Named { .. } => {}
@@ -1017,25 +1014,14 @@ impl<'a> Expander<'a> {
                         }
                     }
                     BExprKind::Current(source) => {
-                        let designator = source
-                            .chars()
-                            .next()
-                            .unwrap_or_default()
-                            .to_ascii_lowercase();
-                        *source = device_name(source, designator, path);
+                        *source = reference_name(source, path);
                     }
                     _ => {}
                 });
                 continue;
             }
             if parameter.kind == ParameterKind::Instance {
-                let designator = parameter
-                    .value
-                    .chars()
-                    .next()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                parameter.value = device_name(&parameter.value, designator, path);
+                parameter.value = reference_name(&parameter.value, path);
             }
         }
     }
@@ -1291,8 +1277,7 @@ impl<'a> Expander<'a> {
                 if terminal.kind == CodePortKind::Digital {
                     Self::rewrite_digital_node(name, &terminals.digital, path)
                 } else if terminal.kind == CodePortKind::BranchCurrent {
-                    let designator = name.chars().next().unwrap_or_default().to_ascii_lowercase();
-                    device_name(name, designator, path)
+                    reference_name(name, path)
                 } else {
                     self.rewrite_node(name, &terminals.analog, path)
                 }
@@ -1489,6 +1474,32 @@ fn device_name(name: &str, designator: char, path: &str) -> String {
     } else {
         format!("{designator}.{path}.{name}")
     }
+}
+
+/// A native qualified descendant reference uses full instance names:
+/// `xouter::xinner::vdrive`. The path is relative to the enclosing occurrence.
+/// Unqualified references retain their existing instance-local meaning.
+/// Keep malformed or non-path names literal so ordinary reference validation
+/// diagnoses an unresolved target rather than silently guessing a designator.
+fn reference_name(name: &str, path: &str) -> String {
+    if let Some((ancestors, leaf)) = name.rsplit_once("::")
+        && !leaf.is_empty()
+        && ancestors.split("::").all(|part| part.starts_with('x'))
+    {
+        let designator = leaf.chars().next().unwrap_or_default().to_ascii_lowercase();
+        let descendants = ancestors.replace("::", ".");
+        let occurrence = if path.is_empty() {
+            descendants
+        } else {
+            format!("{path}.{descendants}")
+        };
+        return device_name(leaf, designator, &occurrence);
+    }
+    device_name(
+        name,
+        name.chars().next().unwrap_or_default().to_ascii_lowercase(),
+        path,
+    )
 }
 
 /// One formal default as a `.param` assignment, so that evaluation orders it
