@@ -627,3 +627,71 @@ fn continuous_physical_taylor_preserves_all_laws_and_one_sided_joins() -> SpiceR
     }
     Ok(())
 }
+
+#[test]
+fn derivative_arrays_follow_continuous_switches_and_current_ports() -> SpiceResult<()> {
+    let cards = "\
+Vctrl c 0 PWL(0 -0.5 2m 1.5)
+Ictrl 0 x PWL(0 -0.5 2m 1.5)
+Vsen x y 0
+Rsen y 0 1
+Vcommon cm 0 5
+Idiff cm ip PWL(0 -0.5 2m 1.5)
+Vb1 p1 0 1
+Vb2 p2 0 -2
+Vb3 p3 0 3
+A1 %gd(c 0) %gd(p1 0) mp
+A2 %id(ip cm) %gd(p2 0) ma
+A3 %vnam(vsen) %gd(p3 0) ma
+.model mp pswitch(cntl_off=0 cntl_on=1 r_on=10 r_off=1k log=true r_cntl_in=100)
+.model ma aswitch(cntl_off=0 cntl_on=1 r_on=10 r_off=1k log=true limit=true)
+B1 o1 0 v=1m*ddt(i(vb1))
+B2 o2 0 v=1m*ddt(i(vb2))
+B3 o3 0 v=1m*ddt(i(vb3))
+R1 o1 0 1k
+R2 o2 0 1k
+R3 o3 0 1k
+.options reltol=1e-8 vntol=1n";
+    let p = run(cards, AnalysisKind::Transient, &["5u", "2m", "0", "20u"])?;
+    let mut interior = 0;
+    let mut exterior = 0;
+    for k in 0..p.point_count() {
+        let t = value(&p, "time", k);
+        let x = 1000_f64.mul_add(t, -0.5);
+        let z = x.clamp(0., 1.);
+        let smooth = z * z * 2_f64.mul_add(-z, 3.);
+        let gp = 100_f64.powf(smooth) / 1000.;
+        let ga = 100_f64.powf(z) / 1000.;
+        for (name, want) in [
+            ("i(vb1)", -gp),
+            ("i(vb2)", 2. * ga),
+            ("i(vb3)", -3. * ga),
+            ("i(vsen)", x),
+            ("v(ip)", 5.),
+        ] {
+            close(name, value(&p, name, k), want, 1e-7, 1e-8);
+        }
+        // Exclude the exact derivative discontinuities of the exponential
+        // clamps, while retaining samples on both sides of each event.
+        if (x - 0.).abs() < 1e-7 || (x - 1.).abs() < 1e-7 || t == 0. || (t - 2e-3).abs() < 1e-12 {
+            continue;
+        }
+        let active = x > 0. && x < 1.;
+        let dp = if active {
+            gp * 100_f64.ln() * 6. * z * (1. - z)
+        } else {
+            0.
+        };
+        let da = if active { ga * 100_f64.ln() } else { 0. };
+        for (name, want) in [("v(o1)", -dp), ("v(o2)", 2. * da), ("v(o3)", -3. * da)] {
+            close(name, value(&p, name, k), want, 2e-6, 1e-8);
+        }
+        if active {
+            interior += 1;
+        } else {
+            exterior += 1;
+        }
+    }
+    assert!(interior > 10 && exterior > 10);
+    Ok(())
+}

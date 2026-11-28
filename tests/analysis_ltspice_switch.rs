@@ -733,8 +733,8 @@ fn continuous_ltspice_physical_taylor_matches_independent_current_and_jacobian()
         for control in [-1.5, -1., -0.37, 0.2, 1., 1.5, 5.] {
             for voltage in [-0.8, -offset - 0.2, -offset - 0.07, -offset, 0.35] {
                 let mut state = vec![Vector::zeros(c.unknown_count()); 9];
-                state[0].set(p, voltage + 0.25)?;
-                state[0].set(n, 0.25)?;
+                state[0].set(p, voltage)?;
+                state[0].set(n, 0.)?;
                 state[0].set(cp, control - 0.125)?;
                 state[0].set(cn, -0.125)?;
                 state[1].set(p, 0.0015)?;
@@ -845,5 +845,53 @@ fn continuous_series_flux_remains_a_physical_branch_coordinate() -> TestResult {
         1e-13,
         1e-20,
     );
+    Ok(())
+}
+
+#[test]
+fn derivative_arrays_use_physical_switch_tangent_not_ac_chord() -> TestResult {
+    let text = "\
+vc cp 0 PWL(0 -2 2m 2)
+vb p 0 0.5
+s1 p 0 cp 0 sw
+.model sw ltspice_switch(ron=.1 roff=100 vt=0 vh=-1 level=1 ilimit=.05)
+b1 out 0 v=1m*ddt(i(vb))
+r1 out 0 1k
+.options reltol=1e-8 vntol=1n";
+    let p = run(text, AnalysisKind::Transient, &["5u", "2m", "0", "20u"])?;
+    let mut limited = 0;
+    let mut active = 0;
+    for k in 0..p.point_count() {
+        let t = p.value("time", k).ok_or("time")?.re;
+        let x = 2000_f64.mul_add(t, -2.);
+        let z = f64::midpoint(x, 1.).clamp(0., 1.);
+        let g = 0.01 * 1000_f64.powf(z * z * 2_f64.mul_add(-z, 3.));
+        let i = (0.5 * g).min(0.05);
+        close(
+            "source current",
+            p.value("i(vb)", k).ok_or("source current")?.re,
+            -(i + 0.5e-12),
+            1e-7,
+            1e-9,
+        );
+        if t == 0. || (t - 2e-3).abs() < 1e-12 || (0.5 * g - 0.05).abs() < 1e-7 {
+            continue;
+        }
+        let dg = if x > -1. && x < 1. && 0.5 * g < 0.05 {
+            active += 1;
+            -0.5 * g * 1000_f64.ln() * 6. * z * (1. - z)
+        } else {
+            limited += 1;
+            0.
+        };
+        close(
+            "physical derivative",
+            p.value("v(out)", k).ok_or("derivative")?.re,
+            dg,
+            2e-6,
+            1e-8,
+        );
+    }
+    assert!(active > 10 && limited > 10);
     Ok(())
 }
