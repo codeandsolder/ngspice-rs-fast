@@ -1314,3 +1314,58 @@ fn bounded_transport_cancels_both_boundaries_when_new_arrival_definitely_precede
     assert!(trial.next_event_time().is_none());
     trial.commit()
 }
+
+#[test]
+fn shared_origin_ordered_xor_retains_both_overlapping_output_edges() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::{
+        DiagnosticDetail,
+        timing::{Arrival, Bounds, DelayWindow, Origin, TimingWindow},
+    };
+    use ngspice_rs::devices::code_model::{WindowDelays, WindowGate};
+    let mut network = Network::default();
+    let a = network.add_net();
+    let b = network.add_net();
+    let q = network.add_net();
+    let sa = network.add_source(a)?;
+    let sb = network.add_source(b)?;
+    let zero = DelayWindow::new(0., 0.)?;
+    network.add_model(
+        WindowGate::new(GateKind::Xor, 2, WindowDelays::binary(zero, zero))?,
+        &[a, b],
+        &[q],
+    )?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let low = Drive::strong(Logic::Zero);
+    let high = Drive::strong(Logic::One);
+    let first = TimingWindow::exact(0.)?.after(DelayWindow::new(10., 20.)?, Origin::shared(77))?;
+    let second = first.after(DelayWindow::new(2., 2.)?, Origin::shared(78))?;
+    let mut trial = engine.trial();
+    trial.schedule(sa, 0., low)?;
+    trial.schedule(sb, 0., low)?;
+    trial.schedule_arrival(sa, Arrival::new(low, high, first)?)?;
+    trial.schedule_arrival(sb, Arrival::new(low, high, second)?)?;
+    trial.advance_to(30.)?;
+    let actual: Vec<_> = trial
+        .changes()
+        .iter()
+        .filter(|c| c.net == q)
+        .map(|c| (c.time, c.drive.logic))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (0., Logic::Zero),
+            (10., Logic::Rising),
+            (12., Logic::Unknown),
+            (20., Logic::Falling),
+            (22., Logic::Zero)
+        ]
+    );
+    let warnings = trial.diagnostics();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let DiagnosticDetail::CumulativeAmbiguity { separation, .. } = warnings[0].detail else {
+        panic!("missing timing diagnostic");
+    };
+    assert_eq!(separation, Bounds::new(2., 2.)?);
+    trial.commit()
+}

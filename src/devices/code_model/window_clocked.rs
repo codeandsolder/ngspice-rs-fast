@@ -4,6 +4,7 @@
 use super::causal_history::{COMPARISON_BUDGET, InputEdge, PortHistory, Relation};
 use super::sequential_timing::{TimingContract, ViolationPolicy, may_trigger};
 use super::source_logic::{AsyncPolicy, ClockedKind, Edge, LogicKernel, Operation};
+use super::window_gate::WindowPaths;
 use super::{
     CodeModel, DelayMode, Delays, Drive, EventContext, Logic, ModelDiagnostic, ModelSchema, Output,
     WindowDelays,
@@ -26,6 +27,29 @@ pub(super) struct WindowClocked {
     clear: WindowDelays,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SelectedPaths {
+    One(WindowDelays),
+    Both(WindowDelays, WindowDelays),
+}
+
+impl From<WindowDelays> for SelectedPaths {
+    fn from(delays: WindowDelays) -> Self {
+        Self::One(delays)
+    }
+}
+
+impl SelectedPaths {
+    fn arrival(self, cause: &TimingWindow, from: Drive, to: Drive) -> SpiceResult<TimingWindow> {
+        let propagate =
+            |delay: WindowDelays| cause.after(delay.transition(from, to)?, Origin::independent()?);
+        match self {
+            Self::One(delay) => propagate(delay),
+            Self::Both(a, b) => TimingWindow::latest(vec![propagate(a)?, propagate(b)?]),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Capture {
     edge: InputEdge,
@@ -46,7 +70,11 @@ pub(super) struct WindowClockedState {
 }
 
 impl WindowClocked {
-    pub(super) fn new(kernel: LogicKernel, delays: WindowDelays) -> SpiceResult<Self> {
+    pub(super) fn new(
+        kernel: LogicKernel,
+        delays: WindowDelays,
+        paths: WindowPaths,
+    ) -> SpiceResult<Self> {
         let Operation::Clocked {
             kind,
             trigger,
@@ -55,18 +83,29 @@ impl WindowClocked {
         else {
             return Err(SpiceError::circuit("causal clocked binding mismatch"));
         };
-        let preset = kernel
-            .causal
-            .preset
-            .map(WindowDelays::exact)
-            .transpose()?
-            .unwrap_or(delays);
-        let clear = kernel
-            .causal
-            .clear
-            .map(WindowDelays::exact)
-            .transpose()?
-            .unwrap_or(delays);
+        let preset = match paths.preset {
+            Some(path) => path,
+            None => kernel
+                .causal
+                .preset
+                .map(WindowDelays::exact)
+                .transpose()?
+                .unwrap_or(delays),
+        };
+        let clear = match paths.clear {
+            Some(path) => path,
+            None => kernel
+                .causal
+                .clear
+                .map(WindowDelays::exact)
+                .transpose()?
+                .unwrap_or(delays),
+        };
+        if paths.gate.is_some() {
+            return Err(SpiceError::circuit(
+                "gate path requires transparent storage",
+            ));
+        }
         Ok(Self {
             kernel,
             kind,
@@ -156,15 +195,12 @@ impl WindowClocked {
         state: &mut WindowClockedState,
         value: Logic,
         cause: &TimingWindow,
-        delays: WindowDelays,
+        delays: SelectedPaths,
         waveform: &mut Vec<Arrival>,
     ) -> SpiceResult<()> {
         let target = self.kernel.strength.drive(value);
         if state.requested != target {
-            let window = cause.after(
-                delays.transition(state.requested, target)?,
-                Origin::independent()?,
-            )?;
+            let window = delays.arrival(cause, state.requested, target)?;
             waveform.push(Arrival::new(state.requested, target, window)?);
             state.requested = target;
         }
@@ -427,7 +463,7 @@ impl WindowClocked {
     fn control_edge(
         &self,
         changes: &[Option<InputEdge>],
-    ) -> SpiceResult<Option<(InputEdge, WindowDelays)>> {
+    ) -> SpiceResult<Option<(InputEdge, SelectedPaths)>> {
         let Some(_) = self.asynchronous else {
             return Ok(None);
         };
@@ -439,8 +475,8 @@ impl WindowClocked {
             .filter(|edge| edge.logic_changed());
         match (preset, clear) {
             (None, None) => Ok(None),
-            (Some(p), None) => Ok(Some((p.clone(), self.preset))),
-            (None, Some(c)) => Ok(Some((c.clone(), self.clear))),
+            (Some(p), None) => Ok(Some((p.clone(), self.preset.into()))),
+            (None, Some(c)) => Ok(Some((c.clone(), self.clear.into()))),
             (Some(p), Some(c)) => {
                 let separation = p.relative_to(c)?;
                 if !separation.is_exact() || separation.minimum() != 0. {
@@ -455,11 +491,11 @@ impl WindowClocked {
                     .ok_or_else(|| SpiceError::circuit("missing asynchronous policy"))?;
                 Ok(Some(
                     if p.to.logic == policy.preset && c.to.logic == policy.clear {
-                        (c.clone(), self.preset.latest(self.clear)?)
+                        (c.clone(), SelectedPaths::Both(self.preset, self.clear))
                     } else if c.to.logic == policy.clear {
-                        (c.clone(), self.clear)
+                        (c.clone(), self.clear.into())
                     } else {
-                        (p.clone(), self.preset)
+                        (p.clone(), self.preset.into())
                     },
                 ))
             }
@@ -577,7 +613,7 @@ impl CodeModel for WindowClocked {
                 .back()
                 .ok_or_else(|| SpiceError::circuit("missing revised capture"))?
                 .result;
-            self.transition(state, value, &cause, self.delays, &mut waveform)?;
+            self.transition(state, value, &cause, self.delays.into(), &mut waveform)?;
         }
         if let Some((edge, path)) = self.control_edge(&changes)? {
             if let Some(capture) = state.captures.back()
@@ -632,7 +668,13 @@ impl CodeModel for WindowClocked {
                     result: value,
                     poisoned,
                 });
-                self.transition(state, value, &edge.window, self.delays, &mut waveform)?;
+                self.transition(
+                    state,
+                    value,
+                    &edge.window,
+                    self.delays.into(),
+                    &mut waveform,
+                )?;
             }
         } else if width_poison {
             if let Some(capture) = state.captures.back_mut() {
@@ -646,7 +688,13 @@ impl CodeModel for WindowClocked {
                     .map(|edge| edge.window.clone())
                     .collect(),
             )?;
-            self.transition(state, Logic::Unknown, &cause, self.delays, &mut waveform)?;
+            self.transition(
+                state,
+                Logic::Unknown,
+                &cause,
+                self.delays.into(),
+                &mut waveform,
+            )?;
         }
         Ok(vec![if waveform.is_empty() {
             TimedOutput::Retain
@@ -686,6 +734,7 @@ mod tests {
         WindowClocked::new(
             kernel,
             WindowDelays::binary(DelayWindow::new(1., 2.)?, DelayWindow::new(1., 2.)?),
+            WindowPaths::default(),
         )
     }
 

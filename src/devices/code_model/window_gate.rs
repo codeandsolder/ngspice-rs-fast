@@ -58,34 +58,6 @@ impl WindowDelays {
         })
     }
 
-    pub(super) fn latest(self, other: Self) -> SpiceResult<Self> {
-        let latest = |a: DelayWindow, b: DelayWindow| {
-            DelayWindow::new(
-                a.bounds().minimum().max(b.bounds().minimum()),
-                a.bounds().maximum().max(b.bounds().maximum()),
-            )
-        };
-        let impedance = match (self.impedance, other.impedance) {
-            (Some(a), Some(b)) => Some([
-                latest(a[0], b[0])?,
-                latest(a[1], b[1])?,
-                latest(a[2], b[2])?,
-                latest(a[3], b[3])?,
-            ]),
-            (None, None) => None,
-            _ => {
-                return Err(SpiceError::circuit(
-                    "incompatible causal propagation path dimensions",
-                ));
-            }
-        };
-        Ok(Self {
-            rise: latest(self.rise, other.rise)?,
-            fall: latest(self.fall, other.fall)?,
-            impedance,
-        })
-    }
-
     fn envelope(a: DelayWindow, b: DelayWindow) -> SpiceResult<DelayWindow> {
         DelayWindow::new(
             a.bounds().minimum().min(b.bounds().minimum()),
@@ -152,17 +124,46 @@ impl WindowDelays {
     }
 }
 
+/// Per-cause propagation intervals. Omitted paths inherit the primary
+/// table or the corresponding explicitly declared exact path.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct WindowPaths {
+    pub(super) gate: Option<WindowDelays>,
+    pub(super) preset: Option<WindowDelays>,
+    pub(super) clear: Option<WindowDelays>,
+}
+
+impl WindowPaths {
+    pub(super) const fn any(self) -> bool {
+        self.gate.is_some() || self.preset.is_some() || self.clear.is_some()
+    }
+
+    pub(super) fn with_load(self, load: [Real; 3]) -> SpiceResult<Self> {
+        let apply = |path: Option<WindowDelays>| path.map(|d| d.with_load(load)).transpose();
+        Ok(Self {
+            gate: apply(self.gate)?,
+            preset: apply(self.preset)?,
+            clear: apply(self.clear)?,
+        })
+    }
+}
 /// A combinational gate transporting causal arrival expressions. A
 /// simultaneous group of monotone independent input transitions uses
 /// the appropriate earliest/latest join. Shared-origin simultaneous
 /// changes are evaluated as one correlated transition.
 #[derive(Debug)]
 pub struct WindowGate {
-    kind: GateKind,
+    function: GateFunction,
     inputs: usize,
     delays: WindowDelays,
     strength: DriveStrengths,
     invert: Vec<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GateFunction {
+    Boolean(GateKind),
+    TriState { active: Logic },
 }
 
 /// Disposable state of a causal gate.
@@ -184,11 +185,24 @@ impl WindowGate {
             return Err(SpiceError::circuit("invalid causal gate arity"));
         }
         Ok(Self {
-            kind,
+            function: GateFunction::Boolean(kind),
             inputs,
             delays,
             strength: DriveStrengths::uniform(Strength::STRONG),
             invert: vec![false; inputs],
+        })
+    }
+
+    pub(super) fn tristate(active: Logic, delays: WindowDelays) -> SpiceResult<Self> {
+        if !active.is_binary() {
+            return Err(SpiceError::circuit("invalid causal tri-state polarity"));
+        }
+        Ok(Self {
+            function: GateFunction::TriState { active },
+            inputs: 2,
+            delays,
+            strength: DriveStrengths::uniform(Strength::STRONG),
+            invert: vec![false; 2],
         })
     }
 
@@ -213,7 +227,18 @@ impl WindowGate {
                 }
             })
             .collect();
-        self.strength.drive(self.kind.evaluate(&inputs))
+        match self.function {
+            GateFunction::Boolean(kind) => self.strength.drive(kind.evaluate(&inputs)),
+            GateFunction::TriState { active } => {
+                if inputs[1].logic == active {
+                    self.strength.drive(inputs[0].logic)
+                } else if inputs[1].logic.is_binary() {
+                    Drive::default()
+                } else {
+                    self.strength.drive(Logic::Unknown)
+                }
+            }
+        }
     }
 
     fn initial(
@@ -252,7 +277,12 @@ impl WindowGate {
         if same {
             return Ok(first.window().clone());
         }
-        let base = match self.kind {
+        let GateFunction::Boolean(kind) = self.function else {
+            return Err(SpiceError::circuit(
+                "independently ordered tri-state transitions require a conditional waveform",
+            ));
+        };
+        let base = match kind {
             GateKind::And | GateKind::Nand => GateKind::And,
             GateKind::Or | GateKind::Nor => GateKind::Or,
             _ => {
@@ -261,7 +291,7 @@ impl WindowGate {
                 ));
             }
         };
-        let raw_target = if matches!(self.kind, GateKind::Nand | GateKind::Nor) {
+        let raw_target = if matches!(kind, GateKind::Nand | GateKind::Nor) {
             target.logic.invert()
         } else {
             target.logic
@@ -297,6 +327,99 @@ impl WindowGate {
             }
             _ => TimingWindow::earliest(arrivals),
         }
+    }
+}
+
+/// Return a causal total preorder when provable from relative timing.
+/// Sorting by absolute lower/upper endpoints cannot reverse a strict
+/// physical order, because the bounds are monotone in delay origins.
+/// Adjacent relations suffice by transitivity.
+fn ordered_groups(transitions: &[(usize, Arrival)]) -> SpiceResult<Option<Vec<Vec<usize>>>> {
+    let mut order: Vec<_> = (0..transitions.len()).collect();
+    order.sort_by(|&a, &b| {
+        let a = transitions[a].1.window().bounds();
+        let b = transitions[b].1.window().bounds();
+        a.minimum()
+            .total_cmp(&b.minimum())
+            .then_with(|| a.maximum().total_cmp(&b.maximum()))
+    });
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for index in order {
+        if let Some(group) = groups.last_mut() {
+            let previous = group[0];
+            let a = transitions[previous].1.window();
+            let b = transitions[index].1.window();
+            if a.same_expression(b) {
+                group.push(index);
+                continue;
+            }
+            let separation = b.relative_to(a, 100_000)?;
+            if separation.is_exact() && separation.minimum() == 0. {
+                group.push(index);
+                continue;
+            }
+            if separation.minimum() <= 0. {
+                return Ok(None);
+            }
+        }
+        groups.push(vec![index]);
+    }
+    Ok(Some(groups))
+}
+
+fn strictly_after(new: &[(usize, Arrival)], old: &[(usize, Arrival)]) -> SpiceResult<bool> {
+    for (_, next) in new {
+        for (_, prior) in old {
+            if next
+                .window()
+                .relative_to(prior.window(), 100_000)?
+                .minimum()
+                <= 0.
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+impl WindowGate {
+    fn ordered_waveform(
+        &self,
+        state: &WindowGateState,
+        transitions: &[(usize, Arrival)],
+        previous: Drive,
+        groups: Vec<Vec<usize>>,
+    ) -> SpiceResult<Vec<Arrival>> {
+        let mut drives = state.inputs.clone();
+        let mut prior = previous;
+        let mut waveform = Vec::new();
+        for group in groups {
+            let cause = transitions[group[0]].1.window();
+            for index in group {
+                let (port, arrival) = &transitions[index];
+                drives[*port] = arrival.to();
+            }
+            let target = self.drive(&drives);
+            if target != prior {
+                let delay = self.delays.transition(prior, target)?;
+                let window = cause.after(delay, Origin::independent()?)?;
+                waveform.push(Arrival::new(prior, target, window)?);
+                prior = target;
+            }
+        }
+        Ok(waveform)
+    }
+
+    fn remember(
+        state: &mut WindowGateState,
+        inputs: &[TimedInput],
+        next: Vec<Drive>,
+        target: Drive,
+    ) {
+        state.inputs = next;
+        state.arrivals = inputs.iter().map(|i| i.arrival.clone()).collect();
+        state.requested = Some(target);
     }
 }
 
@@ -377,6 +500,23 @@ impl CodeModel for WindowGate {
         let previous = state
             .requested
             .ok_or_else(|| SpiceError::circuit("causal gate has no initial output"))?;
+        // A physically later announcement can follow a still-active
+        // earlier envelope. Keep both transitions instead of refusing
+        // overlap or treating the old boundary as another edge.
+        if (old_active.is_empty() || strictly_after(&transitions, &old_active)?)
+            && let Some(groups) = ordered_groups(&transitions)?
+        {
+            let waveform = self.ordered_waveform(state, &transitions, previous, groups)?;
+            if let Some(last) = waveform.last() {
+                state.last_output = Some(last.clone());
+            }
+            Self::remember(state, inputs, next, target);
+            return Ok(vec![if waveform.is_empty() {
+                TimedOutput::Retain
+            } else {
+                TimedOutput::Waveform(waveform)
+            }]);
+        }
         let instantaneous: Vec<_> = inputs.iter().map(|i| i.drive).collect();
         let current = self.drive(&instantaneous);
         if !old_active.is_empty() {
@@ -434,9 +574,7 @@ impl CodeModel for WindowGate {
             state.last_output = Some(arrival.clone());
             TimedOutput::Arrival(arrival)
         };
-        state.inputs = next;
-        state.arrivals = inputs.iter().map(|i| i.arrival.clone()).collect();
-        state.requested = Some(target);
+        Self::remember(state, inputs, next, target);
         Ok(vec![result])
     }
 }

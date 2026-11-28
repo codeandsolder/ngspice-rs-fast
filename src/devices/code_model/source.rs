@@ -213,11 +213,21 @@ impl SourceModel {
                     Some(Integer)
                 }
                 "delay" | "low" | "high" | "output_capacitance" | "pulse_reject" => Some(Real),
-                "input_capacitance" | "load_resistance" | "delay_paths" | "delay_windows"
-                | "delay_gate" | "delay_preset" | "delay_clear" | "timing_setup"
-                | "timing_hold" | "timing_clock_min" | "timing_async_min" | "timing_recovery" => {
-                    Some(RealVector)
-                }
+                "input_capacitance"
+                | "load_resistance"
+                | "delay_paths"
+                | "delay_windows"
+                | "delay_gate"
+                | "delay_preset"
+                | "delay_clear"
+                | "delay_gate_windows"
+                | "delay_preset_windows"
+                | "delay_clear_windows"
+                | "timing_setup"
+                | "timing_hold"
+                | "timing_clock_min"
+                | "timing_async_min"
+                | "timing_recovery" => Some(RealVector),
                 "inertial" => Some(Boolean),
                 "inverted" => Some(BooleanVector),
                 "rx_ic" | "async_policy" | "strength_paths" => Some(IntegerVector),
@@ -375,6 +385,7 @@ fn validate_value(
 use super::pulse::PulseFilter;
 use super::sequential_timing::TimingSpec;
 use super::source_logic::{AsyncPolicy, CausalPaths, DriveStrengths, LogicKernel, Operation};
+use super::window_gate::WindowPaths;
 use super::{
     Adc, AnalogOutputConfig, AnalogOutputDevice, ConductanceConfig, DacConfig, DelayMode, Delays,
     Drive, GapPolicy, Logic, OutputPort, RangeReceiver, Strength, VoltageRange,
@@ -394,6 +405,7 @@ struct LogicMaterial {
     operation: Real,
     delays: Delays,
     windows: Option<super::WindowDelays>,
+    window_paths: WindowPaths,
     causal: CausalPaths,
     inertial: bool,
     pulse: Option<PulseFilter>,
@@ -417,6 +429,7 @@ impl Default for LogicMaterial {
             operation: 0.,
             delays: Delays::ZERO,
             windows: None,
+            window_paths: WindowPaths::default(),
             causal: CausalPaths::default(),
             inertial: true,
             pulse: None,
@@ -477,6 +490,37 @@ fn nonnegative(value: Real) -> SpiceResult<Real> {
     }
 }
 
+fn window_delays(values: &[Real]) -> SpiceResult<super::WindowDelays> {
+    use crate::analysis::digital::timing::DelayWindow;
+    match values {
+        [rmin, rmax, fmin, fmax] => Ok(super::WindowDelays::binary(
+            DelayWindow::new(*rmin, *rmax)?,
+            DelayWindow::new(*fmin, *fmax)?,
+        )),
+        [a, b, c, d, e, f, g, h, i, j, k, l] => Ok(super::WindowDelays::paths([
+            DelayWindow::new(*a, *b)?,
+            DelayWindow::new(*c, *d)?,
+            DelayWindow::new(*e, *f)?,
+            DelayWindow::new(*g, *h)?,
+            DelayWindow::new(*i, *j)?,
+            DelayWindow::new(*k, *l)?,
+        ])),
+        _ => Err(SpiceError::circuit(
+            "delay window table requires four or twelve directional bounds",
+        )),
+    }
+}
+
+fn exact_delays(values: &[Real]) -> SpiceResult<Delays> {
+    match values {
+        [rise, fall] => Delays::new(*rise, *fall),
+        [a, b, c, d, e, f] => Delays::paths([*a, *b, *c, *d, *e, *f]),
+        _ => Err(SpiceError::circuit(
+            "delay path table requires two or six directional values",
+        )),
+    }
+}
+
 impl LogicMaterial {
     fn compile(card: &ModelCard) -> SpiceResult<Self> {
         SourceModel::LogicEvent.validate_parameters(card)?;
@@ -498,17 +542,7 @@ impl LogicMaterial {
                         let delay = numeric_scalar(parameter)?;
                         Delays::new(delay, delay)?
                     } else {
-                        match numeric_vector(parameter)?.as_slice() {
-                            [rise, fall] => Delays::new(*rise, *fall)?,
-                            [rise, fall, lz, hz, zl, zh] => {
-                                Delays::paths([*rise, *fall, *lz, *hz, *zl, *zh])?
-                            }
-                            _ => {
-                                return Err(SpiceError::circuit(
-                                    "delay_paths requires two or six directional values",
-                                ));
-                            }
-                        }
+                        exact_delays(&numeric_vector(parameter)?)?
                     };
                 }
                 "delay_windows" => {
@@ -518,41 +552,35 @@ impl LogicMaterial {
                         ));
                     }
                     timing_given = true;
-                    use crate::analysis::digital::timing::DelayWindow;
-                    let values = numeric_vector(parameter)?;
-                    material.windows = Some(match values.as_slice() {
-                        [rmin, rmax, fmin, fmax] => super::WindowDelays::binary(
-                            DelayWindow::new(*rmin, *rmax)?,
-                            DelayWindow::new(*fmin, *fmax)?,
-                        ),
-                        [a, b, c, d, e, f, g, h, i, j, k, l] => super::WindowDelays::paths([
-                            DelayWindow::new(*a, *b)?,
-                            DelayWindow::new(*c, *d)?,
-                            DelayWindow::new(*e, *f)?,
-                            DelayWindow::new(*g, *h)?,
-                            DelayWindow::new(*i, *j)?,
-                            DelayWindow::new(*k, *l)?,
-                        ]),
-                        _ => {
-                            return Err(SpiceError::circuit(
-                                "delay_windows requires four or twelve directional bounds",
-                            ));
-                        }
-                    });
+                    material.windows = Some(window_delays(&numeric_vector(parameter)?)?);
                 }
-                "delay_gate" | "delay_preset" | "delay_clear" => {
-                    let [rise, fall]: [Real; 2] =
-                        numeric_vector(parameter)?.try_into().map_err(|_| {
-                            SpiceError::circuit(
-                                "causal propagation path requires two directional values",
-                            )
-                        })?;
-                    let target = match parameter.name.as_str() {
-                        "delay_gate" => &mut material.causal.gate,
-                        "delay_preset" => &mut material.causal.preset,
-                        _ => &mut material.causal.clear,
+                "delay_gate"
+                | "delay_preset"
+                | "delay_clear"
+                | "delay_gate_windows"
+                | "delay_preset_windows"
+                | "delay_clear_windows" => {
+                    let (exact, window) = match parameter.name.as_str() {
+                        "delay_gate" | "delay_gate_windows" => {
+                            (&mut material.causal.gate, &mut material.window_paths.gate)
+                        }
+                        "delay_preset" | "delay_preset_windows" => (
+                            &mut material.causal.preset,
+                            &mut material.window_paths.preset,
+                        ),
+                        _ => (&mut material.causal.clear, &mut material.window_paths.clear),
                     };
-                    *target = Some(Delays::new(rise, fall)?);
+                    if exact.is_some() || window.is_some() {
+                        return Err(SpiceError::circuit(
+                            "duplicate causal propagation path declaration",
+                        ));
+                    }
+                    let values = numeric_vector(parameter)?;
+                    if parameter.name.ends_with("_windows") {
+                        *window = Some(window_delays(&values)?);
+                    } else {
+                        *exact = Some(exact_delays(&values)?);
+                    }
                 }
                 "inertial" | "pulse_reject" => {
                     if mode_given {
@@ -660,6 +688,9 @@ impl LogicMaterial {
                 _ => return Err(SpiceError::circuit("unregistered logic parameter")),
             }
         }
+        if material.window_paths.any() && material.windows.is_none() {
+            material.windows = Some(super::WindowDelays::exact(material.delays)?);
+        }
         if material.windows.is_some() {
             if material.pulse.is_some() || (mode_given && material.inertial) {
                 return Err(SpiceError::circuit(
@@ -734,12 +765,27 @@ impl LogicMaterial {
         }
         let operation = Operation::from_value(self.operation, inputs, self.asynchronous)?;
         self.causal.validate(operation)?;
-        let timing = self.timing.bind(operation, inputs)?;
-        if self.windows.is_some()
-            && !matches!(operation, Operation::Gate(_) | Operation::Clocked { .. })
+        if self.window_paths.gate.is_some() && !operation.has_gate_path() {
+            return Err(SpiceError::circuit(
+                "gate propagation windows require transparent storage",
+            ));
+        }
+        if (self.window_paths.preset.is_some() || self.window_paths.clear.is_some())
+            && !operation.has_async_paths()
         {
             return Err(SpiceError::circuit(
-                "causal arrival windows require a combinational gate or clocked storage",
+                "asynchronous propagation windows require preset/clear ports",
+            ));
+        }
+        let timing = self.timing.bind(operation, inputs)?;
+        if self.windows.is_some()
+            && !matches!(
+                operation,
+                Operation::Gate(_) | Operation::TriState(_) | Operation::Clocked { .. }
+            )
+        {
+            return Err(SpiceError::circuit(
+                "causal arrival windows require a combinational gate, tri-state driver or clocked storage",
             ));
         }
         let kernel = LogicKernel {
@@ -782,6 +828,7 @@ struct LogicReceiverDevice {
     output: String,
     kernel: LogicKernel,
     windows: Option<super::WindowDelays>,
+    window_paths: WindowPaths,
     margin: Option<std::num::NonZeroU8>,
     output_capacitance: Real,
     load_resistance: Option<[Real; 3]>,
@@ -1024,6 +1071,7 @@ pub(in crate::devices) fn instantiate(
                 output: output.terminals[0].positive.clone(),
                 kernel,
                 windows: material.windows,
+                window_paths: material.window_paths,
                 margin: material.margin,
                 output_capacitance: material.output_capacitance,
                 load_resistance: material.load_resistance,
@@ -1170,6 +1218,7 @@ fn bind_receiver(
     }
     let mut kernel = device.kernel.clone();
     let mut windows = device.windows;
+    let mut window_paths = device.window_paths;
     if let Some(resistances) = device.load_resistance {
         let total = capacitances
             .get(device.output.as_str())
@@ -1182,6 +1231,7 @@ fn bind_receiver(
         kernel.delays = kernel.delays.with_load(load)?;
         kernel.causal = kernel.causal.with_load(load)?;
         windows = windows.map(|w| w.with_load(load)).transpose()?;
+        window_paths = window_paths.with_load(load)?;
     }
     if let Some(windows) = windows {
         match kernel.operation {
@@ -1190,9 +1240,14 @@ fn bind_receiver(
                     .with_binding(kernel.strength, kernel.invert);
                 network.add_named_model(&device.name, model, &inputs, &[output])
             }
+            Operation::TriState(active) => {
+                let model = super::WindowGate::tristate(active, windows)?
+                    .with_binding(kernel.strength, kernel.invert);
+                network.add_named_model(&device.name, model, &inputs, &[output])
+            }
             Operation::Clocked { .. } => network.add_named_model(
                 &device.name,
-                super::window_clocked::WindowClocked::new(kernel, windows)?,
+                super::window_clocked::WindowClocked::new(kernel, windows, window_paths)?,
                 &inputs,
                 &[output],
             ),

@@ -258,3 +258,23 @@ where needed. Resolving ordinal strengths first would discard parallel
 drive paths, and storing the last logical value would discard leakage.
 The physical RC network retains charge independently of the digital
 event history.
+
+For bounded transport, causally ordered input transitions are evaluated
+in their provable physical order even when their absolute timing windows
+overlap. Equal arrival expressions are evaluated together. The output
+may therefore contain several arrivals; preserving each expression
+retains common-origin correlation in downstream timing checks. This
+applies to non-monotone gates and tri-state enables as well as binary
+gates. Where no total order can be proven, monotone earliest/latest
+joins remain available; conditional waveforms and revision of previously
+announced arrivals are not silently replaced by scalar timing.
+
+For clocked storage, `delay_preset_windows` and `delay_clear_windows`
+are independent bounded propagation tables. As with `delay_windows`,
+each takes four directional bounds (rise min/max, fall min/max) or
+twelve bounds for all six paths. An omitted primary bounded table uses
+the explicitly declared exact primary delay. Exact secondary path tables
+accept two or six values; each secondary path has exactly one declaration.
+When both asynchronous controls assert at the same causal instant, their
+two propagation expressions are joined by latest arrival. Resistive
+loading applies independently to each declared path.

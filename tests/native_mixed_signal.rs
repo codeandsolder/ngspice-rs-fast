@@ -1063,3 +1063,58 @@ fn independent_physical_driver_branches_retain_charge_after_disconnect() -> Spic
     assert!(samples.iter().all(|&n| n > 20), "{samples:?}");
     Ok(())
 }
+
+#[test]
+fn bounded_async_paths_are_independent_of_primary_clock_delay() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vd data 0 0\nvc clk 0 0\n\
+         vp p 0 PWL(0 0 1u 0 1002n 4 1500n 4 1502n 0 3u 0)\n\
+         vr reset 0 PWL(0 0 2u 0 2002n 4 3u 4)\n\
+         a1 %v[data clk p reset] q ff\n.model ff preprocess_logic_event(operation=11 async_policy=[1 1 2] delay=0 delay_preset_windows=[10n 20n 30n 40n] delay_clear_windows=[50n 60n 70n 80n])\n\
+         a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "3u", "0", "1n"])?;
+    let boundaries = [1.0115e-6, 1.0215e-6, 2.0715e-6, 2.0815e-6];
+    let mut samples = [0; 5];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        if boundaries.iter().any(|b| (t - b).abs() <= 1.1e-9) {
+            continue;
+        }
+        let region = boundaries.iter().filter(|&&b| t > b).count();
+        close(output(&plot, i), [0., 2.5, 5., 2.5, 0.][region]);
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 4), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn bounded_tristate_uses_declared_impedance_paths() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 4\nve en 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 3u 0)\n\
+         a1 %v[data en] q tri\n.model tri preprocess_logic_event(operation=21 delay_windows=[1n 2n 3n 4n 5n 6n 7n 8n 9n 10n 11n 12n])\n\
+         a2 q %gd(out hi) b\n.model b preprocess_logic_conductance(conductance=[0 .01 .003 0 0 0 0])\nr1 out 0 1k",
+    )?;
+    let plot = run(
+        &mut c,
+        AnalysisKind::Transient,
+        &["0.1n", "3u", "0", "0.1n"],
+    )?;
+    let boundaries = [1.0125e-6, 1.0135e-6, 2.008e-6, 2.009e-6];
+    let mut samples = [0; 5];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        if boundaries.iter().any(|b| (t - b).abs() <= 0.11e-9) {
+            continue;
+        }
+        let region = boundaries.iter().filter(|&&b| t > b).count();
+        close(
+            output(&plot, i),
+            [0., 3.75, 5. * 0.01 / 0.011, 3.75, 0.][region],
+        );
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 4), "{samples:?}");
+    Ok(())
+}
