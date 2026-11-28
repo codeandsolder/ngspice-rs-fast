@@ -1262,6 +1262,18 @@ mod tests {
         };
         // A zero contribution is discarded before testing the capacity.
         plan.send(&mut kernel, time, other, &[0.; 4]).unwrap();
+        // Exercise the same ordering for an actually pruned nonzero arrival.
+        // This time is well after the physical first path to the target.
+        assert!(plan.first_at_node[0][other.target] < first.hi);
+        plan.path_bound = Some(vec![1.; plan.terminal + plan.launch.len()]);
+        kernel.remaining_roundoff.fill(1e-9);
+        let small: Real = 1e-12;
+        plan.send(&mut kernel, time, other, &[small, 0., 0., 0.])
+            .unwrap();
+        assert_eq!(
+            kernel.remaining_roundoff[0].to_bits(),
+            (1e-9 - small.next_up()).next_down().to_bits(),
+        );
         assert!(
             plan.send(&mut kernel, time, other, &[1., 0., 0., 0.])
                 .is_err()
