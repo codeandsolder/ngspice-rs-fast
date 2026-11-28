@@ -75,6 +75,7 @@ pub struct PhysicalDae<'run, 'circuit> {
     model: ModelContext,
     timing: TransientTiming,
     linear: crate::devices::linear::LinearSystem,
+    regularization: Real,
     history: StateHistory,
     trial: Option<TrialState>,
     rhs: Vector,
@@ -97,11 +98,14 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             ));
         }
         linear.bind_transient_timing(&timing)?;
+        let regularization = circuit.continuation_diagonal();
+        circuit.stamp_nodal_regularization(&mut linear.a, regularization)?;
         Ok(Self {
             run,
             model,
             timing,
             linear,
+            regularization,
             history: circuit.independent_state_history()?,
             trial: None,
             rhs: Vector::zeros(n),
@@ -270,6 +274,9 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         );
         self.trial = Some(trial);
         loaded?;
+        self.run
+            .circuit()
+            .stamp_nodal_regularization(&mut point.conductance, self.regularization)?;
         point
             .conductance
             .mul_vector_into(state, &mut point.residual)?;

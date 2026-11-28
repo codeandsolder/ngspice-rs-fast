@@ -2246,7 +2246,7 @@ impl Circuit {
     }
 
     /// Accepted event work from the most recent successful native mixed analysis.
-    #[must_use]
+    #[must_use = "the returned statistics describe accepted event work from the last successful analysis"]
     pub const fn last_digital_stats(&self) -> Option<crate::analysis::digital::Stats> {
         self.runtime.last_digital_stats
     }
@@ -2749,6 +2749,22 @@ impl Circuit {
 
     pub(crate) fn regularization_nodes(&self) -> Option<&[usize]> {
         self.bindings.regularization_nodes.as_deref()
+    }
+
+    /// Stamp the requested conductance only on original electrical KCL rows.
+    pub(crate) fn stamp_nodal_regularization(
+        &self,
+        matrix: &mut SparseMatrix,
+        conductance: Real,
+    ) -> SpiceResult<()> {
+        if let Some(rows) = self.regularization_nodes()
+            && conductance > 0.
+        {
+            for &row in rows {
+                matrix.add(row, row, conductance)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn private_storage_rows(&self) -> &[(usize, usize)] {
