@@ -468,10 +468,17 @@ impl Bsim4 {
             context.stamp_rhs(a, pol * scale * rhs)?;
             context.stamp_rhs(b, -pol * scale * rhs)?;
         }
+        // A static physical point has no integration companion. Initialize
+        // inactive coordinates and provisional rates explicitly; the accepted
+        // derivative-array candidate replaces the active history rates.
+        let mut states = [0.; state::COUNT];
         for (slot, _, law) in point.charges {
-            context.states.set(slot, law.value.value())?;
+            states[slot] = law.value.value();
         }
         for (slot, value) in point.auxiliary {
+            states[slot] = value;
+        }
+        for (slot, value) in states.into_iter().enumerate() {
             context.states.set(slot, value)?;
         }
         Ok(())

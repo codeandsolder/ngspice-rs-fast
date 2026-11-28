@@ -4,8 +4,8 @@
 //! physical time scale to the k-th power. Products and elementary functions
 //! use coefficient recurrences, not differences of nearly equal samples.
 
-mod arithmetic;
-mod local;
+pub(crate) mod arithmetic;
+pub(crate) mod local;
 pub(crate) use arithmetic::{BranchComparison, ObservedDifferential};
 pub(crate) use local::Local;
 pub mod differential;
