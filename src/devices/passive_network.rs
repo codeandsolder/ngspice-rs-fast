@@ -747,7 +747,10 @@ pub(super) enum NetworkPlan {
 
 impl NetworkPlan {
     /// Detect a resolved zero-copy prepared network before dynamic expansion.
-    pub(super) fn is_removed(instance: &crate::netlist::ast::DeviceInstance) -> SpiceResult<bool> {
+    pub(super) fn is_removed(
+        instance: &crate::netlist::ast::DeviceInstance,
+        graph: &topology::ReferenceGraph,
+    ) -> SpiceResult<bool> {
         if !matches!(instance.designator, 'c' | 'l')
             || !instance
                 .parameters
@@ -763,7 +766,7 @@ impl NetworkPlan {
             return Ok(false);
         }
         Ok(matches!(
-            Self::prepare(instance)?,
+            Self::prepare(instance, graph)?,
             Some(Self::Storage(None))
         ))
     }

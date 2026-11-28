@@ -4949,7 +4949,7 @@ impl Circuit {
         }
         let choices = graph.choices(instances);
         let mut absent = self.absent_storage.clone();
-        let present = absent.partition(instances, &self.nodes)?;
+        let present = absent.partition(instances, &self.nodes, &graph)?;
         let mut seen: BTreeSet<String> = self
             .devices
             .iter()

@@ -41,6 +41,7 @@ impl AbsentStorage {
     pub(in crate::devices) fn validate_voltage_binding(
         &self,
         nodes: &NodeTable,
+        graph: &super::topology::ReferenceGraph,
     ) -> SpiceResult<()> {
         if let Some(name) = self
             .zero_voltage_reads
@@ -61,10 +62,11 @@ impl AbsentStorage {
         &mut self,
         instances: &'a [DeviceInstance],
         nodes: &NodeTable,
+        graph: &super::topology::ReferenceGraph,
     ) -> SpiceResult<Cow<'a, [DeviceInstance]>> {
         let mut removed = BTreeSet::new();
         for (index, instance) in instances.iter().enumerate() {
-            if !NetworkPlan::is_removed(instance)? {
+            if !NetworkPlan::is_removed(instance, graph)? {
                 continue;
             }
             if !self.names.insert(instance.name.to_lowercase()) {
