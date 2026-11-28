@@ -1240,6 +1240,16 @@ mod boundary_tests {
                 &AnalysisContext::default(),
             )
             .unwrap_err();
-        assert!(error.to_string().contains("nonempty square"), "{error}");
+        // Zero-dimensional MNA has a valid empty solution, but an OP with
+        // no observable variables is not a representable nonempty plot.
+        assert!(
+            matches!(
+                &error,
+                SpiceError::Numerical { context, message }
+                    if context == "plot op1"
+                        && message == "zero variables with nonzero points outside a rootless pole-zero result"
+            ),
+            "{error}"
+        );
     }
 }
