@@ -1713,3 +1713,205 @@ fn diode_breakdown_charge_discontinuity_requires_an_impulse() {
         );
     }
 }
+
+/// Check every accepted physical point and require both interior events,
+/// using an independent physical oracle rather than sampled derivatives.
+fn qualify_constitutive_crossings(
+    body: &str,
+    stop: &str,
+    observation: &str,
+    boundaries: [f64; 2],
+    check: impl Fn(&Plot, usize, [bool; 2]),
+) -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["0.4u", stop, "0", "0.4u", "uic", method],
+            &[observation],
+        )?;
+        let mut seen = [false; 2];
+        for index in 0..plot.point_count() {
+            let time = plot.value("time", index).unwrap().re;
+            let at = boundaries.map(|boundary| (time - boundary).abs() <= 1e-17);
+            for (hit, seen) in at.into_iter().zip(&mut seen) {
+                *seen |= hit;
+            }
+            check(&plot, index, at);
+        }
+        assert_eq!(seen, [true; 2], "{method}");
+    }
+    Ok(())
+}
+
+#[test]
+fn diode_high_injection_cutoff_localizes_the_actual_current_threshold() -> SpiceResult<()> {
+    // The branch threshold is defined in amperes, not in junction voltage.
+    // These intentionally small IS/IKF expose the real discontinuity at
+    // 1e-18 A without the ordinary junction gmin obscuring the witness.
+    let body = "vdrive in 0 PWL(0 0 2u 0.4 4u 0)\nd1 in 0 dm\n.model dm d(is=1e-18 n=10 ikf=1e-18)\nb1 out 0 v=1u*ddt(v(in))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n abstol=1e-24 gmin=1e-24";
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    let crossing = thermal * std::f64::consts::LN_2 / 2e5;
+    qualify_constitutive_crossings(
+        body,
+        "4u",
+        "@d1[i]",
+        [crossing, 4e-6 - crossing],
+        |plot, index, [entering, leaving]| {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let voltage = at("v(in)");
+            let current = 1e-18 * (voltage / thermal).exp_m1();
+            let limited = entering || (!leaving && current > 1e-18);
+            let expected = if limited {
+                current / (1. + (current / 1e-18).sqrt())
+            } else {
+                current
+            } + 1e-24 * voltage;
+            close(at("@d1[i]"), expected, 1e-21);
+            close(at("i(vdrive)"), -expected, 1e-21);
+        },
+    )
+}
+
+#[test]
+fn jfet_cutoff_crossings_follow_the_gate_overdrive() -> SpiceResult<()> {
+    let body = "vd d 0 1\nvg g 0 PWL(0 -3 1.9073486328125e-6 -1 3.814697265625e-6 -3)\nj1 d g 0 jm\n.model jm njf(vto=-2 beta=1m lambda=0 b=1 is=1e-15 n=10)\nb1 out 0 v=1u*ddt(v(g))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    let boundary = 9.536_743_164_062_5e-7_f64;
+    qualify_constitutive_crossings(
+        body,
+        "3.814697265625e-6",
+        "@j1[i]",
+        [boundary, 3. * boundary],
+        |plot, index, _| {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let gate = at("v(g)");
+            let vgd = gate - 1.;
+            let junction =
+                -1e-15 * (1. + (3. * thermal / (vgd * std::f64::consts::E)).powi(3)) + 1e-12 * vgd;
+            let expected = 1e-3 * (gate + 2.).max(0.).powi(2) - junction;
+            close(at("@j1[i]"), expected, 1e-12);
+            close(at("i(vd)"), -expected, 1e-12);
+        },
+    )
+}
+
+// The independent level-one BJT junction characteristic and derivative.
+fn crossing_bjt_junction(voltage: f64, thermal: f64, saturation: f64) -> (f64, f64) {
+    if voltage < -3. * thermal {
+        let a = (3. * thermal / (voltage * std::f64::consts::E)).powi(3);
+        (-saturation * (1. + a), 3. * saturation * a / voltage)
+    } else {
+        (
+            saturation * (voltage / thermal).exp_m1(),
+            saturation / thermal * (voltage / thermal).exp(),
+        )
+    }
+}
+
+#[test]
+fn bjt_forward_diffusion_activation_preserves_charge_and_changes_rate() -> SpiceResult<()> {
+    let body = "vc c 0 0.1\nvb b 0 PWL(0 -0.125 1.9073486328125e-6 0.125 3.814697265625e-6 -0.125)\nq1 c b 0 qm\n.model qm npn(is=1e-12 bf=100 br=2 tf=10n xtf=1)\nb1 out 0 v=1u*ddt(v(b))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    let boundary = 9.536_743_164_062_5e-7_f64;
+    qualify_constitutive_crossings(
+        body,
+        "3.814697265625e-6",
+        "@q1[i]",
+        [boundary, 3. * boundary],
+        |plot, index, [entering, leaving]| {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let voltage = at("v(b)");
+            let (be, gbe) = crossing_bjt_junction(voltage, thermal, 1e-12);
+            let (bc, _) = crossing_bjt_junction(voltage - 0.1, thermal, 1e-12);
+            let factor = if entering || (!leaving && voltage > 0.) {
+                2.
+            } else {
+                1.
+            };
+            let rate = at("v(out)") / 1e-6;
+            let base =
+                be / 100. + bc / 2. + 1e-12 * (2. * voltage - 0.1) + factor * 1e-8 * gbe * rate;
+            let collector = be - 1.5 * bc - 1e-12 * (voltage - 0.1) + 1e-13;
+            close(at("i(vb)"), -base, 1e-16);
+            close(at("i(vc)"), -collector, 1e-16);
+            close(at("@q1[i]"), collector, 1e-16);
+        },
+    )
+}
+
+#[test]
+fn bjt_base_charge_clamp_uses_the_selected_one_sided_current() -> SpiceResult<()> {
+    // NKF=1 gives analytic germs on both sides of the actual base-charge
+    // root clamp. With TF=0 the current jump does not demand an impulse.
+    let body = "vc c 0 0.1\nvb b 0 PWL(0 -0.05 2u 0.05 4u -0.05)\nq1 c b 0 qm\n.model qm npn(is=1u bf=100 br=2 ikf=2u nkf=1)\nb1 out 0 v=1u*ddt(v(b))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    let crossing = (0.05 - thermal * std::f64::consts::LN_2) / 5e4;
+    qualify_constitutive_crossings(
+        body,
+        "4u",
+        "@q1[i]",
+        [crossing, 4e-6 - crossing],
+        |plot, index, [entering, leaving]| {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let voltage = at("v(b)");
+            let (be, _) = crossing_bjt_junction(voltage, thermal, 1e-6);
+            let (bc, _) = crossing_bjt_junction(voltage - 0.1, thermal, 1e-6);
+            let argument = 1. + 4. * be / 2e-6;
+            let root = if entering || (!leaving && argument > 0.) {
+                argument
+            } else {
+                1.
+            };
+            let qb = (1. + root) / 2.;
+            let expected = (be - bc) / qb - bc / 2. - 1e-12 * (voltage - 0.1) + 1e-13;
+            close(at("@q1[i]"), expected, 1e-12);
+            close(at("i(vc)"), -expected, 1e-12);
+        },
+    )
+}
+
+#[test]
+fn bjt_base_spreading_clamp_tracks_the_intrinsic_base_current() -> SpiceResult<()> {
+    let body = "vc c 0 0\nvb b 0 PWL(0 -0.05 2u 0.05 4u -0.05)\nq1 c b 0 qm\n.model qm npn(is=1e-12 bf=1 br=1 rb=1meg rbm=1k irb=1m)\nb1 out 0 v=1u*ddt(v(b))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n abstol=1e-17";
+    let thermal = (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    let base = |voltage: f64| 2e-12 * ((voltage / thermal).exp_m1() + voltage);
+    // Here the spreading ratio is < 2e-8, so the first two nonconstant
+    // terms of 3*(tan(z)-z)/(z*tan(z)^2) suffice at voltage tolerance.
+    let resistance = |current: f64| {
+        let ratio = (current / 1e-3).max(1e-9);
+        let angle =
+            (14.59025 / 2.4317) / (ratio.sqrt().recip() + (ratio.recip() + 14.59025).sqrt());
+        1000. + 999_000. * (1. - 4. / 15. * angle.powi(2) - 4. / 105. * angle.powi(4))
+    };
+    let mut lower = 0.;
+    let mut upper = 0.05;
+    for _ in 0..60 {
+        let middle = f64::midpoint(lower, upper);
+        if base(middle) < 1e-12 {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    let voltage = f64::midpoint(lower, upper) + 1e-12 * resistance(1e-12);
+    let crossing = (voltage + 0.05) / 5e4;
+    qualify_constitutive_crossings(
+        body,
+        "4u",
+        "@q1[i]",
+        [crossing, 4e-6 - crossing],
+        |plot, index, hits| {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let intrinsic = at("v(q1#base)");
+            let current = base(intrinsic);
+            if hits.into_iter().any(|hit| hit) {
+                close(current, 1e-12, 1e-17);
+            }
+            close(at("i(vb)"), -current, 1e-17);
+            close(at("i(vc)"), current / 2., 1e-17);
+            close(at("@q1[i]"), -current / 2., 1e-17);
+            close(at("v(b)") - intrinsic, current * resistance(current), 1e-12);
+        },
+    )
+}
