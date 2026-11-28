@@ -269,6 +269,10 @@ fn invalid_scoped_physics_and_ports_are_rejected() {
         "timetol=.1f",
         "ic=2",
         "extra=1",
+        "instantaneous=2",
+        "inclusive_rise=2",
+        "instantaneous=1 ton=1n",
+        "instantaneous=1 toff=0",
     ] {
         let source = format!(
             "invalid timed model\nvdrive a 0 5\nvbias p 0 1\na1 %v(a) %gd(p 0) m\n.model m preprocess_timed_switch({parameter})\n.end\n"
@@ -335,6 +339,282 @@ fn zero_delay_narrow_pulse_and_analytic_branch_jacobian() -> SpiceResult<()> {
         }
         assert!(reached_on, "narrow pulse missed at {max_step}: {stats:?}");
         assert!(stats.device_event_landings >= 2, "{stats:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn instantaneous_inertial_pulses_match_independent_scheduler() -> SpiceResult<()> {
+    use std::fmt::Write as _;
+    // Each analog ramp has a threshold root at the exact binary timestamp
+    // of an independently scheduled digital event. Keep the nonzero common
+    // mode and physically separate voltage and current control ports.
+    let mut wave = String::from("PWL(0 -1");
+    let half_ramp = 2_f64.powi(-30);
+    let mut old = -1.;
+    for row in include_str!("fixtures/native-timed-switch/instant-inertial.txt")
+        .lines()
+        .skip(1)
+    {
+        let (time, bit) = row.split_once(' ').unwrap();
+        let time: f64 = time.parse().unwrap();
+        let next = if bit == "1s" { 1. } else { -1. };
+        write!(
+            wave,
+            " {:.24e} {old} {:.24e} {next}",
+            time - half_ramp,
+            time + half_ramp
+        )
+        .unwrap();
+        old = next;
+    }
+    wave.push_str(" 20u -1)");
+    let source = format!(
+        "instantaneous inertial pulse matrix\n\
+        vref rtn 0 .75\n\
+        vdrive control rtn {wave}\n\
+        idrive rtn sensor {wave}\n\
+        idrive_named rtn named_sensor {wave}\n\
+        vsense named_sensor rtn 0\n\
+        vbn r rtn 1\n\
+        an %vnam(vsense) %gd(r rtn) m\n\
+        vbv p rtn 1\n\
+        vbi q rtn -2\n\
+        av %vd(control rtn) %gd(p rtn) m\n\
+        ai %id(sensor rtn) %gd(q rtn) m\n\
+        .model m preprocess_timed_switch(ron=10 roff=1Meg vt=0 vh=0 instantaneous=1 td_on={:.24e} td_off={:.24e})\n\
+        .end\n",
+        2_f64.powi(-20),
+        2_f64.powi(-21)
+    );
+    let reference: Vec<(f64, bool)> =
+        include_str!("fixtures/native-timed-switch/instant-inertial.csv")
+            .lines()
+            .skip(1)
+            .map(|row| {
+                let fields: Vec<_> = row.split(',').collect();
+                (fields[0].parse().unwrap(), fields[2] == "1")
+            })
+            .collect();
+    for step in ["100n", "0.5n"] {
+        let (mut c, config) = deck(&source)?;
+        let p = plan(&config, AnalysisKind::Transient, &["1n", "20u", "0", step])?;
+        let (plot, stats) = companion_transient(&mut c, &p, &config.context())?;
+        let sample_times = times(&plot);
+        let mut witnessed = vec![false; reference.len()];
+        for (index, time) in sample_times.into_iter().enumerate() {
+            let event = reference
+                .partition_point(|(at, _)| *at <= time)
+                .saturating_sub(1);
+            let g_v = -value(&plot, "i(vbv)", index);
+            let g_i = value(&plot, "i(vbi)", index) / 2.;
+            let g_named = -value(&plot, "i(vbn)", index);
+            for g in [g_v, g_i, g_named] {
+                assert!(
+                    (g - 0.1).abs() <= 1e-12 || (g - 1e-6).abs() <= 1e-12,
+                    "non-rail conductance {g:e}"
+                );
+            }
+            // No artificial intermediate conductance. Skip only a tiny
+            // localization neighborhood of reference event times, not any
+            // substantial portion of the pulse (including equal-width).
+            if reference.iter().any(|(at, _)| (at - time).abs() < 5e-12) {
+                continue;
+            }
+            let expected = if reference[event].1 { 0.1 } else { 1e-6 };
+            close(
+                &format!("voltage at {time:e}, step {step}"),
+                g_v,
+                expected,
+                1e-9,
+                1e-13,
+            );
+            close(
+                &format!("current at {time:e}, step {step}"),
+                g_i,
+                expected,
+                1e-9,
+                1e-13,
+            );
+            close(
+                &format!("named branch at {time:e}, step {step}"),
+                g_named,
+                expected,
+                1e-9,
+                1e-13,
+            );
+            close(
+                "ideal sensor voltage",
+                value(&plot, "v(sensor)", index) - 0.75,
+                0.,
+                0.,
+                1e-13,
+            );
+            close(
+                "unloaded voltage control",
+                value(&plot, "i(vdrive)", index),
+                0.,
+                0.,
+                1e-13,
+            );
+            witnessed[event] = true;
+        }
+        for (index, &(_, high)) in reference.iter().enumerate() {
+            if high
+                && reference
+                    .get(index + 1)
+                    .is_some_and(|(next, _)| *next - reference[index].0 > 1e-8)
+            {
+                assert!(
+                    witnessed[index],
+                    "missing settled high interval {index}, step {step}"
+                );
+            }
+        }
+        assert!(stats.device_event_landings > 0);
+        assert!(stats.device_event_retries > 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn instantaneous_switch_dc_ac_and_thermal_noise() -> SpiceResult<()> {
+    use ngspice_rs::devices::noise::BOLTZMANN;
+    for (control, terminal) in [
+        ("vcontrol cp rtn -1 ac 1", "%vd(cp rtn)"),
+        ("icontrol rtn cp -1 ac 1", "%id(cp rtn)"),
+        ("icontrol rtn cp -1 ac 1\nvsense cp rtn 0", "%vnam(vsense)"),
+    ] {
+        for (ic, resistance) in [(0, 1e6), (1, 10.)] {
+            let source = format!(
+                "instantaneous bias\n\
+                vref rtn 0 .75\n\
+                {control}\n\
+                vin p rtn 1 ac 1\n\
+                rload out rtn 1k noisy=0\n\
+                a1 {terminal} %gd(p out) m\n\
+                .model m preprocess_timed_switch(ron=10 roff=1Meg vt=-1 vh=.5 instantaneous=true td_on=500n td_off=1u ic={ic})\n\
+                .noise v(out,rtn) vin lin 2 1k 2k\n.end\n"
+            );
+            let (mut c, config) = deck(&source)?;
+            let gain = 1e3 / (resistance + 1e3);
+            let op =
+                plan(&config, AnalysisKind::OperatingPoint, &[])?.run(&mut c, &config.context())?;
+            close("dc", value(&op, "v(out)", 0), 0.75 + gain, 1e-10, 1e-13);
+            let ac = plan(&config, AnalysisKind::Ac, &["lin", "1", "1k", "1k"])?
+                .run(&mut c, &config.context())?;
+            close("ac", value(&ac, "v(out)", 0), gain, 1e-10, 1e-13);
+            let source = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("instant-noise.cir"), &source))?;
+            let noise = config
+                .plan_for(&source.analyses[0])?
+                .run_plots(&mut c, &config.context())?;
+            let expected = (4. * BOLTZMANN * 300.15 * resistance).sqrt() * gain;
+            for row in 0..noise[0].point_count() {
+                close(
+                    "thermal voltage density",
+                    value(&noise[0], "onoise_spectrum", row),
+                    expected,
+                    1e-8,
+                    1e-20,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn instantaneous_stiff_switch_rc_converges_to_piecewise_physical_solution() -> SpiceResult<()> {
+    // 1 V -> switched R -> C, with different physical off/on RC time
+    // constants. Before the turn-on event the cap starts at zero; it
+    // cannot jump when conductance changes. No hidden conductance floor.
+    let source = "instantaneous RC\n\
+        vcontrol ctrl 0 PWL(0 -1 1u -1 1002n 1 4u 1 4002n -1 8u -1)\n\
+        v1 p 0 PWL(0 0 1n 1 8u 1)\n\
+        a1 %v(ctrl) %gd(p out) m\n\
+        rload out 0 1k\n\
+        c1 out 0 1n\n\
+        .model m preprocess_timed_switch(ron=10 roff=1Meg instantaneous=1 vt=0 vh=0 td_on=100n td_off=100n)\n\
+        .options reltol=1e-5 abstol=1p vntol=1n\n\
+        .end\n";
+    let g0 = 1e-6;
+    let g1 = 0.1;
+    let load = 1e-3;
+    let cap = 1e-9;
+    let tau0 = cap / (g0 + load);
+    let tau1 = cap / (g1 + load);
+    let steady0 = g0 / (g0 + load);
+    let steady1 = g1 / (g1 + load);
+    let rise = 1.101e-6;
+    let fall = 4.101e-6;
+    // Exact convolution of the initial 1 ns linear source ramp with RC.
+    let initial = steady0 * (1. + tau0 / 1e-9 * (-1e-9_f64 / tau0).exp_m1());
+    let evolve = |initial: f64, steady: f64, dt: f64, tau: f64| {
+        (initial - steady).mul_add((-dt / tau).exp(), steady)
+    };
+    let before_rise = evolve(initial, steady0, rise - 1e-9, tau0);
+    let before_fall = evolve(before_rise, steady1, fall - rise, tau1);
+    let expected = |time: f64| {
+        if time < 1e-9 {
+            steady0 * (time / 1e-9 + tau0 / 1e-9 * (-time / tau0).exp_m1())
+        } else if time < rise {
+            evolve(initial, steady0, time - 1e-9, tau0)
+        } else if time < fall {
+            evolve(before_rise, steady1, time - rise, tau1)
+        } else {
+            evolve(before_fall, steady0, time - fall, tau0)
+        }
+    };
+    for step in ["100n", "1n"] {
+        let (mut c, config) = deck(source)?;
+        let p = plan(&config, AnalysisKind::Transient, &["1n", "8u", "0", step])?;
+        let (plot, stats) = companion_transient(&mut c, &p, &config.context())?;
+        let t = times(&plot);
+        // Compare integration error at real solver knots. In particular,
+        // interpolating a stiff exponential onto an arbitrary output grid
+        // creates a separate error even for an exact integrated solution.
+        for (index, &at) in t.iter().enumerate() {
+            close(
+                &format!("RC accepted point {at:e}, step {step}"),
+                value(&plot, "v(out)", index),
+                expected(at),
+                0.002,
+                2e-5,
+            );
+        }
+        for at in [
+            0.5e-6,
+            rise,
+            rise + 1e-9,
+            rise + 10e-9,
+            rise + 50e-9,
+            3e-6,
+            fall,
+            fall + 10e-9,
+            fall + 1e-6,
+            8e-6,
+        ] {
+            let index = t.partition_point(|&time| time < at);
+            let reference = if index == 0 {
+                expected(t[0])
+            } else if index == t.len() {
+                expected(t[index - 1])
+            } else {
+                let a = expected(t[index - 1]);
+                let b = expected(t[index]);
+                a + (b - a) * (at - t[index - 1]) / (t[index] - t[index - 1])
+            };
+            close(
+                &format!("RC sampled at {at:e}, step {step}"),
+                interpolate(&plot, &t, "v(out)", at),
+                reference,
+                0.002,
+                2e-5,
+            );
+        }
+        assert!(stats.device_event_landings >= 2);
+        assert!(stats.restart_error_probes > 0);
     }
     Ok(())
 }

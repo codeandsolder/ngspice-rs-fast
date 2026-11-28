@@ -91,6 +91,8 @@
 //! `nicomcof.c` (default 0.5).
 
 mod branch_events;
+mod restart;
+use restart::RestartProbe;
 
 use crate::devices::physical_dae::BranchTrace;
 use crate::devices::{
@@ -129,6 +131,8 @@ pub struct TransientStats {
     pub device_event_retries: usize,
     /// Accepted landings on previously scheduled device boundaries.
     pub device_event_landings: usize,
+    /// Disposable midpoint solves used to estimate error after abrupt events.
+    pub restart_error_probes: usize,
 }
 
 /// Convergence and truncation tolerances. `vntol` applies to node voltages and
@@ -465,7 +469,13 @@ impl AcceptedCursor {
         clock.next.delta = clock.next.delta.min(settings.max_step);
         // First timepoint after a breakpoint: reduce the order and step.
         let mut next_break = breaks.first();
-        if almost_equal_ulps(clock.time, next_break, 100) || next_break - clock.time <= min_step {
+        // The duplicated final sentinel is not a breakpoint to restart
+        // from. Exact-event circuits must still take the last positive
+        // representable interval when they are just short of stop.
+        if next_break < settings.stop
+            && (almost_equal_ulps(clock.time, next_break, 100)
+                || next_break - clock.time <= min_step)
+        {
             clock.next.order = Order::One;
             clock.next.delta = clock
                 .next
@@ -589,6 +599,21 @@ impl AttemptedStep {
             event_landing: None,
             probe_landing: None,
         })
+    }
+
+    /// Recompute the same interval at order one if a discrete law change
+    /// was discovered at its already accepted left endpoint. This is not a
+    /// timestep reduction and preserves the exact scheduled end.
+    fn retry_first_order(&self, start: Real) -> ReadyStep {
+        let mut clock = self.clock;
+        clock.time = start;
+        clock.next.order = Order::One;
+        ReadyStep {
+            clock,
+            boundary: self.boundary,
+            event_landing: self.event_start.map(|_| self.clock.time),
+            probe_landing: self.event_start.is_none().then_some(self.clock.time),
+        }
     }
 
     const fn accept(self, mut next: NextStep) -> AcceptedCursor {
@@ -856,6 +881,8 @@ impl DerivativePredictor {
 
 struct EventDevice<'a> {
     source: &'a dyn crate::devices::traits::DeviceTransientEvents,
+    branch: Option<usize>,
+    controls: Vec<usize>,
     rows: std::ops::Range<usize>,
 }
 
@@ -1153,6 +1180,8 @@ fn event_devices(circuit: &Circuit) -> SpiceResult<Vec<EventDevice<'_>>> {
         .map(|(index, source)| {
             Ok(EventDevice {
                 source,
+                branch: circuit.branch_rows(index).and_then(|mut rows| rows.next()),
+                controls: circuit.control_rows(index)?,
                 rows: circuit
                     .state_rows(index)
                     .ok_or_else(|| failure("missing event device state range"))?,
@@ -1426,6 +1455,9 @@ impl Driver<'_> {
                 ready.limit_to_sample(at);
             }
             self.limit_source_step(&mut ready, &sources, time)?;
+            if exact_stop {
+                ready.limit_to_event(stop);
+            }
             accepted = self.advance(
                 ready,
                 solution,
@@ -1679,6 +1711,8 @@ impl Driver<'_> {
                     .ok_or_else(|| failure("invalid event state window"))?,
                 time,
                 solution,
+                branch: event.branch,
+                controls: &event.controls,
                 unknowns: self.circuit.unknowns(),
             };
             if let Some(at) = self
@@ -1719,6 +1753,29 @@ impl Driver<'_> {
             }
         }
         Ok(None)
+    }
+
+    fn device_discontinuity(&self, state: &TrialState) -> SpiceResult<Option<Real>> {
+        if self.event_devices.is_empty() {
+            return Ok(None);
+        }
+        let history = self
+            .history
+            .accepted(1)
+            .ok_or_else(|| failure("missing accepted event state"))?;
+        let mut first = None::<Real>;
+        for event in &self.event_devices {
+            let old = history
+                .get(event.rows.clone())
+                .ok_or_else(|| failure("invalid accepted event state window"))?;
+            let candidate = state
+                .slice(event.rows.clone())
+                .ok_or_else(|| failure("invalid candidate event state window"))?;
+            if let Some(at) = event.source.discontinuity(old, candidate)? {
+                first = Some(first.map_or(at, |prior| prior.min(at)));
+            }
+        }
+        Ok(first)
     }
 
     fn prepare_mixed_point(
@@ -1771,9 +1828,11 @@ impl Driver<'_> {
     }
 
     fn check_step_budget(&self, time: Real) -> SpiceResult<()> {
-        if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
+        if self.stats.accepted + self.stats.rejected + self.stats.restart_error_probes
+            >= self.settings.max_steps
+        {
             return Err(failure(format!(
-                "work limit of {} accepted + rejected steps reached at t = {time:e}",
+                "work limit of {} accepted + rejected steps + restart probes reached at t = {time:e}",
                 self.settings.max_steps
             )));
         }
@@ -1804,6 +1863,9 @@ impl Driver<'_> {
         let physical_event = self.next_physical_event(ready.clock.time);
         let device_boundary = self.next_device_boundary(ready.clock.time)?;
         self.stats.device_event_boundary_probes += self.event_devices.len();
+        let mut restarting = self.steps.is_empty()
+            && ready.clock.phase == Phase::Continuing
+            && !self.event_devices.is_empty();
         loop {
             self.check_step_budget(ready.clock.time)?;
             if let Some(event) = physical_event
@@ -1814,7 +1876,23 @@ impl Driver<'_> {
                 ready.limit_to_event(event);
             }
             let preview = self.preview_events(&mut ready)?;
+            let midpoint = if restarting {
+                self.restart_probe(ready, &iterate)?
+            } else {
+                RestartProbe::Unneeded
+            };
             let attempt = ready.begin(&self.steps, &self.settings)?;
+            let midpoint = match midpoint {
+                RestartProbe::Retry { next, last } => {
+                    iterate = last;
+                    self.stats.rejected += 1;
+                    let start = ready.clock.time;
+                    ready = attempt.retry(next, min_step)?;
+                    ready.clock.time = start;
+                    continue;
+                }
+                other => other,
+            };
             let mut prepared = self.prepared.transient_attempt(
                 &self.history,
                 &self.model_context,
@@ -1865,16 +1943,37 @@ impl Driver<'_> {
                         ready.limit_to_event(ready.clock.time + ready.clock.next.delta);
                         continue;
                     }
-                    let decision =
+                    let discontinuity = self.device_discontinuity(&state)?;
+                    if discontinuity.is_some_and(|at| at <= ready.clock.time)
+                        && (!restarting || attempt.clock.next.order != Order::One)
+                    {
+                        restarting = true;
+                        iterate = x;
+                        self.stats.rejected += 1;
+                        self.stats.device_event_retries += 1;
+                        drop(prepared);
+                        ready = attempt.retry_first_order(ready.clock.time);
+                        continue;
+                    }
+                    let decision = if let Some(decision) =
+                        self.restart_decision(&attempt, &state, &x, &midpoint)?
+                    {
+                        decision
+                    } else {
                         attempt.decision(&self.settings, &self.steps, |coefficients| {
                             self.truncation_limit(coefficients, &state, &x, attempt.clock.time)
-                        })?;
+                        })?
+                    };
                     match decision {
                         StepDecision::Retry(next) => {
                             iterate = x;
                             self.stats.rejected += 1;
                             drop(prepared);
+                            let start = ready.clock.time;
                             ready = attempt.retry(next, min_step)?;
+                            if restarting {
+                                ready.clock.time = start;
+                            }
                         }
                         StepDecision::Accept(next) => {
                             let candidate = self.prepare_accepted_candidate(
@@ -1891,6 +1990,7 @@ impl Driver<'_> {
                                 next,
                                 candidate,
                                 device_boundary,
+                                discontinuity.is_some(),
                             );
                         }
                     }
@@ -1923,11 +2023,12 @@ impl Driver<'_> {
     fn commit_candidate(
         &mut self,
         attempt: AttemptedStep,
-        next: NextStep,
+        mut next: NextStep,
         candidate: AcceptedCandidate,
         device_boundary: Option<Real>,
+        discontinuity: bool,
     ) -> SpiceResult<AcceptedPoint> {
-        let event = self.crosses_physical_event(&attempt);
+        let event = self.crosses_physical_event(&attempt) || discontinuity;
         let device_breaks = self.commit_point(
             Acceptance::Step(&attempt),
             &candidate.solution,
@@ -1939,6 +2040,7 @@ impl Driver<'_> {
         if event {
             self.history.restart_integration()?;
             self.steps.clear();
+            next.order = Order::One;
         }
         Ok(AcceptedPoint {
             cursor: attempt.accept(next),
@@ -2710,6 +2812,22 @@ mod step_control_tests {
             delta,
             order: Order::One,
         }
+    }
+
+    #[test]
+    fn exact_terminal_sentinel_keeps_last_representable_interval() {
+        let settings = settings();
+        let mut breaks = BreakTable::new(settings.stop, settings.min_break()).unwrap();
+        breaks.clear();
+        let mut cursor = AcceptedCursor::initial(&settings);
+        cursor.clock.time = settings.stop.next_down();
+        cursor.clock.phase = Phase::Continuing;
+        let start = cursor.clock.time;
+        let mut ready = cursor.prepare(&settings, &mut breaks, false).unwrap();
+        ready.limit_to_event(settings.stop);
+        let attempt = ready.begin(&StepHistory::new(), &settings).unwrap();
+        assert_eq!(attempt.clock.time, settings.stop);
+        assert_eq!(attempt.coefficients.dt(), settings.stop - start);
     }
 
     #[test]

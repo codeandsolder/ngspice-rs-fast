@@ -9,6 +9,7 @@ mod frequency;
 pub mod rational;
 pub mod source;
 mod source_logic;
+mod switch_control;
 mod timed_switch;
 mod timed_switch_device;
 
