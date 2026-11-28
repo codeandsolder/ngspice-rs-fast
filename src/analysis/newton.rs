@@ -368,6 +368,55 @@ pub(super) enum CircuitLoad<'a, 'p> {
     },
 }
 
+/// One immutable binding of a Newton load's physical context and history.
+/// Only a transient attempt lends its separate disposable workspace.
+struct BoundCircuitLoad<'a, 'p> {
+    prepared: &'a PreparedRun<'a>,
+    context: &'a ModelContext,
+    history: &'a StateHistory,
+    forcing: Option<Forcing>,
+    time: Real,
+    integration: Option<&'a crate::maths::Coefficients>,
+    uic: Option<bool>,
+    explicit_bias: bool,
+    attempt: Option<&'a mut PreparedTransient<'p>>,
+}
+
+impl<'p> CircuitLoad<'_, 'p> {
+    fn bind(&mut self) -> BoundCircuitLoad<'_, 'p> {
+        match self {
+            Self::Bias {
+                prepared,
+                context,
+                history,
+                forcing,
+                explicit_bias,
+            } => BoundCircuitLoad {
+                prepared,
+                context,
+                history,
+                forcing: *forcing,
+                time: 0.,
+                integration: None,
+                uic: None,
+                explicit_bias: *explicit_bias,
+                attempt: None,
+            },
+            Self::Transient { attempt, uic } => BoundCircuitLoad {
+                prepared: attempt.run(),
+                context: attempt.context(),
+                history: attempt.history(),
+                forcing: None,
+                time: attempt.time(),
+                integration: Some(attempt.coefficients()),
+                uic: Some(*uic),
+                explicit_bias: false,
+                attempt: Some(&mut **attempt),
+            },
+        }
+    }
+}
+
 /// The shared device-backed Newton driver. Each iteration creates its trial
 /// from accepted history and the previous disposable trial, stamps the circuit,
 /// and runs device convergence tests with the same options that loaded it.
@@ -393,7 +442,7 @@ impl CircuitNewton<'_, '_> {
     ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
         // Both stamping and convergence read the same attempt-bound model
         // and accepted history, with no second caller-supplied identity.
-        let (
+        let BoundCircuitLoad {
             prepared,
             context,
             history,
@@ -403,36 +452,7 @@ impl CircuitNewton<'_, '_> {
             uic,
             explicit_bias,
             mut attempt,
-        ) = match &mut self.load {
-            CircuitLoad::Bias {
-                prepared,
-                context,
-                history,
-                forcing,
-                explicit_bias,
-            } => (
-                *prepared,
-                *context,
-                *history,
-                *forcing,
-                0.,
-                None,
-                None,
-                *explicit_bias,
-                None,
-            ),
-            CircuitLoad::Transient { attempt, uic } => (
-                attempt.run(),
-                attempt.context(),
-                attempt.history(),
-                None,
-                attempt.time(),
-                Some(attempt.coefficients()),
-                Some(*uic),
-                false,
-                Some(&mut **attempt),
-            ),
-        };
+        } = self.load.bind();
         let circuit = prepared.circuit();
         let nodal_regularization = circuit.regularization_nodes();
         let gmin = self.options.diag_gmin;

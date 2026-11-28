@@ -783,6 +783,24 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         Ok(outcome == Convergence::Retry)
     }
 
+    fn validate_accept(
+        &self,
+        context: &crate::devices::traits::AcceptContext<'_>,
+    ) -> SpiceResult<()> {
+        if self.trial_workspace.is_some()
+            && let Some(states) = context.states
+            && states
+                .get(self.charge_state_count() + self.terminals.len())
+                .is_none_or(|value| value.to_bits() != 1_f64.to_bits())
+        {
+            return Err(SpiceError::circuit(format!(
+                "{}: initialized or limited prepared trial cannot be accepted",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     fn truncation_slots(&self) -> Vec<usize> {
         if self.artifact.descriptor().charge == Capability::Computed {
             (0..self.terminals.len()).map(|index| 2 * index).collect()

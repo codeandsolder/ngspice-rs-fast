@@ -1798,6 +1798,17 @@ fn kernel_trial_policy_preserves_reference_provenance_and_exact_acceptance() {
             None,
         );
         assert!(cold.is_nonconvergent());
+        assert!(
+            circuit
+                .accept_point(
+                    &Vector::from_slice(&proposed),
+                    None,
+                    &mut history,
+                    cold.clone()
+                )
+                .is_err()
+        );
+        assert_eq!(history.depth(), 0);
         let x: Real = 0.1;
         let g = 1e-3 + 6e-4 * x * x;
         let i = 1e-3 * x + 2e-4 * x.powi(3);
@@ -1838,6 +1849,17 @@ fn kernel_trial_policy_preserves_reference_provenance_and_exact_acceptance() {
             Some(&coeff),
         );
         assert!(rejected.is_nonconvergent());
+        assert!(
+            circuit
+                .accept_point(
+                    &Vector::from_slice(&vec![3.; count]),
+                    Some(1e-6),
+                    &mut history,
+                    rejected.clone()
+                )
+                .is_err()
+        );
+        assert_eq!(history.accepted(1).unwrap(), accepted);
         for lane in 0..count {
             let x: Real = 2.125;
             let stored = 1e-6 * x + 2e-7 * x.powi(3);
@@ -2041,4 +2063,58 @@ fn kernel_trial_policy_stamps_limited_thermal_and_internal_coordinates() {
             close(exact.values()[13 * lane + 11], 0.8);
         }
     }
+}
+
+#[test]
+fn explicit_bias_constraints_do_not_invoke_kernel_initialization_or_limiting() {
+    use model_kernel_api::trial::{TrialCapabilities, TrialPolicy};
+    use ngspice_rs::analysis::bias::{
+        DcOutcome, DcSettings, DcStrategy, NodeForcing, solve_dc_forced,
+    };
+    // This witness intentionally declares specialized trial capabilities
+    // without implementing those callbacks. The producer's default callbacks
+    // return Unsupported if invoked, so the real constrained driver must
+    // keep the entire load exact rather than merely converge eventually.
+    let mut descriptor = descriptor(Capability::Computed);
+    descriptor.trial = TrialCapabilities {
+        initialization: TrialPolicy::Kernel,
+        limiting: TrialPolicy::Kernel,
+        convergence: TrialPolicy::Engine,
+    };
+    let artifact = Artifact::new(descriptor, PolynomialKernel).unwrap();
+    let mut circuit = Circuit::new();
+    let p = circuit.add_node("p").unwrap();
+    PreparedDevice::bind(
+        &mut circuit,
+        &artifact,
+        "x1",
+        &[p, NodeId::GROUND],
+        &[1e-3, 2e-4, 1e-6, 2e-7],
+        InstanceTemperature::circuit(27.),
+    )
+    .unwrap();
+    circuit.finalize().unwrap();
+    let row = circuit.unknowns().node_row(p).unwrap();
+    let settings = DcSettings::default();
+    let result = solve_dc_forced(
+        &circuit,
+        &ModelContext::default(),
+        &settings,
+        &[],
+        None,
+        None,
+        &NodeForcing {
+            initial: vec![(row, 2.)],
+            nodesets: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        result.report.outcome,
+        DcOutcome::Converged(DcStrategy::Direct)
+    );
+    close(result.solution.values.get(row).unwrap(), 2.);
+    assert!(!result.solution.trial.is_nonconvergent());
+    close(result.solution.trial.values()[4], 2.);
+    close(result.solution.trial.values()[0], 3.6e-6);
 }
