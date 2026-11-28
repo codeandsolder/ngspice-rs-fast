@@ -292,7 +292,8 @@ impl SidedPwl {
                 || knots[knots.len() - 1].time >= r.period
                 || r.hold.is_some_and(|v| !v.is_finite())
                 || r.limit.is_some_and(|limit| {
-                    !(limit.time.is_finite() && limit.value.is_finite() && r.origin < limit.time)
+                    let time = limit.time;
+                    !time.is_finite() || !limit.value.is_finite() || time <= r.origin
                 })
             {
                 return Err(invalid("invalid repeating knot geometry"));
