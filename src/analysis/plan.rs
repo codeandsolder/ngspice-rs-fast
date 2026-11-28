@@ -880,6 +880,7 @@ impl AnalysisPlan {
         };
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
+            analysis_kind: circuit.requires_analysis_context().then(|| self.kind()),
             bias_analysis: circuit.requires_analysis_context().then(|| self.kind()),
             ..*context
         };
@@ -899,6 +900,7 @@ impl AnalysisPlan {
         use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
+            analysis_kind: circuit.requires_analysis_context().then(|| self.kind()),
             bias_analysis: (!self.uic() && circuit.requires_analysis_context())
                 .then(|| self.kind()),
             ..*context
@@ -984,6 +986,7 @@ impl AnalysisPlan {
         };
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
+            analysis_kind: circuit.requires_analysis_context().then(|| self.kind()),
             bias_analysis: (!self.uic() && circuit.requires_analysis_context())
                 .then(|| self.kind()),
             ..*context

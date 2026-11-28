@@ -134,7 +134,7 @@ impl Device for DampingShunt {
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let g = self
             .damping
-            .stamp_law(context.mode, context.bias_analysis)
+            .stamp_law(context.mode, context.analysis_kind)
             .evaluate(context.gmin)?;
         stamp_conductance(self.terminals, g, context)
     }
@@ -142,7 +142,7 @@ impl Device for DampingShunt {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let g = self
             .damping
-            .law(context.model_context.bias_analysis)
+            .law(context.model_context.analysis_kind)
             .evaluate(context.model_context.gmin)?;
         assemble_conductance(self.terminals, g, context)
     }
@@ -175,7 +175,7 @@ impl Device for DampingShunt {
         match keyword {
             "g" | "conductance" => self
                 .damping
-                .law(context.bias_analysis)
+                .law(context.analysis_kind)
                 .evaluate(context.gmin)
                 .map(Some),
             _ => Ok(None),

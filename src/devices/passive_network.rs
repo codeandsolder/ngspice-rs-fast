@@ -40,6 +40,8 @@ pub struct PassiveNetworkCoefficients {
     pub series_inductance: Real,
     /// Resistance across the additional series inductance, if present.
     pub series_inductance_shunt: Option<Real>,
+    /// Analysis-dependent damping directly across the series inductance.
+    pub series_inductance_damping: Option<AnalysisDamping>,
     /// Resistance directly across the main storage, if present.
     pub storage_shunt: Option<Real>,
     /// Resistance across the external terminal pair, if present.
@@ -61,6 +63,7 @@ enum Role {
     SeriesResistance,
     SeriesInductance,
     SeriesInductanceShunt,
+    SeriesInductanceDamping,
     Primary,
     StorageShunt,
     ParallelResistance,
@@ -75,6 +78,7 @@ impl Role {
             Self::SeriesResistance => format!("r{primary}#series"),
             Self::SeriesInductance => format!("l{primary}#series"),
             Self::SeriesInductanceShunt => format!("r{primary}#series_shunt"),
+            Self::SeriesInductanceDamping => format!("r{primary}#series_damping"),
             Self::Primary => primary.to_owned(),
             Self::StorageShunt => format!("r{primary}#storage_shunt"),
             Self::ParallelResistance => format!("r{primary}#parallel"),
@@ -186,7 +190,7 @@ impl PreparedPassiveNetwork {
         }
 
         let mut edges = Vec::new();
-        reserve(&mut edges, 9, None)?;
+        reserve(&mut edges, 10, None)?;
         let mut append = |role, element: Element, nodes| -> SpiceResult<()> {
             edges.push(Edge {
                 role,
@@ -216,6 +220,13 @@ impl PreparedPassiveNetwork {
                 append(
                     Role::SeriesInductanceShunt,
                     Element::Resistance(r),
+                    [positive, nodes],
+                )?;
+            }
+            if let Some(damping) = input.series_inductance_damping {
+                append(
+                    Role::SeriesInductanceDamping,
+                    Element::Damping(damping),
                     [positive, nodes],
                 )?;
             }
@@ -547,7 +558,7 @@ impl PreparedVoltageNetwork {
 
     /// Select the physical branch used by controlling-current references.
     #[must_use]
-    pub fn with_current_control(mut self, reference: CurrentReference) -> Self {
+    pub const fn with_current_control(mut self, reference: CurrentReference) -> Self {
         self.control = Some(reference);
         self
     }
@@ -763,6 +774,7 @@ impl NetworkPlan {
             series_resistance: zero("pn_rseries"),
             series_inductance: zero("pn_lseries"),
             series_inductance_shunt: get("pn_rseries_shunt").filter(|r| *r != 0.),
+            series_inductance_damping: Self::damping(values, "series")?,
             storage_shunt: get("pn_rstorage_shunt").filter(|r| *r != 0.),
             parallel_resistance: get("pn_rparallel").filter(|r| *r != 0.),
             parallel_capacitance: zero("pn_cparallel"),

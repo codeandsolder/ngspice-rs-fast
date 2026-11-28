@@ -356,6 +356,7 @@ fn real_stamp_uses_explicit_temperature_and_initial_conditions_remain_visible() 
         reltol: ngspice_rs::devices::DEFAULT_RELTOL,
         frequency: 0.,
         mode: AnalysisMode::OperatingPoint,
+        analysis_kind: None,
         bias_analysis: None,
         branches: 0..0,
         controls: &[],

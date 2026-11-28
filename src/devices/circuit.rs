@@ -3029,6 +3029,14 @@ impl Circuit {
             .ok_or_else(|| SpiceError::circuit("circuit topology is stale or not finalized"))
     }
 
+    pub(super) fn intrinsic_current_device_index(&self, name: &str) -> Option<usize> {
+        let original = name.strip_suffix("#intrinsic")?;
+        let index = self.bindings.names.get(original)?;
+        let report = self.current_report(index)?;
+        (report.intrinsic == name && self.devices[index].expression_current_branch().is_some())
+            .then_some(index)
+    }
+
     pub(super) fn observation_device_index(&self, name: &str) -> Option<usize> {
         self.bindings.names.get(name)
     }
@@ -3209,7 +3217,7 @@ impl Circuit {
     pub fn bind_source_target(&self, name: &str) -> SpiceResult<InstanceTarget> {
         let index = self
             .device_index(name)
-            .filter(|&i| matches!(self.devices[i].designator().to_ascii_lowercase(), 'v' | 'i'))
+            .filter(|&i| self.devices[i].input_source().is_some())
             .ok_or_else(|| SpiceError::circuit("invalid or unknown DC source override"))?;
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.bindings += 1);
@@ -3307,6 +3315,7 @@ impl Circuit {
             reltol: request.model_context.reltol,
             frequency: request.model_context.frequency,
             mode: request.mode,
+            analysis_kind: request.model_context.analysis_kind,
             bias_analysis: request.model_context.bias_analysis,
             branches: self.bindings.branch_rows[index].clone(),
             controls: self.controls(index)?,
@@ -3839,6 +3848,7 @@ impl Circuit {
                 reltol: request.model_context.reltol,
                 frequency: request.model_context.frequency,
                 mode: request.mode,
+                analysis_kind: request.model_context.analysis_kind,
                 bias_analysis: request.model_context.bias_analysis,
                 branches: self.bindings.branch_rows[index].clone(),
                 controls: self.controls(index)?,
@@ -4767,18 +4777,27 @@ impl Circuit {
             usage = usage.checked_add(actual, at)?;
             limits.check(usage, at)?;
         }
+        Self::check_private_nodes(nodes, mark, &plan.deck_nodes)?;
+        Ok(staged)
+    }
+
+    fn check_private_nodes(
+        nodes: &crate::primitives::NodeAppend<'_>,
+        mark: usize,
+        deck_nodes: &BTreeSet<String>,
+    ) -> SpiceResult<()> {
         // Factories already reject existing names. Check private nodes which
         // were created before a later parsed card could introduce its name.
         if let Some(collision) = nodes.nodes()[mark..].iter().find(|node| {
             matches!(node.kind, NodeKind::Internal | NodeKind::ProbeAlias)
-                && plan.deck_nodes.contains(&node.name)
+                && deck_nodes.contains(&node.name)
         }) {
             return Err(SpiceError::circuit(format!(
                 "internal-node name collision: {}",
                 collision.name
             )));
         }
-        Ok(staged)
+        Ok(())
     }
 
     fn stage_network(

@@ -945,6 +945,23 @@ pub(super) enum TransientRun<'a> {
     },
 }
 
+impl TransientRun<'_> {
+    fn output(self, circuit: &Circuit) -> SpiceResult<super::linear::LinearOutput> {
+        let (name, title) = match self {
+            TransientRun::Ordinary | TransientRun::Seed => ("tran1", "Transient Analysis"),
+            TransientRun::Shooting { .. } => ("pss1", "Periodic Steady State Analysis"),
+        };
+        plot(
+            circuit,
+            name,
+            title,
+            Some(("time", "time")),
+            false,
+            crate::devices::passive_network::ReportPhase::Transient,
+        )
+    }
+}
+
 /// The probes and verification see only physical state, never optional
 /// observations. The emission pass reuses the verified endpoint's transient
 /// proposal to ask exactly the selected device quantities at phase zero.
@@ -1260,18 +1277,7 @@ impl Driver<'_> {
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
         let mut breaks = BreakTable::new(stop, self.settings.min_break())?;
         let mut sources = SourceBreaks::new(self.system);
-        let (name, title) = match purpose {
-            TransientRun::Ordinary | TransientRun::Seed => ("tran1", "Transient Analysis"),
-            TransientRun::Shooting { .. } => ("pss1", "Periodic Steady State Analysis"),
-        };
-        let output = plot(
-            self.circuit,
-            name,
-            title,
-            Some(("time", "time")),
-            false,
-            crate::devices::passive_network::ReportPhase::Transient,
-        )?;
+        let output = purpose.output(self.circuit)?;
         sink.begin(&output.header)?;
         let mut selected = crate::analysis::results::SelectedOutput::bind(
             sink,

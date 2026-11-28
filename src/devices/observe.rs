@@ -370,6 +370,10 @@ impl ObservationPlan {
         for name in names {
             let name = name.to_ascii_lowercase();
             let (instance, key) = query(&name)?;
+            if name.starts_with("i(") && circuit.intrinsic_current_device_index(instance).is_some()
+            {
+                continue;
+            }
             let index = circuit
                 .observation_device_index(instance)
                 .ok_or_else(|| SpiceError::circuit(format!("{name}: unknown device {instance}")))?;

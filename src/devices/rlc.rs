@@ -1312,6 +1312,7 @@ mod tests {
             reltol: crate::devices::DEFAULT_RELTOL,
             frequency: 0.,
             mode: crate::devices::traits::AnalysisMode::Transient { time: 0., dt: 1e-6 },
+            analysis_kind: None,
             bias_analysis: None,
             branches: 0..0,
             controls: &[],

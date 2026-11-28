@@ -20,6 +20,7 @@ fn coefficients(kind: StorageKind, value: f64) -> PassiveNetworkCoefficients {
         series_resistance: 0.,
         series_inductance: 0.,
         series_inductance_shunt: None,
+        series_inductance_damping: None,
         storage_shunt: None,
         parallel_resistance: None,
         parallel_capacitance: 0.,

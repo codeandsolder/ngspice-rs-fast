@@ -1,0 +1,76 @@
+Storage current reference across multiplicity and parasitics
+.options reltol=1e-10 abstol=1e-14 vntol=1e-12 plotwinsize=0
+Vl1r sl1r 0 DC 1 AC 1
+Rl1r sl1r pl1r 2
+Ll1r pl1r 0 3m Rser=5 Rpar=100 m=1
+Vc1r sc1r 0 DC 1 AC 1
+Rc1r sc1r pc1r 2
+Cc1r pc1r 0 2u Rser=5 Rpar=100 m=1
+Vl1c sl1c 0 DC 1 AC 1
+Rl1c sl1c pl1c 2
+Ll1c pl1c 0 3m Rser=5 Cpar=1u m=1
+Vc1c sc1c 0 DC 1 AC 1
+Rc1c sc1c pc1c 2
+Cc1c pc1c 0 2u Rser=5 Cpar=1u m=1
+Vl1rc sl1rc 0 DC 1 AC 1
+Rl1rc sl1rc pl1rc 2
+Ll1rc pl1rc 0 3m Rser=5 Rpar=100 Cpar=1u m=1
+Vc1rc sc1rc 0 DC 1 AC 1
+Rc1rc sc1rc pc1rc 2
+Cc1rc pc1rc 0 2u Rser=5 Rpar=100 Cpar=1u m=1
+Vl2r sl2r 0 DC 1 AC 1
+Rl2r sl2r pl2r 2
+Ll2r pl2r 0 3m Rser=5 Rpar=100 m=2
+Vc2r sc2r 0 DC 1 AC 1
+Rc2r sc2r pc2r 2
+Cc2r pc2r 0 2u Rser=5 Rpar=100 m=2
+Vl2c sl2c 0 DC 1 AC 1
+Rl2c sl2c pl2c 2
+Ll2c pl2c 0 3m Rser=5 Cpar=1u m=2
+Vc2c sc2c 0 DC 1 AC 1
+Rc2c sc2c pc2c 2
+Cc2c pc2c 0 2u Rser=5 Cpar=1u m=2
+Vl2rc sl2rc 0 DC 1 AC 1
+Rl2rc sl2rc pl2rc 2
+Ll2rc pl2rc 0 3m Rser=5 Rpar=100 Cpar=1u m=2
+Vc2rc sc2rc 0 DC 1 AC 1
+Rc2rc sc2rc pc2rc 2
+Cc2rc pc2rc 0 2u Rser=5 Rpar=100 Cpar=1u m=2
+Vl3r sl3r 0 DC 1 AC 1
+Rl3r sl3r pl3r 2
+Ll3r pl3r 0 3m Rser=5 Rpar=100 m=3
+Vc3r sc3r 0 DC 1 AC 1
+Rc3r sc3r pc3r 2
+Cc3r pc3r 0 2u Rser=5 Rpar=100 m=3
+Vl3c sl3c 0 DC 1 AC 1
+Rl3c sl3c pl3c 2
+Ll3c pl3c 0 3m Rser=5 Cpar=1u m=3
+Vc3c sc3c 0 DC 1 AC 1
+Rc3c sc3c pc3c 2
+Cc3c pc3c 0 2u Rser=5 Cpar=1u m=3
+Vl3rc sl3rc 0 DC 1 AC 1
+Rl3rc sl3rc pl3rc 2
+Ll3rc pl3rc 0 3m Rser=5 Rpar=100 Cpar=1u m=3
+Vc3rc sc3rc 0 DC 1 AC 1
+Rc3rc sc3rc pc3rc 2
+Cc3rc pc3rc 0 2u Rser=5 Rpar=100 Cpar=1u m=3
+Vlp5r slp5r 0 DC 1 AC 1
+Rlp5r slp5r plp5r 2
+Llp5r plp5r 0 3m Rser=5 Rpar=100 m=.5
+Vcp5r scp5r 0 DC 1 AC 1
+Rcp5r scp5r pcp5r 2
+Ccp5r pcp5r 0 2u Rser=5 Rpar=100 m=.5
+Vlp5c slp5c 0 DC 1 AC 1
+Rlp5c slp5c plp5c 2
+Llp5c plp5c 0 3m Rser=5 Cpar=1u m=.5
+Vcp5c scp5c 0 DC 1 AC 1
+Rcp5c scp5c pcp5c 2
+Ccp5c pcp5c 0 2u Rser=5 Cpar=1u m=.5
+Vlp5rc slp5rc 0 DC 1 AC 1
+Rlp5rc slp5rc plp5rc 2
+Llp5rc plp5rc 0 3m Rser=5 Rpar=100 Cpar=1u m=.5
+Vcp5rc scp5rc 0 DC 1 AC 1
+Rcp5rc scp5rc pcp5rc 2
+Ccp5rc pcp5rc 0 2u Rser=5 Rpar=100 Cpar=1u m=.5
+.ac lin 3 100 10000
+.end

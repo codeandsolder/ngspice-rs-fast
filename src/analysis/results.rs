@@ -79,7 +79,7 @@ pub(crate) struct SelectedOutput {
 impl SelectedOutput {
     /// Negotiate exactly once, after the full header has been validated by
     /// the sink. The output is scale, unknowns, then observations.
-    pub(crate) fn bind(
+    pub(super) fn bind(
         sink: &dyn PointSink,
         output: &super::linear::LinearOutput,
         unknowns: usize,

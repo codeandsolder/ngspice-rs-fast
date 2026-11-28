@@ -212,3 +212,151 @@ fn selected_report_columns_match_full_rows() -> SpiceResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn transient_storage_network_matches_independent_switching_endpoint() -> SpiceResult<()> {
+    let deck = "switching storage
+.options reltol=1e-8 abstol=1e-12 vntol=1e-10
+v1 s1 0 pulse(0 1 1u 0.1u 0.1u 10u 20u)
+r1 s1 p1 2
+l1 p1 0 3m pn_rseries=5 pn_rparallel=100 pn_cparallel=1u m=3 pn_report_ac_rparallel_factor=2
+v2 s2 0 pulse(0 1 1u 0.1u 0.1u 10u 20u)
+r2 s2 p2 2
+c2 p2 0 2u pn_rseries=5 pn_rparallel=100 pn_cparallel=1u pn_lseries=3m pn_gseries_dc={1/(20*3)} pn_gseries_ac=.05 pn_gseries_tran={1/(20*3)} m=3 pn_report_tran=1
+.tran 100n 30u 0 100n
+.end
+";
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("network.cir"), deck))?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    let plot = config
+        .plan_for(&netlist.analyses[0])?
+        .run(&mut circuit, &config.context())?;
+    let last = plot.point_count() - 1;
+    close(
+        plot.value("time", last).unwrap(),
+        Complex::real(30e-6),
+        1e-12,
+        1e-14,
+    );
+    for (name, expected) in [
+        ("v(p1)", 0.7584027154835773),
+        ("i(l1)", 0.1207986422582508),
+        ("v(p2)", 0.7260855908107419),
+        ("i(c2)", 0.1369572045946370),
+    ] {
+        close(
+            plot.value(name, last).unwrap(),
+            Complex::real(expected),
+            2e-5,
+            2e-7,
+        );
+    }
+    for (row, t) in plot.rows().enumerate() {
+        for (report, port) in [("i(l1)", "i(vl1#port)"), ("i(c2)", "i(vc2#port)")] {
+            assert_eq!(
+                t[plot.variable_index(report).unwrap()],
+                t[plot.variable_index(port).unwrap()],
+                "row {row}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn uic_damping_uses_transient_coefficients_without_bias_constraints() -> SpiceResult<()> {
+    let text = "uic damping\nv1 s 0 1\nr1 s p 10\nc1 p 0 1u ic=0 pn_bias_tran=1000 pn_gterminal_dc=.01 pn_gterminal_tran=.03 pn_report_tran=1\n.end\n";
+    let mut circuit = circuit(text)?;
+    let mut input =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["100n", "100u", "0", "100n"]);
+    input.uic = true;
+    circuit.finalize()?;
+    let plot = input
+        .resolve()?
+        .run(&mut circuit, &AnalysisContext::default())?;
+    let last = plot.point_count() - 1;
+    let equilibrium = 1. / 1.3;
+    let expected = equilibrium * (1. - (-100e-6_f64 * 0.13 / 1e-6).exp());
+    close(
+        plot.value("v(p)", last).unwrap(),
+        Complex::real(expected),
+        2e-5,
+        1e-7,
+    );
+    Ok(())
+}
+
+#[test]
+fn series_inductance_shunt_supports_distinct_multiplicity_laws() -> SpiceResult<()> {
+    let mut deck = String::from(
+        "series shunt multiplicity\n.options reltol=1e-8 abstol=1e-12 vntol=1e-10\nv1 s 0 pulse(0 1 1u .1u .1u 10u 20u) ac 1\n",
+    );
+    for (index, m) in [1., 2., 3., 0.5].into_iter().enumerate() {
+        let n = index + 1;
+        writeln!(
+            deck,
+            "r{n} s p{n} 2\nc{n} p{n} 0 2u m={m} pn_rseries=5 pn_rparallel=100 pn_cparallel=1u pn_lseries=3m pn_gseries_ac=.05 pn_gseries_tran={{1/(20*{m})}}"
+        )
+        .unwrap();
+    }
+    deck.push_str(".ac lin 3 100 10000\n.tran 100n 30u 0 100n\n.end\n");
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("network.cir"), &deck))?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    let ac = config
+        .plan_for(&netlist.analyses[0])?
+        .run(&mut circuit, &config.context())?;
+    let tran = config
+        .plan_for(&netlist.analyses[1])?
+        .run(&mut circuit, &config.context())?;
+    // Independent LTspice 24.0.12 reference: each column uses a different m.
+    let reference = [
+        [
+            (0.9803629380716185, -0.003628936428701225),
+            (0.961457406132857, -0.006980919486193901),
+            (0.943244677387502, -0.01007904087107339),
+            (0.9900875007544451, -0.001850624543540288),
+        ],
+        [
+            (0.9128491594308511, -0.08062262101802195),
+            (0.8296089265627619, -0.1356829812321496),
+            (0.7537167234428188, -0.1721498485127054),
+            (0.9562933410095975, -0.04399006895389805),
+        ],
+        [
+            (0.896629327911288, -0.1175458510453922),
+            (0.7922861612565576, -0.1909383740850804),
+            (0.6975657707736985, -0.2333041598145967),
+            (0.9495325892464954, -0.06510396310725285),
+        ],
+    ];
+    for (point, row) in reference.into_iter().enumerate() {
+        for (index, (re, im)) in row.into_iter().enumerate() {
+            close(
+                ac.value(&format!("v(p{})", index + 1), point).unwrap(),
+                Complex::new(re, im),
+                1e-10,
+                1e-12,
+            );
+        }
+    }
+    let last = tran.point_count() - 1;
+    for (index, expected) in [
+        0.9153207353710472,
+        0.8201352172432387,
+        0.7260842981738106,
+        0.9497307705099741,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        close(
+            tran.value(&format!("v(p{})", index + 1), last).unwrap(),
+            Complex::real(expected),
+            2e-5,
+            2e-7,
+        );
+    }
+    Ok(())
+}

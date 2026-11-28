@@ -124,7 +124,7 @@ pub(in crate::devices) struct CurrentReportSpec {
 /// The output phase is not the enclosing bias analysis: the retained bias
 /// plot of an AC run uses the steady reporting convention.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ReportPhase {
+pub enum ReportPhase {
     Steady,
     SmallSignal,
     Transient,
@@ -132,7 +132,7 @@ pub(crate) enum ReportPhase {
 
 /// Bound projection of one reported current, independent of the solver.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CurrentOutputLaw {
+pub struct CurrentOutputLaw {
     row: usize,
     voltage_rows: [Option<usize>; 2],
     conductance: Real,
@@ -153,7 +153,7 @@ impl CurrentOutputLaw {
 
 /// All phase-specific projections and the original physical device identity.
 #[derive(Debug)]
-pub(crate) struct BoundCurrentReport {
+pub struct BoundCurrentReport {
     pub(crate) original_device: usize,
     pub(crate) original: String,
     pub(crate) intrinsic: String,
