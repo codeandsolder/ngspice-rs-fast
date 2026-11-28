@@ -79,6 +79,14 @@ pub(super) fn instantiate_with_models(
         ModelBackend::LtspiceIdealDiode => {
             crate::devices::ideal_diode::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::LtspiceFowlerNordheim => {
+            crate::devices::ltspice_diode::instantiate_fn(instance, nodes, &model, context)
+        }
+        ModelBackend::LtspiceSemiconductorDiode => {
+            crate::devices::ltspice_diode::instantiate_semiconductor(
+                instance, nodes, &model, context,
+            )
+        }
         ModelBackend::Bjt => {
             crate::devices::bjt::Bjt::instantiate(instance, nodes, &model, context)
         }

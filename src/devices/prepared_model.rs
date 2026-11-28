@@ -188,7 +188,7 @@ pub(super) struct SourceBinding {
     pub parameters: &'static [SourceParameter],
     pub gmin_slot: Option<usize>,
     pub model_ambient: AmbientTemperature,
-    pub relative_temperature_slot: usize,
+    pub relative_temperature_slot: Option<usize>,
     pub absolute_temperature_slot: Option<usize>,
 }
 
@@ -996,7 +996,11 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                 }
                 .ambient_kelvin();
                 let effective = source.absolute_temperature_slot.map_or_else(
-                    || base + self.values[source.relative_temperature_slot],
+                    || {
+                        base + source
+                            .relative_temperature_slot
+                            .map_or(0., |slot| self.values[slot])
+                    },
                     |slot| self.values[slot],
                 );
                 return Ok(Some(effective - CELSIUS_TO_KELVIN));

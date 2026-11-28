@@ -68,6 +68,7 @@ pub mod jfet;
 pub mod jfet2;
 pub mod limiting;
 pub mod linear;
+mod ltspice_diode;
 pub mod mesfet;
 pub mod models;
 pub mod mos;

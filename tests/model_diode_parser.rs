@@ -117,7 +117,7 @@ fn forward_and_unresolved_model_references_are_syntax_not_elaboration() {
 }
 
 #[test]
-fn diode_scalar_parameters_and_perimeter_alias_are_canonicalized() {
+fn diode_scalar_parameters_retain_source_perimeter_spelling() {
     let netlist = parse(
         "D1 A B DM AREA=2 PERIM 3 M=4 IC=.1 TEMP=30 DTEMP=2 W=10u L=20u LM=1u LP=2u WM=3u WP=4u\n",
     )
@@ -128,7 +128,7 @@ fn diode_scalar_parameters_and_perimeter_alias_are_canonicalized() {
         pairs(&diode.parameters),
         [
             ("area", "2"),
-            ("pj", "3"),
+            ("perim", "3"),
             ("m", "4"),
             ("ic", ".1"),
             ("temp", "30"),

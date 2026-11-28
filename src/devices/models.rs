@@ -58,8 +58,8 @@ pub enum ModelFamily {
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
     SimetrixDiodeLevel1,
-    /// Explicit source-selected `LTspice` idealized diode.
-    LtspiceIdealDiode,
+    /// Resolved source dialect marker for all `LTspice` diode models.
+    LtspiceDiode,
     /// NPN classic BJT.
     Npn,
     /// PNP classic BJT.
@@ -129,7 +129,7 @@ impl ModelFamily {
             }
             "d" => Some(Self::Diode),
             model_kernel_diode::MODEL_FAMILY => Some(Self::SimetrixDiodeLevel1),
-            super::ideal_diode::MODEL_FAMILY => Some(Self::LtspiceIdealDiode),
+            super::ltspice_diode::MODEL_FAMILY => Some(Self::LtspiceDiode),
             "npn" => Some(Self::Npn),
             "pnp" => Some(Self::Pnp),
             "gummel_poon_legacy_npn" => Some(Self::GummelPoonLegacyNpn),
@@ -168,7 +168,7 @@ impl ModelFamily {
             Self::Resistor => 'r',
             Self::Capacitor | Self::PolynomialCapacitor => 'c',
             Self::Inductor | Self::PolynomialInductor => 'l',
-            Self::Diode | Self::SimetrixDiodeLevel1 | Self::LtspiceIdealDiode => 'd',
+            Self::Diode | Self::SimetrixDiodeLevel1 | Self::LtspiceDiode => 'd',
             Self::Npn | Self::Pnp | Self::GummelPoonLegacyNpn | Self::GummelPoonLegacyPnp => 'q',
             Self::Nmos | Self::Pmos => 'm',
             Self::Switch | Self::LtspiceSwitch => 's',
@@ -210,6 +210,10 @@ pub enum ModelBackend {
     SimetrixDiodeLevel1,
     /// Explicit source-selected `LTspice` idealized diode.
     LtspiceIdealDiode,
+    /// Explicit `LTspice` Fowler–Nordheim tunnelling law.
+    LtspiceFowlerNordheim,
+    /// Explicit `LTspice` semiconductor junction and sidewall law.
+    LtspiceSemiconductorDiode,
     /// Gummel-Poon.
     Bjt,
     /// MOS1.
@@ -309,8 +313,20 @@ impl ModelBackend {
                             &[1],
                         )
                         .for_family(ModelFamily::SimetrixDiodeLevel1),
-                        BackendSpec::new(Self::LtspiceIdealDiode, "LTspice idealized diode", &[1])
-                            .for_family(ModelFamily::LtspiceIdealDiode),
+                        BackendSpec::new(Self::LtspiceIdealDiode, "LTspice idealized diode", &[0])
+                            .for_family(ModelFamily::LtspiceDiode),
+                        BackendSpec::new(
+                            Self::LtspiceSemiconductorDiode,
+                            "LTspice semiconductor diode",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::LtspiceDiode),
+                        BackendSpec::new(
+                            Self::LtspiceFowlerNordheim,
+                            "LTspice Fowler–Nordheim diode",
+                            &[2],
+                        )
+                        .for_family(ModelFamily::LtspiceDiode),
                     ]
                 }
             }
@@ -464,11 +480,13 @@ pub struct LevelSelection {
     pub first_raw: Option<Real>,
     /// First rounded level for selector-based families (including aliases);
     /// fixed 1 for families whose C backend does not scan the level.
+    /// For `LTspice` D, a physical dispatch code: 0 ideal, 1 semiconductor,
+    /// 2 Fowler–Nordheim, independent of the actual non-FN LEVEL spelling.
     pub selector: u8,
     /// Concrete implementation for the validated selector.
     pub backend: ModelBackend,
     /// Diode's last integer setter (`floor(raw + 0.5)`), defaulting to 1.
-    /// `None` for families with no level setter.
+    /// `None` for families with no integer setter or out-of-range LTspice LEVEL.
     pub applied: Option<u8>,
 }
 
@@ -482,6 +500,11 @@ pub(super) enum PreparationKey {
     Nominal(u64),
     PreparedTopology {
         series: bool,
+        absolute_temperature: bool,
+    },
+    LtspiceDiodeTopology {
+        nominal: u64,
+        shape: u8,
         absolute_temperature: bool,
     },
 }
@@ -1364,6 +1387,9 @@ fn level_setters(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSett
 }
 
 fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> {
+    if family == ModelFamily::LtspiceDiode {
+        return super::ltspice_diode::select(card);
+    }
     let LevelSetters { first, last } = level_setters(card, family)?;
     let raw = first.map(|(raw, _, _)| raw);
     if card.level != raw {
@@ -1388,10 +1414,6 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         | ModelFamily::Nmf
         | ModelFamily::Pmf => (first_integer, true, None),
         ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => (first_integer, true, None),
-        ModelFamily::LtspiceIdealDiode => {
-            let applied = last.unwrap_or(1);
-            (1, applied <= 1, Some(applied))
-        }
         ModelFamily::Diode => {
             let applied = last.unwrap_or(1);
             (1, applied == 1, Some(applied))
@@ -1417,16 +1439,15 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
                 "src/spicelib/parser/inpdomod.c (only MESFET levels 1-4 and HFET levels 5-6 exist in C)",
             ));
         }
-        let setter_location =
-            if matches!(family, ModelFamily::Diode | ModelFamily::LtspiceIdealDiode) {
-                card.parameters
-                    .iter()
-                    .rev()
-                    .find(|p| p.name.eq_ignore_ascii_case("level"))
-                    .map_or(location, |p| &p.location)
-            } else {
-                location
-            };
+        let setter_location = if family == ModelFamily::Diode {
+            card.parameters
+                .iter()
+                .rev()
+                .find(|p| p.name.eq_ignore_ascii_case("level"))
+                .map_or(location, |p| &p.location)
+        } else {
+            location
+        };
         let reference = if matches!(family, ModelFamily::Nmos | ModelFamily::Pmos) {
             mos_level_reference(selector)
         } else {

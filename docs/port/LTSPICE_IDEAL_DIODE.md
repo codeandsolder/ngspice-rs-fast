@@ -1,6 +1,6 @@
 # LTspice idealized diode
 
-The explicit model family `ltspice_ideal_diode` is selected by the
+The explicit model family `ltspice_diode` retains source dialect; its idealized backend is selected by the
 LTspice dialect preprocessor. Native SPICE `D` model cards continue
 to select the ordinary semiconductor diode. This device implements a
 memoryless two-terminal conduction law, not a semiconductor charge
