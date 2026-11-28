@@ -831,7 +831,19 @@ impl DerivativePredictor {
                 .as_slice()
                 .iter()
                 .zip(self.seed.rate.as_slice())
-                .map(|(&x, &rate)| rate.mul_add(delta, x))
+                .map(|(&x, &rate)| {
+                    let predicted = rate.mul_add(delta, x);
+                    // Extrapolation can land on a zero of a singular residual.
+                    // Within the rounding envelope of the cancelling terms,
+                    // prefer exact zero as a disposable Newton seed. The
+                    // physical residual and rank checks still certify the germ.
+                    let scale = x.abs().max((rate * delta).abs());
+                    if scale.is_finite() && predicted.abs() <= 2. * Real::EPSILON * scale {
+                        0.
+                    } else {
+                        predicted
+                    }
+                })
                 .collect::<Vec<_>>(),
         );
         guess.is_finite().then_some(guess)

@@ -1649,3 +1649,59 @@ fn singular_germ_predictor_survives_rejected_steps_and_source_event() -> SpiceRe
     }
     Ok(())
 }
+
+#[test]
+fn singular_germ_and_behavioural_corner_share_the_exact_event() -> SpiceResult<()> {
+    let body = "b1 x 0 i=v(x)^3-((time-0.5u)/1u)^3\nb2 out 0 v=1u*ddt(abs(v(x)))\nr1 out 0 1k\nc1 stored 0 1u ic=2\nr2 stored 0 1k\n.ic v(x)=-0.5\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        let mut crossing = None;
+        let mut previous = -1.;
+        for index in 0..plot.point_count() {
+            let time = plot.value("time", index).unwrap().re;
+            let x = plot.value("v(x)", index).unwrap().re;
+            let rate = plot.value("v(out)", index).unwrap().re;
+            close(x, (time - 0.5e-6) / 1e-6, 1e-8);
+            close(rate.abs(), 1., 1e-7);
+            if (time - 0.5e-6).abs() > 1e-14 {
+                close(rate, (time - 0.5e-6).signum(), 1e-7);
+            }
+            close(plot.value("i(b2)", index).unwrap().re, -rate * 1e-3, 1e-10);
+            close(
+                plot.value("v(stored)", index).unwrap().re,
+                2. * (-time / 1e-3).exp(),
+                2e-6,
+            );
+            if rate > 0. && previous < 0. {
+                assert!(crossing.is_none());
+                crossing = Some(time);
+                close(x, 0., 1e-8);
+            }
+            previous = rate;
+        }
+        close(crossing.expect("missing behavioural corner"), 0.5e-6, 1e-14);
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_recovery_cannot_accept_discontinuous_derivative_input() {
+    let body = "b1 x 0 i=v(x)^3-((time-0.5u)/1u)^3\nb2 out 0 v=1u*ddt(u(v(x)))\nr1 out 0 1k\n.ic v(x)=-0.5\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let error = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )
+        .expect_err("the recovered singular germ cannot erase a physical impulse")
+        .to_string();
+        assert!(
+            error.contains("derivative input jumps"),
+            "{method}: {error}"
+        );
+    }
+}
