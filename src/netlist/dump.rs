@@ -987,8 +987,7 @@ fn write_expression_header(
     out.line(
         indent,
         format!(
-            "expression braced={}{} text={} span={}",
-            braced,
+            "expression braced={braced}{} text={} span={}",
             if quoted { " quoted=true" } else { "" },
             quote(text),
             Ctx::span(span)

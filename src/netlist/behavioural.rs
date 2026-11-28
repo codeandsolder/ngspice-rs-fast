@@ -41,7 +41,9 @@ use crate::netlist::bexpr::{
 use crate::netlist::elaborate::format_literal;
 use crate::netlist::eval::statistics::PreparedSite;
 use crate::netlist::eval::{EvalBudget, FunctionDef, FunctionScope, ParamScope};
-use crate::netlist::expr::{Expr, ExprKind, MAX_TREE_NODES, SourceSpan, TreeBudget};
+use crate::netlist::expr::{
+    Expr, ExprKind, MAX_TREE_NODES, ParameterExpression, SourceSpan, TreeBudget,
+};
 
 mod edits;
 pub(super) mod forms;
@@ -806,10 +808,9 @@ fn runtime_call(
         };
         // A behavioural-only definition must be resolved in that phase
         // before the final classification can be made.
-        return match &def.body.scalar {
-            Ok(body) => has_runtime(body, site, Some(&frame), depth + 1, budget),
-            Err(_) => Ok(true),
-        };
+        return def.body.scalar.as_ref().map_or(Ok(true), |body| {
+            has_runtime(body, site, Some(&frame), depth + 1, budget)
+        });
     }
     if matches!(name, "v" | "i" | "ddt") {
         return Ok(true);
@@ -950,22 +951,7 @@ impl Resolver<'_> {
             BExprKind::Call { name, arguments } => {
                 return self.call(expr, name, arguments, depth, frame);
             }
-            BExprKind::Value(value) => {
-                value
-                    .root
-                    .check_tree(depth + 1, &mut self.expansion_budget)?;
-                if self.syntax_only {
-                    expr.kind.clone()
-                } else {
-                    let identity = self
-                        .prepared_frame(&expr.span)
-                        .map(|(identity, _)| identity);
-                    let evaluated =
-                        self.scope
-                            .evaluate_sampled(value, self.budget, &self.sampler, identity)?;
-                    self.numeric_value(evaluated)
-                }
-            }
+            BExprKind::Value(value) => self.resolve_value(expr, value, depth)?,
             BExprKind::Table(table) => {
                 let input = self.resolve(&table.input, depth + 1, frame)?;
                 let mut points = Vec::with_capacity(table.points.len());
@@ -986,6 +972,27 @@ impl Resolver<'_> {
             kind,
             span: expr.span.clone(),
         })
+    }
+
+    fn resolve_value(
+        &mut self,
+        expr: &BExpr,
+        value: &ParameterExpression,
+        depth: usize,
+    ) -> SpiceResult<BExprKind> {
+        value
+            .root
+            .check_tree(depth + 1, &mut self.expansion_budget)?;
+        if self.syntax_only {
+            return Ok(expr.kind.clone());
+        }
+        let identity = self
+            .prepared_frame(&expr.span)
+            .map(|(identity, _)| identity);
+        let evaluated = self
+            .scope
+            .evaluate_sampled(value, self.budget, &self.sampler, identity)?;
+        Ok(self.numeric_value(evaluated))
     }
 
     fn name(&self, expr: &BExpr, name: &str) -> SpiceResult<BExpr> {

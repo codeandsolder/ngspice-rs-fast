@@ -941,10 +941,9 @@ impl ParamScope {
                     .and_then(|scope| scope.get(name))
                     .or_else(|| self.functions.as_deref().and_then(|scope| scope.get(name)))
                     && visited.insert(std::ptr::from_ref(definition))
+                    && let Ok(body) = &definition.body.scalar
                 {
-                    if let Ok(body) = &definition.body.scalar {
-                        pending.push((body, Some(owner)));
-                    }
+                    pending.push((body, Some(owner)));
                 }
             }
         }
@@ -1283,10 +1282,10 @@ fn function_body_calls(body: &FunctionBody) -> Vec<(&str, usize, &SourceLoc)> {
         use crate::netlist::bexpr::BExprKind;
         root.visit(&mut |node| match &node.kind {
             BExprKind::Call { name, arguments } => {
-                calls.push((name.as_str(), arguments.len(), &node.span.start))
+                calls.push((name.as_str(), arguments.len(), &node.span.start));
             }
             BExprKind::Voltage { negative, .. } => {
-                calls.push(("v", 1 + usize::from(negative.is_some()), &node.span.start))
+                calls.push(("v", 1 + usize::from(negative.is_some()), &node.span.start));
             }
             BExprKind::Current(_) => calls.push(("i", 1, &node.span.start)),
             _ => {}
@@ -1812,7 +1811,7 @@ fn eval(
         } => {
             let condition = eval(condition, root, env, budget, depth + 1)?;
             eval(
-                if condition != 0.0 { then } else { otherwise },
+                if condition == 0.0 { otherwise } else { then },
                 root,
                 env,
                 budget,
@@ -1914,7 +1913,7 @@ fn builtin_call(
         };
         let condition = eval(condition, root, env, budget, depth + 1)?;
         return eval(
-            if condition != 0.0 { then } else { otherwise },
+            if condition == 0.0 { otherwise } else { then },
             root,
             env,
             budget,
@@ -2066,7 +2065,7 @@ fn call(
         call: node.span.start.clone(),
         call_offset: node
             .span
-            .relative_to(&root.span)
+            .relative_to(root.span)
             .map(|span| span.start as u64),
         outer: env.frame,
     };

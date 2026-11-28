@@ -292,7 +292,7 @@ impl SidedPwl {
                 || knots[knots.len() - 1].time >= r.period
                 || r.hold.is_some_and(|v| !v.is_finite())
                 || r.limit.is_some_and(|limit| {
-                    !limit.time.is_finite() || !limit.value.is_finite() || limit.time <= r.origin
+                    !(limit.time.is_finite() && limit.value.is_finite() && r.origin < limit.time)
                 })
             {
                 return Err(invalid("invalid repeating knot geometry"));
@@ -555,10 +555,6 @@ enum Events {
 }
 
 impl Events {
-    #[expect(
-        clippy::float_cmp,
-        reason = "coincident event times must be emitted once"
-    )]
     fn fixed(mut times: [Option<Real>; 2], start: Real, end: Real) -> Self {
         times.sort_by(|a, b| match (a, b) {
             (Some(a), Some(b)) => a.total_cmp(b),
