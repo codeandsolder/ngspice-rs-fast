@@ -290,12 +290,15 @@ struct MutualEvaluation {
 
 impl MutualEvaluation {
     fn matches(&self, values: &BTreeMap<usize, InductanceValue>, mutuals: &[Real]) -> bool {
-        const fn bits(value: &InductanceValue) -> [u64; 3] {
-            [
-                value.effective.to_bits(),
-                value.coupling_base.to_bits(),
-                value.initial.to_bits(),
-            ]
+        fn bits(value: &InductanceValue) -> ([u64; 3], Option<u64>) {
+            (
+                [
+                    value.effective.to_bits(),
+                    value.coupling_base.to_bits(),
+                    value.initial.to_bits(),
+                ],
+                value.exact_startup.map(Real::to_bits),
+            )
         }
         self.values.len() == values.len()
             && self
@@ -2096,11 +2099,13 @@ impl Circuit {
                 row: self.bindings.branch_rows[pair.second].start,
                 inductance,
                 initial: b.initial,
+                exact_startup: b.exact_startup,
             });
             terms[pair.second].push(MutualTerm {
                 row: self.bindings.branch_rows[pair.first].start,
                 inductance,
                 initial: a.initial,
+                exact_startup: a.exact_startup,
             });
         }
         let terms = PreparedMutualTerms(Some(terms.into()));
