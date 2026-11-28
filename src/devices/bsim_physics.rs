@@ -568,6 +568,141 @@ impl ThresholdRollOff {
     }
 }
 
+/// Short/narrow-channel factor and independent body/depletion partials.
+pub(super) fn channel_rolloff<S: Constitutive>(
+    body: &S,
+    depletion: &S,
+    body_coefficient: Real,
+    length_factor: Real,
+    argument_scale: Real,
+    generation: ThresholdRollOff,
+) -> SpiceResult<LocalPart<S, 2>> {
+    let (body_factor, slope) = rational_floor(body.clone().scale(body_coefficient), -0.5, 1., 8.)?;
+    let length = depletion
+        .clone()
+        .sqrt()?
+        .multiply(&body_factor)
+        .scale(length_factor);
+    let argument = body.constant(argument_scale).divide(&length)?;
+    let (value, exponent_partial) = generation.evaluate(&argument)?;
+    let common = exponent_partial.multiply(&argument).scale(-1.);
+    let body_partial = common
+        .clone()
+        .multiply(&slope)
+        .scale(body_coefficient)
+        .divide(&body_factor)?;
+    let depletion_partial = common.scale(0.5).divide(depletion)?;
+    Ok(LocalPart {
+        value,
+        partials: [body_partial, depletion_partial],
+    })
+}
+
+/// Bias-independent threshold coefficients shared by both generations.
+/// The fixed term includes nominal, reference surface, temperature and
+/// width corrections; the linear body term includes their body partial.
+pub(super) struct ThresholdParameters {
+    pub(super) fixed: Real,
+    pub(super) surface: Real,
+    pub(super) body: Real,
+    pub(super) short: Real,
+    pub(super) narrow: Real,
+    pub(super) eta0: Real,
+    pub(super) etab: Real,
+    pub(super) theta0vb0: Real,
+}
+
+impl ThresholdParameters {
+    /// Value and independent partials in body, drain, surface-root,
+    /// short-channel factor, narrow-channel factor.
+    pub(super) fn evaluate<S: Constitutive>(
+        &self,
+        body: &S,
+        drain: &S,
+        surface: &S,
+        short: &S,
+        narrow: &S,
+    ) -> SpiceResult<LocalPart<S, 5>> {
+        let (eta, slope) = rational_floor(
+            body.clone().scale(self.etab).offset(self.eta0),
+            1e-4,
+            0.,
+            2e4,
+        )?;
+        let dibl = eta.scale(-self.theta0vb0);
+        let value = body
+            .clone()
+            .scale(self.body)
+            .offset(self.fixed)
+            .add(&surface.clone().scale(self.surface))
+            .add(&short.clone().scale(self.short))
+            .add(&narrow.clone().scale(self.narrow));
+        let value = dibl.clone().mul_add(drain, &value);
+        let body_partial = slope
+            .scale(-self.etab * self.theta0vb0)
+            .mul_add(drain, &body.constant(self.body));
+        Ok(LocalPart {
+            value,
+            partials: [
+                body_partial,
+                dibl,
+                body.constant(self.surface),
+                body.constant(self.short),
+                body.constant(self.narrow),
+            ],
+        })
+    }
+}
+
+/// Subthreshold slope-factor parameters, including the bias-dependent
+/// charge sharing coefficients and interface/oxide capacitances.
+pub(super) struct SlopeParameters {
+    pub(super) depletion: Real,
+    pub(super) coupling: [Real; 3],
+    pub(super) interface: Real,
+    pub(super) oxide: Real,
+}
+
+impl SlopeParameters {
+    /// Value and independent partials in body, drain, depletion depth
+    /// and the short-channel threshold factor.
+    pub(super) fn evaluate<S: Constitutive>(
+        &self,
+        body: &S,
+        drain: &S,
+        depletion: &S,
+        theta: &S,
+    ) -> SpiceResult<LocalPart<S, 4>> {
+        let [constant, body_coefficient, drain_coefficient] = self.coupling;
+        let coupling = body.constant(drain_coefficient).mul_add(
+            drain,
+            &body
+                .constant(body_coefficient)
+                .mul_add(body, &body.constant(constant)),
+        );
+        let capacitance = body.constant(self.depletion).divide(depletion)?;
+        let raw = coupling
+            .clone()
+            .mul_add(theta, &capacitance.clone().offset(self.interface))
+            .divide(&body.constant(self.oxide))?;
+        let (value, slope) = rational_floor(raw, -0.5, 1., 8.)?;
+        let scale = slope.scale(self.oxide.recip());
+        let body_partial = theta.clone().scale(body_coefficient).multiply(&scale);
+        let drain_partial = theta.clone().scale(drain_coefficient).multiply(&scale);
+        let depletion_partial = capacitance.scale(-1.).divide(depletion)?.multiply(&scale);
+        let theta_partial = coupling.multiply(&scale);
+        Ok(LocalPart {
+            value,
+            partials: [
+                body_partial,
+                drain_partial,
+                depletion_partial,
+                theta_partial,
+            ],
+        })
+    }
+}
+
 /// Saturation-shape coefficient, with the exact overdrive partial.
 /// The sign of a1 selects a parameterization, not a trajectory event.
 pub(super) fn saturation_shape<S: Constitutive>(
@@ -1675,6 +1810,108 @@ mod tests {
                     };
                     close(value_at(&value.value, time), reference, 1e-30);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_local<const N: usize>(part: &LocalPart<Differential<N>, N>) {
+        for (coordinate, partial) in part.partials.iter().enumerate() {
+            for (degree, &expected) in partial.value.coefficients().iter().enumerate() {
+                let actual = part.value.gradient[coordinate]
+                    .as_ref()
+                    .map_or(0., |g| g.coefficients()[degree]);
+                close(actual, expected, 1e-18);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_threshold_and_slope_factors_match_reference_trajectories() -> SpiceResult<()> {
+        for body in [-3.1, -0.3, 0.1] {
+            let depth = 1e-7;
+            let b = Differential::<2>::variable(0, Jet::affine(ORDER, body, 0.003))?;
+            let d = Differential::<2>::variable(1, Jet::affine(ORDER, depth, 1e-10))?;
+            for (generation, scale) in [
+                (ThresholdRollOff::Bsim3, -1e-6),
+                (ThresholdRollOff::Bsim4, 1e-6),
+            ] {
+                let rolloff = channel_rolloff(&b, &d, 0.2, 0.003, scale, generation)?;
+                verify_local(&rolloff);
+                for t in [0., 0.01, 0.02] {
+                    let x = 0.2 * 0.003_f64.mul_add(t, body);
+                    let factor = if x < -0.5 {
+                        (1. + 3. * x) / (3. + 8. * x)
+                    } else {
+                        1. + x
+                    };
+                    let arg = scale / (0.003 * 1e-10_f64.mul_add(t, depth).sqrt() * factor);
+                    let e = arg.exp();
+                    let expected = match generation {
+                        ThresholdRollOff::Bsim3 => e * (1. + 2. * e),
+                        ThresholdRollOff::Bsim4 => e / ((e - 1.).powi(2) + 2. * e * MIN_EXP),
+                    };
+                    close(value_at(&rolloff.value.value, t), expected, 1e-15);
+                }
+            }
+        }
+        for eta0 in [-0.03, 0.07] {
+            let parameters = ThresholdParameters {
+                fixed: 0.4,
+                surface: 0.2,
+                body: -0.1,
+                short: -0.3,
+                narrow: -0.2,
+                eta0,
+                etab: 0.02,
+                theta0vb0: 0.5,
+            };
+            let point = [-0.3, 0.4, 0.8, 0.2, 0.1];
+            let rates = [0.002, 0.003, -0.004, 0.001, -0.002];
+            let local =
+                |i: usize| Differential::<5>::variable(i, Jet::affine(ORDER, point[i], rates[i]));
+            let law =
+                parameters.evaluate(&local(0)?, &local(1)?, &local(2)?, &local(3)?, &local(4)?)?;
+            verify_local(&law);
+            for t in [0., 0.01, 0.02] {
+                let [b, drain, root, short, narrow] =
+                    std::array::from_fn(|i| rates[i].mul_add(t, point[i]));
+                let x = 0.02_f64.mul_add(b, eta0);
+                let eta = if x < 1e-4 {
+                    (2e-4 - x) / (3. - 2e4 * x)
+                } else {
+                    x
+                };
+                let expected =
+                    0.4 + 0.2 * root - 0.1 * b - 0.3 * short - 0.2 * narrow - 0.5 * eta * drain;
+                close(value_at(&law.value.value, t), expected, 1e-15);
+            }
+        }
+        for interface in [-0.01, 0.001] {
+            let parameters = SlopeParameters {
+                depletion: 1e-10,
+                coupling: [0.001, -0.0002, 0.0003],
+                interface,
+                oxide: 0.01,
+            };
+            let point = [-0.3, 0.4, 1e-7, 0.2];
+            let rates = [0.002, 0.003, 1e-10, 0.001];
+            let local =
+                |i: usize| Differential::<4>::variable(i, Jet::affine(ORDER, point[i], rates[i]));
+            let law = parameters.evaluate(&local(0)?, &local(1)?, &local(2)?, &local(3)?)?;
+            verify_local(&law);
+            for t in [0., 0.01, 0.02] {
+                let [b, drain, depth, theta] =
+                    std::array::from_fn(|i| rates[i].mul_add(t, point[i]));
+                let raw =
+                    (1e-10 / depth + (0.001 - 0.0002 * b + 0.0003 * drain) * theta + interface)
+                        / 0.01;
+                let expected = if raw < -0.5 {
+                    (1. + 3. * raw) / (3. + 8. * raw)
+                } else {
+                    1. + raw
+                };
+                close(value_at(&law.value.value, t), expected, 1e-15);
             }
         }
         Ok(())

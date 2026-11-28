@@ -22,10 +22,11 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use crate::devices::bsim_physics::{
-    ThresholdRollOff, bsim3_body_limit, bsim3_junction, bsim3_overdrive, channel_conductance,
-    dibl_early_voltage, impact_ionization, poly_depletion, rational_floor, reciprocal_floor,
-    saturation_early_voltage, saturation_shape, saturation_voltage, series_conductance,
-    smooth_drain, substrate_early_voltage, surface_potential,
+    SlopeParameters, ThresholdParameters, ThresholdRollOff, bsim3_body_limit, bsim3_junction,
+    bsim3_overdrive, channel_conductance, channel_rolloff, dibl_early_voltage, impact_ionization,
+    poly_depletion, rational_floor, reciprocal_floor, saturation_early_voltage, saturation_shape,
+    saturation_voltage, series_conductance, smooth_drain, substrate_early_voltage,
+    surface_potential,
 };
 use crate::primitives::{Real, SpiceResult};
 
@@ -232,91 +233,75 @@ impl DcModel<'_> {
 
         let leff = p.leff;
         let v0 = p.derived.vbi - phi;
-        let t3 = xdep.sqrt();
-
-        // dvt2 body-bias dependence of the threshold.
-        let (t1, slope) = rational_floor(p.binned.dvt2 * vbseff, -0.5, 1., 8.)?;
-        let t2 = p.binned.dvt2 * slope;
-        let lt1 = factor1 * t3 * t1;
-        let dlt1_dvb = factor1 * t3.mul_add(t2, 0.5 / t3 * t1 * dxdep_dvb);
-        let (t1, slope) = rational_floor(p.binned.dvt2w * vbseff, -0.5, 1., 8.)?;
-        let t2 = p.binned.dvt2w * slope;
-        let ltw = factor1 * t3 * t1;
-        let dltw_dvb = factor1 * t3.mul_add(t2, 0.5 / t3 * t1 * dxdep_dvb);
-
-        // Narrow/short-channel threshold shifts.
-        let argument = -0.5 * p.binned.dvt1 * leff / lt1;
-        let (theta0, slope) = ThresholdRollOff::Bsim3.evaluate(&argument)?;
-        let dtheta0_dvb = -slope * argument / lt1 * dlt1_dvb;
+        let short = channel_rolloff(
+            &vbseff,
+            &xdep,
+            p.binned.dvt2,
+            factor1,
+            -0.5 * p.binned.dvt1 * leff,
+            ThresholdRollOff::Bsim3,
+        )?;
+        let narrow = channel_rolloff(
+            &vbseff,
+            &xdep,
+            p.binned.dvt2w,
+            factor1,
+            -0.5 * p.binned.dvt1w * p.weff * leff,
+            ThresholdRollOff::Bsim3,
+        )?;
+        let body_depth = [[0., 0., 1.], [0., 0., dxdep_dvb]];
+        let short_slopes = short.project(&body_depth);
+        let narrow_slopes = narrow.project(&body_depth);
+        let theta0 = short.value;
         let thetavth = p.binned.dvt0 * theta0;
-        let delt_vth = thetavth * v0;
-        let ddelt_vth_dvb = p.binned.dvt0 * dtheta0_dvb * v0;
-
-        let argument = -0.5 * p.binned.dvt1w * p.weff * leff / ltw;
-        let (t2w, slope) = ThresholdRollOff::Bsim3.evaluate(&argument)?;
-        let dt2w_dvb = -slope * argument / ltw * dltw_dvb;
-        let t0 = p.binned.dvt0w * t2w;
-        let t2 = t0 * v0;
-        let dt2_dvb = p.binned.dvt0w * dt2w_dvb * v0;
 
         let temp_ratio = (temp - tnom) / tnom;
         let length_ratio = p.binned.nlx / leff;
         let root_offset = length_ratio / ((1.0 + length_ratio).sqrt() + 1.0);
-        let t1 = p
-            .binned
-            .kt2
-            .mul_add(vbseff, p.binned.kt1 + p.binned.kt1l / leff)
+        let width_shift = tox * phi / (p.weff + p.binned.w0);
+        let temperature_offset = (p.binned.kt1 + p.binned.kt1l / leff)
             .mul_add(temp_ratio, p.derived.k1ox * root_offset * p.derived.sqrtphi);
-        let effective_width_offset = p.weff + p.binned.w0;
-        let tmp2 = tox * phi / effective_width_offset;
-
-        let t3eta = p.binned.etab.mul_add(vbseff, p.binned.eta0);
-        let (t3eta, t4) = rational_floor(t3eta, 1e-4, 0., 2e4)?;
-        let ddibl_sft_dvd = t3eta * p.derived.theta0vb0;
-        let dibl_sft = ddibl_sft_dvd * vds;
-
-        // `here->BSIM3vth0` is the instance value after DELVTO.
-        let vth = p.binned.k3b.mul_add(vbseff, p.binned.k3).mul_add(
-            tmp2,
-            p.derived.k2ox.mul_add(
-                -vbseff,
-                p.derived.k1ox.mul_add(
-                    sqrt_phis,
-                    p.binned.k1.mul_add(-p.derived.sqrtphi, type_ * p.vth0),
-                ),
-            ) - delt_vth
-                - t2,
-        ) + t1
-            - dibl_sft;
-        let von = vth;
-        let dvth_dvb = p.binned.kt2.mul_add(
-            temp_ratio,
-            (p.binned.etab * vds * p.derived.theta0vb0).mul_add(
-                -t4,
-                p.binned.k3b.mul_add(
-                    tmp2,
-                    p.derived.k1ox.mul_add(dsqrt_phis_dvb, -p.derived.k2ox)
-                        - ddelt_vth_dvb
-                        - dt2_dvb,
-                ),
+        let threshold = ThresholdParameters {
+            fixed: p.binned.k3.mul_add(
+                width_shift,
+                p.binned.k1.mul_add(-p.derived.sqrtphi, type_ * p.vth0) + temperature_offset,
             ),
-        );
-        let dvth_dvd = -ddibl_sft_dvd;
+            surface: p.derived.k1ox,
+            body: p.binned.kt2.mul_add(
+                temp_ratio,
+                p.binned.k3b.mul_add(width_shift, -p.derived.k2ox),
+            ),
+            short: -p.binned.dvt0 * v0,
+            narrow: -p.binned.dvt0w * v0,
+            eta0: p.binned.eta0,
+            etab: p.binned.etab,
+            theta0vb0: p.derived.theta0vb0,
+        }
+        .evaluate(&vbseff, &vds, &sqrt_phis, &theta0, &narrow.value)?;
+        let vth = threshold.value;
+        let von = vth;
+        let [_, dvth_dvd, dvth_dvb] = threshold.project(&[
+            [0., 0., 1.],
+            [0., 1., 0.],
+            [0., 0., dsqrt_phis_dvb],
+            short_slopes,
+            narrow_slopes,
+        ]);
 
-        // Subthreshold slope factor n.
-        let tmp2n = p.binned.nfactor * EPS_SI / xdep;
-        let tmp3n = p
-            .binned
-            .cdscd
-            .mul_add(vds, p.binned.cdscb.mul_add(vbseff, p.binned.cdsc));
-        let tmp4 = (tmp3n.mul_add(theta0, tmp2n) + p.binned.cit) / cox;
-        let (n, slope) = rational_floor(tmp4, -0.5, 1., 8.)?;
-        let dn_dvb = p.binned.cdscb.mul_add(
-            theta0,
-            tmp3n.mul_add(dtheta0_dvb, -tmp2n / xdep * dxdep_dvb),
-        ) / cox
-            * slope;
-        let dn_dvd = p.binned.cdscd * theta0 / cox * slope;
+        let slope = SlopeParameters {
+            depletion: p.binned.nfactor * EPS_SI,
+            coupling: [p.binned.cdsc, p.binned.cdscb, p.binned.cdscd],
+            interface: p.binned.cit,
+            oxide: cox,
+        }
+        .evaluate(&vbseff, &vds, &xdep, &theta0)?;
+        let n = slope.value;
+        let [_, dn_dvd, dn_dvb] = slope.project(&[
+            [0., 0., 1.],
+            [0., 1., 0.],
+            [0., 0., dxdep_dvb],
+            short_slopes,
+        ]);
 
         let (vgs_eff, dvgseff_dvg) =
             poly_depletion(vgs, p.vfb + phi, p.binned.ngate, EPS_SI, cox, CHARGE_Q)?;

@@ -43,10 +43,10 @@ use super::{
 };
 
 use crate::devices::bsim_physics::{
-    ThresholdRollOff, bsim4_body_limit, channel_conductance, dibl_early_voltage,
-    effective_overdrive, impact_ionization, poly_depletion, rational_floor, reciprocal_floor,
-    saturation_early_voltage, saturation_shape, saturation_voltage, series_conductance,
-    substrate_early_voltage, surface_potential,
+    SlopeParameters, ThresholdParameters, ThresholdRollOff, bsim4_body_limit, channel_conductance,
+    channel_rolloff, dibl_early_voltage, effective_overdrive, impact_ionization, poly_depletion,
+    rational_floor, reciprocal_floor, saturation_early_voltage, saturation_shape,
+    saturation_voltage, series_conductance, substrate_early_voltage, surface_potential,
 };
 use crate::primitives::SpiceResult;
 
@@ -146,17 +146,12 @@ pub(super) fn electrostatics(
     let mut dVbseff_dVb: f64;
     let mut T0: f64;
     let mut T1: f64;
-    let mut dT1_dVb: f64;
     let mut T2: f64;
     let mut dT2_dVd: f64;
-    let mut dT2_dVb: f64;
     let mut T3: f64;
     let mut dT3_dVd: f64;
     let mut T4: f64;
     let mut dT4_dVd: f64;
-    let mut T5: f64;
-    let mut dT5_dVb: f64;
-    let mut T9: f64;
     let mut T10: f64;
     let mut Lpe_Vb: f64;
     let mut dDITS_Sft_dVb: f64;
@@ -165,21 +160,8 @@ pub(super) fn electrostatics(
     let mut dDITS_Sft2_dVd: f64;
     let mut Xdep: f64;
     let mut dXdep_dVb: f64;
-    let mut lt1: f64;
-    let mut dlt1_dVb: f64;
-    let mut ltw: f64;
-    let mut dltw_dVb: f64;
-    let mut Delt_vth: f64;
-    let mut dDelt_vth_dVb: f64;
     let mut Theta0: f64;
-    let mut dTheta0_dVb: f64;
     let mut TempRatio: f64;
-    let mut tmp1: f64;
-    let mut tmp2: f64;
-    let mut tmp3: f64;
-    let mut tmp4: f64;
-    let mut DIBL_Sft: f64;
-    let mut dDIBL_Sft_dVd: f64;
     let mut Vgsteff: f64;
     let mut dVgsteff_dVg: f64;
     let mut dVgsteff_dVd: f64;
@@ -221,60 +203,75 @@ pub(super) fn electrostatics(
     Leff = pParam.leff;
     Vtm = model.vtm;
     Vtm0 = model.vtm0;
-    T3 = sqrt(Xdep);
     V0 = pParam.vbi - pParam.phi;
-    (T1, T2) = rational_floor(pParam.dvt2 * Vbseff, -0.5, 1., 8.)?;
-    T2 *= pParam.dvt2;
-    lt1 = model.factor1 * T3 * T1;
-    dlt1_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
-    (T1, T2) = rational_floor(pParam.dvt2w * Vbseff, -0.5, 1., 8.)?;
-    T2 *= pParam.dvt2w;
-    ltw = model.factor1 * T3 * T1;
-    dltw_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
-    T0 = pParam.dvt1 * Leff / lt1;
-    (Theta0, T1) = ThresholdRollOff::Bsim4.evaluate(&T0)?;
-    dTheta0_dVb = -T1 * T0 / lt1 * dlt1_dVb;
+    let short = channel_rolloff(
+        &Vbseff,
+        &Xdep,
+        pParam.dvt2,
+        model.factor1,
+        pParam.dvt1 * Leff,
+        ThresholdRollOff::Bsim4,
+    )?;
+    let narrow = channel_rolloff(
+        &Vbseff,
+        &Xdep,
+        pParam.dvt2w,
+        model.factor1,
+        pParam.dvt1w * pParam.weff * Leff,
+        ThresholdRollOff::Bsim4,
+    )?;
+    let body_depth = [[0., 0., 1.], [0., 0., dXdep_dVb]];
+    let short_slopes = short.project(&body_depth);
+    let narrow_slopes = narrow.project(&body_depth);
+    Theta0 = short.value;
     here.thetavth = pParam.dvt0 * Theta0;
-    Delt_vth = here.thetavth * V0;
-    dDelt_vth_dVb = pParam.dvt0 * dTheta0_dVb * V0;
-    T0 = pParam.dvt1w * pParam.weff * Leff / ltw;
-    (T5, T1) = ThresholdRollOff::Bsim4.evaluate(&T0)?;
-    dT5_dVb = -T1 * T0 / ltw * dltw_dVb;
-    T0 = pParam.dvt0w * T5;
-    T2 = T0 * V0;
-    dT2_dVb = pParam.dvt0w * dT5_dVb * V0;
     TempRatio = ckt.temp() / model.tnom - 1.0;
-    T0 = sqrt(1.0 + pParam.lpe0 / Leff);
-    T1 = pParam.k1ox * (T0 - 1.0) * pParam.sqrtPhi
-        + (pParam.kt1 + pParam.kt1l / Leff + pParam.kt2 * Vbseff) * TempRatio;
+    let length_ratio = pParam.lpe0 / Leff;
+    let root_offset = length_ratio / ((1. + length_ratio).sqrt() + 1.);
+    let temperature_offset = (pParam.kt1 + pParam.kt1l / Leff)
+        .mul_add(TempRatio, pParam.k1ox * root_offset * pParam.sqrtPhi);
     Vth_NarrowW = toxe * pParam.phi / (pParam.weff + pParam.w0);
-    T3 = here.eta0 + pParam.etab * Vbseff;
-    (T3, T4) = rational_floor(T3, 1e-4, 0., 2e4)?;
-    dDIBL_Sft_dVd = T3 * pParam.theta0vb0;
-    DIBL_Sft = dDIBL_Sft_dVd * Vds;
     Lpe_Vb = sqrt(1.0 + pParam.lpeb / Leff);
-    Vth = f64::from(model.r#type) * here.vth0
-        + (pParam.k1ox * sqrtPhis - pParam.k1 * pParam.sqrtPhi) * Lpe_Vb
-        - here.k2ox * Vbseff
-        - Delt_vth
-        - T2
-        + (pParam.k3 + pParam.k3b * Vbseff) * Vth_NarrowW
-        + T1
-        - DIBL_Sft;
-    dVth_dVb = Lpe_Vb * pParam.k1ox * dsqrtPhis_dVb - here.k2ox - dDelt_vth_dVb - dT2_dVb
-        + pParam.k3b * Vth_NarrowW
-        - pParam.etab * Vds * pParam.theta0vb0 * T4
-        + pParam.kt2 * TempRatio;
-    dVth_dVd = -dDIBL_Sft_dVd;
-    tmp1 = epssub / Xdep;
-    here.nstar = model.vtm / Charge_q * (model.coxe + tmp1 + pParam.cit);
-    tmp2 = pParam.nfactor * tmp1;
-    tmp3 = pParam.cdsc + pParam.cdscb * Vbseff + pParam.cdscd * Vds;
-    tmp4 = (tmp2 + tmp3 * Theta0 + pParam.cit) / model.coxe;
-    (n, T0) = rational_floor(tmp4, -0.5, 1., 8.)?;
-    dn_dVb =
-        (-tmp2 / Xdep * dXdep_dVb + tmp3 * dTheta0_dVb + pParam.cdscb * Theta0) / model.coxe * T0;
-    dn_dVd = pParam.cdscd * Theta0 / model.coxe * T0;
+    let threshold = ThresholdParameters {
+        fixed: pParam.k3.mul_add(
+            Vth_NarrowW,
+            (pParam.k1 * Lpe_Vb).mul_add(-pParam.sqrtPhi, f64::from(model.r#type) * here.vth0)
+                + temperature_offset,
+        ),
+        surface: pParam.k1ox * Lpe_Vb,
+        body: pParam
+            .kt2
+            .mul_add(TempRatio, pParam.k3b.mul_add(Vth_NarrowW, -here.k2ox)),
+        short: -pParam.dvt0 * V0,
+        narrow: -pParam.dvt0w * V0,
+        eta0: here.eta0,
+        etab: pParam.etab,
+        theta0vb0: pParam.theta0vb0,
+    }
+    .evaluate(&Vbseff, &Vds, &sqrtPhis, &Theta0, &narrow.value)?;
+    Vth = threshold.value;
+    [_, dVth_dVd, dVth_dVb] = threshold.project(&[
+        [0., 0., 1.],
+        [0., 1., 0.],
+        [0., 0., dsqrtPhis_dVb],
+        short_slopes,
+        narrow_slopes,
+    ]);
+    here.nstar = model.vtm / Charge_q * (model.coxe + epssub / Xdep + pParam.cit);
+    let slope = SlopeParameters {
+        depletion: pParam.nfactor * epssub,
+        coupling: [pParam.cdsc, pParam.cdscb, pParam.cdscd],
+        interface: pParam.cit,
+        oxide: model.coxe,
+    }
+    .evaluate(&Vbseff, &Vds, &Xdep, &Theta0)?;
+    n = slope.value;
+    [_, dn_dVd, dn_dVb] = slope.project(&[
+        [0., 0., 1.],
+        [0., 1., 0.],
+        [0., 0., dXdep_dVb],
+        short_slopes,
+    ]);
     if pParam.dvtp0 > 0.0 {
         T0 = -pParam.dvtp1 * Vds;
         if T0 < -EXP_THRESHOLD {
