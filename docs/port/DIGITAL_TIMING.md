@@ -120,3 +120,25 @@ zero propagation path remains zero. Analog receiver capacitance belongs
 in physical circuit elements, not the digital timing approximation.
 This is a fixed-topology fanout loading model; it does not replace
 analog RC dynamics or infer source-specific converter switching offsets.
+
+## Causal timing-window algebra
+
+The independent `analysis::digital::timing` layer represents propagation
+intervals as persistent arrival expressions, with explicitly identified
+uncertainty origins. Fanout shares ancestry. Reconvergent relative-time
+comparisons cancel shared delays before bounding independent uncertainty;
+earliest/latest joins preserve all input expressions. Affine comparisons
+are exact in the mathematical model; joins provide enclosures, not
+necessarily tight bounds. Comparison work is explicitly bounded, and
+deep expressions are released iteratively.
+
+For example, a common arrival in [15,30] followed by data delay [10,30]
+and clock delay [40,60] gives data arrival [25,60] and clock arrival
+[55,90]. Independent absolute comparisons would permit a negative
+setup interval; the shared-origin comparison gives [10,50].
+
+This is a numerical/provenance foundation, not a min/max event scheduler.
+The source-bound digital runtime still uses deterministic delays.
+In particular, uncertain rising/falling transitions must not be encoded
+as an ordinary unknown logic drive. Interval propagation, sensitization,
+hazards, and storage qualification require their own event semantics.

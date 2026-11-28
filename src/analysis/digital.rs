@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 mod diagnostics;
+pub mod timing;
 use diagnostics::DiagnosticLog;
 pub use diagnostics::EventDiagnostic;
 
