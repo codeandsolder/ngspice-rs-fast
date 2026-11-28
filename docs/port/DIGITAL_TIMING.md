@@ -357,3 +357,43 @@ the initial drive requires all requests undelivered. An interval sweep
 produces the exact feasible drive set at every representable observation.
 The symbolic branches remain available to downstream model evaluation;
 the feasible drive set is an observation, not a substitute for them.
+
+### Guarded delivery and capture
+
+The symbolic queue partitions on the earliest physical event group and
+then on same-time delta ordering. A positive propagation delay starts
+at delta zero; an exactly zero delay follows the causal group. Only the
+earliest feasible group needs its delta resolved. Transport deliveries
+respect posting order even when physical delays reorder requests.
+Inertial qualification can cancel pending requests within a guarded
+branch without canceling the corresponding request in other feasible
+branches. Coincident input/deadline delivery has an explicit equality
+policy.
+
+An incremental guarded frontier retains both its pending events and
+branch-local state across an observation horizon. External requests
+may be announced at or after the accepted observation. Equal-time
+announcements follow the last settled group in each branch. The
+executor rejects a noncausal reducer, bounds work and delta cycles,
+and retains the original frontier if a speculative advance fails.
+The ordinary native mixed-signal event engine has not yet been
+converted to this full guarded frontier; guarded waveform execution
+and this incremental frontier are its shared scheduling foundation.
+
+Native clocked capture now selects each port's latest physically
+visible request by a priority guard (the request must have arrived,
+and every later-posted request must be absent). It composes all port
+partitions before evaluating storage, so correlated data and control
+signals cannot fabricate an impossible combination. In particular,
+a masked synchronous capture requires a joint realization in which
+both asynchronous controls are inactive.
+
+Setup, hold, recovery and pulse-width checks use the inexpensive
+relative enclosure first, then exact joint feasibility if that
+enclosure cannot classify the requirement. Separation comparisons
+retain the required interval as an exact affine constant rather than
+rounding it into an absolute event deadline. The reported elapsed
+range remains a sound enclosure, while violation certainty is based
+on feasibility of the violation and its complement. This improves
+the current arrival-aware engine without claiming that it preserves
+all divergent stored states across subsequent captures.

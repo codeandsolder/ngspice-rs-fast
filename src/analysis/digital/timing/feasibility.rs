@@ -561,13 +561,16 @@ impl<'a> Graph<'a> {
             forms.push(affine);
         }
         for comparison in comparisons {
-            Row::comparison(
-                &forms[self.index(&comparison.lhs)],
-                &forms[self.index(&comparison.rhs)],
-                comparison.relation,
-                &mut rows,
-                budget,
-            )?;
+            let lhs = &forms[self.index(&comparison.lhs)];
+            let rhs = &forms[self.index(&comparison.rhs)];
+            if comparison.offset == 0. {
+                Row::comparison(lhs, rhs, comparison.relation, &mut rows, budget)?;
+            } else {
+                charge(budget, rhs.terms.len().saturating_add(1))?;
+                let mut rhs = rhs.clone();
+                rhs.constant += units(comparison.offset);
+                Row::comparison(lhs, &rhs, comparison.relation, &mut rows, budget)?;
+            }
         }
         if !observations.is_empty() {
             let observation = Affine {

@@ -3,7 +3,9 @@
 //! completion only settles the envelope and is not another edge.
 
 use super::{Drive, EventContext, Logic};
-use crate::analysis::digital::timing::{Arrival, Bounds, TimedInput, TimingWindow};
+use crate::analysis::digital::timing::{
+    Arrival, Bounds, Guarded, TimedInput, TimingRelation, TimingWindow,
+};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::collections::VecDeque;
 
@@ -131,46 +133,27 @@ impl PortHistory {
         Ok(Some(edge))
     }
 
-    /// The possible binary value at the capture expression, factoring
-    /// common causal origins before deciding which input edge has
-    /// already occurred. Ordered transport supersedes earlier arrivals.
-    pub(super) fn sample(&self, capture: &InputEdge) -> SpiceResult<Drive> {
-        let mut value = None;
-        let mut later = Vec::<&InputEdge>::new();
-        let mut include = |drive: Drive| {
-            let logic = drive.logic.instantaneous();
-            value = Some(value.map_or(logic, |prior| {
-                if prior == logic {
-                    logic
-                } else {
-                    Logic::Unknown
-                }
-            }));
-        };
-        for edge in self.edges.iter().rev() {
-            let relation = edge.occurs_before(capture)?;
-            if relation == Relation::After {
-                continue;
-            }
-            // If a later posted edge must arrive no later than this
-            // edge, the older value cannot be visible at this capture.
-            let mut superseded = false;
-            for candidate in &later {
-                if candidate.occurs_before(edge)? == Relation::Before {
-                    superseded = true;
-                    break;
-                }
-            }
-            if !superseded {
-                include(edge.to);
-            }
-            if relation == Relation::Before {
-                return Ok(Drive::strong(value.unwrap_or(Logic::Unknown)));
-            }
-            later.push(edge);
-        }
-        include(self.initial);
-        Ok(Drive::strong(value.unwrap_or(Logic::Unknown)))
+    /// The exact feasible logical values at the capture expression.
+    /// A visible edge must have arrived and every later-posted edge
+    /// must still be undelivered. Their conjunction is solved over
+    /// shared origins, not independent pairwise possibility tests.
+    fn sample_cases(&self, capture: &InputEdge, budget: &mut usize) -> SpiceResult<Guarded<Drive>> {
+        Guarded::first_match(
+            self.edges.iter().rev().map(|edge| {
+                (
+                    edge.window.clone(),
+                    if edge.precedes_at_equality(capture) {
+                        TimingRelation::NoLater
+                    } else {
+                        TimingRelation::Before
+                    },
+                    capture.window.clone(),
+                    Drive::strong(edge.to.logic.instantaneous()),
+                )
+            }),
+            Drive::strong(self.initial.logic.instantaneous()),
+            budget,
+        )
     }
 
     /// Keep the newest completed logical predecessor and all later
@@ -187,6 +170,26 @@ impl PortHistory {
             self.initial = edge.to;
         }
     }
+}
+
+/// Sample all ports in the same feasible origin assignment. Combining
+/// marginal three-valued samples would invent impossible combinations
+/// of data and asynchronous control states at a common capture.
+pub(super) fn sample_joint(
+    ports: &[PortHistory],
+    capture: &InputEdge,
+) -> SpiceResult<Guarded<Vec<Drive>>> {
+    let mut budget = COMPARISON_BUDGET;
+    let mut values = Guarded::unconditional(Vec::with_capacity(ports.len()));
+    for port in ports {
+        let cases = port.sample_cases(capture, &mut budget)?;
+        values = values.zip_with_budget(&cases, &mut budget, |prior, value| {
+            let mut next = prior.clone();
+            next.push(*value);
+            Ok(next)
+        })?;
+    }
+    Ok(values)
 }
 
 pub(super) fn qualify_inputs(

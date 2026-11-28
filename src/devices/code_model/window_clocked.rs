@@ -1,10 +1,10 @@
 //! Clocked storage samples the causal waveform, not its displayed phase.
 //! Each announced edge is processed once; completion only settles its
 //! envelope. History belongs to the disposable digital trial.
-use super::causal_checks::{aperture, check_capture, check_widths};
-use super::causal_history::{InputEdge, PortHistory, Relation, qualify_inputs};
+use super::causal_checks::{aperture, check_capture, check_widths, controls_may_be_inactive};
+use super::causal_history::{InputEdge, PortHistory, Relation, qualify_inputs, sample_joint};
 use super::sequential_timing::may_trigger;
-use super::source_logic::{AsyncPolicy, ClockedKind, Edge, LogicKernel, Operation};
+use super::source_logic::{AsyncPolicy, ClockedKind, Edge, LogicKernel, Operation, consensus};
 use super::window_gate::WindowPaths;
 use super::{
     CodeModel, DelayMode, Delays, Drive, EventContext, Logic, ModelDiagnostic, ModelSchema, Output,
@@ -118,15 +118,18 @@ impl WindowClocked {
     }
 
     fn sample(&self, ports: &[PortHistory], edge: &InputEdge, prior: Logic) -> SpiceResult<Logic> {
-        let inputs = ports
-            .iter()
-            .map(|port| port.sample(edge))
+        let cases = sample_joint(ports, edge)?;
+        let results = cases
+            .branches()
+            .map(|(_, inputs)| {
+                let captured = self.kind.capture(&inputs[..self.kind.arity()], prior)?;
+                let clocked = self
+                    .trigger
+                    .capture(edge.from.logic, edge.to.logic, prior, captured);
+                Ok(self.resolve_controls(inputs, clocked))
+            })
             .collect::<SpiceResult<Vec<_>>>()?;
-        let captured = self.kind.capture(&inputs[..self.kind.arity()], prior)?;
-        let clocked = self
-            .trigger
-            .capture(edge.from.logic, edge.to.logic, prior, captured);
-        Ok(self.resolve_controls(&inputs, clocked))
+        Ok(consensus(results))
     }
 
     fn resolve_controls(&self, inputs: &[Drive], normal: Logic) -> Logic {
@@ -143,9 +146,7 @@ impl WindowClocked {
         let Some(policy) = self.asynchronous else {
             return Ok(true);
         };
-        let p = ports[self.kind.arity()].sample(edge)?.logic;
-        let c = ports[self.kind.arity() + 1].sample(edge)?.logic;
-        Ok(p != policy.preset && c != policy.clear)
+        controls_may_be_inactive(policy, &ports[self.kind.arity()..], edge)
     }
 
     fn initial(&self, inputs: &[TimedInput], state: &mut WindowClockedState) -> Vec<TimedOutput> {
@@ -422,12 +423,12 @@ impl CodeModel for WindowClocked {
                     "asynchronous control arrival order is not guaranteed",
                 ));
             }
-            let drives = state
-                .ports
-                .iter()
-                .map(|port| port.sample(&edge))
-                .collect::<SpiceResult<Vec<_>>>()?;
-            let value = self.resolve_controls(&drives, state.requested.logic);
+            let cases = sample_joint(&state.ports, &edge)?;
+            let value = consensus(
+                cases
+                    .branches()
+                    .map(|(_, drives)| self.resolve_controls(drives, state.requested.logic)),
+            );
             // Even an assertion that leaves Q unchanged supersedes earlier
             // captures. It must not be revised by a later data edge.
             if !self.enabled_at(&state.ports, &edge)? || value != state.requested.logic {
@@ -641,6 +642,81 @@ mod tests {
         trial.advance_to(40.)?;
         assert_eq!(trial.value(q), Some(low));
         assert_eq!(trial.arrival(q).expect("falling Q").to(), low);
+        trial.commit()
+    }
+    #[test]
+    fn capture_excludes_jointly_impossible_visible_data_pulse() -> SpiceResult<()> {
+        let mut network = Network::default();
+        let d = network.add_net();
+        let c = network.add_net();
+        let q = network.add_net();
+        let data = network.add_source(d)?;
+        let clock = network.add_source(c)?;
+        network.add_model(model(0., 0., 2., 11.)?, &[d, c], &[q])?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let low = Drive::strong(Logic::Zero);
+        let high = Drive::strong(Logic::One);
+        // The pulse is visible only when A <= C < B. At C=20,
+        // A=10+20u and B=15+10u make this conjunction impossible.
+        // Marginal timing bounds nevertheless admit both endpoints.
+        let u = Origin::shared(0);
+        let root = TimingWindow::exact(0.)?;
+        let rise = root.after(DelayWindow::new(10., 30.)?, u)?;
+        let fall = root.after(DelayWindow::new(15., 25.)?, u)?;
+        let mut trial = engine.trial();
+        trial.schedule(data, 0., low)?;
+        trial.schedule(clock, 0., low)?;
+        trial.schedule_arrival(data, Arrival::new(low, high, rise)?)?;
+        trial.schedule_arrival(data, Arrival::new(high, low, fall)?)?;
+        trial.schedule(clock, 20., high)?;
+        trial.advance_to(40.)?;
+        assert_eq!(trial.value(q), Some(low));
+        trial.commit()
+    }
+
+    #[test]
+    fn capture_combines_data_ports_under_one_origin_assignment() -> SpiceResult<()> {
+        let mut network = Network::default();
+        let s = network.add_net();
+        let r = network.add_net();
+        let c = network.add_net();
+        let q = network.add_net();
+        let set = network.add_source(s)?;
+        let reset = network.add_source(r)?;
+        let clock = network.add_source(c)?;
+        let kernel = LogicKernel {
+            operation: Operation::from_value(7., 3, None)?,
+            inputs: 3,
+            initial: Logic::Zero,
+            delays: Delays::ZERO,
+            causal: CausalPaths::default(),
+            mode: DelayMode::Transport,
+            pulse: None,
+            strength: DriveStrengths::uniform(Strength::STRONG),
+            invert: vec![false; 3],
+            timing: None,
+        };
+        let model = WindowClocked::new(
+            kernel,
+            WindowDelays::exact(Delays::ZERO),
+            WindowPaths::default(),
+        )?;
+        network.add_model(model, &[s, r, c], &[q])?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let low = Drive::strong(Logic::Zero);
+        let high = Drive::strong(Logic::One);
+        let both =
+            TimingWindow::exact(0.)?.after(DelayWindow::new(10., 30.)?, Origin::shared(0))?;
+        let mut trial = engine.trial();
+        for source in [set, reset, clock] {
+            trial.schedule(source, 0., low)?;
+        }
+        trial.schedule_arrival(set, Arrival::new(low, high, both.clone())?)?;
+        trial.schedule_arrival(reset, Arrival::new(low, high, both)?)?;
+        trial.schedule(clock, 20., high)?;
+        trial.advance_to(40.)?;
+        // SR hold-on-equal sees either (0,0) or (1,1), never (1,0).
+        assert_eq!(trial.value(q), Some(low));
         trial.commit()
     }
 }

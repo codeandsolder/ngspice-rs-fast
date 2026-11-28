@@ -101,15 +101,28 @@ pub enum TimingRelation {
 }
 
 impl TimingRelation {
-    fn classify(self, bounds: super::Bounds) -> (bool, bool) {
+    fn classify(self, bounds: super::Bounds, threshold: Real) -> (bool, bool) {
         let lo = bounds.minimum();
         let hi = bounds.maximum();
         match self {
-            Self::Before => (lo < 0., hi < 0.),
-            Self::NoLater => (lo <= 0., hi <= 0.),
-            Self::Coincident => (lo <= 0. && hi >= 0., lo == 0. && hi == 0.),
-            Self::NoEarlier => (hi >= 0., lo >= 0.),
-            Self::After => (hi > 0., lo > 0.),
+            Self::Before => (lo < threshold, hi < threshold),
+            Self::NoLater => (lo <= threshold, hi <= threshold),
+            Self::Coincident => (
+                lo <= threshold && hi >= threshold,
+                lo == threshold && hi == threshold,
+            ),
+            Self::NoEarlier => (hi >= threshold, lo >= threshold),
+            Self::After => (hi > threshold, lo > threshold),
+        }
+    }
+
+    const fn complement(self) -> &'static [Self] {
+        match self {
+            Self::Before => &[Self::NoEarlier],
+            Self::NoLater => &[Self::After],
+            Self::Coincident => &[Self::Before, Self::After],
+            Self::NoEarlier => &[Self::Before],
+            Self::After => &[Self::NoLater],
         }
     }
 
@@ -129,6 +142,7 @@ pub(super) struct Comparison {
     pub(super) lhs: TimingWindow,
     pub(super) rhs: TimingWindow,
     pub(super) relation: TimingRelation,
+    pub(super) offset: Real,
 }
 
 /// A conjunction of physical-time comparisons on shared delay origins.
@@ -144,8 +158,41 @@ impl TimingGuard {
     #[must_use = "the guard constrains a joint timing realization"]
     pub fn compare(lhs: TimingWindow, rhs: TimingWindow, relation: TimingRelation) -> Self {
         Self {
-            comparisons: vec![Comparison { lhs, rhs, relation }],
+            comparisons: vec![Comparison {
+                lhs,
+                rhs,
+                relation,
+                offset: 0.,
+            }],
         }
+    }
+
+    /// Compare a physical separation with an exact finite constant:
+    /// `lhs - rhs relation offset`. The offset is not an event time,
+    /// so sub-ULP or nonrepresentable absolute deadlines do not round
+    /// the constraint or create spurious delivery events.
+    ///
+    /// # Errors
+    /// Nonfinite comparison offset.
+    pub fn separation(
+        lhs: TimingWindow,
+        rhs: TimingWindow,
+        relation: TimingRelation,
+        offset: Real,
+    ) -> SpiceResult<Self> {
+        if !offset.is_finite() {
+            return Err(SpiceError::circuit(
+                "nonfinite timing separation constraint",
+            ));
+        }
+        Ok(Self {
+            comparisons: vec![Comparison {
+                lhs,
+                rhs,
+                relation,
+                offset,
+            }],
+        })
     }
 
     /// Conjoin two guarded conditions, retaining the original expressions.
@@ -169,7 +216,7 @@ impl TimingGuard {
         let mut uncertain = Vec::new();
         for comparison in &self.comparisons {
             let b = relative(&comparison.lhs, &comparison.rhs, budget)?;
-            let (possible, always) = comparison.relation.classify(b);
+            let (possible, always) = comparison.relation.classify(b, comparison.offset);
             if !possible {
                 return Ok(GuardStatus::Impossible);
             }
@@ -230,6 +277,11 @@ impl TimingGuard {
         let mut graph = DiGraph::<(), bool>::new();
         let mut nodes = BTreeMap::new();
         for comparison in &self.comparisons {
+            // Weighted cycles are decided by affine feasibility, not
+            // by the unweighted strict-order shortcut.
+            if comparison.offset != 0. {
+                continue;
+            }
             let mut node = |window: &TimingWindow| -> NodeIndex {
                 *nodes
                     .entry(Arc::as_ptr(&window.0))
@@ -283,7 +335,8 @@ impl TimingGuard {
     ) -> SpiceResult<bool> {
         for comparison in &self.comparisons {
             let lhs = exact_at(&comparison.lhs, origins, budget)?;
-            let rhs = exact_at(&comparison.rhs, origins, budget)?;
+            let mut rhs = exact_at(&comparison.rhs, origins, budget)?;
+            rhs.add_product(comparison.offset, 1.);
             if !comparison.relation.accepts(lhs.exact_cmp(&rhs)) {
                 return Ok(false);
             }
@@ -368,6 +421,56 @@ impl<T> Guarded<T> {
         Self { branches }
     }
 
+    // A priority decision list forms a complete partition: each match
+    // excludes all preceding predicates, and the fallback excludes
+    // every predicate. A predicate can be false in more than one
+    // disjoint relation (the complement of coincidence).
+    pub(crate) fn first_match(
+        choices: impl IntoIterator<Item = (TimingWindow, TimingRelation, TimingWindow, T)>,
+        fallback: T,
+        budget: &mut usize,
+    ) -> SpiceResult<Self>
+    where
+        T: Clone,
+    {
+        let mut pending = vec![TimingGuard::default()];
+        let mut branches = Vec::new();
+        for (lhs, relation, rhs, payload) in choices {
+            if pending.is_empty() {
+                break;
+            }
+            let predicate = TimingGuard::compare(lhs.clone(), rhs.clone(), relation);
+            match predicate.status_with_budget(budget)? {
+                GuardStatus::Impossible => continue,
+                GuardStatus::Always => {
+                    branches.extend(pending.drain(..).map(|guard| (guard, payload.clone())));
+                    break;
+                }
+                GuardStatus::Conditional => {}
+            }
+            let mut next = Vec::new();
+            for guard in pending {
+                charge(budget, 1)?;
+                let selected = guard.clone().and(predicate.clone());
+                if selected.status_with_budget(budget)? != GuardStatus::Impossible {
+                    branches.push((selected, payload.clone()));
+                }
+                for &opposite in relation.complement() {
+                    let rejected =
+                        guard
+                            .clone()
+                            .and(TimingGuard::compare(lhs.clone(), rhs.clone(), opposite));
+                    if rejected.status_with_budget(budget)? != GuardStatus::Impossible {
+                        next.push(rejected);
+                    }
+                }
+            }
+            pending = next;
+        }
+        branches.extend(pending.into_iter().map(|guard| (guard, fallback.clone())));
+        Self::from_partitioned(branches)
+    }
+
     /// Inspect each mutually exclusive branch and its payload.
     pub fn branches(&self) -> impl Iterator<Item = (&TimingGuard, &T)> {
         self.branches
@@ -405,7 +508,7 @@ impl<T> Guarded<T> {
         self.zip_with_budget(other, &mut budget, transform)
     }
 
-    pub(super) fn zip_with_budget<U, V>(
+    pub(crate) fn zip_with_budget<U, V>(
         &self,
         other: &Guarded<U>,
         budget: &mut usize,
@@ -619,6 +722,7 @@ impl OrderPartition {
                         lhs: self.windows[prior].clone(),
                         rhs: self.windows[first].clone(),
                         relation: TimingRelation::Before,
+                        offset: 0.,
                     });
                 }
                 for &other in rest {
@@ -626,6 +730,7 @@ impl OrderPartition {
                         lhs: self.windows[first].clone(),
                         rhs: self.windows[other].clone(),
                         relation: TimingRelation::Coincident,
+                        offset: 0.,
                     });
                 }
                 previous = Some(first);
@@ -907,6 +1012,7 @@ mod tests {
                 lhs,
                 rhs,
                 relation: TimingRelation::Before,
+                offset: 0.,
             }],
         };
         let cycle = before(a.clone(), b.clone())

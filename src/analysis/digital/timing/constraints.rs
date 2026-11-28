@@ -2,7 +2,7 @@
 //! absolute arrival domain. Bounds may be sound enclosures, so a
 //! possible violation is not reported as a definite one.
 
-use super::{Bounds, TimingWindow};
+use super::{Bounds, GuardStatus, TimingGuard, TimingRelation, TimingWindow, relative};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Whether the enclosure proves that a timing condition is satisfied or
@@ -60,9 +60,24 @@ impl ConstraintResult {
         later: &TimingWindow,
         earlier: &TimingWindow,
         minimum: Real,
-        budget: usize,
+        mut budget: usize,
     ) -> SpiceResult<Self> {
-        Self::from_bounds(later.relative_to(earlier, budget)?, minimum)
+        let mut result = Self::from_bounds(relative(later, earlier, &mut budget)?, minimum)?;
+        if result.certainty == Certainty::PossibleViolation {
+            let comparison = |relation| {
+                TimingGuard::separation(later.clone(), earlier.clone(), relation, minimum)
+            };
+            if comparison(TimingRelation::Before)?.status_with_budget(&mut budget)?
+                == GuardStatus::Impossible
+            {
+                result.certainty = Certainty::Satisfied;
+            } else if comparison(TimingRelation::NoEarlier)?.status_with_budget(&mut budget)?
+                == GuardStatus::Impossible
+            {
+                result.certainty = Certainty::DefiniteViolation;
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -93,7 +108,35 @@ impl ApertureResult {
         hold: Real,
         budget: usize,
     ) -> SpiceResult<Self> {
-        Self::from_bounds(capture.relative_to(data, budget)?, setup, hold)
+        Self::check_ordered(capture, data, setup, hold, true, budget)
+    }
+
+    /// Classify setup and hold with exact joint feasibility whenever
+    /// relative enclosures alone do not decide the result.
+    ///
+    /// # Errors
+    /// Invalid requirements or exhausted timing comparison work.
+    pub fn check_ordered(
+        capture: &TimingWindow,
+        data: &TimingWindow,
+        setup: Real,
+        hold: Real,
+        data_first: bool,
+        mut budget: usize,
+    ) -> SpiceResult<Self> {
+        let mut result = Self::from_ordered_bounds(
+            relative(capture, data, &mut budget)?,
+            setup,
+            hold,
+            data_first,
+        )?;
+        if result.setup == Certainty::PossibleViolation {
+            result.setup = exact_aperture(capture, data, setup, data_first, &mut budget)?;
+        }
+        if result.hold == Certainty::PossibleViolation {
+            result.hold = exact_aperture(data, capture, hold, !data_first, &mut budget)?;
+        }
+        Ok(result)
     }
 
     /// Classify both aperture sides using an existing signed enclosure.
@@ -140,6 +183,43 @@ impl ApertureResult {
             setup,
             hold,
         })
+    }
+}
+
+// A violation occupies a half-open interval of relative separations.
+// Prove both the violation and its complement; merely finding a
+// feasible violation does not establish that it is definite.
+fn exact_aperture(
+    later: &TimingWindow,
+    earlier: &TimingWindow,
+    minimum: Real,
+    inclusive_lower: bool,
+    budget: &mut usize,
+) -> SpiceResult<Certainty> {
+    let lower = if inclusive_lower {
+        TimingRelation::NoEarlier
+    } else {
+        TimingRelation::After
+    };
+    let outside = if inclusive_lower {
+        TimingRelation::Before
+    } else {
+        TimingRelation::NoLater
+    };
+    let compare = |relation| TimingGuard::compare(later.clone(), earlier.clone(), relation);
+    let at_minimum =
+        |relation| TimingGuard::separation(later.clone(), earlier.clone(), relation, minimum);
+    let violation = compare(lower).and(at_minimum(TimingRelation::Before)?);
+    if violation.status_with_budget(budget)? == GuardStatus::Impossible {
+        return Ok(Certainty::Satisfied);
+    }
+    if compare(outside).status_with_budget(budget)? == GuardStatus::Impossible
+        && at_minimum(TimingRelation::NoEarlier)?.status_with_budget(budget)?
+            == GuardStatus::Impossible
+    {
+        Ok(Certainty::DefiniteViolation)
+    } else {
+        Ok(Certainty::PossibleViolation)
     }
 }
 
@@ -190,6 +270,41 @@ mod tests {
             let result = ApertureResult::from_bounds(Bounds::new(dt, dt)?, 2., 3.)?;
             assert_eq!((result.setup, result.hold), (setup, hold));
         }
+        Ok(())
+    }
+    #[test]
+    fn exact_extremum_constraints_refine_loose_relative_enclosures() -> SpiceResult<()> {
+        let u = Origin::shared(0);
+        let zero = TimingWindow::exact(0.)?;
+        let a = zero.after(DelayWindow::new(10., 30.)?, u)?;
+        let b = TimingWindow::exact(20.)?;
+        let midpoint = zero.after(DelayWindow::new(15., 25.)?, u)?;
+        let latest = TimingWindow::latest(vec![a.clone(), b.clone()])?
+            .after(DelayWindow::new(1., 1.)?, Origin::shared(1))?;
+        let earliest = TimingWindow::earliest(vec![a, b])?
+            .after(DelayWindow::new(10., 10.)?, Origin::shared(1))?;
+        let bounds = latest.relative_to(&midpoint, 100_000)?;
+        assert_eq!(
+            ConstraintResult::from_bounds(bounds, 1.)?.certainty,
+            Certainty::PossibleViolation
+        );
+        assert_eq!(
+            ConstraintResult::minimum(&latest, &midpoint, 1., 100_000)?.certainty,
+            Certainty::Satisfied
+        );
+        let aperture = ApertureResult::check(&latest, &midpoint, 1., 2., 100_000)?;
+        assert_eq!(
+            (aperture.setup, aperture.hold),
+            (Certainty::Satisfied, Certainty::Satisfied)
+        );
+        assert_eq!(
+            ConstraintResult::minimum(&earliest, &midpoint, 11., 100_000)?.certainty,
+            Certainty::DefiniteViolation
+        );
+        assert_eq!(
+            ApertureResult::check(&earliest, &midpoint, 11., 0., 100_000)?.setup,
+            Certainty::DefiniteViolation
+        );
         Ok(())
     }
 }

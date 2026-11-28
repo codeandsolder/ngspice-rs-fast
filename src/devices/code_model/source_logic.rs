@@ -19,7 +19,7 @@ fn possible(value: Logic) -> &'static [Logic] {
     }
 }
 
-fn consensus(values: impl IntoIterator<Item = Logic>) -> Logic {
+pub(super) fn consensus(values: impl IntoIterator<Item = Logic>) -> Logic {
     let mut values = values.into_iter();
     let first = values.next().unwrap_or(Logic::Unknown);
     if values.all(|value| value == first) {

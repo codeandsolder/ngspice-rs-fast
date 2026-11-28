@@ -1,6 +1,7 @@
 //! Shared timing constraints for arrival-aware sequential primitives.
-use super::causal_history::{COMPARISON_BUDGET, InputEdge, PortHistory};
+use super::causal_history::{COMPARISON_BUDGET, InputEdge, PortHistory, sample_joint};
 use super::sequential_timing::{TimingContract, ViolationPolicy};
+use super::source_logic::AsyncPolicy;
 use super::{Logic, ModelDiagnostic};
 use crate::analysis::digital::timing::{ApertureResult, Bounds, Certainty, ConstraintResult};
 use crate::primitives::SpiceResult;
@@ -13,10 +14,23 @@ pub(super) fn capture_enabled(
     let Some(policy) = timing.asynchronous else {
         return Ok(true);
     };
-    let p = ports[timing.clock + 1].sample(edge)?.logic;
-    let c = ports[timing.clock + 2].sample(edge)?.logic;
-    Ok(p != policy.preset && c != policy.clear)
+    controls_may_be_inactive(policy, &ports[timing.clock + 1..], edge)
 }
+
+/// An asynchronous mask permits synchronous capture only if both
+/// controls can be inactive in the *same* timing realization.
+pub(super) fn controls_may_be_inactive(
+    policy: AsyncPolicy,
+    ports: &[PortHistory],
+    edge: &InputEdge,
+) -> SpiceResult<bool> {
+    let controls = sample_joint(ports, edge)?;
+    let enabled = controls
+        .branches()
+        .any(|(_, values)| values[0].logic != policy.preset && values[1].logic != policy.clear);
+    Ok(enabled)
+}
+
 pub(super) fn aperture(
     timing: &TimingContract,
     capture: &InputEdge,
@@ -27,13 +41,15 @@ pub(super) fn aperture(
     if !data.logic_changed() || (timing.setup[index] == 0. && timing.hold[index] == 0.) {
         return Ok(false);
     }
-    let bounds = capture.relative_to(data)?;
-    let result = ApertureResult::from_ordered_bounds(
-        bounds,
+    let result = ApertureResult::check_ordered(
+        &capture.window,
+        &data.window,
         timing.setup[index],
         timing.hold[index],
         data.precedes_at_equality(capture),
+        COMPARISON_BUDGET,
     )?;
+    let bounds = result.capture_minus_data;
     let mut violated = false;
     for (kind, certainty, minimum, elapsed) in [
         ("setup", result.setup, timing.setup[index], bounds),
@@ -147,14 +163,16 @@ pub(super) fn check_capture(
                     continue;
                 }
                 // Recovery is the setup aperture of an asynchronous release.
-                let bounds = capture.relative_to(edge)?;
-                let certainty = ApertureResult::from_ordered_bounds(
-                    bounds,
+                let result = ApertureResult::check_ordered(
+                    &capture.window,
+                    &edge.window,
                     minimum,
                     0.,
                     edge.precedes_at_equality(capture),
-                )?
-                .setup;
+                    COMPARISON_BUDGET,
+                )?;
+                let bounds = result.capture_minus_data;
+                let certainty = result.setup;
                 poisoned |= report(
                     timing.policy,
                     "asynchronous recovery",
