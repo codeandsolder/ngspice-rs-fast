@@ -41,7 +41,6 @@ impl AbsentStorage {
     pub(in crate::devices) fn validate_voltage_binding(
         &self,
         nodes: &NodeTable,
-        graph: &super::topology::ReferenceGraph,
     ) -> SpiceResult<()> {
         if let Some(name) = self
             .zero_voltage_reads
