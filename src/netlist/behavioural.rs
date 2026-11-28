@@ -35,8 +35,8 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{DeviceInstance, Netlist, ParameterAssignment, ParameterKind, ScopeView};
 use crate::netlist::bexpr::{
-    BBinaryOp, BExpr, BExprKind, BehaviouralExpression, SPECIAL_NAMES, STATISTICAL_FUNCTIONS,
-    TableTransfer, is_builtin_function, round_like_c_literal,
+    BExpr, BExprKind, BehaviouralExpression, SPECIAL_NAMES, STATISTICAL_FUNCTIONS, TableTransfer,
+    is_builtin_function, round_like_c_literal,
 };
 use crate::netlist::elaborate::format_literal;
 use crate::netlist::eval::statistics::PreparedSite;
