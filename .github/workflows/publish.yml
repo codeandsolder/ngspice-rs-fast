@@ -37,7 +37,7 @@ env:
 jobs:
   strict-rust:
     name: Shared strict Rust release gate
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@535609a4878f34a6697afea7ba3da04a454cc5f4 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@707c9e77430c7feed80a39959b273501ca786825 # main
     with:
       allow-test-panics: true
 
@@ -56,7 +56,7 @@ jobs:
           persist-credentials: false
 
       - name: Check release dependency quarantine
-        uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+        uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
         with:
           base-ref: refs/remotes/origin/${{ github.event.repository.default_branch }}
           hours: "72"
@@ -64,7 +64,7 @@ jobs:
 
       - name: Resolve quarantined repository compiler
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
 
       - name: Install pinned nightly Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -73,7 +73,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
 
@@ -104,7 +104,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
 
   publish:
     name: Publish to crates.io
@@ -126,7 +126,7 @@ jobs:
 
       - name: Resolve quarantined repository compiler
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
 
       - name: Install pinned nightly Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -134,7 +134,7 @@ jobs:
           toolchain: ${{ steps.compiler.outputs.channel }}
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
 
@@ -149,4 +149,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main

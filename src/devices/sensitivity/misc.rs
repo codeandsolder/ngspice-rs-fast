@@ -12,31 +12,28 @@
 //!   coupling to `M + delta` and "restores" it to `M`.
 //!
 //! In an AC sweep these devices load what `cktsens.c`'s per-frequency reset
-//! left ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]): a B source's `ASRCacValues`
+//! left ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]): a B source's `ASRCacValues`
 //! are reallocated (zeroed) by every `ASRCsetup` and written only by a
 //! small-signal load, so only a voltage source's branch incidences remain; a
 //! switch keeps the state its `MODEINITFLOAT` load chose for a zero control.
 
 use super::{
-    AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetStamp, ResetStamps,
-    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
-    SensitivityParameter as P, SensitivityRecord, StampAt, StampPart,
+    AcReset, AcSensitivityLoad, CELSIUS_TO_KELVIN, DcSensitivityLoad, ParameterScope, RecordPair,
+    ResetStamp, ResetStamps, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
+    SensitivityRecord, StampAt, StampPart,
 };
 use crate::devices::{
     Behavioural, BehaviouralOutput, BehaviouralScale, Device, MutualInductance, Switch, SwitchKind,
 };
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SpiceResult};
 
 /// Real stamps of `value` between nodes, in order.
-fn real(stamps: impl IntoIterator<Item = (StampAt, Real)>) -> Vec<ResetStamp> {
-    stamps
-        .into_iter()
-        .map(|(at, value)| ResetStamp {
-            at,
-            value,
-            part: StampPart::Real,
-        })
-        .collect()
+fn real<const N: usize>(stamps: [(StampAt, Real); N]) -> [ResetStamp; N] {
+    stamps.map(|(at, value)| ResetStamp {
+        at,
+        value,
+        part: StampPart::Real,
+    })
 }
 
 /// `ASRCpTable` entries `set_param()` accepts.
@@ -162,12 +159,11 @@ impl SensitivityKernel for BehaviouralSensitivity<'_> {
         }
     }
 
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        _mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<DcSensitivityLoad> {
         let i = current.instance;
         let scale = BehaviouralScale {
             m: i.value("m")?,
@@ -177,37 +173,37 @@ impl SensitivityKernel for BehaviouralSensitivity<'_> {
             dtemp: i.value("dtemp")?,
             ..*self.source.scale()
         };
-        Ok(SensitivityLoad::Replacement(Box::new(
+        Ok(DcSensitivityLoad::replacement(
             self.source.with_scale(scale),
-        )))
+        ))
     }
 
     /// `ASRCacLoad` with the zeroed `ASRCacValues` of the reset: a voltage
     /// source's `+1, -1, -1, +1` branch incidences and zero derivatives, a
     /// current source nothing. The scale factor multiplies only those zeros.
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         _reset: AcReset<'_>,
         _current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<AcSensitivityLoad> {
         let source = self.source;
         let [pos, neg] = [source.terminals()[0], source.terminals()[1]];
-        let stamps = match source.output() {
-            BehaviouralOutput::Voltage => real([
-                (StampAt::NodeBranch(pos), 1.),
-                (StampAt::NodeBranch(neg), -1.),
-                (StampAt::BranchNode(neg), -1.),
-                (StampAt::BranchNode(pos), 1.),
-            ]),
-            BehaviouralOutput::Current => Vec::new(),
-        };
-        Ok(SensitivityLoad::Replacement(Box::new(ResetStamps::new(
-            source.name(),
-            source.designator(),
-            source.terminals(),
-            stamps,
-        )?)))
+        match source.output() {
+            BehaviouralOutput::Voltage => Ok(AcSensitivityLoad::stamp(ResetStamps::new(
+                source.name(),
+                real([
+                    (StampAt::NodeBranch(pos), 1.),
+                    (StampAt::NodeBranch(neg), -1.),
+                    (StampAt::BranchNode(neg), -1.),
+                    (StampAt::BranchNode(pos), 1.),
+                ]),
+            )?)),
+            BehaviouralOutput::Current => Ok(AcSensitivityLoad::stamp(ResetStamps::new(
+                source.name(),
+                [],
+            )?)),
+        }
     }
 }
 
@@ -325,32 +321,29 @@ impl SensitivityKernel for SwitchSensitivity<'_> {
         Ok(())
     }
 
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        _mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<DcSensitivityLoad> {
         let (threshold, hysteresis) = self.keys();
         let m = current.model;
-        Ok(SensitivityLoad::Replacement(Box::new(
-            self.switch.with_model(
-                m.value(threshold)?,
-                m.value(hysteresis)?,
-                m.value("gon")?,
-                m.value("goff")?,
-            )?,
-        )))
+        Ok(DcSensitivityLoad::replacement(self.switch.with_model(
+            m.value(threshold)?,
+            m.value(hysteresis)?,
+            m.value("gon")?,
+            m.value("goff")?,
+        )?))
     }
 
     /// `SWacLoad`/`CSWacLoad`: the on or off conductance of `current` for the
     /// state the reset load chose with the `state` threshold and hysteresis.
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<AcSensitivityLoad> {
         let (threshold, hysteresis) = self.keys();
         let closed = self
             .switch
@@ -364,17 +357,15 @@ impl SensitivityKernel for SwitchSensitivity<'_> {
         let g = current.model.value(if closed { "gon" } else { "goff" })?;
         let switch = self.switch;
         let [pos, neg] = [switch.terminals()[0], switch.terminals()[1]];
-        Ok(SensitivityLoad::Replacement(Box::new(ResetStamps::new(
+        Ok(AcSensitivityLoad::stamp(ResetStamps::new(
             switch.name(),
-            switch.designator(),
-            switch.terminals(),
             real([
                 (StampAt::Nodes(pos, pos), g),
                 (StampAt::Nodes(pos, neg), -g),
                 (StampAt::Nodes(neg, pos), -g),
                 (StampAt::Nodes(neg, neg), g),
             ]),
-        )?)))
+        )?))
     }
 }
 
@@ -448,45 +439,34 @@ impl SensitivityKernel for MutualSensitivity<'_> {
     }
 
     /// The circuit's own K device stamps nothing at DC.
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         _current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        match mode {
-            SensitivityMode::Dc => Ok(SensitivityLoad::Original),
-            SensitivityMode::Ac => Err(SpiceError::circuit(
-                "a K coupling's AC sensitivity load is its reset load",
-            )),
-        }
+    ) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::Original)
     }
 
     /// `MUTacLoad`: `-= omega MUTfactor` in the imaginary parts of
     /// `(br1, br2)` and `(br2, br1)`.
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         _reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
+    ) -> SpiceResult<AcSensitivityLoad> {
         let i = current.instance;
         let factor = i.value("factor")?;
         let (row1, row2) = (i.index("row1")?, i.index("row2")?);
-        let stamps = [(row1, row2), (row2, row1)]
-            .into_iter()
-            .map(|(r, c)| ResetStamp {
-                at: StampAt::Rows(r, c),
-                value: -factor,
-                part: StampPart::Reactive,
-            })
-            .collect();
-        Ok(SensitivityLoad::Replacement(Box::new(ResetStamps::new(
+        let stamps = [(row1, row2), (row2, row1)].map(|(r, c)| ResetStamp {
+            at: StampAt::Rows(r, c),
+            value: -factor,
+            part: StampPart::Reactive,
+        });
+        Ok(AcSensitivityLoad::stamp(ResetStamps::new(
             self.coupling.name(),
-            'k',
-            &[],
             stamps,
-        )?)))
+        )?))
     }
 
     fn coupled_inductors(&self) -> Option<[&str; 2]> {

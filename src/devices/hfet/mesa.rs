@@ -39,14 +39,15 @@
 )]
 
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
-use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature, stamp_reset};
+use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature};
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE};
 use crate::devices::nonlinear::unaliased_conductance;
 use crate::devices::sensitivity::{
-    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter, SensitivityRecord,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_loads,
+    stamp_reset,
 };
 use crate::devices::sweep::check_swept;
 use crate::devices::{
@@ -1912,40 +1913,19 @@ impl SensitivityKernel for MesaSensitivity<'_> {
         Ok(())
     }
 
-    fn load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "a MESA's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(self.mesa(current)?)))
-    }
-
-    /// `MESAacLoad` after `cktsens.c`'s reset load: `ggs`/`ggd` in
-    /// `CKTstate0` and the instance fields `gm0`..`gds0`/`delidgch0`.. that
-    /// `mesaload.c` wrote at zero gate voltages with the reset records (at the
-    /// reset's `vds = 0` C's `lambda` blend multiplies zero, so `gm`/`gds` are
-    /// the load's own); the charge slots and `ggspp`/`ggdpp` are zero; the
-    /// conductances and `m` come from `current`. Level 4's `mesa3` never
-    /// writes those fields, so its AC load has no `gm`/`gds` at all, which
-    /// here (unlike `.ac` at an operating point) is reproduced: they are
-    /// zero whatever ran before.
-    fn reset_ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(ResetMesa {
-            state: self.mesa(reset.state)?,
-            current: self.mesa(current)?,
-        })))
-    }
+    reconstructed_loads!(
+        reset,
+        /// `MESAacLoad` after `cktsens.c`'s reset load: `ggs`/`ggd` in
+        /// `CKTstate0` and the instance fields `gm0`..`gds0`/`delidgch0`.. that
+        /// `mesaload.c` wrote at zero gate voltages with the reset records (at the
+        /// reset's `vds = 0` C's `lambda` blend multiplies zero, so `gm`/`gds` are
+        /// the load's own); the charge slots and `ggspp`/`ggdpp` are zero; the
+        /// conductances and `m` come from `current`. Level 4's `mesa3` never
+        /// writes those fields, so its AC load has no `gm`/`gds` at all, which
+        /// here (unlike `.ac` at an operating point) is reproduced: they are
+        /// zero whatever ran before.
+        mesa
+    );
 }
 
 impl MesaSensitivity<'_> {
@@ -2043,42 +2023,16 @@ impl MesaSensitivity<'_> {
     }
 }
 
-/// A MESA's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
-#[derive(Debug)]
-struct ResetMesa {
-    /// Built from the reset load's records: the gate and channel
-    /// conductances.
-    state: Mesa,
-    /// Built from the current records: the series conductances and `m`.
-    current: Mesa,
-}
-
-impl Device for ResetMesa {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'z'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl ResetAcDevice for Mesa {
     /// `mesaacl.c`'s real stamps in its order; `xgs`/`xgd` are zero.
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        _omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let model_context = context.model_context;
         let (temperature, nominal) = (model_context.temperature, model_context.nominal_temperature);
-        let state = &self.state;
         let derived = state.derived(temperature, nominal)?;
         // `von` with a zero `CKTrhsOld` source-prime voltage.
         let von = state.model.ks.mul_add(0. - state.model.vsg, derived.tvto);
@@ -2089,7 +2043,6 @@ impl Device for ResetMesa {
             (point.gm, point.gds)
         };
         let (ggs, ggd, ggspp, ggdpp) = (point.ggs, point.ggd, 0., 0.);
-        let current = &self.current;
         let c = current.derived(temperature, nominal)?;
         let m = current.instance.m;
         let n = current.nodes;
@@ -2124,6 +2077,10 @@ impl Device for ResetMesa {
             (n.gp, n.dpp, -(m * ggdpp)),
             (n.dpp, n.gp, -(m * ggdpp)),
         ];
-        stamp_reset(&current.name, context, &stamps, &[])
+        stamp_reset(
+            &current.name,
+            node_stamps(&stamps, StampPart::Real),
+            context,
+        )
     }
 }

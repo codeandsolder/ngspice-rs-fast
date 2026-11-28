@@ -6,15 +6,15 @@
 //! every DC sensitivity of theirs is exactly zero.
 
 use super::{
-    CELSIUS_TO_KELVIN, ParameterScope, PassiveInputs, RecordPair, SensitivityFamily,
-    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
-    SensitivityRecord,
+    AcReset, AcSensitivityLoad, AcSensitivityStamp, CELSIUS_TO_KELVIN, DcSensitivityLoad,
+    ParameterScope, PassiveInputs, RecordPair, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter as P, SensitivityRecord,
 };
+use crate::devices::LinearContext;
 use crate::devices::passive::physics::{
     CapacitorGeometry, CapacitorSetup, Coefficients, CoilGeometry, CoilSetup, TemperaturePoint,
     scaled,
 };
-use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 
 /// `CAPmPTable` entries `set_param()` accepts.
@@ -425,15 +425,20 @@ impl SensitivityKernel for ReactiveSensitivity<'_> {
     /// DC: the device's own load (independent of every parameter). AC:
     /// `CAPacLoad` stamps `omega CAPcapac m`, `INDacLoad` `omega INDinduct /
     /// m` on the branch.
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
+        _current: RecordPair<'_>,
+    ) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::Original)
+    }
+
+    fn ac_load(
+        &self,
+        _setup: RecordPair<'_>,
+        _reset: AcReset<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Dc {
-            return Ok(SensitivityLoad::Original);
-        }
+    ) -> SpiceResult<AcSensitivityLoad> {
         let i = current.instance;
         let m = i.value("m")?;
         let value = match self.kind {
@@ -450,21 +455,19 @@ impl SensitivityKernel for ReactiveSensitivity<'_> {
                 message: format!("nonfinite perturbed value {effective}"),
             });
         }
-        Ok(SensitivityLoad::Replacement(Box::new(ReactiveStandIn {
-            name: self.name.to_owned(),
+        Ok(AcSensitivityLoad::stamp(ReactiveStandIn {
             kind: self.kind,
             terminals: self.terminals,
             value,
             m,
             hard_branch: self.hard_branch,
-        })))
+        }))
     }
 }
 
 /// The AC stand-in of a perturbed capacitor or inductor.
 #[derive(Debug)]
 struct ReactiveStandIn {
-    name: String,
     kind: ReactiveKind,
     terminals: [NodeId; 2],
     /// `CAPcapac` or `INDinduct`.
@@ -474,34 +477,8 @@ struct ReactiveStandIn {
     hard_branch: bool,
 }
 
-impl Device for ReactiveStandIn {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn designator(&self) -> char {
-        match self.kind {
-            ReactiveKind::Capacitor => 'c',
-            ReactiveKind::Inductor => 'l',
-        }
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.terminals
-    }
-
-    fn branch_currents(&self) -> usize {
-        usize::from(self.kind == ReactiveKind::Inductor || self.hard_branch)
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: the sensitivity stand-in has no DC load",
-            self.name
-        )))
-    }
-
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+impl AcSensitivityStamp for ReactiveStandIn {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         match self.kind {
             ReactiveKind::Capacitor => {
                 crate::devices::passive_bias::release_capacitor_branch(self.hard_branch, context)?;
