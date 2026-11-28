@@ -953,7 +953,7 @@ impl Resolver<'_> {
     /// Prepared sampling binds an explicit i(formal) operand to the actual
     /// device name without evaluating it as a numeric parameter. Follow the
     /// caller frame through nested macro forwarding, including parentheses.
-    /// A shadowed i() remains an ordinary user macro.
+    /// A shadowed `i()` remains an ordinary user macro.
     fn sampled_operand(
         &mut self,
         operand: &BExpr,

@@ -133,8 +133,8 @@ impl AbsentStorage {
             let mut instance = instance.clone();
             for parameter in &mut instance.parameters {
                 if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
-                    expression.root.visit_mut(&mut |expr| match &mut expr.kind {
-                        BExprKind::Voltage { positive, negative } => {
+                    expression.root.visit_mut(&mut |expr| {
+                        if let BExprKind::Voltage { positive, negative } = &mut expr.kind {
                             let mut zero = |name: &mut String| {
                                 let canonical = NodeTable::canonical_name(name, nodes.auto_gnd());
                                 if isolated.contains(&canonical) {
@@ -147,7 +147,6 @@ impl AbsentStorage {
                                 zero(negative);
                             }
                         }
-                        _ => {}
                     });
                 }
             }
