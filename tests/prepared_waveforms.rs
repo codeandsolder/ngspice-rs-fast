@@ -73,6 +73,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
                 origin,
                 period: 1.,
                 hold: None,
+                limit: None,
             }),
             0.,
             if origin < 0. { 3. } else { 5. },
@@ -98,6 +99,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
             origin: 0.25,
             period: 1.,
             hold: Some(-3.),
+            limit: None,
         }),
         -3.,
         -3.,
@@ -131,6 +133,8 @@ fn invalid_geometry_is_rejected_and_sine_respects_signed_delay() {
             delay: -0.25,
             damping: 0.4,
             hold_before_delay: false,
+            phase: 0.,
+            stop_after: None,
         },
         idle_in_pop: true,
     })
@@ -401,6 +405,7 @@ fn rounded_periodic_knots_cannot_silently_collapse() {
             origin,
             period,
             hold: None,
+            limit: None,
         }),
         0.,
         0.,
@@ -443,6 +448,7 @@ fn prepared_repeat_jets_follow_previous_cycle_and_startup_hold() {
                 origin: -0.25,
                 period: 1.,
                 hold,
+                limit: None,
             }),
             0.,
             8.,
@@ -514,6 +520,8 @@ fn prepared_sine_jets_respect_delay_hold_and_exact_analytic_derivatives() {
                     delay: -0.25,
                     damping: 2.,
                     hold_before_delay: hold,
+                    phase: 0.,
+                    stop_after: None,
                 },
                 idle_in_pop: false,
             })
@@ -779,6 +787,7 @@ fn prepared_periodic_jets_agree_with_every_generated_interval_at_wide_time_scale
                     origin,
                     period,
                     hold: None,
+                    limit: None,
                 }),
                 0.,
                 if origin < 0. {
@@ -812,4 +821,352 @@ fn prepared_periodic_jets_agree_with_every_generated_interval_at_wide_time_scale
             }
         }
     }
+}
+
+#[test]
+fn finite_repetition_preserves_exact_cutoff_and_does_not_scan_after_it() {
+    use model_normalize_ngspice::waveform::RepeatLimit;
+    for (cutoff, incoming, slope, expected_events) in [
+        (1.5, 4., 1., vec![0., 0.5, 1., 1.5]),
+        (1.75, 4., -2., vec![0., 0.5, 1., 1.5, 1.75]),
+        (2., 2., -2., vec![0., 0.5, 1., 1.5, 2.]),
+    ] {
+        let wave = pwl(
+            vec![knot(0., 2., 2.), knot(0.5, 4., 6.)],
+            Some(Repeat {
+                origin: 0.,
+                period: 1.,
+                hold: Some(0.),
+                limit: Some(RepeatLimit {
+                    time: cutoff,
+                    value: -7.,
+                }),
+            }),
+            2.,
+            2.,
+        );
+        assert_eq!(
+            wave.breakpoints_in(0., f64::MAX)
+                .unwrap()
+                .map(|event| event.time)
+                .collect::<Vec<_>>(),
+            expected_events
+        );
+        assert_eq!(
+            wave.breakpoints_in(cutoff, f64::MAX)
+                .unwrap()
+                .map(|event| event.time)
+                .collect::<Vec<_>>(),
+            [cutoff]
+        );
+        assert_eq!(
+            wave.breakpoints_in(cutoff.next_up(), f64::MAX)
+                .unwrap()
+                .count(),
+            0
+        );
+        close(wave.value_at(cutoff, Limit::Left).unwrap(), incoming, 0.);
+        close(wave.value_at(cutoff, Limit::Right).unwrap(), -7., 0.);
+        close(wave.value_at(f64::MAX, Limit::Left).unwrap(), -7., 0.);
+        let waveform = Waveform::Prepared(wave);
+        assert_eq!(
+            waveform.taylor_at(cutoff, 0.25, 2, Limit::Left).unwrap(),
+            [incoming, slope, 0.]
+        );
+        assert_eq!(
+            waveform.taylor_at(cutoff, 0.25, 2, Limit::Right).unwrap(),
+            [-7., 0., 0.]
+        );
+    }
+}
+
+#[test]
+fn signed_and_finite_sine_uses_phase_and_exact_hold_boundaries() {
+    let delay = 0.125;
+    for (frequency, amplitude, damping, phase, cap, hold) in [
+        (2., 3., 0.4, 30., Some(0.625), true),
+        (-2., -3., -0.4, 30., Some(-0.625), true),
+        (-2., 3., 0.4, -30., Some(-0.625), false),
+        (0., -3., 0.4, 90., None, true),
+        (2., 3., 0.4, 30., None, false),
+    ] {
+        let phase_rad = f64::to_radians(phase);
+        let omega = frequency * std::f64::consts::TAU;
+        let at = |elapsed: f64| {
+            let a = amplitude * (-damping * elapsed).exp();
+            let (sin, cos) = omega.mul_add(elapsed, phase_rad).sin_cos();
+            (a.mul_add(sin, 1.), a * omega.mul_add(cos, -damping * sin))
+        };
+        let elapsed_at_zero = if hold {
+            0.
+        } else {
+            cap.map_or(-delay, |c: f64| c.min(-delay))
+        };
+        let forcing = PreparedForcing::new(ResolvedWaveform {
+            dc: 7.,
+            startup: at(elapsed_at_zero).0,
+            idle_in_pop: false,
+            forcing: Forcing::Sine {
+                offset: 1.,
+                amplitude,
+                frequency,
+                delay,
+                damping,
+                phase,
+                hold_before_delay: hold,
+                stop_after: cap,
+            },
+        })
+        .unwrap();
+        let events = forcing
+            .breakpoints_in(-1., 2.)
+            .unwrap()
+            .map(|event| event.time)
+            .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        if hold {
+            expected.push(delay);
+        }
+        if let Some(cap) = cap
+            && (!hold || cap > 0.)
+        {
+            expected.push(delay + cap);
+        }
+        expected.sort_by(f64::total_cmp);
+        assert_eq!(events, expected);
+        close(forcing.dc(), 7., 0.);
+        let wave = Waveform::Prepared(forcing);
+        let mut samples = vec![-0.75, -0.25, 0., delay, 0.25, 1., 2.];
+        samples.extend(expected);
+        for time in samples {
+            for side in [Limit::Left, Limit::Right] {
+                let (elapsed, active) =
+                    if hold && (time < delay || (time == delay && side == Limit::Left)) {
+                        (0., false)
+                    } else if let Some(cap) = cap
+                        && (time > delay + cap || (time == delay + cap && side == Limit::Right))
+                    {
+                        (cap, false)
+                    } else {
+                        (time - delay, true)
+                    };
+                let (value, derivative) = at(elapsed);
+                let jet = wave.taylor_at(time, 0.125, 2, side).unwrap();
+                close(jet[0], value, 2e-13);
+                close(jet[1], if active { 0.125 * derivative } else { 0. }, 2e-13);
+                if !active {
+                    close(jet[2], 0., 0.);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exponential_independent_delays_and_analytic_derivatives() {
+    use model_normalize_ngspice::waveform::ExponentialForcing;
+    for (rise_delay, fall_delay) in [(-0.5, 0.25), (0.25, -0.5), (0., 0.), (0.25, 0.75)] {
+        let exp = ExponentialForcing {
+            initial: 1.,
+            pulsed: 3.,
+            rise_delay,
+            fall_delay,
+            rise_tau: 0.25,
+            fall_tau: 0.5,
+        };
+        let transition = |time: f64, delay: f64, tau: f64, side| {
+            if time < delay || (time == delay && side == Limit::Left) {
+                (0., 0., 0.)
+            } else {
+                let e = (-(time - delay) / tau).exp();
+                (-(-(time - delay) / tau).exp_m1(), e / tau, -e / (tau * tau))
+            }
+        };
+        let expected = |time, side| {
+            let r = transition(time, rise_delay, exp.rise_tau, side);
+            let f = transition(time, fall_delay, exp.fall_tau, side);
+            [2_f64.mul_add(r.0 - f.0, 1.), 2. * (r.1 - f.1), r.2 - f.2]
+        };
+        let forcing = PreparedForcing::new(ResolvedWaveform {
+            dc: 7.,
+            startup: expected(0., Limit::Right)[0],
+            idle_in_pop: false,
+            forcing: Forcing::Exponential(exp),
+        })
+        .unwrap();
+        let mut events = vec![rise_delay, fall_delay];
+        events.sort_by(f64::total_cmp);
+        events.dedup();
+        assert_eq!(
+            forcing
+                .breakpoints_in(-1., 3.)
+                .unwrap()
+                .map(|event| event.time)
+                .collect::<Vec<_>>(),
+            events
+        );
+        let wave = Waveform::Prepared(forcing);
+        let mut times = vec![-1., 0., 0.5, 1., 3.];
+        times.extend(events);
+        for time in times {
+            for side in [Limit::Left, Limit::Right] {
+                for (value, want) in wave
+                    .taylor_at(time, 1., 2, side)
+                    .unwrap()
+                    .iter()
+                    .zip(expected(time, side))
+                {
+                    close(*value, want, 2e-14);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn actual_ltspice_prepared_waveforms_drive_transient_with_exact_cutoffs() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = prepare_deck(
+        dir.path(),
+        "* linked LTspice waveform witness\n.param cycle_count=1.5\nV1 a 0 DC 7 SINE(1 2 1Meg 1u 1e5 30 1.5)\nV2 b 0 EXP(1 3 5u 2u 1u 3u)\nI1 0 c PULSE(0 1 1u .1u .1u 8u 10u {cycle_count})\nR1 c 0 1\nV3 d 0 SINE(1 2 0 1u 1e5 30)\n.end\n",
+        InputFormat::LtspiceDeck,
+    );
+    assert_eq!(bundle.waveforms.len(), 4);
+    let netlist = Parser::new()
+        .parse_file(dir.path().join(&bundle.primary.filename))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config
+        .prepared_circuit(
+            &netlist,
+            ngspice_rs::devices::subckt::PreparedDeclarations {
+                waveforms: &bundle.waveforms,
+                pwl_resistors: &bundle.pwl_resistors,
+            },
+        )
+        .unwrap();
+    let mut input =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["50n", "20u", "0", "50n"]);
+    input.uic = true;
+    let plot = config
+        .plan(input)
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    let timelines = circuit
+        .source_timelines(TransientTiming::new(50e-9, 20e-6).unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let pulse = timelines.iter().find(|source| source.name == "i1").unwrap();
+    let cutoff = pulse
+        .waveform
+        .breakpoints_in(0., 20e-6)
+        .unwrap()
+        .last()
+        .unwrap();
+    // The parser's engineering-suffix multiplication can round differently
+    // from a Rust decimal literal. Require the exact *bound* event in the plot.
+    close(cutoff, 16e-6, 1e-19);
+    for point in 0..plot.point_count() {
+        let time = plot.value("time", point).unwrap().re;
+        let elapsed = (time - 1e-6).clamp(0., 1.5e-6);
+        let a = (2. * (-1e5 * elapsed).exp()).mul_add(
+            (std::f64::consts::TAU * 1e6)
+                .mul_add(elapsed, 30_f64.to_radians())
+                .sin(),
+            1.,
+        );
+        let rise = -(-(time - 5e-6).max(0.) / 2e-6).exp_m1();
+        let fall = -(-(time - 1e-6).max(0.) / 3e-6).exp_m1();
+        let b = 2_f64.mul_add(rise - fall, 1.);
+        let phase = (time - 1e-6).max(0.) % 10e-6;
+        // The accepted endpoint of a step landing on a discontinuity
+        // is the incoming value; the restarted step uses the right limit.
+        let c = if time > cutoff {
+            0.
+        } else {
+            (phase / 1e-7)
+                .min(1.)
+                .min(((8.2e-6 - phase) / 1e-7).max(0.))
+        };
+        let d = 2_f64.mul_add(
+            30_f64.to_radians().sin() * (-1e5 * (time - 1e-6).max(0.)).exp(),
+            1.,
+        );
+        for (name, want) in [("v(a)", a), ("v(b)", b), ("v(c)", c), ("v(d)", d)] {
+            close(plot.value(name, point).unwrap().re, want, 2e-8);
+        }
+    }
+    assert!(
+        (0..plot.point_count())
+            .any(|point| plot.value("time", point).unwrap().re.to_bits() == cutoff.to_bits())
+    );
+}
+
+#[test]
+fn vendor_prepared_waveform_values_match_at_independent_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = prepare_deck(
+        dir.path(),
+        &include_str!("fixtures/ltspice_waveforms/waveforms-gear.cir")
+            .replace(" plotwinsize=0", "")
+            .replace(" numdgt=15", ""),
+        InputFormat::LtspiceDeck,
+    );
+    let netlist = Parser::new()
+        .parse_file(dir.path().join(&bundle.primary.filename))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let circuit = config
+        .prepared_circuit(
+            &netlist,
+            ngspice_rs::devices::subckt::PreparedDeclarations {
+                waveforms: &bundle.waveforms,
+                pwl_resistors: &bundle.pwl_resistors,
+            },
+        )
+        .unwrap();
+    let timelines = circuit
+        .source_timelines(TransientTiming::new(20e-9, 20e-6).unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let waves = ["v1", "v2", "i1", "v3", "v4", "v5", "v6", "v7", "v8"].map(|name| {
+        let source = timelines.iter().find(|source| source.name == name).unwrap();
+        let Waveform::Prepared(wave) = &source.waveform else {
+            panic!("expected prepared source {name}")
+        };
+        wave
+    });
+    assert_eq!(bundle.waveforms.len(), waves.len());
+    close(waves[0].dc(), 7., 0.);
+    let mut count = 0;
+    for row in include_str!("fixtures/ltspice_waveforms/waveforms-gear.tsv").lines() {
+        let numbers = row
+            .split_ascii_whitespace()
+            .map(|value| value.parse::<f64>().unwrap())
+            .collect::<Vec<_>>();
+        let [time, expected @ ..] = numbers.as_slice() else {
+            panic!("missing witness time")
+        };
+        assert_eq!(expected.len(), waves.len());
+        // LTspice records a left landing value at zero for the negative
+        // frequency train, and at its positive-delay counterpart's release.
+        // The separate sided tests qualify both physical external limits.
+        for (index, (wave, expected)) in waves.iter().zip(expected).enumerate() {
+            let side = if (index == 5 && time.to_bits() == 0)
+                || (index == 4 && time.to_bits() == 1e-6_f64.to_bits())
+            {
+                Limit::Left
+            } else {
+                Limit::Right
+            };
+            let actual = wave.value_at(*time, side).unwrap();
+            assert!(
+                (actual - expected).abs() <= 2e-10,
+                "witness source {index} at {time:.17e}: {actual:.17e} != {expected:.17e}"
+            );
+        }
+        count += 1;
+    }
+    assert_eq!(count, 139);
 }

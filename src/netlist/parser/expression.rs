@@ -11,6 +11,7 @@
 //! byte column. Nothing is evaluated.
 
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult, parse_numparam_number_prefix};
+use model_normalize_ngspice::native_scalar::{ConditionalChain, OPERATOR_LEVELS};
 use winnow::Parser as _;
 use winnow::combinator::{opt, peek, separated};
 use winnow::error::{AddContext, ErrMode, ModalResult, ParserError};
@@ -181,10 +182,7 @@ fn span(input: &In<'_>, start: usize, end: usize) -> SourceSpan {
 /// Describes the character that cannot start/continue an expression here.
 fn describe(c: char) -> String {
     match c {
-        '%' | '\\' | '!' | '<' | '>' | '=' | '&' | '|' | '?' | ':' => format!(
-            "operator '{c}' is outside the bounded subset (only + - * / ^ ** are parsed; \
-             comparison, logical, ternary, '%' and '\\' operators are not)"
-        ),
+        '&' | '|' => format!("unexpected '{c}'; logical operators require doubled characters"),
         '\'' | '"' => "quoted text inside an expression is outside the bounded subset \
                         (single quotes may only delimit a whole value, like braces)"
             .to_owned(),
@@ -196,10 +194,7 @@ fn describe(c: char) -> String {
 }
 
 const fn is_unsupported(c: char) -> bool {
-    matches!(
-        c,
-        '%' | '\\' | '!' | '<' | '>' | '=' | '&' | '|' | '?' | ':' | '\'' | '"'
-    )
+    matches!(c, '\'' | '"')
 }
 
 fn unexpected(remaining: usize, c: char, context: &str) -> ErrMode<Fail> {
@@ -230,13 +225,21 @@ const fn leave(input: &mut In<'_>) {
     input.state.depth = input.state.depth.saturating_sub(1);
 }
 
-/// `sum := [sign] term { ('+' | '-') term }`
-fn sum(input: &mut In<'_>) -> Res<Built<Expr>> {
-    ws.parse_next(input)?;
+/// Parse shared native binary precedence levels, with C's context-sensitive
+/// leading sign applied at the additive level before the first fold.
+fn low_binary(input: &mut In<'_>, level: usize, leading_sign: bool) -> Res<Built<Expr>> {
+    let Some(operators) = OPERATOR_LEVELS.get(level) else {
+        return operand(input);
+    };
+    ws(input)?;
     let open = input.eof_offset();
-    let lead = opt(one_of(['+', '-'])).parse_next(input)?;
-    let first = term.parse_next(input)?;
-    let first = match lead {
+    let lead = if leading_sign && matches!(operators.first(), Some((_, BinaryOp::Add))) {
+        opt(one_of(['+', '-'])).parse_next(input)?
+    } else {
+        None
+    };
+    let first = low_binary(input, level + 1, leading_sign && lead.is_none())?;
+    let mut lhs = match lead {
         Some(sign) => {
             let op = if sign == '-' {
                 UnaryOp::Minus
@@ -258,29 +261,83 @@ fn sum(input: &mut In<'_>) -> Res<Built<Expr>> {
         }
         None => first,
     };
-    let mut lhs = first;
     loop {
         ws(input)?;
         let at = input.eof_offset();
-        let Some(op) = opt(additive).parse_next(input)? else {
+        let Some(&(symbol, op)) = operators
+            .iter()
+            .find(|(symbol, _)| input.input.starts_with(symbol))
+        else {
             return Ok(lhs);
         };
-        let rhs = term(input)?;
+        take(symbol.len()).void().parse_next(input)?;
+        let rhs = low_binary(input, level + 1, false)?;
         lhs = binary(input, at, op, lhs, rhs)?;
     }
 }
 
-fn additive(input: &mut In<'_>) -> Res<BinaryOp> {
-    ws.parse_next(input)?;
-    one_of(['+', '-'])
-        .map(|c| {
-            if c == '+' {
-                BinaryOp::Add
-            } else {
-                BinaryOp::Sub
-            }
-        })
-        .parse_next(input)
+/// C numparam reduces '?' and ':' at two distinct precedence levels. A
+/// completed pair chains to the right; repeated operators at the same level
+/// retain the earlier accumulator. Parentheses create a separate expression.
+fn conditional(input: &mut In<'_>) -> Res<Built<Expr>> {
+    let condition = low_binary(input, 0, true)?;
+    ws(input)?;
+    let at = input.eof_offset();
+    if opt(literal("?")).parse_next(input)?.is_none() {
+        return Ok(condition);
+    }
+    let mut chain = ConditionalChain::new(condition, at);
+    loop {
+        let value = low_binary(input, 0, false)?;
+        ws(input)?;
+        let next = input.eof_offset();
+        if opt(literal("?")).parse_next(input)?.is_some() {
+            chain.question(value, next);
+        } else if opt(literal(":")).parse_next(input)?.is_some() {
+            chain
+                .colon(value)
+                .map_err(|_| cut(next, "unmatched ':' in conditional expression"))?;
+        } else {
+            return chain.finish(
+                value,
+                |_| {
+                    cut(
+                        next,
+                        "unmatched '?' in conditional expression (expected ':')",
+                    )
+                },
+                |condition, positive, negative, at| {
+                    ternary_node(input, at, condition, positive, negative)
+                },
+            );
+        }
+    }
+}
+
+fn ternary_node(
+    input: &mut In<'_>,
+    at: usize,
+    condition: Built<Expr>,
+    then: Built<Expr>,
+    otherwise: Built<Expr>,
+) -> Res<Built<Expr>> {
+    let span = SourceSpan {
+        start: condition.node.span.start.clone(),
+        end: otherwise.node.span.end.clone(),
+        logical: condition.node.span.logical.start..otherwise.node.span.logical.end,
+    };
+    input.state.node(
+        at,
+        condition.height.max(then.height).max(otherwise.height),
+        || Expr {
+            kind: ExprKind::Ternary {
+                condition: Box::new(condition.node),
+                then: Box::new(then.node),
+                otherwise: Box::new(otherwise.node),
+            },
+            span,
+        },
+    )
 }
 
 fn binary(
@@ -305,45 +362,6 @@ fn binary(
     })
 }
 
-/// Multiplication/division and power are separate left folds. No reassociation.
-fn term(input: &mut In<'_>) -> Res<Built<Expr>> {
-    let mut lhs = power(input)?;
-    loop {
-        ws(input)?;
-        let at = input.eof_offset();
-        let op = if input.input.starts_with("**") {
-            return Ok(lhs);
-        } else if input.input.starts_with('*') {
-            BinaryOp::Mul
-        } else if input.input.starts_with('/') {
-            BinaryOp::Div
-        } else {
-            return Ok(lhs);
-        };
-        take(1usize).void().parse_next(input)?;
-        let rhs = power(input)?;
-        lhs = binary(input, at, op, lhs, rhs)?;
-    }
-}
-
-fn power(input: &mut In<'_>) -> Res<Built<Expr>> {
-    let mut lhs = operand(input)?;
-    loop {
-        ws(input)?;
-        let at = input.eof_offset();
-        let width = if input.input.starts_with("**") {
-            2usize
-        } else if input.input.starts_with('^') {
-            1
-        } else {
-            return Ok(lhs);
-        };
-        take(width).void().parse_next(input)?;
-        let rhs = operand(input)?;
-        lhs = binary(input, at, BinaryOp::Pow, lhs, rhs)?;
-    }
-}
-
 /// Every operand position is mandatory, so failures here are committed.
 fn operand(input: &mut In<'_>) -> Res<Built<Expr>> {
     ws.parse_next(input)?;
@@ -356,10 +374,27 @@ fn operand(input: &mut In<'_>) -> Res<Built<Expr>> {
         Some('(') => group(input),
         Some(c) if c.is_ascii_digit() || c == '.' => number(input),
         Some('-') => signed_number(input),
+        Some('!') => logical_not(input),
         Some(c) if is_ident_start(c) => identifier_or_call(input),
         Some(')') => Err(cut(start, "expected an operand, found ')'")),
         Some(c) => Err(unexpected(start, c, "where an operand is required")),
     }
+}
+
+fn logical_not(input: &mut In<'_>) -> Res<Built<Expr>> {
+    let start = input.eof_offset();
+    literal("!").void().parse_next(input)?;
+    enter(input, start)?;
+    let inner = operand(input)?;
+    leave(input);
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, inner.height, || Expr {
+        kind: ExprKind::Unary {
+            op: UnaryOp::Not,
+            operand: Box::new(inner.node),
+        },
+        span,
+    })
 }
 
 fn number(input: &mut In<'_>) -> Res<Built<Expr>> {
@@ -429,7 +464,7 @@ fn group(input: &mut In<'_>) -> Res<Built<Expr>> {
     let start = input.eof_offset();
     literal("(").void().parse_next(input)?;
     enter(input, start)?;
-    let inner = sum.parse_next(input)?;
+    let inner = conditional.parse_next(input)?;
     close(input, start)?;
     leave(input);
     let span = span(input, start, input.eof_offset());
@@ -513,7 +548,8 @@ fn identifier_or_call(input: &mut In<'_>) -> Res<Built<Expr>> {
     let open = input.eof_offset();
     literal("(").void().parse_next(input)?;
     enter(input, open)?;
-    let arguments: Vec<Built<Expr>> = separated(1.., sum, (ws, literal(","))).parse_next(input)?;
+    let arguments: Vec<Built<Expr>> =
+        separated(1.., conditional, (ws, literal(","))).parse_next(input)?;
     close(input, open)?;
     leave(input);
     if arguments.len() != function.arity() {
@@ -549,7 +585,7 @@ fn user_call(input: &mut In<'_>, start: usize, name: String) -> Res<Built<Expr>>
     let arguments: Vec<Built<Expr>> = if empty {
         Vec::new()
     } else {
-        separated(1.., sum, (ws, literal(","))).parse_next(input)?
+        separated(1.., conditional, (ws, literal(","))).parse_next(input)?
     };
     close(input, open)?;
     leave(input);
@@ -652,7 +688,7 @@ fn parse_with_names(
         },
     };
     let run = |input: &mut In<'_>| -> Res<Built<Expr>> {
-        let root = sum(input)?;
+        let root = conditional(input)?;
         ws.parse_next(input)?;
         let here = input.eof_offset();
         if let Some(c) = peek(opt(any)).parse_next(input)? {
@@ -673,6 +709,7 @@ fn parse_with_names(
                 text: text.to_owned(),
                 braced: braced || quoted,
                 quoted,
+                behavioural_alternative: None,
                 span: SourceSpan::from_positions(origin, origin.advance(text.len())),
                 root: root.node,
             },
