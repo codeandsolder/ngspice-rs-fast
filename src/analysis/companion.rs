@@ -719,15 +719,11 @@ enum Acceptance<'a> {
     Step(&'a AttemptedStep),
 }
 
-struct TruncationDevice {
+struct TruncationDevice<'a> {
+    device: &'a dyn crate::devices::Device,
+    timestep: Option<&'a dyn crate::devices::DeviceTimestepControl>,
     rows: std::ops::Range<usize>,
-    slots: Vec<TruncationSlot>,
-}
-
-struct TruncationSlot {
-    base: usize,
-    explicit_derivative: bool,
-    derived: bool,
+    slots: &'a [crate::devices::circuit::TruncationSlot],
 }
 
 /// Accepted voltage history used only when newtrunc is requested. Rejected
@@ -881,7 +877,7 @@ struct Driver<'a> {
     limited_rows: Option<Vec<bool>>,
     /// Each device's state rows and the absolute state index of every
     /// charge it hands `CKTterr` (`truncation_slots`), fixed for the run.
-    truncation: Vec<TruncationDevice>,
+    truncation: Vec<TruncationDevice<'a>>,
     event_devices: Vec<EventDevice<'a>>,
     voltage_history: Option<VoltageHistory>,
     stats: TransientStats,
@@ -1124,30 +1120,25 @@ pub(super) fn run_transient(
     run_transient_inner(circuit, request, context, settings, purpose, sink, None)
 }
 
-fn truncation_devices(circuit: &Circuit) -> SpiceResult<Vec<TruncationDevice>> {
+fn truncation_devices(circuit: &Circuit) -> SpiceResult<Vec<TruncationDevice<'_>>> {
     circuit
-        .devices()
+        .truncation_bindings()
         .iter()
-        .enumerate()
-        .map(|(index, device)| {
-            let rows = circuit
-                .state_rows(index)
-                .ok_or_else(|| failure("missing state range"))?;
-            let bases = device
-                .truncation_slots()
-                .into_iter()
-                .map(|slot| TruncationSlot {
-                    base: rows.start + slot,
-                    explicit_derivative: device
-                        .initial_expression_storage()
-                        .is_some_and(|storage| storage.slot == slot),
-                    derived: device.initial_expression_storage().is_some_and(|storage| {
-                        storage.slot == slot
-                            && storage.policy == crate::devices::InitialStoragePolicy::Derived
-                    }),
-                })
-                .collect();
-            Ok(TruncationDevice { rows, slots: bases })
+        .map(|binding| {
+            let device = circuit.devices()[binding.index].as_ref();
+            let timestep = if binding.timestep {
+                Some(device.timestep_control().ok_or_else(|| {
+                    failure("finalized timestep capability changed without rebinding")
+                })?)
+            } else {
+                None
+            };
+            Ok(TruncationDevice {
+                device,
+                timestep,
+                rows: binding.rows.clone(),
+                slots: &binding.slots,
+            })
         })
         .collect()
 }
@@ -1511,7 +1502,7 @@ impl Driver<'_> {
                 .accepted(1)
                 .ok_or_else(|| failure("periodic charge history is empty"))?;
             for TruncationDevice { slots, .. } in &self.truncation {
-                for TruncationSlot { base: slot, .. } in slots {
+                for crate::devices::circuit::TruncationSlot { base: slot, .. } in *slots {
                     let slot = *slot;
                     scales[slot] = scales[slot].max(state[slot].abs());
                 }
@@ -2534,7 +2525,7 @@ impl Driver<'_> {
     }
 
     /// C `CKTtrunc`: the smallest step bound over every charge-storage element,
-    /// every discrete-state device ([`crate::devices::Device::timestep_limit`],
+    /// every discrete-state device ([`crate::devices::DeviceTimestepControl::timestep_limit`],
     /// `swtrunc.c`) and every delay line (`tratrunc.c`), from the converged
     /// trial `solution` at `time` and the accepted history.
     fn truncation_limit(
@@ -2553,14 +2544,18 @@ impl Driver<'_> {
         };
         let order = usize::from(coefficients.order());
         let mut limit = Real::INFINITY;
-        for (device, TruncationDevice { rows, slots: bases }) in
-            self.circuit.devices().iter().zip(&self.truncation)
+        for TruncationDevice {
+            device,
+            timestep,
+            rows,
+            slots: bases,
+        } in &self.truncation
         {
-            for &TruncationSlot {
+            for &crate::devices::circuit::TruncationSlot {
                 base,
                 explicit_derivative,
                 ..
-            } in bases
+            } in *bases
             {
                 let accepted = |age: usize, offset: usize| {
                     self.history
@@ -2594,8 +2589,8 @@ impl Driver<'_> {
                 limit = limit.min(bound);
             }
             // Discrete-state bounds (`swtrunc.c`), from the same trial.
-            if !rows.is_empty() {
-                let bound = device.timestep_limit(&crate::devices::TruncationContext {
+            if let Some(hook) = timestep {
+                let bound = hook.timestep_limit(&crate::devices::TruncationContext {
                     trial: trial
                         .slice(rows.clone())
                         .ok_or_else(|| failure("trial state is too short"))?,

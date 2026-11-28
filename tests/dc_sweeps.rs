@@ -593,6 +593,12 @@ impl Device for Probe {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal([self.node, NodeId::GROUND], 1e-3, false)
     }
+    fn accept_notifier(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptNotification> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptNotification for Probe {
     fn accept(&self, _: &AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
     }
@@ -675,6 +681,12 @@ impl Device for ContextProbe {
         self.loads.set(self.loads.get() + 1);
         context.stamp(self.node, self.node, 1e-3)
     }
+    fn accept_notifier(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptNotification> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptNotification for ContextProbe {
     fn accept(&self, _: &AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
     }
@@ -747,6 +759,12 @@ impl Device for Gate {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal([self.node, NodeId::GROUND], 1e-3, false)
     }
+    fn accept_notifier(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptNotification> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptNotification for Gate {
     fn accept(&self, _: &AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
     }

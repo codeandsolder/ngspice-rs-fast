@@ -2036,22 +2036,12 @@ impl Device for Diode {
         let evaluation = sample.evaluate(context.gmin)?;
         self.commit_load(context, &evaluation)
     }
-    fn convergence_test(
-        &self,
-        context: &crate::devices::traits::ConvergenceContext<'_>,
-    ) -> SpiceResult<bool> {
-        if self.recovery_node.is_none() {
-            return Ok(false);
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        if self.recovery_node.is_some() {
+            Some(self)
+        } else {
+            None
         }
-        let thermal = self.thermal(context.model_context)?;
-        let voltage = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
-        let current = thermal
-            .point(voltage, context.model_context.gmin)?
-            .junction
-            .current;
-        self.recovery(&thermal).map_or(Ok(false), |recovery| {
-            recovery.not_converged(context, current)
-        })
     }
     fn physical_charge_histories(
         &self,
@@ -2299,6 +2289,26 @@ impl Device for Diode {
             family: NoiseFamily::Diode,
             model: Some(&self.model),
             total: true,
+        })
+    }
+}
+
+impl crate::devices::DeviceConvergence for Diode {
+    fn convergence_test(
+        &self,
+        context: &crate::devices::traits::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        if self.recovery_node.is_none() {
+            return Ok(false);
+        }
+        let thermal = self.thermal(context.model_context)?;
+        let voltage = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
+        let current = thermal
+            .point(voltage, context.model_context.gmin)?
+            .junction
+            .current;
+        self.recovery(&thermal).map_or(Ok(false), |recovery| {
+            recovery.not_converged(context, current)
         })
     }
 }

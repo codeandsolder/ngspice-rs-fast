@@ -73,6 +73,12 @@ impl Device for Probe {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal(self.terminals, 1., false)
     }
+    fn accept_validator(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptValidation> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptValidation for Probe {
     fn validate_accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
         if context.time == Some(99.) {
             return Err(SpiceError::circuit("accept hook refused"));

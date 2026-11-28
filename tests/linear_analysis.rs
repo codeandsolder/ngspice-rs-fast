@@ -279,6 +279,12 @@ impl ngspice_rs::devices::Device for AcceptProbe {
     ) -> ngspice_rs::primitives::SpiceResult<()> {
         self.inner.assemble_linear(context)
     }
+    fn accept_notifier(&self) -> Option<&dyn ngspice_rs::devices::DeviceAcceptNotification> {
+        Some(self)
+    }
+}
+
+impl ngspice_rs::devices::DeviceAcceptNotification for AcceptProbe {
     fn accept(&self, context: &ngspice_rs::devices::AcceptContext<'_>) {
         self.times.borrow_mut().push(context.time);
     }

@@ -144,29 +144,8 @@ impl Device for TimedSwitch {
         )
     }
 
-    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
-        let time = context.time;
-        let control = self.control(|node| context.voltage(node));
-        let accepted = context
-            .history
-            .accepted(1)
-            .and_then(|values| values.get(context.state_range.clone()));
-        let actual = self.state(time, control, accepted)?;
-        let stamped = State::from_values(context.states)?;
-        if actual.discrete() != stamped.discrete() {
-            return Ok(true);
-        }
-        let [p, n] = self.branch();
-        let voltage = context.voltage(p) - context.voltage(n);
-        let expected = actual.at_conductance(self.material)? * voltage;
-        let observed = stamped.at_conductance(self.material)? * voltage;
-        if !expected.is_finite() || !observed.is_finite() {
-            return Err(SpiceError::circuit("nonfinite timed switch branch current"));
-        }
-        let tolerance = context
-            .reltol
-            .mul_add(expected.abs().max(observed.abs()), context.abstol);
-        Ok((expected - observed).abs() > tolerance)
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
 
     fn assemble_small_signal(
@@ -195,6 +174,33 @@ impl Device for TimedSwitch {
     ) -> SpiceResult<()> {
         // This memory is logical history, not electric charge or flux.
         Ok(())
+    }
+}
+
+impl crate::devices::DeviceConvergence for TimedSwitch {
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        let time = context.time;
+        let control = self.control(|node| context.voltage(node));
+        let accepted = context
+            .history
+            .accepted(1)
+            .and_then(|values| values.get(context.state_range.clone()));
+        let actual = self.state(time, control, accepted)?;
+        let stamped = State::from_values(context.states)?;
+        if actual.discrete() != stamped.discrete() {
+            return Ok(true);
+        }
+        let [p, n] = self.branch();
+        let voltage = context.voltage(p) - context.voltage(n);
+        let expected = actual.at_conductance(self.material)? * voltage;
+        let observed = stamped.at_conductance(self.material)? * voltage;
+        if !expected.is_finite() || !observed.is_finite() {
+            return Err(SpiceError::circuit("nonfinite timed switch branch current"));
+        }
+        let tolerance = context
+            .reltol
+            .mul_add(expected.abs().max(observed.abs()), context.abstol);
+        Ok((expected - observed).abs() > tolerance)
     }
 }
 

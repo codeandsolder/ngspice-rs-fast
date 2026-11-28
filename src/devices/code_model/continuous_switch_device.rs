@@ -255,22 +255,8 @@ impl Device for ContinuousSwitch {
         Ok(())
     }
 
-    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
-        let coordinates =
-            self.mna_coordinates(context.unknowns, context.branch, context.controls)?;
-        let (voltage, control) = coordinates.sample(context.solution)?;
-        let (prior, gm, prior_control) = self.linearization(coordinates, context.previous)?;
-        let actual = self.material.point(control)?.g * voltage;
-        let predicted = gm.mul_add(control - prior_control, prior.g * voltage);
-        if !actual.is_finite() || !predicted.is_finite() {
-            return Err(SpiceError::circuit(
-                "nonfinite continuous switch convergence residual",
-            ));
-        }
-        let tolerance = context
-            .reltol
-            .mul_add(actual.abs().max(predicted.abs()), context.abstol);
-        Ok((actual - predicted).abs() > tolerance)
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
 
     fn assemble_small_signal(
@@ -337,6 +323,26 @@ impl Device for ContinuousSwitch {
     ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         // XSPICE switch models declare no noise generator.
         Ok(crate::devices::noise::DeviceNoise::Noiseless)
+    }
+}
+
+impl crate::devices::DeviceConvergence for ContinuousSwitch {
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        let coordinates =
+            self.mna_coordinates(context.unknowns, context.branch, context.controls)?;
+        let (voltage, control) = coordinates.sample(context.solution)?;
+        let (prior, gm, prior_control) = self.linearization(coordinates, context.previous)?;
+        let actual = self.material.point(control)?.g * voltage;
+        let predicted = gm.mul_add(control - prior_control, prior.g * voltage);
+        if !actual.is_finite() || !predicted.is_finite() {
+            return Err(SpiceError::circuit(
+                "nonfinite continuous switch convergence residual",
+            ));
+        }
+        let tolerance = context
+            .reltol
+            .mul_add(actual.abs().max(predicted.abs()), context.abstol);
+        Ok((actual - predicted).abs() > tolerance)
     }
 }
 
