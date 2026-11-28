@@ -5,17 +5,42 @@
 //! reconvergence can cancel that common uncertainty before comparing
 //! setup/hold intervals or the order of conflicting transitions.
 
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{ExactSum, Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+mod delivery;
+pub use delivery::{Arrival, TimedInput, TimedOutput};
 
 /// Identity of one uncertain delay variable. Reusing an identity expresses
 /// the same normalized uncertainty, not another independent random draw.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Origin(
-    /// Stable identity assigned by the timing-event producer.
-    pub u64,
-);
+pub struct Origin {
+    generated: bool,
+    identity: u64,
+}
+
+impl Origin {
+    /// Explicit shared identity assigned by a timing-event producer.
+    #[must_use = "the identity establishes delay correlation"]
+    pub const fn shared(identity: u64) -> Self {
+        Self {
+            generated: false,
+            identity,
+        }
+    }
+
+    /// Allocate an independent delay variable, disjoint from explicitly
+    /// assigned shared origins.
+    ///
+    /// # Errors
+    /// Identity space exhausted.
+    pub fn independent() -> SpiceResult<Self> {
+        Ok(Self {
+            generated: true,
+            identity: super::external_identity()?,
+        })
+    }
+}
 
 /// Finite inclusive lower and upper time bounds, in seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -191,6 +216,9 @@ impl TimingWindow {
     /// Nonrepresentable physical arrival time.
     pub fn after(&self, delay: DelayWindow, origin: Origin) -> SpiceResult<Self> {
         let d = delay.bounds();
+        if d.minimum == 0. && d.maximum == 0. {
+            return Ok(self.clone());
+        }
         let bounds = Bounds::new(
             self.0.bounds.minimum + d.minimum,
             self.0.bounds.maximum + d.maximum,
@@ -203,6 +231,20 @@ impl TimingWindow {
                 "timing ambiguity below physical time resolution",
             ));
         }
+        let bounds = if bounds.is_exact() {
+            bounds
+        } else {
+            let add = |a: Real, b: Real, upper: bool| -> SpiceResult<Real> {
+                let mut sum = ExactSum::new();
+                sum.add_product(a, 1.);
+                sum.add_product(b, 1.);
+                round_outward(sum, upper)
+            };
+            Bounds::new(
+                add(self.0.bounds.minimum, d.minimum, false)?,
+                add(self.0.bounds.maximum, d.maximum, true)?,
+            )?
+        };
         Ok(Self(Arc::new(Node {
             depth: self
                 .0
@@ -259,6 +301,12 @@ impl TimingWindow {
         })))
     }
 
+    /// Whether both handles identify the same causal arrival expression.
+    #[must_use = "identity distinguishes completion of a previously announced transition"]
+    pub fn same_expression(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Absolute arrival interval. Because all expressions are monotone in
     /// every delay variable, the two extrema are jointly attainable.
     #[must_use = "the bounds describe absolute arrival uncertainty"]
@@ -307,6 +355,27 @@ fn charge(budget: &mut usize, work: usize) -> SpiceResult<()> {
     Ok(())
 }
 
+// The exact accumulator contains sums of binary64 numbers, so any
+// nonzero residual is at least one smallest subnormal. Round outward
+// only when the nearest representable result lies inside the interval.
+fn round_outward(mut sum: ExactSum, upper: bool) -> SpiceResult<Real> {
+    let rounded = sum.rounded_sum();
+    if !rounded.is_finite() {
+        return Err(SpiceError::circuit(
+            "timing comparison outside representable range",
+        ));
+    }
+    sum.add_product(rounded, -1.);
+    let residual = sum.rounded_sum();
+    Ok(if upper && residual > 0. {
+        rounded.next_up()
+    } else if !upper && residual < 0. {
+        rounded.next_down()
+    } else {
+        rounded
+    })
+}
+
 fn affine_difference(
     left: Real,
     right: Real,
@@ -318,31 +387,42 @@ fn affine_difference(
     // Each origin is one normalized variable in [0,1]. Subtract the
     // coefficients before bounding its contribution, including cases
     // where the same origin has a different range on each path.
-    let mut origin_widths = BTreeMap::<Origin, (Real, Real)>::new();
-    let mut bases = [left, right];
-    for (side, shifts) in [lhs, rhs].into_iter().enumerate() {
+    let mut origins = BTreeMap::<Origin, Vec<(Bounds, Real)>>::new();
+    let mut lower = ExactSum::new();
+    lower.add_product(left, 1.);
+    lower.add_product(right, -1.);
+    for (shifts, sign) in [(lhs, 1.), (rhs, -1.)] {
         for shift in shifts {
             let bounds = shift.delay.bounds();
-            bases[side] += bounds.minimum;
-            if !bounds.is_exact() {
-                let widths = origin_widths.entry(shift.origin).or_default();
-                if side == 0 {
-                    widths.0 += bounds.maximum - bounds.minimum;
-                } else {
-                    widths.1 += bounds.maximum - bounds.minimum;
-                }
+            if bounds.is_exact() {
+                lower.add_product(bounds.minimum, sign);
+            } else {
+                origins
+                    .entry(shift.origin)
+                    .or_default()
+                    .push((bounds, sign));
             }
         }
     }
-    let base = bases[0] - bases[1];
-    let mut minimum = base;
-    let mut maximum = base;
-    for (left, right) in origin_widths.into_values() {
-        let width = left - right;
-        minimum += width.min(0.);
-        maximum += width.max(0.);
+    let mut upper = lower.clone();
+    for terms in origins.values() {
+        let mut width = ExactSum::new();
+        for &(bounds, sign) in terms {
+            width.add_product(bounds.maximum, sign);
+            width.add_product(bounds.minimum, -sign);
+        }
+        let increasing = width.rounded_sum() >= 0.;
+        for &(bounds, sign) in terms {
+            let (lo, hi) = if increasing {
+                (bounds.minimum, bounds.maximum)
+            } else {
+                (bounds.maximum, bounds.minimum)
+            };
+            lower.add_product(lo, sign);
+            upper.add_product(hi, sign);
+        }
     }
-    Bounds::new(minimum, maximum)
+    Bounds::new(round_outward(lower, false)?, round_outward(upper, true)?)
 }
 
 fn relative(left: &TimingWindow, right: &TimingWindow, mut budget: usize) -> SpiceResult<Bounds> {
@@ -497,22 +577,24 @@ mod tests {
 
     #[test]
     fn reconvergent_paths_cancel_common_timing_origin() -> SpiceResult<()> {
-        let root = TimingWindow::exact(0.)?.after(DelayWindow::new(15., 30.)?, Origin(0))?;
-        let data = root.after(DelayWindow::new(10., 30.)?, Origin(1))?;
-        let clock = root.after(DelayWindow::new(40., 60.)?, Origin(2))?;
+        let root =
+            TimingWindow::exact(0.)?.after(DelayWindow::new(15., 30.)?, Origin::shared(0))?;
+        let data = root.after(DelayWindow::new(10., 30.)?, Origin::shared(1))?;
+        let clock = root.after(DelayWindow::new(40., 60.)?, Origin::shared(2))?;
         assert_eq!(data.bounds(), Bounds::new(25., 60.)?);
         assert_eq!(clock.bounds(), Bounds::new(55., 90.)?);
         assert_eq!(clock.relative_to(&data, 100)?, Bounds::new(10., 50.)?);
         assert_eq!(data.relative_to(&clock, 100)?, Bounds::new(-50., -10.)?);
-        let unrelated = TimingWindow::exact(0.)?.after(DelayWindow::new(55., 90.)?, Origin(3))?;
+        let unrelated =
+            TimingWindow::exact(0.)?.after(DelayWindow::new(55., 90.)?, Origin::shared(3))?;
         assert_eq!(unrelated.relative_to(&data, 100)?, Bounds::new(-5., 65.)?);
         Ok(())
     }
 
     #[test]
     fn shared_origin_with_distinct_ranges_and_nested_extrema() -> SpiceResult<()> {
-        let a = TimingWindow::exact(2.)?.after(DelayWindow::new(1., 4.)?, Origin(7))?;
-        let b = TimingWindow::exact(0.)?.after(DelayWindow::new(4., 8.)?, Origin(7))?;
+        let a = TimingWindow::exact(2.)?.after(DelayWindow::new(1., 4.)?, Origin::shared(7))?;
+        let b = TimingWindow::exact(0.)?.after(DelayWindow::new(4., 8.)?, Origin::shared(7))?;
         assert_eq!(b.relative_to(&a, 100)?, Bounds::new(1., 2.)?);
         let first = TimingWindow::earliest(vec![a.clone(), b.clone()])?;
         let last = TimingWindow::latest(vec![a.clone(), b.clone()])?;
@@ -520,7 +602,7 @@ mod tests {
         assert_eq!(last.bounds(), b.bounds());
         assert_eq!(first.relative_to(&a, 100)?, Bounds::new(0., 0.)?);
         assert_eq!(last.relative_to(&b, 100)?, Bounds::new(0., 0.)?);
-        let shifted = last.after(DelayWindow::new(1., 3.)?, Origin(8))?;
+        let shifted = last.after(DelayWindow::new(1., 3.)?, Origin::shared(8))?;
         assert_eq!(shifted.relative_to(&last, 100)?, Bounds::new(1., 3.)?);
         assert!(shifted.relative_to(&first, 1).is_err());
         Ok(())
@@ -530,12 +612,12 @@ mod tests {
     fn deep_shared_ancestry_cancels_with_constant_comparison_work() -> SpiceResult<()> {
         let mut root = TimingWindow::exact(1e12)?;
         for origin in 0..10_000 {
-            root = root.after(DelayWindow::new(1., 2.)?, Origin(origin))?;
+            root = root.after(DelayWindow::new(1., 2.)?, Origin::shared(origin))?;
         }
-        let a = root.after(DelayWindow::new(1., 2.)?, Origin(10_000))?;
+        let a = root.after(DelayWindow::new(1., 2.)?, Origin::shared(10_000))?;
         let b = root
-            .after(DelayWindow::new(2., 4.)?, Origin(10_001))?
-            .after(DelayWindow::new(1., 1.)?, Origin(10_002))?;
+            .after(DelayWindow::new(2., 4.)?, Origin::shared(10_001))?
+            .after(DelayWindow::new(1., 1.)?, Origin::shared(10_002))?;
         assert_eq!(b.relative_to(&a, 20)?, Bounds::new(1., 4.)?);
         drop(root);
         drop(a);
@@ -545,10 +627,10 @@ mod tests {
 
     #[test]
     fn extremum_relative_enclosure_contains_sampled_correlated_arrivals() -> SpiceResult<()> {
-        let root = TimingWindow::exact(0.)?.after(DelayWindow::new(2., 7.)?, Origin(1))?;
-        let a = root.after(DelayWindow::new(1., 8.)?, Origin(2))?;
-        let b = root.after(DelayWindow::new(4., 5.)?, Origin(3))?;
-        let c = TimingWindow::exact(3.)?.after(DelayWindow::new(2., 7.)?, Origin(2))?;
+        let root = TimingWindow::exact(0.)?.after(DelayWindow::new(2., 7.)?, Origin::shared(1))?;
+        let a = root.after(DelayWindow::new(1., 8.)?, Origin::shared(2))?;
+        let b = root.after(DelayWindow::new(4., 5.)?, Origin::shared(3))?;
+        let c = TimingWindow::exact(3.)?.after(DelayWindow::new(2., 7.)?, Origin::shared(2))?;
         let joined = TimingWindow::latest(vec![TimingWindow::earliest(vec![a, b])?, c.clone()])?;
         let bounds = joined.relative_to(&c, 1000)?;
         for x in [0., 0.25, 0.5, 0.75, 1.] {
@@ -567,13 +649,22 @@ mod tests {
     }
 
     #[test]
+    fn separately_constructed_large_arrivals_cancel_without_losing_small_offsets() -> SpiceResult<()>
+    {
+        let a = TimingWindow::exact(1e16)?.after(DelayWindow::new(4., 8.)?, Origin::shared(1))?;
+        let b = TimingWindow::exact(1e16)?.after(DelayWindow::new(5., 9.)?, Origin::shared(1))?;
+        assert_eq!(b.relative_to(&a, 100)?, Bounds::new(1., 1.)?);
+        Ok(())
+    }
+
+    #[test]
     fn invalid_or_subresolution_intervals_fail_explicitly() -> SpiceResult<()> {
         assert!(DelayWindow::new(-1., 1.).is_err());
         assert!(DelayWindow::new(2., 1.).is_err());
         assert!(TimingWindow::earliest(Vec::new()).is_err());
         let root = TimingWindow::exact(1.)?;
         assert!(
-            root.after(DelayWindow::new(0., Real::EPSILON / 4.)?, Origin(1))
+            root.after(DelayWindow::new(0., Real::EPSILON / 4.)?, Origin::shared(1))
                 .is_err()
         );
         Ok(())

@@ -812,3 +812,44 @@ fn short_pulse_direction_reaches_explicit_physical_interface() -> SpiceResult<()
     );
     Ok(())
 }
+
+#[test]
+fn source_bound_window_propagates_both_causal_boundaries_to_physical_output() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 3u 0)\n\
+         a1 %v[data] first bounded\n.model bounded preprocess_logic_event(operation=25 delay_windows=[10n 30n 20n 40n])\n\
+         a2 %d[first] q second\n.model second preprocess_logic_event(operation=25 delay_windows=[5n 15n 2n 12n])\n\
+         a3 q %gd(out hi) drive\n.model drive preprocess_logic_conductance(conductance=[0 .01 .003 0 0 0 0 .001 .004 0 0])\n\
+         rload out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "3u", "0", "1n"])?;
+    let rise_min = 1.0015e-6 + 15e-9;
+    let rise_max = 1.0015e-6 + 45e-9;
+    let fall_min = 2.001e-6 + 22e-9;
+    let fall_max = 2.001e-6 + 52e-9;
+    let mut samples = [0; 5];
+    for index in 0..plot.point_count() {
+        let t = plot.value("time", index).unwrap().re;
+        if [rise_min, rise_max, fall_min, fall_max]
+            .iter()
+            .any(|&edge| (t - edge).abs() <= 1.1e-9)
+        {
+            continue;
+        }
+        let (region, expected) = if t < rise_min {
+            (0, 0.)
+        } else if t < rise_max {
+            (1, 2.5)
+        } else if t < fall_min {
+            (2, 5. * 0.01 / 0.011)
+        } else if t < fall_max {
+            (3, 4.)
+        } else {
+            (4, 0.)
+        };
+        close(output(&plot, index), expected);
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&count| count > 10), "{samples:?}");
+    Ok(())
+}

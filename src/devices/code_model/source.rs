@@ -159,9 +159,11 @@ impl SourceModel {
                     Some(Integer)
                 }
                 "delay" | "low" | "high" | "output_capacitance" | "pulse_reject" => Some(Real),
-                "input_capacitance" | "load_resistance" | "delay_paths" | "delay_gate"
-                | "delay_preset" | "delay_clear" | "timing_setup" | "timing_hold"
-                | "timing_clock_min" | "timing_async_min" | "timing_recovery" => Some(RealVector),
+                "input_capacitance" | "load_resistance" | "delay_paths" | "delay_windows"
+                | "delay_gate" | "delay_preset" | "delay_clear" | "timing_setup"
+                | "timing_hold" | "timing_clock_min" | "timing_async_min" | "timing_recovery" => {
+                    Some(RealVector)
+                }
                 "inertial" => Some(Boolean),
                 "inverted" => Some(BooleanVector),
                 "rx_ic" | "async_policy" | "strength_paths" => Some(IntegerVector),
@@ -321,6 +323,7 @@ use std::collections::BTreeMap;
 struct LogicMaterial {
     operation: Real,
     delays: Delays,
+    windows: Option<super::WindowDelays>,
     causal: CausalPaths,
     inertial: bool,
     pulse: Option<PulseFilter>,
@@ -343,6 +346,7 @@ impl Default for LogicMaterial {
         Self {
             operation: 0.,
             delays: Delays::ZERO,
+            windows: None,
             causal: CausalPaths::default(),
             inertial: true,
             pulse: None,
@@ -436,6 +440,35 @@ impl LogicMaterial {
                             }
                         }
                     };
+                }
+                "delay_windows" => {
+                    if timing_given {
+                        return Err(SpiceError::circuit(
+                            "specify exactly one logic timing declaration",
+                        ));
+                    }
+                    timing_given = true;
+                    use crate::analysis::digital::timing::DelayWindow;
+                    let values = numeric_vector(parameter)?;
+                    material.windows = Some(match values.as_slice() {
+                        [rmin, rmax, fmin, fmax] => super::WindowDelays::binary(
+                            DelayWindow::new(*rmin, *rmax)?,
+                            DelayWindow::new(*fmin, *fmax)?,
+                        ),
+                        [a, b, c, d, e, f, g, h, i, j, k, l] => super::WindowDelays::paths([
+                            DelayWindow::new(*a, *b)?,
+                            DelayWindow::new(*c, *d)?,
+                            DelayWindow::new(*e, *f)?,
+                            DelayWindow::new(*g, *h)?,
+                            DelayWindow::new(*i, *j)?,
+                            DelayWindow::new(*k, *l)?,
+                        ]),
+                        _ => {
+                            return Err(SpiceError::circuit(
+                                "delay_windows requires four or twelve directional bounds",
+                            ));
+                        }
+                    });
                 }
                 "delay_gate" | "delay_preset" | "delay_clear" => {
                     let [rise, fall]: [Real; 2] =
@@ -557,6 +590,14 @@ impl LogicMaterial {
                 _ => return Err(SpiceError::circuit("unregistered logic parameter")),
             }
         }
+        if material.windows.is_some() {
+            if material.pulse.is_some() || (mode_given && material.inertial) {
+                return Err(SpiceError::circuit(
+                    "causal arrival windows require transport mode",
+                ));
+            }
+            material.inertial = false;
+        }
         Adc::qualified(material.low, material.high, Logic::Zero, false)?;
         Ok(material)
     }
@@ -624,6 +665,12 @@ impl LogicMaterial {
         let operation = Operation::from_value(self.operation, inputs, self.asynchronous)?;
         self.causal.validate(operation)?;
         let timing = self.timing.bind(operation, inputs)?;
+        if self.windows.is_some() && (!matches!(operation, Operation::Gate(_)) || timing.is_some())
+        {
+            return Err(SpiceError::circuit(
+                "causal arrival windows require a combinational gate",
+            ));
+        }
         let kernel = LogicKernel {
             operation,
             timing,
@@ -663,6 +710,7 @@ struct LogicReceiverDevice {
     terminals: Vec<NodeId>,
     output: String,
     kernel: LogicKernel,
+    windows: Option<super::WindowDelays>,
     margin: Option<std::num::NonZeroU8>,
     output_capacitance: Real,
     load_resistance: Option<[Real; 3]>,
@@ -759,6 +807,7 @@ pub(in crate::devices) fn instantiate(
                 terminals,
                 output: output.terminals[0].positive.clone(),
                 kernel,
+                windows: material.windows,
                 margin: material.margin,
                 output_capacitance: material.output_capacitance,
                 load_resistance: material.load_resistance,
@@ -882,6 +931,7 @@ fn bind_receiver(
         inputs.push(net);
     }
     let mut kernel = device.kernel.clone();
+    let mut windows = device.windows;
     if let Some(resistances) = device.load_resistance {
         let total = capacitances
             .get(device.output.as_str())
@@ -893,8 +943,18 @@ fn bind_receiver(
         }
         kernel.delays = kernel.delays.with_load(load)?;
         kernel.causal = kernel.causal.with_load(load)?;
+        windows = windows.map(|w| w.with_load(load)).transpose()?;
     }
-    network.add_named_model(&device.name, kernel, &inputs, &[output])
+    if let Some(windows) = windows {
+        let Operation::Gate(kind) = kernel.operation else {
+            return Err(SpiceError::circuit("causal window gate binding mismatch"));
+        };
+        let model = super::WindowGate::new(kind, inputs.len(), windows)?
+            .with_binding(kernel.strength, kernel.invert);
+        network.add_named_model(&device.name, model, &inputs, &[output])
+    } else {
+        network.add_named_model(&device.name, kernel, &inputs, &[output])
+    }
 }
 
 /// Sum terminal capacitance once after flattening, including every

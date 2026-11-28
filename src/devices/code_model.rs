@@ -10,6 +10,8 @@ pub mod source;
 mod source_logic;
 mod timed_switch;
 mod timed_switch_device;
+mod window_gate;
+pub use window_gate::{WindowDelays, WindowGate, WindowGateState};
 
 /// Stable digital logic and directional timing ambiguity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -436,6 +438,42 @@ pub trait CodeModel: std::fmt::Debug + Send + Sync + 'static {
     /// engine records these in the same disposable transaction as outputs.
     fn take_diagnostics(&self, _state: &mut Self::State) -> Vec<ModelDiagnostic> {
         Vec::new()
+    }
+
+    /// Request causal arrival tracking, including exact input events.
+    fn tracks_arrivals(&self) -> bool {
+        false
+    }
+
+    /// Evaluate resolved inputs with causal provenance. A scalar model
+    /// must explicitly handle nonexact arrivals rather than flattening
+    /// them to a guessed physical instant.
+    ///
+    /// # Errors
+    /// Unsupported arrival uncertainty, invalid inputs or state.
+    fn evaluate_timed(
+        &self,
+        context: EventContext,
+        inputs: &[crate::analysis::digital::timing::TimedInput],
+        state: &mut Self::State,
+    ) -> SpiceResult<Vec<crate::analysis::digital::timing::TimedOutput>> {
+        use crate::analysis::digital::timing::TimedOutput;
+        if inputs.iter().any(|input| {
+            input
+                .arrival
+                .as_ref()
+                .is_some_and(|arrival| !arrival.window().bounds().is_exact())
+        }) {
+            return Err(SpiceError::circuit(
+                "code model has no causal interval semantics",
+            ));
+        }
+        let drives: Vec<_> = inputs.iter().map(|input| input.drive).collect();
+        Ok(self
+            .evaluate(context, &drives, state)?
+            .into_iter()
+            .map(TimedOutput::Scalar)
+            .collect())
     }
 
     /// Evaluate the model against resolved inputs.

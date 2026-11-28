@@ -572,7 +572,7 @@ impl DriveStrengths {
         Self([strength; 3])
     }
 
-    const fn drive(self, logic: Logic) -> Drive {
+    pub(super) const fn drive(self, logic: Logic) -> Drive {
         let index = match logic {
             Logic::Zero => 0,
             Logic::One => 1,

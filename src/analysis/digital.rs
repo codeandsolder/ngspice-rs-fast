@@ -6,6 +6,7 @@ mod diagnostics;
 pub mod timing;
 use diagnostics::DiagnosticLog;
 pub use diagnostics::EventDiagnostic;
+use timing::{Arrival, TimedInput, TimedOutput, TimingWindow};
 
 use crate::devices::code_model::{
     AutonomousAdvance, CodeModel, DelayMode, Drive, EventContext, ModelDiagnostic, Output,
@@ -47,6 +48,7 @@ struct Key {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventId {
     key: Key,
+    completion: Option<Key>,
     identity: u64,
 }
 
@@ -57,12 +59,13 @@ fn external_identity() -> SpiceResult<u64> {
         .map_err(|_| SpiceError::circuit("external event identity space exhausted"))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Event {
     Drive {
         driver: usize,
         drive: Drive,
         external: Option<u64>,
+        arrival: Option<(Arrival, bool)>,
     },
     Wake(usize),
 }
@@ -105,6 +108,12 @@ trait ErasedModel: std::fmt::Debug {
         inputs: &[Drive],
         state: &mut dyn ModelState,
     ) -> SpiceResult<(Vec<Output>, Vec<ModelDiagnostic>)>;
+    fn evaluate_timed(
+        &self,
+        context: EventContext,
+        inputs: &[TimedInput],
+        state: &mut dyn ModelState,
+    ) -> SpiceResult<(Vec<TimedOutput>, Vec<ModelDiagnostic>)>;
 }
 
 impl<M: CodeModel> ErasedModel for M {
@@ -143,6 +152,18 @@ impl<M: CodeModel> ErasedModel for M {
         let outputs = CodeModel::evaluate(self, context, inputs, state)?;
         Ok((outputs, CodeModel::take_diagnostics(self, state)))
     }
+    fn evaluate_timed(
+        &self,
+        context: EventContext,
+        inputs: &[TimedInput],
+        state: &mut dyn ModelState,
+    ) -> SpiceResult<(Vec<TimedOutput>, Vec<ModelDiagnostic>)> {
+        let state = (state as &mut dyn std::any::Any)
+            .downcast_mut::<M::State>()
+            .ok_or_else(|| SpiceError::circuit("digital model state identity mismatch"))?;
+        let outputs = CodeModel::evaluate_timed(self, context, inputs, state)?;
+        Ok((outputs, CodeModel::take_diagnostics(self, state)))
+    }
 }
 
 #[derive(Debug)]
@@ -161,6 +182,7 @@ pub struct Network {
     sources: Vec<usize>,
     models: Vec<Model>,
     lookahead: Vec<usize>,
+    track_arrivals: bool,
 }
 
 impl Network {
@@ -262,6 +284,7 @@ impl Network {
             self.check_net(net)?;
         }
         let index = self.models.len();
+        self.track_arrivals |= model.tracks_arrivals();
         if model.requires_lookahead() {
             self.lookahead.push(index);
         }
@@ -313,7 +336,7 @@ pub struct Stats {
 }
 
 /// Resolved net change after all output events at a time/delta are applied.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Change {
     /// Physical time.
     pub time: Real,
@@ -323,6 +346,8 @@ pub struct Change {
     pub net: NetId,
     /// Resolved value.
     pub drive: Drive,
+    /// Causal transition behind this boundary, if tracked.
+    pub arrival: Option<Arrival>,
 }
 
 #[derive(Clone, Debug)]
@@ -338,6 +363,41 @@ struct Group {
 }
 
 #[derive(Clone, Debug)]
+struct Arrivals {
+    drivers: Vec<Option<Arrival>>,
+    nets: Vec<Option<Arrival>>,
+}
+
+impl Arrivals {
+    fn new(drivers: usize, nets: usize) -> Self {
+        Self {
+            drivers: vec![None; drivers],
+            nets: vec![None; nets],
+        }
+    }
+}
+
+fn same_arrival(a: Option<&Arrival>, b: Option<&Arrival>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_transition(b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn exact_arrival(from: Drive, to: Drive, time: Real) -> SpiceResult<Option<Arrival>> {
+    use crate::devices::code_model::Logic;
+    if from == to
+        || [from, to]
+            .iter()
+            .any(|d| matches!(d.logic, Logic::Rising | Logic::Falling))
+    {
+        return Ok(None);
+    }
+    Ok(Some(Arrival::new(from, to, TimingWindow::exact(time)?)?))
+}
+
+#[derive(Clone, Debug)]
 struct State {
     time: Time,
     delta: usize,
@@ -349,6 +409,7 @@ struct State {
     pending: Vec<BTreeSet<Key>>,
     wakeups: Vec<Option<Key>>,
     nets: Vec<Drive>,
+    arrivals: Option<Arrivals>,
     models: Vec<Box<dyn ModelState>>,
     predictions: Vec<Option<Prediction>>,
     stats: Stats,
@@ -369,6 +430,9 @@ impl State {
             pending: vec![BTreeSet::new(); network.drivers.len()],
             wakeups: vec![None; network.models.len()],
             nets: vec![Drive::default(); network.nets.len()],
+            arrivals: network
+                .track_arrivals
+                .then(|| Arrivals::new(network.drivers.len(), network.nets.len())),
             models: network
                 .models
                 .iter()
@@ -394,8 +458,251 @@ impl State {
                 driver,
                 drive,
                 external,
+                arrival: None,
             },
         )
+    }
+
+    fn enable_arrivals(&mut self) {
+        if self.arrivals.is_none() {
+            self.arrivals = Some(Arrivals::new(self.drivers.len(), self.nets.len()));
+        }
+    }
+
+    fn schedule_arrival(
+        &mut self,
+        driver: usize,
+        arrival: Arrival,
+        external: Option<u64>,
+    ) -> SpiceResult<(Key, Option<Key>)> {
+        let bounds = arrival.window().bounds();
+        let start = Time::new(bounds.minimum())?;
+        let end = Time::new(bounds.maximum())?;
+        if start == Time(0) && start != end {
+            return Err(SpiceError::circuit(
+                "causal uncertainty starts before initial settlement",
+            ));
+        }
+        if start < self.time
+            || self
+                .sequence
+                .checked_add(if start == end { 1 } else { 2 })
+                .is_none()
+            || (start == self.time && self.initialized && self.delta == usize::MAX)
+        {
+            return Err(SpiceError::circuit(
+                "noncausal or unrepresentable arrival boundaries",
+            ));
+        }
+        self.enable_arrivals();
+        let key = self.schedule_event(
+            start,
+            Event::Drive {
+                driver,
+                drive: if start == end {
+                    arrival.to()
+                } else {
+                    arrival.phase()
+                },
+                external,
+                arrival: Some((arrival.clone(), start == end)),
+            },
+        )?;
+        let completion = if start == end {
+            None
+        } else {
+            Some(self.schedule_event(
+                end,
+                Event::Drive {
+                    driver,
+                    drive: arrival.to(),
+                    external,
+                    arrival: Some((arrival, true)),
+                },
+            )?)
+        };
+        Ok((key, completion))
+    }
+
+    fn deliver_drive(
+        &mut self,
+        driver: usize,
+        drive: Drive,
+        delivery: Option<(Arrival, bool)>,
+    ) -> SpiceResult<bool> {
+        let previous = self.drivers[driver];
+        let mut changed = previous != drive;
+        if let Some(records) = &mut self.arrivals {
+            let prior = &mut records.drivers[driver];
+            let now = self.time.value();
+            let next = if let Some((arrival, complete)) = delivery {
+                let exact = arrival.window().bounds().is_exact();
+                if (complete
+                    && !exact
+                    && !prior.as_ref().is_some_and(|p| p.same_transition(&arrival)))
+                    || ((!complete || exact)
+                        && (previous != arrival.from()
+                            || prior.as_ref().is_some_and(|p| p.active_at(now))))
+                {
+                    return Err(SpiceError::circuit(
+                        "overlapping or inconsistent causal driver transitions",
+                    ));
+                }
+                Some(arrival)
+            } else {
+                if prior.as_ref().is_some_and(|p| p.active_at(now)) {
+                    return Err(SpiceError::circuit(
+                        "scalar event interrupts causal driver transition",
+                    ));
+                }
+                if !changed {
+                    return Ok(false);
+                }
+                exact_arrival(previous, drive, now)?
+            };
+            changed |= !same_arrival(prior.as_ref(), next.as_ref());
+            *prior = next;
+        }
+        self.drivers[driver] = drive;
+        Ok(changed)
+    }
+
+    fn net_arrival(
+        &self,
+        binding: &Net,
+        net: NetId,
+        resolved: Drive,
+    ) -> SpiceResult<Option<Arrival>> {
+        let Some(records) = &self.arrivals else {
+            return Ok(None);
+        };
+        let now = self.time.value();
+        if let [driver] = binding.drivers.as_slice() {
+            if let Some(arrival) = &records.drivers[*driver] {
+                let from = Drive::resolve([arrival.from()]);
+                let to = Drive::resolve([arrival.to()]);
+                if from != to {
+                    return Ok(Some(Arrival::new(from, to, arrival.window().clone())?));
+                }
+                if arrival.active_at(now) {
+                    return Err(SpiceError::circuit(
+                        "causal drive has indistinguishable resolved endpoints",
+                    ));
+                }
+            }
+            return if self.nets[net.0] == resolved {
+                Ok(records.nets[net.0].clone())
+            } else {
+                exact_arrival(self.nets[net.0], resolved, now)
+            };
+        }
+        let margin = binding.margin.unwrap_or(std::num::NonZeroU8::MIN);
+        let mut active = binding
+            .drivers
+            .iter()
+            .filter_map(|&id| records.drivers[id].as_ref().filter(|a| a.active_at(now)));
+        if let Some(first) = active.next() {
+            // A stable driver which dominates every possible endpoint
+            // masks uncertainty independently of the transition order.
+            let masked =
+                binding.drivers.iter().any(|&id| {
+                    self.drivers[id] == resolved
+                        && records.drivers[id]
+                            .as_ref()
+                            .is_none_or(|a| !a.active_at(now))
+                        && binding.drivers.iter().all(|&other| {
+                            records.drivers[other]
+                                .as_ref()
+                                .filter(|a| a.active_at(now))
+                                .is_none_or(|a| {
+                                    resolved.strength.rank().saturating_sub(
+                                        a.from().strength.max(a.to().strength).rank(),
+                                    ) >= margin.get()
+                                })
+                        })
+                });
+            if masked {
+                return if self.nets[net.0] == resolved {
+                    Ok(records.nets[net.0].clone())
+                } else {
+                    exact_arrival(self.nets[net.0], resolved, now)
+                };
+            }
+            if active.any(|a| !a.window().same_expression(first.window())) {
+                return Err(SpiceError::circuit(
+                    "independent overlapping causal arrivals on resolved bus",
+                ));
+            }
+            let endpoint = |after: bool| {
+                Drive::resolve_with_margin(
+                    binding.drivers.iter().map(|&id| {
+                        records.drivers[id]
+                            .as_ref()
+                            .filter(|a| a.active_at(now))
+                            .map_or(self.drivers[id], |a| if after { a.to() } else { a.from() })
+                    }),
+                    margin,
+                )
+            };
+            let from = endpoint(false);
+            let to = endpoint(true);
+            if from == to && from == resolved {
+                return if self.nets[net.0] == resolved {
+                    Ok(records.nets[net.0].clone())
+                } else {
+                    exact_arrival(self.nets[net.0], resolved, now)
+                };
+            }
+            let arrival = Arrival::new(from, to, first.window().clone())?;
+            if arrival.phase() != resolved
+                || (self.nets[net.0] != from
+                    && !records.nets[net.0]
+                        .as_ref()
+                        .is_some_and(|old| old.same_transition(&arrival)))
+            {
+                return Err(SpiceError::circuit(
+                    "bus resolution changes within causal arrival",
+                ));
+            }
+            return Ok(Some(arrival));
+        }
+        let prior = &records.nets[net.0];
+        if prior
+            .as_ref()
+            .is_some_and(|a| a.window().bounds().maximum() == now && a.to() == resolved)
+        {
+            return Ok(prior.clone());
+        }
+        if self.nets[net.0] == resolved {
+            return Ok(prior.clone());
+        }
+        exact_arrival(self.nets[net.0], resolved, now)
+    }
+
+    fn model_arrival(&mut self, driver: usize, arrival: Arrival) -> SpiceResult<()> {
+        let earliest = Time::new(arrival.window().bounds().minimum())?;
+        // A complete transport transition is indivisible. Do not retain a
+        // stale end event when a later waveform overlaps its uncertainty.
+        if self.pending[driver]
+            .last()
+            .is_some_and(|key| key.time > earliest)
+            || self
+                .arrivals
+                .as_ref()
+                .and_then(|a| a.drivers[driver].as_ref())
+                .is_some_and(|a| a.window().bounds().maximum() > earliest.value())
+        {
+            return Err(SpiceError::circuit(
+                "overlapping causal output transitions require a hazard model",
+            ));
+        }
+        self.desired[driver] = Some(arrival.to());
+        let (start, end) = self.schedule_arrival(driver, arrival, None)?;
+        self.pending[driver].insert(start);
+        if let Some(end) = end {
+            self.pending[driver].insert(end);
+        }
+        Ok(())
     }
 
     fn schedule_event(&mut self, time: Time, event: Event) -> SpiceResult<Key> {
@@ -429,6 +736,21 @@ impl State {
     }
 
     fn model_output_at(&mut self, driver: usize, output: Output, at: Time) -> SpiceResult<()> {
+        if self.arrivals.is_some()
+            && self.pending[driver].iter().any(|key| {
+                matches!(
+                    self.queue.get(key),
+                    Some(Event::Drive {
+                        arrival: Some(_),
+                        ..
+                    })
+                )
+            })
+        {
+            return Err(SpiceError::circuit(
+                "scalar output supersedes an unfinished causal transition",
+            ));
+        }
         let previous = self.desired[driver];
         if previous == Some(output.drive) {
             return Ok(());
@@ -504,16 +826,38 @@ impl State {
             self.stats.evaluations += 1;
             self.charge_work(before, limit)?;
             let instance = &network.models[index];
-            let inputs: Vec<_> = instance.inputs.iter().map(|id| self.nets[id.0]).collect();
-            let (outputs, diagnostics) = instance.kernel.evaluate(
-                EventContext {
-                    time: self.time.value(),
-                    delta: self.delta,
-                    initial: self.time == Time(0),
-                },
-                &inputs,
-                self.models[index].as_mut(),
-            )?;
+            let context = EventContext {
+                time: self.time.value(),
+                delta: self.delta,
+                initial: self.time == Time(0),
+            };
+            enum Evaluated {
+                Scalar(Vec<Output>),
+                Timed(Vec<TimedOutput>),
+            }
+            let (outputs, diagnostics) = if let Some(records) = &self.arrivals {
+                let inputs: Vec<_> = instance
+                    .inputs
+                    .iter()
+                    .map(|id| TimedInput {
+                        drive: self.nets[id.0],
+                        arrival: records.nets[id.0].clone(),
+                    })
+                    .collect();
+                let (outputs, diagnostics) = instance.kernel.evaluate_timed(
+                    context,
+                    &inputs,
+                    self.models[index].as_mut(),
+                )?;
+                (Evaluated::Timed(outputs), diagnostics)
+            } else {
+                let inputs: Vec<_> = instance.inputs.iter().map(|id| self.nets[id.0]).collect();
+                let (outputs, diagnostics) =
+                    instance
+                        .kernel
+                        .evaluate(context, &inputs, self.models[index].as_mut())?;
+                (Evaluated::Scalar(outputs), diagnostics)
+            };
             self.stats.diagnostics = self
                 .stats
                 .diagnostics
@@ -532,7 +876,10 @@ impl State {
                 }
                 self.diagnostics.push(diagnostic);
             }
-            self.accept_model_outputs(network, index, outputs)?;
+            match outputs {
+                Evaluated::Scalar(outputs) => self.accept_model_outputs(network, index, outputs)?,
+                Evaluated::Timed(outputs) => self.accept_timed_outputs(network, index, outputs)?,
+            }
         }
         Ok(())
     }
@@ -552,6 +899,33 @@ impl State {
         for (&driver, output) in instance.outputs.iter().zip(outputs) {
             self.model_output(driver, output)?;
         }
+        self.update_wakeup(network, index)
+    }
+
+    fn accept_timed_outputs(
+        &mut self,
+        network: &Network,
+        index: usize,
+        outputs: Vec<TimedOutput>,
+    ) -> SpiceResult<()> {
+        let instance = &network.models[index];
+        if outputs.len() != instance.outputs.len() {
+            return Err(SpiceError::circuit(
+                "digital model returned incorrect output count",
+            ));
+        }
+        for (&driver, output) in instance.outputs.iter().zip(outputs) {
+            match output {
+                TimedOutput::Retain => {}
+                TimedOutput::Scalar(output) => self.model_output(driver, output)?,
+                TimedOutput::Arrival(arrival) => self.model_arrival(driver, arrival)?,
+            }
+        }
+        self.update_wakeup(network, index)
+    }
+
+    fn update_wakeup(&mut self, network: &Network, index: usize) -> SpiceResult<()> {
+        let instance = &network.models[index];
         if let Some(key) = self.wakeups[index].take() {
             self.queue.remove(&key);
         }
@@ -725,10 +1099,14 @@ impl State {
                 self.stats.events += 1;
                 self.charge_work(before, limits.work)?;
                 match event {
-                    Event::Drive { driver, drive, .. } => {
+                    Event::Drive {
+                        driver,
+                        drive,
+                        arrival,
+                        ..
+                    } => {
                         self.pending[driver].remove(&key);
-                        if self.drivers[driver] != drive {
-                            self.drivers[driver] = drive;
+                        if self.deliver_drive(driver, drive, arrival)? {
                             affected.insert(network.drivers[driver]);
                         }
                     }
@@ -744,13 +1122,22 @@ impl State {
                     binding.drivers.iter().map(|&id| self.drivers[id]),
                     binding.margin.unwrap_or(std::num::NonZeroU8::MIN),
                 );
-                if self.nets[net.0] != resolved {
+                let arrival = self.net_arrival(binding, net, resolved)?;
+                let provenance_changed = if let Some(records) = &mut self.arrivals {
+                    let changed = !same_arrival(records.nets[net.0].as_ref(), arrival.as_ref());
+                    records.nets[net.0] = arrival.clone();
+                    changed
+                } else {
+                    false
+                };
+                if self.nets[net.0] != resolved || provenance_changed {
                     self.nets[net.0] = resolved;
                     changes.push(Change {
                         time: self.time.value(),
                         delta: self.delta,
                         net,
                         drive: resolved,
+                        arrival,
                     });
                     dirty.extend(binding.subscribers.iter().copied());
                 }
@@ -837,6 +1224,12 @@ impl Engine {
         self.accepted.nets.get(net.0).copied()
     }
 
+    /// Latest accepted causal arrival for a valid net, if tracked.
+    #[must_use = "the accepted expression retains correlated event timing"]
+    pub fn arrival(&self, net: NetId) -> Option<&Arrival> {
+        self.accepted.arrivals.as_ref()?.nets.get(net.0)?.as_ref()
+    }
+
     /// Accepted counters.
     #[must_use = "the returned counters quantify committed digital engine work"]
     pub const fn stats(&self) -> Stats {
@@ -886,22 +1279,50 @@ impl Trial<'_> {
         let key = self
             .state
             .schedule(Time::new(time)?, driver, drive, Some(identity))?;
-        Ok(EventId { key, identity })
+        Ok(EventId {
+            key,
+            completion: None,
+            identity,
+        })
     }
 
-    /// Cancel an external event if it has not yet been delivered.
-    pub fn cancel(&mut self, event: EventId) -> bool {
-        if self
+    /// Queue both boundaries of one causal transition atomically.
+    ///
+    /// # Errors
+    /// Invalid source, past arrival or exhausted event identifiers.
+    /// Overlapping or inconsistent source waveforms are rejected at delivery.
+    pub fn schedule_arrival(&mut self, source: SourceId, arrival: Arrival) -> SpiceResult<EventId> {
+        let driver = *self
+            .engine
+            .network
+            .sources
+            .get(source.0)
+            .ok_or_else(|| SpiceError::circuit("unknown digital source"))?;
+        let identity = external_identity()?;
+        let (key, completion) = self
             .state
-            .queue
-            .get(&event.key)
-            .is_some_and(|queued| matches!(queued, Event::Drive { external: Some(id), .. } if *id == event.identity))
-        {
-            self.state.queue.remove(&event.key);
-            true
-        } else {
-            false
+            .schedule_arrival(driver, arrival, Some(identity))?;
+        Ok(EventId {
+            key,
+            completion,
+            identity,
+        })
+    }
+
+    /// Cancel an external event before its first boundary has been delivered.
+    pub fn cancel(&mut self, event: EventId) -> bool {
+        let matches = |key| {
+            self.state.queue.get(&key).is_some_and(
+            |queued| matches!(queued, Event::Drive { external: Some(id), .. } if *id == event.identity))
+        };
+        if !matches(event.key) || event.completion.is_some_and(|key| !matches(key)) {
+            return false;
         }
+        self.state.queue.remove(&event.key);
+        if let Some(key) = event.completion {
+            self.state.queue.remove(&key);
+        }
+        true
     }
 
     /// Evaluate all events up to and including the specified physical time.
@@ -930,6 +1351,12 @@ impl Trial<'_> {
     #[must_use = "the returned option identifies the provisional net drive without committing trial state"]
     pub fn value(&self, net: NetId) -> Option<Drive> {
         self.state.nets.get(net.0).copied()
+    }
+
+    /// Latest provisional causal arrival for a valid net, if tracked.
+    #[must_use = "the provisional expression retains correlated event timing"]
+    pub fn arrival(&self, net: NetId) -> Option<&Arrival> {
+        self.state.arrivals.as_ref()?.nets.get(net.0)?.as_ref()
     }
 
     /// Diagnostics in the disposable event state, including prior committed
