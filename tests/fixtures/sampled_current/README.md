@@ -29,3 +29,17 @@ LTspice's `Time step too small` error (gain 5 reached approximately 4 ps;
 10, 20 and 100 failed at the initial transient point). This is consistent
 with convergence limitations of an iteration-sampled feedback law. It is
 not a requirement that the native solver reproduce vendor failures.
+
+## Generic current target selection
+
+`selection.cir` and `selection-ltspice-24.0.12.tsv` are a further independent
+OP and 1 kHz AC experiment using the same `.func read(x) {I(x)}` for eleven
+actual device kinds, including a nested macro for R2. LTspice printed
+questionable-brace/undefined-symbol diagnostics during macro preprocessing,
+but completed and the raw OP and AC monitors unambiguously matched the
+intended physical references. R/C/I/G/F/current-output B monitor tangents
+are zero; V/E/H/L/voltage-output B monitors equal actual branch tangents.
+Both output types of B use a nonconstant expression; a voltage-output B's
+actual branch tangent is preserved regardless of the expression's form.
+The native regression converts only the source-policy spelling, not the
+macro or network structure, and compares all eleven monitors to the raw data.
