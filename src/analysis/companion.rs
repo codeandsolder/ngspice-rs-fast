@@ -464,39 +464,40 @@ impl AcceptedCursor {
         let min_step = settings.min_step();
         clock.next.delta = clock.next.delta.min(settings.max_step);
         // First timepoint after a breakpoint: reduce the order and step.
-        if almost_equal_ulps(clock.time, breaks.first(), 100)
-            || breaks.first() - clock.time <= min_step
-        {
+        let mut next_break = breaks.first();
+        if almost_equal_ulps(clock.time, next_break, 100) || next_break - clock.time <= min_step {
             clock.next.order = Order::One;
             clock.next.delta = clock
                 .next
                 .delta
-                .min(0.1 * clock.save_delta.min(breaks.second() - breaks.first()));
+                .min(0.1 * clock.save_delta.min(breaks.second() - next_break));
             if clock.phase == Phase::First {
                 if uic {
                     breaks.set(clock.time, settings.step)?;
+                    next_break = breaks.first();
                 }
                 clock.next.delta /= 10.;
             }
             // XSPICE builds do not raise delta to 2 * CKTdelmin here.
         }
-        while (breaks.first() <= clock.time + breaks.min_break()
-            || almost_equal_ulps(breaks.first(), clock.time, 100))
-            && breaks.first() < settings.stop
+        while (next_break <= clock.time + breaks.min_break()
+            || almost_equal_ulps(next_break, clock.time, 100))
+            && next_break < settings.stop
         {
             breaks.clear();
+            next_break = breaks.first();
         }
 
         let mut boundary = Boundary::Ordinary;
-        if clock.time + clock.next.delta > breaks.first() {
+        if clock.time + clock.next.delta > next_break {
             boundary = Boundary::Forced;
             clock.save_delta = clock.next.delta;
-            clock.next.delta = breaks.first() - clock.time;
+            clock.next.delta = next_break - clock.time;
         } else if !almost_equal_ulps(clock.time + clock.next.delta, settings.stop, 100)
-            && clock.next.delta.mul_add(1.9, clock.time) > breaks.first()
+            && clock.next.delta.mul_add(1.9, clock.time) > next_break
         {
             clock.save_delta = clock.next.delta;
-            clock.next.delta = (breaks.first() - clock.time) / 2.0;
+            clock.next.delta = (next_break - clock.time) / 2.0;
         }
         Ok(ReadyStep {
             clock,

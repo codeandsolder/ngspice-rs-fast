@@ -228,9 +228,12 @@ tolerance is unchanged. As with other numerical
 integration tolerances, local waveform error is not a global pointwise
 error bound. Reduce `reltol` to refine the history approximation.
 
-For separable modes and a single scattering stage, the solver instead
-compiles the inexpensive exact impulse response. Finite boundary ramps
-are integrated against its cumulative response. When a verified
+For separable modes or a single scattering stage, the solver instead
+compiles the inexpensive exact impulse response. The ordered arrival map
+keys events by their rounded time and node; one lookup either coalesces
+the contribution in its original arithmetic order, retaining the first
+two-word arrival time, or inserts a new event after pruning and resource
+checks. Finite boundary ramps are integrated against its cumulative response. When a verified
 nonnegative absolute-path majorant exists, numerical roundoff-scale
 contributions may be discarded using a single accumulated allowance per
 input column; first arrivals are retained. Finite-support response
