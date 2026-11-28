@@ -4,6 +4,7 @@
 //! physical time scale to the k-th power. Products and elementary functions
 //! use coefficient recurrences, not differences of nearly equal samples.
 
+pub(crate) mod constitutive;
 pub mod differential;
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -93,6 +94,13 @@ impl Jet {
     pub(crate) fn scale(mut self, factor: Real) -> Self {
         for value in &mut self.coefficients {
             *value *= factor;
+        }
+        self
+    }
+
+    pub(crate) fn divide_constant(mut self, divisor: Real) -> Self {
+        for value in &mut self.coefficients {
+            *value /= divisor;
         }
         self
     }

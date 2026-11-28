@@ -1104,6 +1104,56 @@ impl Device for Switch {
         Ok((predicted - point.current).abs() > tol)
     }
 
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        use crate::devices::physical_dae::TaylorControl;
+        let Some(law) = self.model.ltspice.filter(|law| !law.discrete()) else {
+            return Err(SpiceError::Unsupported {
+                feature: format!("memoryless physical Taylor law for {}", self.name),
+                location: None,
+            });
+        };
+        if let Some(series) = self.series() {
+            let branch = context
+                .branch
+                .ok_or_else(|| SpiceError::circuit("missing Lser branch"))?;
+            for (node, sign) in series.terminals.into_iter().zip([1., -1.]) {
+                let node = context.unknowns.node_row(node);
+                context.linear_static(node, Some(branch), sign)?;
+                context.linear_static(Some(branch), node, sign)?;
+            }
+            context.linear_charge(Some(branch), Some(branch), -series.value)?;
+        }
+        let output = self
+            .conducting_terminals()
+            .map(|node| context.unknowns.node_row(node));
+        let control =
+            [self.terminals[2], self.terminals[3]].map(|node| context.unknowns.node_row(node));
+        let controls = [output, control].map(|rows| TaylorControl { rows, polarity: 1. });
+        let voltage = controls[0].input::<2>(0, context)?;
+        let control = controls[1].input::<2>(1, context)?;
+        let mut guards = Vec::new();
+        let gmin = context.model.gmin;
+        let current = law.taylor(
+            ltspice::Conductance {
+                on: self.model.on_conductance,
+                off: self.model.off_conductance.unwrap_or(gmin),
+                threshold: self.model.threshold,
+                width: self.model.hysteresis.abs(),
+                gmin,
+            },
+            voltage,
+            control,
+            &mut guards,
+        )?;
+        if let Some(trace) = &mut context.output.guards {
+            trace.extend(context.device, guards)?;
+        }
+        context.local_law(output, &current, &controls, 1., None)
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         context: &mut crate::devices::traits::ChargeContext<'_>,

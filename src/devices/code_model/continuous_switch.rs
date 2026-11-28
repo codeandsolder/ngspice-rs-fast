@@ -2,6 +2,11 @@
 //! Unlike a threshold switch these have no trial or accepted discrete state.
 
 use super::source::{SourceModel, numeric_scalar};
+use crate::devices::physical_dae::LocalGuard;
+use crate::maths::taylor::{
+    constitutive::{Constitutive, Dual},
+    differential::Differential,
+};
 use crate::netlist::ast::ModelCard;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::cmp::Ordering;
@@ -107,139 +112,175 @@ impl Material {
         })
     }
 
-    const fn endpoint(resistance: Real) -> Point {
-        Point {
-            g: resistance.recip(),
-            dg: 0.,
-        }
-    }
-
-    fn normalized(self, control: Real) -> Real {
-        // Exact endpoint identity avoids cancellation in high-ratio laws.
-        if control.partial_cmp(&self.on) == Some(Ordering::Equal) {
-            1.
-        } else if control.partial_cmp(&self.off) == Some(Ordering::Equal) {
-            0.
+    fn normalized<T: Constitutive>(self, control: T) -> T {
+        // Preserve the exact scalar endpoint while retaining derivatives.
+        let endpoint = match control.value().partial_cmp(&self.on) {
+            Some(Ordering::Equal) => Some(1.),
+            _ if control.value().partial_cmp(&self.off) == Some(Ordering::Equal) => Some(0.),
+            _ => None,
+        };
+        let t = control.offset(-self.off).divide_constant(self.delta);
+        if let Some(value) = endpoint {
+            t.with_value(value)
         } else {
-            (control - self.off) / self.delta
+            t
         }
     }
 
     pub(super) fn point(self, control: Real) -> SpiceResult<Point> {
+        let point = self.conductance(Dual::<1>::variable(0, control)?, |_, _, _| {})?;
+        Ok(Point {
+            g: point.value,
+            dg: point.gradient[0],
+        })
+    }
+
+    pub(super) fn taylor(
+        self,
+        control: Differential<2>,
+        guards: &mut Vec<LocalGuard>,
+    ) -> SpiceResult<Differential<2>> {
+        self.conductance(control, |slot, argument, boundary| {
+            guards.push(LocalGuard::sign(slot, 0, argument.value.clone(), boundary));
+        })
+    }
+
+    fn conductance<T: Constitutive>(
+        self,
+        control: T,
+        mut guard: impl FnMut(usize, &T, Real),
+    ) -> SpiceResult<T> {
+        control.check()?;
         let t = self.normalized(control);
         let point = match self.law {
-            Law::CubicLog => self.cubic(t),
-            Law::LinearBounded | Law::Linear => self.linear(t),
-            Law::Exponential => self.exponential(t),
+            Law::CubicLog => self.cubic(t, &mut guard),
+            Law::LinearBounded | Law::Linear => self.linear(t, &mut guard)?,
+            Law::Exponential => self.exponential(t, &mut guard),
         };
-        if !control.is_finite() || !point.g.is_finite() || !point.dg.is_finite() {
-            return Err(SpiceError::circuit(
-                "nonfinite continuous switch operating point",
-            ));
-        }
+        point.check()?;
         Ok(point)
     }
 
-    fn cubic(self, t: Real) -> Point {
-        if t < 0. {
-            return Self::endpoint(self.roff);
+    fn endpoint<T: Constitutive>(t: &T, resistance: Real) -> T {
+        t.constant_like(resistance.recip())
+    }
+
+    fn cubic<T: Constitutive>(self, t: T, guard: &mut impl FnMut(usize, &T, Real)) -> T {
+        guard(0, &t, 0.);
+        guard(1, &t, 1.);
+        if t.compare(0.) == Ordering::Less {
+            return Self::endpoint(&t, self.roff);
         }
-        if t >= 1. {
-            return Self::endpoint(self.ron);
+        if t.compare(1.) != Ordering::Less {
+            return Self::endpoint(&t, self.ron);
         }
         if self.ron > self.roff {
-            // Native P-switch logarithmic minimum-resistance limiter.
-            return Self::endpoint(self.ron);
+            return Self::endpoint(&t, self.ron);
         }
-        if matches!(t, 0.) || matches!(self.log_ratio, 0.) {
-            return Self::endpoint(self.roff);
+        if t.compare(0.) == Ordering::Equal || self.log_ratio == 0. {
+            return Self::endpoint(&t, self.roff);
         }
-        // Smoothstep in log(R). Evaluate the nearer endpoint's expression
-        // to retain accuracy at high ratios and at both joins.
-        let s = 1. - t;
-        let log_r = if t <= 0.5 {
-            self.log_ratio
-                .mul_add(t * t * 2.0_f64.mul_add(-t, 3.), self.roff.ln())
+        // Near each endpoint use its own logarithmic origin.
+        let (fraction, span, origin) = if t.value() <= 0.5 {
+            (t, self.log_ratio, self.roff.ln())
         } else {
-            (-self.log_ratio).mul_add(s * s * 2.0_f64.mul_add(-s, 3.), self.ron.ln())
+            (t.scale(-1.).offset(1.), -self.log_ratio, self.ron.ln())
         };
-        let g = (-log_r).exp();
-        Point {
-            g,
-            dg: (-self.log_ratio * 6. * t * s / self.delta) * g,
-        }
+        let smooth = fraction
+            .clone()
+            .square()
+            .multiply(&fraction.affine(-2., 3.));
+        smooth.affine(-span, -origin).exp()
     }
 
-    fn exponential(self, t: Real) -> Point {
-        if self.limited {
-            if self.ron > self.roff {
-                // A-switch applies the minimum then the maximum limiter.
-                return Self::endpoint(self.roff);
-            }
-            if t < 0. {
-                return Self::endpoint(self.roff);
-            }
-            if t > 1. {
-                return Self::endpoint(self.ron);
-            }
+    fn bounded<T: Constitutive>(
+        self,
+        t: &T,
+        bounded: bool,
+        guard: &mut impl FnMut(usize, &T, Real),
+    ) -> Option<T> {
+        if !self.limited {
+            return None;
         }
-        if matches!(self.log_ratio, 0.) {
-            return Self::endpoint(self.ron);
+        if !bounded && self.ron > self.roff {
+            return Some(Self::endpoint(t, self.roff));
         }
-        let log_r = if t <= 0.5 {
-            self.log_ratio.mul_add(t, self.roff.ln())
-        } else {
-            (-self.log_ratio).mul_add(1. - t, self.ron.ln())
-        };
-        if !self.limited && log_r <= 1e-9_f64.ln() {
-            return Self::endpoint(1e-9);
-        }
-        let g = if matches!(t, 0.) {
-            self.roff.recip()
-        } else if matches!(t, 1.) {
-            self.ron.recip()
-        } else {
-            (-log_r).exp()
-        };
-        Point {
-            g,
-            dg: (-self.log_ratio / self.delta) * g,
-        }
-    }
-
-    fn linear(self, t: Real) -> Point {
-        let bounded = self.law == Law::LinearBounded;
-        if self.limited {
-            if !bounded && self.ron > self.roff {
-                return Self::endpoint(self.roff);
-            }
-            if t < 0. {
-                return Self::endpoint(if bounded {
+        guard(0, t, 0.);
+        guard(1, t, 1.);
+        if t.compare(0.) == Ordering::Less {
+            Some(Self::endpoint(
+                t,
+                if bounded {
                     self.roff.max(1e-9)
                 } else {
                     self.roff
-                });
+                },
+            ))
+        } else if t.compare(1.) == Ordering::Greater {
+            Some(Self::endpoint(t, self.ron))
+        } else {
+            None
+        }
+    }
+
+    fn exponential<T: Constitutive>(self, t: T, guard: &mut impl FnMut(usize, &T, Real)) -> T {
+        if let Some(point) = self.bounded(&t, false, guard) {
+            return point;
+        }
+        if self.log_ratio == 0. {
+            return Self::endpoint(&t, self.ron);
+        }
+        let endpoint = match t.value() {
+            0. => Some(self.roff.recip()),
+            1. => Some(self.ron.recip()),
+            _ => None,
+        };
+        let log_r = if t.value() <= 0.5 {
+            t.affine(self.log_ratio, self.roff.ln())
+        } else {
+            t.scale(-1.)
+                .offset(1.)
+                .affine(-self.log_ratio, self.ron.ln())
+        };
+        if !self.limited {
+            let cutoff = 1e-9_f64.ln();
+            guard(2, &log_r, cutoff);
+            if log_r.compare(cutoff) != Ordering::Greater {
+                return Self::endpoint(&log_r, 1e-9);
             }
-            if t > 1. {
-                return Self::endpoint(self.ron);
-            }
+        }
+        let g = log_r.scale(-1.).exp();
+        if let Some(value) = endpoint {
+            g.with_value(value)
+        } else {
+            g
+        }
+    }
+
+    fn linear<T: Constitutive>(
+        self,
+        t: T,
+        guard: &mut impl FnMut(usize, &T, Real),
+    ) -> SpiceResult<T> {
+        let bounded = self.law == Law::LinearBounded;
+        if let Some(point) = self.bounded(&t, bounded, guard) {
+            return Ok(point);
         }
         let difference = self.ron - self.roff;
-        if matches!(difference, 0.) {
-            return Self::endpoint(self.ron);
+        if difference == 0. {
+            return Ok(Self::endpoint(&t, self.ron));
         }
-        let r = if t <= 0.5 {
-            difference.mul_add(t, self.roff)
+        let r = if t.value() <= 0.5 {
+            t.affine(difference, self.roff)
         } else {
-            (-difference).mul_add(1. - t, self.ron)
+            t.scale(-1.).offset(1.).affine(-difference, self.ron)
         };
-        if (bounded || !self.limited) && r <= 1e-9 {
-            return Self::endpoint(1e-9);
+        if bounded || !self.limited {
+            guard(2, &r, 1e-9);
+            if r.compare(1e-9) != Ordering::Greater {
+                return Ok(Self::endpoint(&r, 1e-9));
+            }
         }
-        let g = r.recip();
-        Point {
-            g,
-            dg: -(difference / self.delta) * g * g,
-        }
+        r.reciprocal()
     }
 }
