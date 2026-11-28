@@ -73,6 +73,9 @@ pub(super) fn instantiate_with_models(
         ModelBackend::SimetrixDiodeLevel1 => {
             crate::devices::simetrix_diode::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::LtspiceIdealDiode => {
+            crate::devices::ideal_diode::instantiate(instance, nodes, &model, context)
+        }
         ModelBackend::Bjt => {
             crate::devices::bjt::Bjt::instantiate(instance, nodes, &model, context)
         }

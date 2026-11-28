@@ -249,9 +249,38 @@ The derivative-order bound and projected rank tests are not a proof of
 solvability for every singular or nonanalytic nonlinear DAE. Delayed rank
 emergence from time-dependent coefficients is covered at startup and exact
 interior events, including coefficients vanishing through dozens of Taylor
-orders. Recovery from a singular provisional Newton seed and genuinely
-singular nonlinear germs is tracked in
-[#251](https://github.com/codeandsolder/ngspice-rs-fast/issues/251).
+orders.
+
+When the ordinary order search exhausts with an unrepresented nonlinear
+physical residual, the solver can explore homogeneous nullspace
+directions of the mandatory derivative array. Probe amplitudes are
+bracketed by the response of the physical residual, not by a fixed
+voltage or time scale. Opposite directions and coupled combinations
+are tried; the perturbed state is only a disposable Newton seed.
+Recovered candidates must increase mandatory projected rank, satisfy
+the original physical residuals and storage constraints, and pass the
+same order lookahead checks. A residual-space arithmetic error envelope
+is propagated through the selected tangent basis for comparison of
+candidate states and normalized rates. Resolved distinct germs are
+reported as ambiguous. A search that cannot establish a determined
+prefix reports its numerical limit instead of installing an arbitrary
+derivative gauge. This bounded local recovery does not enumerate every
+nonlinear branch or prove global uniqueness, and an exactly singular
+homogeneous repeated root can still remain unresolved.
+
+The last accepted physical state and rate provide an extrapolated
+Newton seed for subsequent trials. When the extrapolated sum cancels
+within its floating-point rounding envelope, use zero as the seed, not
+as a physical constraint. This allows an exact singular crossing to be
+solved without carrying a spurious nonzero roundoff residual into the
+branch guard. A localized event uses its actual left-limit solution and
+rate instead. Neither rejected trials nor branch
+probes update the accepted predictor. The verified derivative array
+also supplies the executed guard trace and canonical candidate states,
+without re-evaluating the scalar expression on a potentially different
+branch. A domain failure in a predictor falls back to the ordinary
+state and zero-rate guess without changing the constraints.
+See [#251](https://github.com/codeandsolder/ngspice-rs-fast/issues/251).
 
 Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
 discarded by the frontend as observed in ngspice 47 (instance and node
@@ -386,3 +415,38 @@ limits, including under UIC. Remaining higher-order model kernels and
 behavioural branch-event localization are tracked in #242 and #241.
 Broader reference coverage and numerical golden validation remain ongoing. Static statistical realization is documented in
 [PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md).
+
+### Behavioural branch events in physical derivative-array transients
+
+Physical Taylor evaluation retains the executed branch choices at the final
+converged trial point. Device ordinals, compiled instruction slots, and
+operand discriminators identify guards; unexecuted conditional branches do
+not contribute. Adjacent boundaries in guard-operand coordinates are
+prepared from the same piecewise laws used by value/derivative evaluation.
+The local Taylor polynomial proposes inspection times; a linear fast path
+and bounded Bernstein subdivision can detect candidate roots even when the
+two endpoint signs would agree. A backward endpoint germ supplies additional
+interior inspection hints.
+
+A changed branch trace causes disposable trial solves against the original
+accepted history. A representable crossing can be confirmed from its two
+one-sided germs, otherwise the changed and unchanged states are bracketed
+to adjacent representable times. At the right boundary the original
+physical and derived-storage continuity constraints must hold, and the
+integration history restarts only after successful acceptance. The derived
+storage increment is also checked against the endpoint-rate envelope:
+zero endpoint derivatives alone cannot establish continuity. An inconsistent
+increment requests refinement, not an extra constitutive constraint.
+
+The physical one-sided algebraic source outputs are retained in candidate
+state and used directly for instantaneous current observations. In
+particular, a scalar conditional selected only at equality must not
+invalidate an otherwise well-defined one-sided germ.
+
+This is numerical event localization, not a certificate of every zero of an
+arbitrary function over a finite interval. Finite Taylor order and the
+chosen step control the resolution; locally invisible or arbitrarily rapid
+oscillations can require a smaller maximum step. Root subdivision and
+disposable solves are bounded; an unresolved discontinuity or exhausted
+work budget must fail rather than publish speculative history. Adjacent
+representable times are not merged using the analog breakpoint tolerance.

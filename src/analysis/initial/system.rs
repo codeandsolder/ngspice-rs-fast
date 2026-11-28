@@ -695,6 +695,7 @@ mod tests {
             fixed_coordinates: BTreeMap::new(),
             capacitors: Vec::new(),
             charges: BTreeMap::new(),
+            local_charges: Vec::new(),
         }
     }
 

@@ -7,7 +7,10 @@ use crate::devices::behavioural::program::{
     EXP_LIMIT, Environment, PowerLaw, PowerPart, TWO_PI, divide, modulus, power, power_h, pwr,
     unary_value,
 };
+use crate::devices::physical_dae::LocalGuard;
 use crate::maths::taylor::Jet;
+
+mod guards;
 use crate::primitives::{Real, SpiceError, SpiceResult, almost_equal_ulps};
 use std::cmp::Ordering;
 
@@ -16,6 +19,7 @@ const MAX_JET_ENTRIES: usize = 8_388_608;
 pub(in crate::devices::behavioural) struct TaylorEvaluation {
     pub value: Jet,
     pub gradient: Vec<Jet>,
+    pub guards: Vec<LocalGuard>,
 }
 
 struct Evaluator<'a> {
@@ -34,6 +38,7 @@ impl Plan {
         environment: &Environment<'_>,
         variables: &[Jet],
         time: &Jet,
+        collect_guards: bool,
     ) -> SpiceResult<TaylorEvaluation> {
         if variables.iter().any(|jet| jet.order() != time.order())
             || (root + 1)
@@ -55,7 +60,16 @@ impl Plan {
         };
         let value = evaluator.eval(root)?.clone();
         let gradient = evaluator.gradient(root)?;
-        Ok(TaylorEvaluation { value, gradient })
+        let guards = if collect_guards {
+            evaluator.guards()?
+        } else {
+            Vec::new()
+        };
+        Ok(TaylorEvaluation {
+            value,
+            gradient,
+            guards,
+        })
     }
 }
 
@@ -800,6 +814,7 @@ mod tests {
             &environment,
             variables,
             &Jet::affine(variables[0].order(), 0., 1.),
+            true,
         )
     }
 

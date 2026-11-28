@@ -156,6 +156,33 @@ impl Recovery {
             ))
     }
 
+    /// The same conservative charge-state equation, before any integration.
+    pub(super) fn stamp_taylor(
+        self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+        junction: [Option<usize>; 2],
+        current: &super::taylor::Law,
+    ) -> SpiceResult<()> {
+        let node = context.unknowns.node_row(self.node);
+        let gain = -self.row_weight * self.scale * self.tt;
+        let charge = context.variable(node)?.scale(self.scale.recip());
+        let gradient = crate::maths::taylor::Jet::constant(charge.order(), self.scale.recip());
+        context.record_charge(CHARGE_SLOT, &charge, node.map(|node| (node, gradient)))?;
+        context.branch_taylor(
+            [node, None],
+            junction,
+            &current.value.clone().scale(gain),
+            &current.slope.clone().scale(gain),
+            false,
+        )?;
+        context.linear_static(node, node, self.row_weight)?;
+        context.linear_charge(node, node, self.row_weight * self.time_constant())?;
+        for (row, sign) in junction.into_iter().zip([1., -1.]) {
+            context.linear_charge(row, node, sign * self.terminal_gain() / self.scale)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn assemble_charge(
         self,
         context: &mut ChargeContext<'_>,

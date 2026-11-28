@@ -40,11 +40,25 @@ is applied to external terminal currents. MESFET cd, cg and is similarly
 use its loaded Statz channel and gate currents. HFET1 and MESA already
 implement their own C-backed cd, cg and cs asks.
 
-Where legacy MOS and BJT levels lack model-specific current asks, requests
-such as @m1[id] or @q1[ic] now report unsupported rather than returning
-an externally stamped current under a misleading C parameter name. Use
-i(m1), @m1[current], i(q1) or @q1[current] explicitly for terminal current.
-These are intentionally different queries, not compatibility aliases.
+The diode, Gummel–Poon BJT, and shared classic MOS level implementations
+now provide their C-specific DC intrinsic asks. Diodes evaluate DIOcurrent
+(`@d1[id]`/`@d1[c]`), intrinsic `vd` and `gd` from the
+temperature-adjusted junction with gmin and internal series node. The BJT
+returns `BJTcc` and `BJTcb` as `@q1[ic]` and `@q1[ib]`, with the
+multiplicity and lateral-substrate correction prescribed by `bjtask.c`.
+Classic MOS levels replay `MOSXcd = mode*cdrain - cbd` for `@m1[id]`,
+respecting each level's multiplicity placement. These quantities are not
+external terminal residuals: use `i(m1)`, `@m1[current]`, `i(q1)` or
+`@q1[current]` explicitly for terminal current.
+
+For the independent C ngspice-47+ BJT deck
+(`vcc=5 V`, `vb=0.7 V`, `is=1e-14 A`, `bf=100`),
+`@q1[ic] = 0.0056703467757422835 A` and
+`@q1[ib] = 5.670346410422285e-5 A`. The external collector terminal
+current differs by about `5e-12 A` owing to the physical gmin branch.
+The integration test checks both reference quantities and that difference.
+Unsupported model-specific asks still fail explicitly; an external residual
+is never silently substituted.
 
 State-backed transient C asks, including JFET/MESFET currents that depend
 on integrated gate charge, remain explicitly unsupported until the required

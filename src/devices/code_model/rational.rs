@@ -325,7 +325,7 @@ impl RationalTransfer {
     }
 
     /// Number of dynamic states in the retained realization.
-    #[must_use]
+    #[must_use = "the order determines the number of retained dynamic states"]
     pub fn order(&self) -> usize {
         self.model.order()
     }

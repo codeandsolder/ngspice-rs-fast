@@ -425,6 +425,7 @@ struct ImpulseStorage {
     fixed_coordinates: BTreeMap<AbsoluteRow, FixedCoordinate>,
     capacitors: Vec<CapacitorInitial>,
     charges: BTreeMap<AbsoluteRow, ChargeInitial>,
+    local_charges: Vec<LocalChargeInitial>,
 }
 
 struct FixedCoordinate {
@@ -443,6 +444,13 @@ struct CapacitorInitial {
     equation: Option<AbsoluteRow>,
     slot: usize,
     scale: Real,
+}
+
+struct LocalChargeInitial {
+    name: String,
+    slot: usize,
+    target: Real,
+    optional: bool,
 }
 
 struct ChargeInitial {
@@ -469,6 +477,7 @@ impl ImpulseStorage {
             fixed_coordinates: BTreeMap::new(),
             capacitors: Vec::new(),
             charges: BTreeMap::new(),
+            local_charges: Vec::new(),
         };
         for index in 0..circuit.device_count() {
             for (row, coordinate) in bound_initial_coordinates(circuit, index, context)? {
@@ -1000,6 +1009,35 @@ impl ImpulseStorage {
         }
     }
 
+    fn bind_local_charges(
+        &mut self,
+        dae: &crate::devices::physical_dae::PhysicalDae<'_, '_>,
+        values: &[Real],
+        optional: bool,
+    ) -> SpiceResult<()> {
+        self.local_charges = dae
+            .storage_bindings()
+            .iter()
+            .map(|(slot, name)| {
+                let target = *values
+                    .get(*slot)
+                    .ok_or_else(|| failure("missing physical device charge history"))?;
+                if !target.is_finite() {
+                    return Err(failure(format!(
+                        "{name}: nonfinite physical device charge history"
+                    )));
+                }
+                Ok(LocalChargeInitial {
+                    name: name.clone(),
+                    slot: *slot,
+                    target,
+                    optional,
+                })
+            })
+            .collect::<SpiceResult<_>>()?;
+        Ok(())
+    }
+
     fn consistent_history(
         &self,
         circuit: &Circuit,
@@ -1007,7 +1045,8 @@ impl ImpulseStorage {
         continuity: Option<Real>,
         tolerances: Tolerances,
     ) -> SpiceResult<Vec<(usize, Real)>> {
-        let mut slots = Vec::new();
+        let mut slots = right.candidate_states.clone();
+        slots.extend_from_slice(&right.local_history);
         for (&AbsoluteRow(row), charge) in &self.charges {
             let actual = right.charge.as_slice()[row];
             if let Some(time) = continuity
@@ -1081,8 +1120,10 @@ fn potential(state: &Vector, vertex: VoltageVertex) -> Real {
 /// disposable computational metadata, not an accepted integration state.
 pub(super) struct DerivativePoint {
     pub solution: Vector,
+    pub rate: Vector,
     pub canonical: Vec<(usize, Real)>,
     pub order_hint: usize,
+    pub guards: crate::devices::physical_dae::BranchTrace,
 }
 
 /// Calculate the right-limit state and all declared initial storage rates.
@@ -1113,6 +1154,10 @@ pub(super) fn consistent_derivative_start(
     }
     let result = (|| {
         let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+        // Like C's junction UIC load, unspecified device charge is a seed.
+        // Prescribed sources may determine it instead; after initialization
+        // the actual accepted charge is retained at events.
+        storage.bind_local_charges(&dae, trial.values(), uic)?;
         let solve = |seed: &Vector| {
             system::solve_right_limit(
                 &dae,
@@ -1151,7 +1196,9 @@ pub(super) fn consistent_derivative_start(
             storage.consistent_history(circuit, &right, (!uic).then_some(0.), tolerances)?;
         Ok(DerivativePoint {
             solution: right.state,
+            rate: right.rate,
             order_hint: right.order_hint,
+            guards: right.guards,
             canonical,
         })
     })();
@@ -1161,6 +1208,13 @@ pub(super) fn consistent_derivative_start(
         Err(SpiceError::Unsupported { .. }) => Ok(None),
         other => other.map(Some),
     }
+}
+
+/// Disposable Taylor seed metadata, not a constraint or accepted history.
+#[derive(Clone, Copy)]
+pub(super) struct DerivativeGuess<'a> {
+    pub order_hint: usize,
+    pub rate: Option<&'a Vector>,
 }
 
 pub(super) enum DerivativeTrial {
@@ -1175,7 +1229,7 @@ pub(super) fn consistent_derivative_step(
     request: &LoadRequest<'_>,
     tolerances: Tolerances,
     iterations: usize,
-    order_hint: usize,
+    guess: DerivativeGuess<'_>,
 ) -> SpiceResult<DerivativeTrial> {
     let circuit = prepared.circuit();
     let forcing = request
@@ -1185,13 +1239,14 @@ pub(super) fn consistent_derivative_step(
         .history
         .accepted(1)
         .ok_or_else(|| failure("missing derivative step history"))?;
-    let storage =
+    let mut storage =
         ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+    storage.bind_local_charges(&dae, values, false)?;
     let right = match system::solve_step(
-        &dae, circuit, request, &storage, tolerances, iterations, order_hint,
+        &dae, circuit, request, &storage, tolerances, iterations, guess,
     )? {
-        system::SolveOutcome::Converged(right) => right,
+        system::SolveOutcome::Converged(right) => *right,
         system::SolveOutcome::NotConverged { last, .. } => {
             return Ok(DerivativeTrial::NotConverged(last));
         }
@@ -1199,7 +1254,9 @@ pub(super) fn consistent_derivative_step(
     let canonical = storage.consistent_history(circuit, &right, None, tolerances)?;
     Ok(DerivativeTrial::Converged(DerivativePoint {
         solution: right.state,
+        rate: right.rate,
         order_hint: right.order_hint,
+        guards: right.guards,
         canonical,
     }))
 }
@@ -1212,7 +1269,7 @@ pub(super) fn consistent_derivative_event(
     left: &crate::devices::TrialState,
     tolerances: Tolerances,
     iterations: usize,
-    order_hint: usize,
+    guess: DerivativeGuess<'_>,
 ) -> SpiceResult<DerivativePoint> {
     let circuit = prepared.circuit();
     let forcing = request
@@ -1229,12 +1286,31 @@ pub(super) fn consistent_derivative_event(
     )?;
     storage.retain_operating_point(request.solution);
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    let right = system::solve_event(&dae, request, &storage, tolerances, iterations, order_hint)
-        .map_err(|error| failure(format!("source event at t = {time:e}: {error}")))?;
+    storage.bind_local_charges(&dae, left.values(), false)?;
+    let right = match system::solve_event(&dae, request, &storage, tolerances, iterations, guess) {
+        // A one-sided germ may have a different admissible derivative
+        // domain than the incoming one. Retry without the disposable rate
+        // hint, retaining exactly the same physical event constraints.
+        Err(SpiceError::Circuit { .. }) if guess.rate.is_some() => system::solve_event(
+            &dae,
+            request,
+            &storage,
+            tolerances,
+            iterations,
+            DerivativeGuess {
+                rate: None,
+                ..guess
+            },
+        ),
+        result => result,
+    }
+    .map_err(|error| failure(format!("source event at t = {time:e}: {error}")))?;
     let canonical = storage.consistent_history(circuit, &right, Some(time), tolerances)?;
     Ok(DerivativePoint {
         solution: right.state,
+        rate: right.rate,
         order_hint: right.order_hint,
+        guards: right.guards,
         canonical,
     })
 }

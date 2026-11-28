@@ -1126,3 +1126,684 @@ fn wide_parallel_derivative_constraints_do_not_lose_physical_rank() -> SpiceResu
     }
     Ok(())
 }
+
+#[test]
+fn behavioural_step_inside_derivative_requires_impulse() {
+    for method in ["method=trap", "method=gear"] {
+        for input in [
+            "u(time-10u)",
+            "floor(time/10u)",
+            "sgn(time-10u)",
+            "(time<10u ? 0 : 1)",
+            "u((time-10.2u)*(time-10.25u))",
+            "1u*ddt(abs(time/1u-10))",
+        ] {
+            let body =
+                format!("b1 out 0 v=1u*ddt({input})\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n");
+            let error = run(
+                &body,
+                AnalysisKind::Transient,
+                &["1u", "25u", "0", "1u", "uic", method],
+            )
+            .expect_err("a jump in a derived storage coordinate requires an impulse")
+            .to_string();
+            assert!(
+                error.contains("derivative input jumps"),
+                "{input} ({method}): {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compiled_behavioural_corner_uses_right_germ_and_preserves_storage() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let body = "bdrive x 0 v=(time-1u)/1u\nrdrive x 0 1\nbv out 0 v=1u*ddt(abs(v(x)))\nbi other 0 v=1u*ddt(abs(i(bdrive)))\nrout out 0 1k\nrother other 0 1k\nrcap cap 0 1k\nccap cap 0 1n ic=1\nvli lin 0 0\nrli lin li 1\nlli li 0 1u ic=1\nvrational ri 0 dc 3\na1 ri rational mdl\nrrational rational 0 1k\n.model mdl s_xfer(num_coeff=[1] den_coeff=[1 1] denormalized_freq=1e6 int_ic=[2])\n.options reltol=1e-8 vntol=1n chgtol=1e-18 trtol=0.01";
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "3u", "0", "1u", "uic", method],
+        )?;
+        let mut seen = false;
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let at_corner = (t - 1e-6).abs() <= 1e-18;
+            seen |= at_corner;
+            let expected = if t < 1e-6 && !at_corner { -1. } else { 1. };
+            for name in ["v(out)", "v(other)"] {
+                close(plot.value(name, index).unwrap().re, expected, 1e-7);
+            }
+            let decay = (-t / 1e-6).exp();
+            close(plot.value("v(cap)", index).unwrap().re, decay, 2e-6);
+            close(plot.value("i(lli)", index).unwrap().re, decay, 2e-6);
+            close(
+                plot.value("v(rational)", index).unwrap().re,
+                3. - decay,
+                2e-6,
+            );
+        }
+        assert!(seen, "missing localized behavioural event");
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_lazy_branch_and_boundary_observation_use_physical_value() -> SpiceResult<()> {
+    // The isolated scalar equality branch is not part of either
+    // one-sided physical germ. Evaluating it would take sqrt(-1).
+    let body = "bguard x 0 i=(time==10u ? sqrt(-1) : abs(time/1u-10))\nrguard x 0 1\nb1 out 0 v=1u*ddt(-v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "15u", "0", "1u", "uic", method],
+            &["@bguard[i]"],
+        )?;
+        let mut seen = false;
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let at_corner = (t - 10e-6).abs() <= 1e-18;
+            seen |= at_corner;
+            close(
+                plot.value("@bguard[i]", index).unwrap().re,
+                (t / 1e-6 - 10.).abs(),
+                1e-7,
+            );
+            close(
+                plot.value("v(out)", index).unwrap().re,
+                if t < 10e-6 && !at_corner { -1. } else { 1. },
+                1e-7,
+            );
+        }
+        assert!(seen);
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_two_corners_within_one_requested_step() -> SpiceResult<()> {
+    let body = "b1 out 0 v=1u*ddt(max(0,min((time-10.2u)/1u,(10.3u-time)/1u)))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "15u", "0", "1u", "uic", method],
+        )?;
+        let mut seen = [false; 3];
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let boundaries = [10.2e-6, 10.25e-6, 10.3e-6];
+            for (at, flag) in boundaries.into_iter().zip(&mut seen) {
+                *flag |= (t - at).abs() <= 1e-18;
+            }
+            // Ignore a few ulps around knots in this slope comparison;
+            // the preceding assertion still demands all three landings.
+            if boundaries.into_iter().any(|at| (t - at).abs() <= 1e-18) {
+                continue;
+            }
+            let expected = if (boundaries[0]..boundaries[1]).contains(&t) {
+                1.
+            } else if (boundaries[1]..boundaries[2]).contains(&t) {
+                -1.
+            } else {
+                0.
+            };
+            close(plot.value("v(out)", index).unwrap().re, expected, 1e-7);
+        }
+        assert_eq!(seen, [true; 3]);
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_adjacent_representable_events_are_not_coalesced() -> SpiceResult<()> {
+    let a = 2_f64.powi(-16);
+    let b = a.next_up();
+    let body = format!(
+        "va ta 0 {a:.17e}\nvb tb 0 {b:.17e}\nb1 out 0 v=ddt(uramp(time-v(ta))+uramp(time-v(tb)))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n"
+    );
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            &body,
+            AnalysisKind::Transient,
+            &["1u", "20u", "0", "1u", "uic", method],
+        )?;
+        let mut seen = [false; 2];
+        let mut previous = 0.;
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            assert!(t > previous, "duplicate or reversed event at {t:e}");
+            previous = t;
+            assert_eq!(
+                plot.value("v(ta)", index).unwrap().re.to_bits(),
+                a.to_bits()
+            );
+            assert_eq!(
+                plot.value("v(tb)", index).unwrap().re.to_bits(),
+                b.to_bits()
+            );
+            seen[0] |= t.to_bits() == a.to_bits();
+            seen[1] |= t.to_bits() == b.to_bits();
+            let expected = if t < a {
+                0.
+            } else if t < b {
+                1.
+            } else {
+                2.
+            };
+            close(plot.value("v(out)", index).unwrap().re, expected, 1e-9);
+        }
+        assert_eq!(seen, [true, true], "{method}");
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_state_dependent_event_follows_physical_decay() -> SpiceResult<()> {
+    let body = "rcap cap 0 1k\nccap cap 0 1n ic=1\nb1 out 0 v=1u*ddt(abs(v(cap)-0.5))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n chgtol=1e-18 trtol=0.01";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "2u", "0", "0.1u", "uic", method],
+        )?;
+        let mut crossing = None;
+        let mut previous = -1.;
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let v = plot.value("v(cap)", index).unwrap().re;
+            let rate = plot.value("v(out)", index).unwrap().re;
+            close(v, (-t / 1e-6).exp(), 2e-6);
+            close(rate.abs(), v, 1e-7);
+            if rate > 0. && previous < 0. {
+                crossing = Some(t);
+                close(v, 0.5, 1e-8);
+            }
+            previous = rate;
+        }
+        close(
+            crossing.expect("missing state-triggered event"),
+            1e-6 * 2_f64.ln(),
+            5e-12,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_piecewise_and_clipped_derivatives_localize_knots() -> SpiceResult<()> {
+    let body = "bup up 0 v=1u*ddt(pwl(time/1u, 0, 0, 1, 1, 2, 3))\nbdown down 0 v=1u*ddt(pwl(time/1u, 2, 3, 1, 1, 0, 0))\nbclip clip 0 v=1u*ddt(u2(time/1u-1))\nrup up 0 1k\nrdown down 0 1k\nrclip clip 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "3u", "0", "1u", "uic", method],
+        )?;
+        let mut seen = [false; 2];
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            for (at, flag) in [1e-6, 2e-6].into_iter().zip(&mut seen) {
+                *flag |= (t - at).abs() < 1e-18;
+            }
+            if [1e-6, 2e-6].iter().any(|at| (t - at).abs() < 1e-18) {
+                continue;
+            }
+            let slope = if t < 1e-6 { 1. } else { 2. };
+            for name in ["v(up)", "v(down)"] {
+                close(plot.value(name, index).unwrap().re, slope, 1e-7);
+            }
+            close(
+                plot.value("v(clip)", index).unwrap().re,
+                if (1e-6..2e-6).contains(&t) { 1. } else { 0. },
+                1e-7,
+            );
+        }
+        assert_eq!(seen, [true, true]);
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_smoothed_table_second_derivative_localizes_edges() -> SpiceResult<()> {
+    let body = "bdrive in 0 v=time/1u\ne1 x 0 table {v(in)} = (0,0) (1,2) (2,3)\nb1 out 0 v=1u*ddt(1u*ddt(v(x)))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "3u", "0", "1u", "uic", method],
+        )?;
+        let mut seen = [false; 5];
+        let boundaries = [0.1e-6, 0.9e-6, 1.1e-6, 1.9e-6, 2.1e-6];
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            for (at, flag) in boundaries.into_iter().zip(&mut seen) {
+                *flag |= (t - at).abs() < 1e-18;
+            }
+            if boundaries.iter().any(|at| (t - at).abs() < 1e-18) {
+                continue;
+            }
+            let expected = if t < 0.1e-6 {
+                10.
+            } else if (0.9e-6..1.1e-6).contains(&t) {
+                -5.
+            } else if (1.9e-6..2.1e-6).contains(&t) {
+                -5.
+            } else {
+                0.
+            };
+            close(plot.value("v(out)", index).unwrap().re, expected, 1e-6);
+        }
+        assert_eq!(seen, [true; 5]);
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_provisional_tangent_recovers_regular_nonlinear_root() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            "b1 x 0 i=v(x)^3-(2+time/1u)^3\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        for i in 0..plot.point_count() {
+            let u = plot.value("time", i).unwrap().re / 1e-6;
+            close(plot.value("v(x)", i).unwrap().re, 2. + u, 1e-10);
+            close(plot.value("v(out)", i).unwrap().re, 1., 1e-9);
+            close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-12);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_nonlinear_germ_recovers_unique_cubic_rate() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            "b1 x 0 i=v(x)^3-(time/1u)^3\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        for i in 0..plot.point_count() {
+            let u = plot.value("time", i).unwrap().re / 1e-6;
+            close(plot.value("v(x)", i).unwrap().re, u, 1e-10);
+            close(plot.value("v(out)", i).unwrap().re, 1., 1e-9);
+            close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-12);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_quadratic_germ_reports_distinct_branches() {
+    for method in ["method=trap", "method=gear"] {
+        let error = run(
+            "b1 x 0 i=v(x)^2-(time/1u)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        ).expect_err("two distinct right-hand slopes must not be chosen by a numerical gauge");
+        assert!(
+            error.to_string().contains("ambiguous nonlinear DAE"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn singular_germ_recovery_uses_coupled_nonpolynomial_equations() -> SpiceResult<()> {
+    // The two nonlinear equations have a singular Jacobian at the zero
+    // seed, but each real solution of sinh(z)-z=a is unique. The actual
+    // variables are recovered through their coupled linear combinations.
+    let body = "b1 x 0 i=sinh(v(x)+v(y))-(v(x)+v(y))-(sinh(3+time/1u)-(3+time/1u))\nb2 y 0 i=sinh(v(x)-v(y))-(v(x)-v(y))-(sinh(1+3*time/1u)-(1+3*time/1u))\nb3 dx 0 v=1u*ddt(v(x))\nb4 dy 0 v=1u*ddt(v(y))\nr1 dx 0 1k\nr2 dy 0 2k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "0.5u", "0", "0.1u", "uic", method],
+        )?;
+        for i in 0..plot.point_count() {
+            let u = plot.value("time", i).unwrap().re / 1e-6;
+            close(plot.value("v(x)", i).unwrap().re, 2. + 2. * u, 1e-9);
+            close(plot.value("v(y)", i).unwrap().re, 1. - u, 1e-9);
+            close(plot.value("v(dx)", i).unwrap().re, 2., 1e-9);
+            close(plot.value("v(dy)", i).unwrap().re, -1., 1e-9);
+            close(plot.value("i(b3)", i).unwrap().re, -2e-3, 1e-12);
+            close(plot.value("i(b4)", i).unwrap().re, 0.5e-3, 1e-12);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_recovery_at_exact_source_event_preserves_storage() -> SpiceResult<()> {
+    let body = "vtrigger trigger 0 PWL(0 0 0.5u 1 1u 0)\nb1 x 0 i=v(x)^3-((time-0.5u)/1u)^3\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\nc1 stored 0 1u ic=2\nr2 stored 0 1k\n.ic v(x)=-0.5\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        let mut event = false;
+        for i in 0..plot.point_count() {
+            let t = plot.value("time", i).unwrap().re;
+            event |= t.to_bits() == 0.5e-6_f64.to_bits();
+            close(plot.value("v(x)", i).unwrap().re, (t - 0.5e-6) / 1e-6, 1e-9);
+            close(plot.value("v(out)", i).unwrap().re, 1., 1e-8);
+            close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-11);
+            close(
+                plot.value("v(stored)", i).unwrap().re,
+                2. * (-t / 1e-3).exp(),
+                1e-7,
+            );
+        }
+        assert!(event, "the physical singular event was not sampled");
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_moving_repeated_root_recovers_consistent_germ() -> SpiceResult<()> {
+    // A repeated root can have a unique moving germ despite a vanishing
+    // instantaneous tangent. Verify the actual recovered trajectory.
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            "b1 x 0 i=(v(x)-time/1u)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        for i in 0..plot.point_count() {
+            let u = plot.value("time", i).unwrap().re / 1e-6;
+            close(plot.value("v(x)", i).unwrap().re, u, 1e-10);
+            close(plot.value("v(out)", i).unwrap().re, 1., 1e-9);
+            close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-12);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_homogeneous_repeated_root_is_not_arbitrarily_gauged() {
+    let error = run(
+        "b1 x 0 i=v(x)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k",
+        AnalysisKind::Transient,
+        &["0.1u", "1u", "0", "0.1u", "uic", "method=gear"],
+    )
+    .expect_err("a zero residual and unresolved tangent must not establish rank");
+    assert!(
+        error.to_string().contains("singular") || error.to_string().contains("underdetermined"),
+        "{error}"
+    );
+}
+
+#[test]
+fn singular_germ_recovery_handles_high_order_and_scaled_offsets() -> SpiceResult<()> {
+    for (power, offset, h) in [
+        (3, 0.001, 1e-6),
+        (15, 0.001, 1e-6),
+        (15, 0., 1e-9),
+        (15, 0., 1e-3),
+        (15, 1000., 1e-6),
+    ] {
+        let body = format!(
+            "b1 x 0 i=v(x)^{power}-({offset:e}+time/{h:e})^{power}\nb2 out 0 v={h:e}*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n"
+        );
+        let step = format!("{:e}", h / 10.);
+        let stop = format!("{h:e}");
+        for method in ["method=trap", "method=gear"] {
+            let plot = run(
+                &body,
+                AnalysisKind::Transient,
+                &[&step, &stop, "0", &step, "uic", method],
+            )?;
+            for i in 0..plot.point_count() {
+                let u = plot.value("time", i).unwrap().re / h;
+                close(plot.value("v(x)", i).unwrap().re, offset + u, 1e-9);
+                close(plot.value("v(out)", i).unwrap().re, 1., 1e-9);
+                close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-12);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_recovery_respects_explicit_branch_selection() -> SpiceResult<()> {
+    for sign in [-1., 1.] {
+        let body = format!(
+            "b1 x 0 i=v(x)^2-(2+time/1u)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.ic v(x)={}\n.options reltol=1e-8 vntol=1n",
+            2. * sign
+        );
+        for method in ["method=trap", "method=gear"] {
+            let plot = run(
+                &body,
+                AnalysisKind::Transient,
+                &["0.1u", "1u", "0", "0.1u", "uic", method],
+            )?;
+            for i in 0..plot.point_count() {
+                let u = plot.value("time", i).unwrap().re / 1e-6;
+                close(plot.value("v(x)", i).unwrap().re, sign * (2. + u), 1e-10);
+                close(plot.value("v(out)", i).unwrap().re, sign, 1e-9);
+                close(plot.value("i(b2)", i).unwrap().re, -sign * 1e-3, 1e-12);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_recovery_rejects_ambiguous_curvature_and_nonanalytic_roots() {
+    for (law, diagnostic) in [
+        ("v(x)^2-(2+time/1u)^2", "ambiguous nonlinear DAE"),
+        ("v(x)^2-(time/1u)^4", "ambiguous nonlinear DAE"),
+        ("v(x)^2-time/1u", "could not resolve a singular tangent"),
+        ("v(x)^2+(time/1u)^2", "could not resolve a singular tangent"),
+    ] {
+        let body = format!(
+            "b1 x 0 i={law}\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n"
+        );
+        for method in ["method=trap", "method=gear"] {
+            let error = run(
+                &body,
+                AnalysisKind::Transient,
+                &["0.1u", "1u", "0", "0.1u", "uic", method],
+            )
+            .expect_err("an unresolved or ambiguous germ must not be assigned an arbitrary rate");
+            assert!(error.to_string().contains(diagnostic), "{law}: {error}");
+        }
+    }
+}
+
+#[test]
+fn singular_germ_predictor_survives_rejected_steps_and_source_event() -> SpiceResult<()> {
+    for method in ["trap", "gear"] {
+        let body = format!(
+            "predictor transaction\nvtrigger trigger 0 PWL(0 0 0.5u 1 1u 0)\nb1 x 0 i=v(x)^3-((time-0.5u)/1u+0.25*((time-0.5u)/1u)^3)^3\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\nc1 stored 0 1n ic=1\nr2 stored 0 200\n.options method={method} reltol=1e-8 vntol=1n chgtol=1e-18 trtol=0.1\n.tran 0.2u 1u 0 0.5u uic\n.end"
+        );
+        let netlist = Parser::new().parse_deck(&parse_deck_text(
+            Path::new("predictor-transaction.cir"),
+            &body,
+        ))?;
+        let config = RunConfig::from_netlist(&netlist)?;
+        let plan = config.plan_for(&netlist.analyses[0])?;
+        let mut circuit = config.circuit(&netlist)?;
+        let (plot, stats) =
+            ngspice_rs::analysis::companion_transient(&mut circuit, &plan, &config.context())?;
+        assert!(stats.rejected > 0, "{method}: no rejected trial");
+        let mut event = false;
+        for i in 0..plot.point_count() {
+            let time = plot.value("time", i).unwrap().re;
+            event |= time.to_bits() == 0.5e-6_f64.to_bits();
+            let u = (time - 0.5e-6) / 1e-6;
+            let x = 0.25_f64.mul_add(u.powi(3), u);
+            let rate = 0.75_f64.mul_add(u * u, 1.);
+            close(plot.value("v(x)", i).unwrap().re, x, 1e-8);
+            close(plot.value("v(out)", i).unwrap().re, rate, 1e-7);
+            close(plot.value("i(b2)", i).unwrap().re, -rate * 1e-3, 1e-10);
+            close(
+                plot.value("v(stored)", i).unwrap().re,
+                (-time / 0.2e-6).exp(),
+                2e-5,
+            );
+        }
+        assert!(event, "{method}: missing exact singular event");
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_and_behavioural_corner_share_the_exact_event() -> SpiceResult<()> {
+    let body = "b1 x 0 i=v(x)^3-((time-0.5u)/1u)^3\nb2 out 0 v=1u*ddt(abs(v(x)))\nr1 out 0 1k\nc1 stored 0 1u ic=2\nr2 stored 0 1k\n.ic v(x)=-0.5\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        let mut crossing = None;
+        let mut previous = -1.;
+        for index in 0..plot.point_count() {
+            let time = plot.value("time", index).unwrap().re;
+            let x = plot.value("v(x)", index).unwrap().re;
+            let rate = plot.value("v(out)", index).unwrap().re;
+            close(x, (time - 0.5e-6) / 1e-6, 1e-8);
+            close(rate.abs(), 1., 1e-7);
+            if (time - 0.5e-6).abs() > 1e-14 {
+                close(rate, (time - 0.5e-6).signum(), 1e-7);
+            }
+            close(plot.value("i(b2)", index).unwrap().re, -rate * 1e-3, 1e-10);
+            close(
+                plot.value("v(stored)", index).unwrap().re,
+                2. * (-time / 1e-3).exp(),
+                2e-6,
+            );
+            if rate > 0. && previous < 0. {
+                assert!(crossing.is_none());
+                crossing = Some(time);
+                close(x, 0., 1e-8);
+            }
+            previous = rate;
+        }
+        close(crossing.expect("missing behavioural corner"), 0.5e-6, 1e-14);
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_recovery_cannot_accept_discontinuous_derivative_input() {
+    let body = "b1 x 0 i=v(x)^3-((time-0.5u)/1u)^3\nb2 out 0 v=1u*ddt(u(v(x)))\nr1 out 0 1k\n.ic v(x)=-0.5\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let error = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )
+        .expect_err("the recovered singular germ cannot erase a physical impulse")
+        .to_string();
+        assert!(
+            error.contains("derivative input jumps"),
+            "{method}: {error}"
+        );
+    }
+}
+
+#[test]
+fn behavioural_event_preserves_independent_semiconductor_charge_histories() -> SpiceResult<()> {
+    // At the interior corner the right-limit candidate must retain both
+    // the selected behavioural value and each diode's charge/rate pair.
+    // Two diodes share an equation row, but have different physical laws.
+    let body = "vdrive in 0 PWL(0 -0.4 1m 0.6)\nd1 in 0 dm1\nd2 in 0 dm2\n.model dm1 d(is=1e-12 n=10 cjo=20p vj=.8 m=.4 tt=5n)\n.model dm2 d(is=2e-12 n=10 cjo=70p vj=.7 m=.3 tt=9n)\nbguard x 0 i=(time==10u ? sqrt(-1) : abs(time/1u-10))\nrguard x 0 1\nb1 out 0 v=1u*ddt(-v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "15u", "0", "1u", "uic", method],
+            &["@bguard[i]", "@d1[i]", "@d2[i]"],
+        )?;
+        let mut seen = false;
+        for index in 0..plot.point_count() {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let time = at("time");
+            let voltage = 1000_f64.mul_add(time, -0.4);
+            let corner = (time - 10e-6).abs() <= 1e-18;
+            seen |= corner;
+            close(at("@bguard[i]"), (time / 1e-6 - 10.).abs(), 1e-7);
+            close(
+                at("v(out)"),
+                if time < 10e-6 && !corner { -1. } else { 1. },
+                1e-7,
+            );
+            let diode = |sat: f64, cap: f64, potential: f64, grading: f64, transit: f64| {
+                let current = sat * (voltage / thermal).exp_m1() + 1e-12 * voltage;
+                let conductance = sat / thermal * (voltage / thermal).exp() + 1e-12;
+                current
+                    + 1000.
+                        * (cap * (1. - voltage / potential).powf(-grading) + transit * conductance)
+            };
+            let first = diode(1e-12, 20e-12, 0.8, 0.4, 5e-9);
+            let second = diode(2e-12, 70e-12, 0.7, 0.3, 9e-9);
+            close(at("@d1[i]"), first, 1e-15);
+            close(at("@d2[i]"), second, 1e-15);
+            close(at("i(vdrive)"), -(first + second), 1e-15);
+        }
+        assert!(seen, "missing semiconductor-loaded branch event");
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_recovers_distinct_semiconductor_histories() -> SpiceResult<()> {
+    // The nonlinear singular coordinate drives both junctions through a
+    // voltage law. The local physical charge constraints must be retained
+    // across a coincident behavioural corner, including their separate
+    // terminal-current observations and their sum in source KCL.
+    let body = "b1 x 0 i=v(x)^3-((time-0.5u)/1u)^3\nb2 out 0 v=1u*ddt(abs(v(x)))\nr1 out 0 1k\nbdrive in 0 v=0.1*v(x)-0.4\nd1 in 0 dm1\nd2 in 0 dm2\n.model dm1 d(is=1e-12 n=10 cjo=20p vj=.8 m=.4 tt=5n)\n.model dm2 d(is=2e-12 n=10 cjo=70p vj=.7 m=.3 tt=9n)\n.ic v(x)=-0.5\n.options reltol=1e-8 vntol=1n";
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+            &["@d1[i]", "@d2[i]"],
+        )?;
+        let mut previous = -1.;
+        let mut event = None;
+        for index in 0..plot.point_count() {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let time = at("time");
+            let x = (time - 0.5e-6) / 1e-6;
+            let voltage = 0.1_f64.mul_add(x, -0.4);
+            let rate = at("v(out)");
+            close(at("v(x)"), x, 1e-8);
+            close(at("v(in)"), voltage, 1e-9);
+            close(rate.abs(), 1., 1e-7);
+            if (time - 0.5e-6).abs() > 1e-14 {
+                close(rate, x.signum(), 1e-7);
+            }
+            close(at("i(b2)"), -rate * 1e-3, 1e-10);
+            let diode = |sat: f64, cap: f64, potential: f64, grading: f64, transit: f64| {
+                let current = sat * (voltage / thermal).exp_m1() + 1e-12 * voltage;
+                let conductance = sat / thermal * (voltage / thermal).exp() + 1e-12;
+                current
+                    + 1e5
+                        * (cap * (1. - voltage / potential).powf(-grading) + transit * conductance)
+            };
+            let first = diode(1e-12, 20e-12, 0.8, 0.4, 5e-9);
+            let second = diode(2e-12, 70e-12, 0.7, 0.3, 9e-9);
+            close(at("@d1[i]"), first, 1e-13);
+            close(at("@d2[i]"), second, 1e-13);
+            close(at("i(bdrive)"), -(first + second), 1e-13);
+            if rate > 0. && previous < 0. {
+                assert!(event.is_none());
+                event = Some(time);
+            }
+            previous = rate;
+        }
+        close(
+            event.expect("missing singular semiconductor event"),
+            0.5e-6,
+            1e-14,
+        );
+    }
+    Ok(())
+}

@@ -2,7 +2,7 @@ name: Rust CI
 
 on:
   push:
-    branches: [main, refactor/architecture-campaign]
+    branches: [main]
     tags: ["v*"]
   pull_request:
   merge_group:
@@ -18,23 +18,25 @@ permissions:
 jobs:
   rust:
     name: Nightly Rust build, tests, docs and goldens
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
     with:
       command: |
-        cargo test --workspace --locked
+        cargo test --workspace --locked --no-fail-fast
         cargo xtask golden verify
         cargo doc --workspace --no-deps --locked
         cargo build --workspace --locked --release
 
   strict-rust:
     name: Strict Rust and workflow policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@cb9083676196a8ec3bf013e7253907b2759020c7 # main
+    with:
+      allow-test-panics: true
 
   source-quality:
-    uses: codeandsolder/ci-workflows/.github/workflows/source-quality.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/source-quality.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
   clone-regression:
-    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
   # The shared strict gate already enforces the quarantine on pull requests.
   # Also enforce it for direct campaign-branch pushes and merge queues.
@@ -49,7 +51,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
-      - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+      - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           base-ref: ${{ github.event.merge_group.base_sha || github.event.before }}
           hours: "72"

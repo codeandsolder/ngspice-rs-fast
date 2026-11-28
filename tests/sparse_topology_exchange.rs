@@ -24,8 +24,8 @@ fn permuted_sparse_real_and_complex_solves_match_direct_products() {
             let mut real = SparseMatrix::new(n, n);
             let mut imaginary = SparseMatrix::new(n, n);
             let mut dense = vec![vec![Complex::ZERO; n]; n];
-            for row in 0..n {
-                for col in 0..n {
+            for (row, dense_row) in dense.iter_mut().enumerate() {
+                for (col, dense_cell) in dense_row.iter_mut().enumerate() {
                     let main = (row + shift) % n == col;
                     let secondary = (row * 11 + col * 7 + shift) % 5 == 0;
                     if main || secondary {
@@ -38,12 +38,12 @@ fn permuted_sparse_real_and_complex_solves_match_direct_products() {
                         // insertion order, not change stable source handles.
                         real.add(row, col, value * 0.75).unwrap();
                         real.add(row, col, value * 0.25).unwrap();
-                        dense[row][col].re += value * 0.75 + value * 0.25;
+                        dense_cell.re += value * 0.75 + value * 0.25;
                     }
                     if main || (row + col) % 4 == 0 {
                         let value = if main { 0.05 } else { 0.007 };
                         imaginary.add(row, col, value).unwrap();
-                        dense[row][col].im += value;
+                        dense_cell.im += value;
                     }
                 }
             }

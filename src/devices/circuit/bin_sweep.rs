@@ -21,6 +21,7 @@ pub(crate) struct BinnedDeck {
     noise_analysis: bool,
     prepared_initialization: BoundInitializations,
     prepared_waveforms: Vec<(String, PreparedForcing)>,
+    prepared_resistors: crate::devices::pwl_resistor::BoundResistors,
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +43,7 @@ impl BinnedDeck {
         noise_analysis: bool,
         prepared_initialization: &BoundInitializations,
         prepared_waveforms: &[(String, PreparedForcing)],
+        prepared_resistors: &crate::devices::pwl_resistor::BoundResistors,
     ) -> Option<Self> {
         let binned: BTreeMap<_, _> = devices
             .iter()
@@ -65,6 +67,7 @@ impl BinnedDeck {
             noise_analysis,
             prepared_initialization: prepared_initialization.clone(),
             prepared_waveforms: prepared_waveforms.to_vec(),
+            prepared_resistors: prepared_resistors.clone(),
         })
     }
 
@@ -287,7 +290,7 @@ impl BinnedDeck {
             elaboration_limits: baseline.elaboration_limits,
             ..Circuit::default()
         };
-        circuit.add_instances(&devices, resolver, &setup)?;
+        circuit.add_prepared_instances(&devices, resolver, &setup, &self.prepared_resistors)?;
         circuit.apply_prepared_waveforms(self.prepared_waveforms.clone())?;
         circuit.apply_prepared_initializations(self.prepared_initialization.clone())?;
         circuit.add_topology_shunts(setup.shunts)?;

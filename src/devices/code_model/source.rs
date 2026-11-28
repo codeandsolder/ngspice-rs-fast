@@ -41,7 +41,7 @@ pub enum ParameterShape {
 
 impl ParameterShape {
     /// Whether a bracketed array is required.
-    #[must_use]
+    #[must_use = "the shape determines whether a parameter requires bracketed grouping"]
     pub const fn vector(self) -> bool {
         matches!(
             self,
@@ -50,7 +50,7 @@ impl ParameterShape {
     }
 
     /// Whether literal boolean spellings are accepted.
-    #[must_use]
+    #[must_use = "the result determines whether boolean spellings are valid"]
     pub const fn boolean(self) -> bool {
         matches!(self, Self::Boolean | Self::BooleanVector)
     }
@@ -96,7 +96,7 @@ impl PortSpec {
 
 impl SourceModel {
     /// Registered model type, without applying node aliasing.
-    #[must_use]
+    #[must_use = "the lookup result identifies the registered source model or an unsupported name"]
     pub const fn from_base(base: &str) -> Option<Self> {
         if base.eq_ignore_ascii_case("s_xfer") {
             Some(Self::RationalTransfer)
@@ -116,7 +116,7 @@ impl SourceModel {
     }
 
     /// Ordered terminal groups and their default domains.
-    #[must_use]
+    #[must_use = "the port specifications are required to bind terminal groups in source order"]
     pub const fn ports(self) -> &'static [PortSpec] {
         const TRANSFER_PORTS: &[PortSpec] = &[
             PortSpec::new(Voltage, TRANSFER, false, false),
@@ -170,7 +170,7 @@ impl SourceModel {
 
     /// Shape of a declared static setter. Unknown setters are rejected during
     /// model binding, after source expressions have been evaluated.
-    #[must_use]
+    #[must_use = "the shape determines how the static setter must be interpreted"]
     pub fn parameter(self, name: &str) -> Option<ParameterShape> {
         use ParameterShape::{Boolean, BooleanVector, Integer, IntegerVector, Real, RealVector};
         match self {

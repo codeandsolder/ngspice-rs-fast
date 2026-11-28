@@ -33,6 +33,20 @@ use crate::primitives::{Node, NodeId, NodeTable, Real, SourceLoc, SpiceError, Sp
 use crate::devices::linear::Forcing;
 use crate::devices::state::DeviceState;
 
+/// Device-local physical charge history and its electrical incidence.
+///
+/// The stored rate is multiplied by `scale` and enters the positive node,
+/// leaving the negative node. Internal state equations are not terminals.
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicalChargeHistory {
+    /// Local charge slot, followed immediately by its physical time derivative.
+    pub slot: usize,
+    /// Positive and negative electrical nodes of the charge contribution.
+    pub nodes: [NodeId; 2],
+    /// Conversion from device-local charge to signed electrical charge.
+    pub scale: Real,
+}
+
 /// Physical nonlinear charge and its exact Jacobian in MNA coordinates.
 /// This is independent of the time integration formula and AC's historical
 /// small-signal linearization conventions.
@@ -155,7 +169,7 @@ pub enum BranchQuantity {
 
 impl BranchQuantity {
     /// Plot vector identity and unit for this coordinate.
-    #[must_use]
+    #[must_use = "the returned identity and unit define the requested branch observation"]
     pub fn observation(self, name: &str) -> (String, &'static str) {
         match self {
             Self::Current => (format!("i({name})"), "current"),
@@ -636,7 +650,7 @@ pub struct ConvergenceContext<'a> {
 
 impl ConvergenceContext<'_> {
     /// A device-local accepted state value, age one being the latest.
-    #[must_use]
+    #[must_use = "the returned value is the accepted state used for device convergence checks"]
     pub fn accepted(&self, age: usize, slot: usize) -> Option<Real> {
         self.history
             .accepted(age)?
@@ -953,6 +967,13 @@ pub trait Device: fmt::Debug + std::any::Any {
     ) -> SpiceResult<Option<Real>> {
         Ok(None)
     }
+    /// Physical two-terminal current retained by a converged derivative
+    /// array. Returning a value avoids scalar evaluation at a branch event.
+    /// The default leaves the existing isolated observation load in use.
+    fn physical_terminal_current(&self, _states: &[Real], _branches: &[Real]) -> Option<Real> {
+        None
+    }
+
     /// Factor applied to this device's observed terminal currents: `-1` for
     /// devices whose C ask reports polarity-normalized currents for the
     /// p-type variant (`jfetask.c`), `1` (the default) otherwise.
@@ -1441,6 +1462,18 @@ pub trait Device: fmt::Debug + std::any::Any {
         })
     }
 
+    /// Visit device-local charge/rate pairs and their electrical incidence.
+    /// The same declaration binds physical histories and reconstructs their
+    /// displacement currents in instantaneous terminal observations.
+    /// # Errors
+    /// Propagates an error from the visitor.
+    fn physical_charge_histories(
+        &self,
+        _visit: &mut dyn FnMut(PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
     /// Assemble nonlinear physical residual/charge Taylor coefficients and
     /// the corresponding state-Jacobian jets.
     ///
@@ -1774,7 +1807,7 @@ pub struct TransientEventContext<'a> {
 
 impl TransientEventContext<'_> {
     /// Candidate node potential, zero at ground.
-    #[must_use]
+    #[must_use = "the candidate node potential is required to evaluate the event law"]
     pub fn voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)
