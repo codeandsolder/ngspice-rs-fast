@@ -48,8 +48,13 @@ pub(super) fn param_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     // is fully consumed (the tokenizer already matched braces and quotes).
     winnow::token::rest.parse_next(input)?;
     if defines_function(&raw[start..]) {
-        let card = super::func::definition(input.state.card, start, FuncSpelling::Param)
-            .map_err(|error| ErrMode::Cut(Failure(error)))?;
+        let card = super::func::definition(
+            input.state.card,
+            start,
+            FuncSpelling::Param,
+            input.state.auto_gnd,
+        )
+        .map_err(|error| ErrMode::Cut(Failure(error)))?;
         return Ok(ParsedCard::Func(card));
     }
     let assignments =

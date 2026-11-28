@@ -1550,6 +1550,7 @@ fn literal_expression(text: &str, value: Real, start: &SourceLoc) -> ParameterEx
         text: text.to_owned(),
         braced: false,
         quoted: false,
+        behavioural_alternative: None,
         span: span.clone(),
         root: Expr {
             kind: ExprKind::Number {
