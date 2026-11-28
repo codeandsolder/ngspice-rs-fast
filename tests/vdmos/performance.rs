@@ -166,7 +166,8 @@ fn prepared_model_circuit_stamping_throughput() {
         .unwrap();
         let solve = start.elapsed().as_secs_f64();
         let x = dc.solution.values;
-        let history = circuit.state_history();
+        let history = circuit.state_history().unwrap();
+        let prepared = circuit.prepare_run();
         let request = LoadRequest {
             mode: AnalysisMode::OperatingPoint,
             solution: &x,
@@ -184,7 +185,7 @@ fn prepared_model_circuit_stamping_throughput() {
         let mut stamp = || {
             matrix.clear();
             rhs.clear();
-            circuit
+            prepared
                 .load(&request, &mut matrix, &mut rhs, &mut trial)
                 .unwrap();
         };
