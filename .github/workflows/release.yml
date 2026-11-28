@@ -42,7 +42,7 @@ env:
 jobs:
   qualify:
     name: Check release input and dependency quarantine
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       revision: ${{ steps.source.outputs.revision }}
@@ -161,7 +161,7 @@ jobs:
     name: Attach to GitHub release
     needs: [qualify, build]
     if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.dry-run == false)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: write
