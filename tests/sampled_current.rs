@@ -190,7 +190,9 @@ fn transient_load_samples_only_its_input_iterate_and_has_no_control_tangent() ->
         let mut trial = history.trial();
         let mut a = c.new_matrix()?;
         let mut rhs = Vector::zeros(n);
-        c.load(
+        c.load_device(
+            sample,
+            c.devices()[sample].as_ref(),
             &LoadRequest {
                 mode,
                 solution: &Vector::from_slice(&x),
