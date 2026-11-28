@@ -583,7 +583,7 @@ pub(super) fn channel_inversion<S: Constitutive>(
 }
 
 /// Independent local coordinates of the abrupt charge model, in the
-/// reference source-oriented frame. The surface term is k1ox*sqrt(phi_s).
+/// reference source-oriented frame. The surface term is `k1ox*sqrt(phi_s)`.
 pub(super) struct CapZeroBias<S> {
     pub(super) gate: S,
     pub(super) body_cv: S,
