@@ -1118,3 +1118,31 @@ fn bounded_tristate_uses_declared_impedance_paths() -> SpiceResult<()> {
     assert!(samples.iter().all(|&n| n > 4), "{samples:?}");
     Ok(())
 }
+
+#[test]
+fn causal_descendants_preserve_uncertainty_through_exact_transport_and_zero_delay()
+-> SpiceResult<()> {
+    // Deliberately declare receivers in reverse signal-flow order.
+    // Exact paths need not repeat the bounded timing declaration.
+    let mut c = circuit(
+        "vd data 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 3u 0)\n\
+         a3 %d[middle] q zero\n.model zero preprocess_logic_event(operation=25 delay=0)\n\
+         a2 %d[first] middle exact\n.model exact preprocess_logic_event(operation=25 delay_paths=[5n 7n] inertial=0)\n\
+         a1 %v[data] first bounded\n.model bounded preprocess_logic_event(operation=25 delay_windows=[10n 30n 20n 40n])\n\
+         a4 q out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "3u", "0", "1n"])?;
+    let boundaries = [1.0165e-6, 1.0365e-6, 2.028e-6, 2.048e-6];
+    let mut samples = [0; 5];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        if boundaries.iter().any(|b| (t - b).abs() <= 1.1e-9) {
+            continue;
+        }
+        let region = boundaries.iter().filter(|&&b| t > b).count();
+        close(output(&plot, i), [0., 2.5, 5., 2.5, 0.][region]);
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 10), "{samples:?}");
+    Ok(())
+}

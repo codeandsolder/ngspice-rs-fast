@@ -606,6 +606,24 @@ pub(super) struct LogicKernel {
     pub(super) timing: Option<TimingContract>,
 }
 
+impl LogicKernel {
+    pub(super) fn supports_causal_transport(&self) -> bool {
+        // Zero-delay inertial scheduling has no pulse to reject. A
+        // nonzero inertial path or a separate pulse filter needs causal
+        // cancellation semantics, not an implicit transport conversion.
+        let zero = self.delays.is_zero()
+            && [self.causal.gate, self.causal.preset, self.causal.clear]
+                .into_iter()
+                .all(|d| d.is_none_or(Delays::is_zero));
+        self.pulse.is_none()
+            && (self.mode == DelayMode::Transport || zero)
+            && matches!(
+                self.operation,
+                Operation::Gate(_) | Operation::TriState(_) | Operation::Clocked { .. }
+            )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct LogicState {
     committed: Drive,

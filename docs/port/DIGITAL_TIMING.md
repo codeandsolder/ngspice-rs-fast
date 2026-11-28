@@ -278,3 +278,14 @@ accept two or six values; each secondary path has exactly one declaration.
 When both asynchronous controls assert at the same causal instant, their
 two propagation expressions are joined by latest arrival. Resistive
 loading applies independently to each declared path.
+
+An ordinary transport path downstream of bounded timing carries the
+incoming causal expression through its exact delay. Zero-delay inertial
+paths also have no nonzero rejection interval and can carry that
+expression. Reachability is computed over the flattened digital topology,
+independently of device declaration order, so unrelated scalar components
+keep their existing event path. Exact propagation preserves the scalar
+law's actual X and impedance-transition selections, rather than inventing
+an additional local interval. Nonzero inertial and explicit pulse-reject
+policies require their own causal cancellation semantics and are not
+silently converted into transport.

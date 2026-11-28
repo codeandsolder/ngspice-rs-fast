@@ -89,7 +89,6 @@ impl WindowClocked {
                 .causal
                 .preset
                 .map(WindowDelays::exact)
-                .transpose()?
                 .unwrap_or(delays),
         };
         let clear = match paths.clear {
@@ -98,7 +97,6 @@ impl WindowClocked {
                 .causal
                 .clear
                 .map(WindowDelays::exact)
-                .transpose()?
                 .unwrap_or(delays),
         };
         if paths.gate.is_some() {

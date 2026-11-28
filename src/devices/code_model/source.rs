@@ -398,7 +398,7 @@ use crate::devices::models::{PreparationKey, ResolvedModel};
 use crate::devices::{Device, ElaborationLimits};
 use crate::netlist::ast::CodeTerminal;
 use crate::primitives::{NodeAppend, NodeId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Debug)]
 struct LogicMaterial {
@@ -689,7 +689,7 @@ impl LogicMaterial {
             }
         }
         if material.window_paths.any() && material.windows.is_none() {
-            material.windows = Some(super::WindowDelays::exact(material.delays)?);
+            material.windows = Some(super::WindowDelays::exact(material.delays));
         }
         if material.windows.is_some() {
             if material.pulse.is_some() || (mode_given && material.inertial) {
@@ -1177,6 +1177,7 @@ fn bind_receiver(
     names: &mut BTreeMap<String, NetId>,
     adcs: &mut Vec<ReceiverBinding>,
     capacitances: &BTreeMap<&str, Real>,
+    causal: bool,
     limits: ElaborationLimits,
 ) -> SpiceResult<()> {
     let output = digital_net(network, names, &device.output, limits.nodes)?;
@@ -1232,6 +1233,9 @@ fn bind_receiver(
         kernel.causal = kernel.causal.with_load(load)?;
         windows = windows.map(|w| w.with_load(load)).transpose()?;
         window_paths = window_paths.with_load(load)?;
+    }
+    if causal && windows.is_none() && kernel.supports_causal_transport() {
+        windows = Some(super::WindowDelays::exact(kernel.delays));
     }
     if let Some(windows) = windows {
         match kernel.operation {
@@ -1289,6 +1293,45 @@ fn digital_capacitances(devices: &[ElaboratedDevice]) -> SpiceResult<BTreeMap<&s
     Ok(totals)
 }
 
+/// Discover causal descendants independently of netlist order. Only
+/// models with a genuine transport law (including zero-delay inertial
+/// paths) can continue an uncertain arrival expression. Keep unrelated
+/// components on their ordinary scalar path.
+fn causal_nets(devices: &[ElaboratedDevice]) -> BTreeSet<&str> {
+    let mut users = BTreeMap::<&str, Vec<&str>>::new();
+    let mut causal = BTreeSet::new();
+    let mut pending = VecDeque::new();
+    for device in devices {
+        if device.designator() != 'a' {
+            continue;
+        }
+        let Some(receiver) =
+            (device.as_ref() as &dyn std::any::Any).downcast_ref::<LogicReceiverDevice>()
+        else {
+            continue;
+        };
+        let output = receiver.output.as_str();
+        if receiver.windows.is_some() && causal.insert(output) {
+            pending.push_back(output);
+        }
+        if receiver.kernel.supports_causal_transport() {
+            for input in &receiver.inputs {
+                if let LogicInput::Digital { name, .. } = input {
+                    users.entry(name.as_str()).or_default().push(output);
+                }
+            }
+        }
+    }
+    while let Some(net) = pending.pop_front() {
+        for output in users.remove(net).into_iter().flatten() {
+            if causal.insert(output) {
+                pending.push_back(output);
+            }
+        }
+    }
+    causal
+}
+
 /// Build the fixed mixed-domain topology once after native device binding.
 /// The analog-only path never constructs a network or event state.
 pub(in crate::devices) fn mixed_topology(
@@ -1296,6 +1339,7 @@ pub(in crate::devices) fn mixed_topology(
     limits: ElaborationLimits,
 ) -> SpiceResult<Option<NativeTopology>> {
     let capacitances = digital_capacitances(devices)?;
+    let causal = causal_nets(devices);
     let mut topology = None;
     for device in devices {
         if device.designator() != 'a' {
@@ -1317,7 +1361,18 @@ pub(in crate::devices) fn mixed_topology(
             Vec<AnalogOutputBinding>,
         ) = topology.get_or_insert_with(Default::default);
         if let Some(receiver) = receiver {
-            bind_receiver(receiver, network, names, adcs, &capacitances, limits)?;
+            let has_causal_input = receiver.inputs.iter().any(|input| {
+                matches!(input, LogicInput::Digital { name,.. } if causal.contains(name.as_str()))
+            });
+            bind_receiver(
+                receiver,
+                network,
+                names,
+                adcs,
+                &capacitances,
+                has_causal_input,
+                limits,
+            )?;
         }
         if let Some(device) = range {
             if adcs.len() >= limits.state_slots {

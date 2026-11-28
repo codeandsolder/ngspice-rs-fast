@@ -276,6 +276,16 @@ impl Delays {
         }
     }
 
+    pub(super) fn is_zero(self) -> bool {
+        self.rise == 0.
+            && self.fall == 0.
+            && self.impedance.is_none_or(|p| {
+                [p.low_to_z, p.high_to_z, p.z_to_low, p.z_to_high]
+                    .into_iter()
+                    .all(|d| d == 0.)
+            })
+    }
+
     /// Select the physical transition using both logic and drive strength.
     /// An unknown endpoint of an explicitly specified Z path uses the later
     /// of its two possible known transitions. Ordinary XSPICE rise/fall

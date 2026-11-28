@@ -14,48 +14,44 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Directional inclusive propagation intervals.
 #[derive(Clone, Copy, Debug)]
-pub struct WindowDelays {
-    rise: DelayWindow,
-    fall: DelayWindow,
-    impedance: Option<[DelayWindow; 4]>,
+pub struct WindowDelays(WindowDelayLaw);
+
+#[derive(Clone, Copy, Debug)]
+enum WindowDelayLaw {
+    Exact(Delays),
+    Bounded {
+        rise: DelayWindow,
+        fall: DelayWindow,
+        impedance: Option<[DelayWindow; 4]>,
+    },
 }
 
 impl WindowDelays {
     /// Binary rise and fall intervals.
     #[must_use = "the intervals define the propagation law"]
     pub const fn binary(rise: DelayWindow, fall: DelayWindow) -> Self {
-        Self {
+        Self(WindowDelayLaw::Bounded {
             rise,
             fall,
             impedance: None,
-        }
+        })
     }
 
     /// LH, HL, LZ, HZ, ZL, ZH intervals.
     #[must_use = "the intervals define the directional propagation law"]
     pub const fn paths(paths: [DelayWindow; 6]) -> Self {
         let [rise, fall, lz, hz, zl, zh] = paths;
-        Self {
+        Self(WindowDelayLaw::Bounded {
             rise,
             fall,
             impedance: Some([lz, hz, zl, zh]),
-        }
+        })
     }
 
-    pub(super) fn exact(delays: Delays) -> SpiceResult<Self> {
-        let exact = |value| DelayWindow::new(value, value);
-        Ok(if let Some(p) = delays.impedance {
-            Self::paths([
-                exact(delays.rise)?,
-                exact(delays.fall)?,
-                exact(p.low_to_z)?,
-                exact(p.high_to_z)?,
-                exact(p.z_to_low)?,
-                exact(p.z_to_high)?,
-            ])
-        } else {
-            Self::binary(exact(delays.rise)?, exact(delays.fall)?)
-        })
+    /// Transport an upstream arrival using the declared scalar propagation
+    /// law, including its exact unknown-state and impedance selection.
+    pub(super) const fn exact(delays: Delays) -> Self {
+        Self(WindowDelayLaw::Exact(delays))
     }
 
     fn envelope(a: DelayWindow, b: DelayWindow) -> SpiceResult<DelayWindow> {
@@ -66,7 +62,18 @@ impl WindowDelays {
     }
 
     pub(super) fn transition(self, from: Drive, to: Drive) -> SpiceResult<DelayWindow> {
-        if let Some([lz, hz, zl, zh]) = self.impedance {
+        let (rise, fall, impedance) = match self.0 {
+            WindowDelayLaw::Exact(delays) => {
+                let d = delays.transition(from, to);
+                return DelayWindow::new(d, d);
+            }
+            WindowDelayLaw::Bounded {
+                rise,
+                fall,
+                impedance,
+            } => (rise, fall, impedance),
+        };
+        if let Some([lz, hz, zl, zh]) = impedance {
             match (
                 from.strength == Strength::HIGH_IMPEDANCE,
                 to.strength == Strength::HIGH_IMPEDANCE,
@@ -90,37 +97,47 @@ impl WindowDelays {
             }
         }
         match to.logic {
-            Logic::One => Ok(self.rise),
-            Logic::Zero => Ok(self.fall),
+            Logic::One => Ok(rise),
+            Logic::Zero => Ok(fall),
             _ => match from.logic {
-                Logic::Zero => Ok(self.rise),
-                Logic::One => Ok(self.fall),
-                _ => Self::envelope(self.rise, self.fall),
+                Logic::Zero => Ok(rise),
+                Logic::One => Ok(fall),
+                _ => Self::envelope(rise, fall),
             },
         }
     }
 
     pub(super) fn with_load(self, load: [Real; 3]) -> SpiceResult<Self> {
+        let (rise, fall, impedance) = match self.0 {
+            WindowDelayLaw::Exact(delays) => return Ok(Self::exact(delays.with_load(load)?)),
+            WindowDelayLaw::Bounded {
+                rise,
+                fall,
+                impedance,
+            } => (rise, fall, impedance),
+        };
         let add = |window: DelayWindow, extra: Real| {
             let b = window.bounds();
             let endpoint = |value| if value == 0. { 0. } else { value + extra };
             DelayWindow::new(endpoint(b.minimum()), endpoint(b.maximum()))
         };
-        Ok(Self {
-            rise: add(self.rise, load[1])?,
-            fall: add(self.fall, load[0])?,
-            impedance: self
-                .impedance
-                .map(|[lz, hz, zl, zh]| -> SpiceResult<_> {
-                    Ok([
-                        add(lz, load[2])?,
-                        add(hz, load[2])?,
-                        add(zl, load[0])?,
-                        add(zh, load[1])?,
-                    ])
-                })
-                .transpose()?,
-        })
+        let rise = add(rise, load[1])?;
+        let fall = add(fall, load[0])?;
+        let impedance = impedance
+            .map(|[lz, hz, zl, zh]| -> SpiceResult<_> {
+                Ok([
+                    add(lz, load[2])?,
+                    add(hz, load[2])?,
+                    add(zl, load[0])?,
+                    add(zh, load[1])?,
+                ])
+            })
+            .transpose()?;
+        Ok(Self(WindowDelayLaw::Bounded {
+            rise,
+            fall,
+            impedance,
+        }))
     }
 }
 
@@ -576,5 +593,39 @@ impl CodeModel for WindowGate {
         };
         Self::remember(state, inputs, next, target);
         Ok(vec![result])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_window_paths_preserve_scalar_selection_for_every_drive_pair() -> SpiceResult<()> {
+        // In particular, actual X->Z and Z->X select the later scalar
+        // impedance path, not a new bounded interval.
+        let drives = [
+            Drive::strong(Logic::Zero),
+            Drive::strong(Logic::One),
+            Drive::strong(Logic::Unknown),
+            Drive::strong(Logic::Rising),
+            Drive::strong(Logic::Falling),
+            Drive::default(),
+        ];
+        for scalar in [
+            Delays::new(1., 2.)?,
+            Delays::paths([1., 2., 3., 4., 5., 6.])?,
+        ] {
+            let loaded = scalar.with_load([0.25, 0.5, 0.75])?;
+            let windows = WindowDelays::exact(scalar).with_load([0.25, 0.5, 0.75])?;
+            for from in drives {
+                for to in drives {
+                    let bounds = windows.transition(from, to)?.bounds();
+                    let expected = loaded.transition(from, to);
+                    assert_eq!((bounds.minimum(), bounds.maximum()), (expected, expected));
+                }
+            }
+        }
+        Ok(())
     }
 }
