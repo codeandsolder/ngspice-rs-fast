@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
+use ngspice_rs::analysis::{AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{AnalysisMode, Circuit, IterationPhase, LoadRequest, ModelContext};
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::{Parser, source::parse_deck_text};
@@ -20,9 +20,14 @@ fn circuit(body: &str) -> SpiceResult<Circuit> {
 }
 
 fn run(body: &str, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
-    AnalysisInput::with_arguments(kind, args.iter().copied())
-        .resolve()?
-        .run(&mut circuit(body)?, &AnalysisContext::default())
+    let netlist = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("prepared-switch.cir"),
+        &format!("prepared switch\n{body}\n.end\n"),
+    ))?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    config
+        .plan(AnalysisInput::with_arguments(kind, args.iter().copied()))?
+        .run(&mut config.circuit(&netlist)?, &config.context())
 }
 
 fn close(label: &str, actual: f64, expected: f64, rel: f64, absolute: f64) {
