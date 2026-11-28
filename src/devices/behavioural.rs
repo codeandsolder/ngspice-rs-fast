@@ -321,6 +321,7 @@ impl Behavioural {
                 },
                 &variables,
                 context.time,
+                context.output.guards.is_some(),
             )
             .map_err(|error| self.evaluation_error(error))?;
         Ok((result, columns))
@@ -471,6 +472,13 @@ impl Device for Behavioural {
     /// B sources before parsing.
     fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
         crate::devices::setup::CDeviceType::Asrc
+    }
+
+    fn physical_terminal_current(&self, states: &[Real], branches: &[Real]) -> Option<Real> {
+        match self.output {
+            BehaviouralOutput::Voltage => branches.first().copied(),
+            BehaviouralOutput::Current => states.first().copied(),
+        }
     }
 
     /// One trial slot: the physical output at the last load.
@@ -758,7 +766,11 @@ impl Device for Behavioural {
         context: &mut crate::devices::physical_dae::TaylorContext<'_>,
     ) -> SpiceResult<()> {
         let (evaluation, columns) = self.bound_taylor(context)?;
+        if let Some(trace) = &mut context.output.guards {
+            trace.extend(context.device, evaluation.guards)?;
+        }
         let factor = self.checked_factor(context.model.temperature)?;
+        context.candidate_state(0, factor * evaluation.value.coefficients()[0])?;
         let p = context.unknowns.node_row(self.terminals[0]);
         let n = context.unknowns.node_row(self.terminals[1]);
         let outputs = match self.output {

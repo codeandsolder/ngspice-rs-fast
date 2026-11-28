@@ -422,3 +422,38 @@ limits, including under UIC. Remaining higher-order model kernels and
 behavioural branch-event localization are tracked in #242 and #241.
 Broader reference coverage and numerical golden validation remain ongoing. Static statistical realization is documented in
 [PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md).
+
+### Behavioural branch events in physical derivative-array transients
+
+Physical Taylor evaluation retains the executed branch choices at the final
+converged trial point. Device ordinals, compiled instruction slots, and
+operand discriminators identify guards; unexecuted conditional branches do
+not contribute. Adjacent boundaries in guard-operand coordinates are
+prepared from the same piecewise laws used by value/derivative evaluation.
+The local Taylor polynomial proposes inspection times; a linear fast path
+and bounded Bernstein subdivision can detect candidate roots even when the
+two endpoint signs would agree. A backward endpoint germ supplies additional
+interior inspection hints.
+
+A changed branch trace causes disposable trial solves against the original
+accepted history. A representable crossing can be confirmed from its two
+one-sided germs, otherwise the changed and unchanged states are bracketed
+to adjacent representable times. At the right boundary the original
+physical and derived-storage continuity constraints must hold, and the
+integration history restarts only after successful acceptance. The derived
+storage increment is also checked against the endpoint-rate envelope:
+zero endpoint derivatives alone cannot establish continuity. An inconsistent
+increment requests refinement, not an extra constitutive constraint.
+
+The physical one-sided algebraic source outputs are retained in candidate
+state and used directly for instantaneous current observations. In
+particular, a scalar conditional selected only at equality must not
+invalidate an otherwise well-defined one-sided germ.
+
+This is numerical event localization, not a certificate of every zero of an
+arbitrary function over a finite interval. Finite Taylor order and the
+chosen step control the resolution; locally invisible or arbitrarily rapid
+oscillations can require a smaller maximum step. Root subdivision and
+disposable solves are bounded; an unresolved discontinuity or exhausted
+work budget must fail rather than publish speculative history. Adjacent
+representable times are not merged using the analog breakpoint tolerance.

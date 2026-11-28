@@ -509,6 +509,8 @@ pub(in crate::analysis::initial) struct RightLimit {
     pub charge: Vector,
     pub charge_rate: Vector,
     pub order_hint: usize,
+    pub guards: crate::devices::physical_dae::BranchTrace,
+    pub candidate_states: Vec<(usize, Real)>,
 }
 
 #[derive(Clone, Copy)]
@@ -639,14 +641,14 @@ fn newton(
 }
 
 pub(in crate::analysis::initial) enum SolveOutcome {
-    Converged(RightLimit),
+    Converged(Box<RightLimit>),
     NotConverged { last: Vector, reason: String },
 }
 
 impl SolveOutcome {
     fn require(self) -> SpiceResult<RightLimit> {
         match self {
-            Self::Converged(right) => Ok(right),
+            Self::Converged(right) => Ok(*right),
             Self::NotConverged { reason, .. } => Err(failure(reason)),
         }
     }
@@ -788,7 +790,8 @@ fn solve(
             if local.prefix_rank(dae, &state)? != rank {
                 continue;
             }
-            let point = local.evaluate(dae, &state)?;
+            let point =
+                dae.evaluate_taylor_with_guards(&state, local.time, local.scale, local.limit)?;
             let to_rate = |vector: &Vector| {
                 Vector::from_slice(
                     &vector
@@ -798,7 +801,7 @@ fn solve(
                         .collect::<Vec<_>>(),
                 )
             };
-            return Ok(SolveOutcome::Converged(RightLimit {
+            return Ok(SolveOutcome::Converged(Box::new(RightLimit {
                 state: state[0].clone(),
                 rate: to_rate(&state[1]),
                 charge: point.charge[0].clone(),
@@ -806,7 +809,9 @@ fn solve(
                 // The two extra orders were rank/affine lookahead checks;
                 // retain a lower bound so the next trial still repeats them.
                 order_hint: state.len().saturating_sub(3).max(2),
-            }));
+                guards: point.guards.unwrap_or_default(),
+                candidate_states: point.candidate_states,
+            })));
         }
     }
 }

@@ -1202,7 +1202,7 @@ impl RunConfig {
     pub fn prepared_circuit(
         &self,
         netlist: &Netlist,
-        waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+        declarations: crate::devices::subckt::PreparedDeclarations<'_>,
     ) -> SpiceResult<Circuit> {
         Circuit::from_prepared_netlist_with_limits(
             netlist,
@@ -1210,7 +1210,7 @@ impl RunConfig {
             crate::devices::MutualLimits::default(),
             crate::devices::ElaborationLimits::default(),
             self.params.clone(),
-            waveforms,
+            declarations,
         )
     }
 

@@ -22,6 +22,7 @@ pub struct XspicePwl {
     y: Vec<Real>,
     fraction: Real,
     midpoints: Vec<Real>,
+    boundaries: Vec<Real>,
 }
 
 impl XspicePwl {
@@ -58,15 +59,25 @@ impl XspicePwl {
         }
         x.push(mirrored_abscissa(points[n - 1].0, points[n - 2].0));
         y.push(points[n - 1].1);
-        let midpoints = x
+        let midpoints: Vec<_> = x
             .windows(2)
             .map(|pair| reference_midpoint(pair[0], pair[1]))
             .collect();
+        // Only smoothing edges change the physical polynomial. The
+        // midpoint search can switch between equivalent affine segments.
+        let mut boundaries = Vec::with_capacity(2 * n);
+        for i in 1..x.len() - 1 {
+            let domain = fraction * (x[i] - x[i - 1]).min(x[i + 1] - x[i]);
+            boundaries.extend([x[i] - domain, x[i] + domain]);
+        }
+        boundaries.sort_by(Real::total_cmp);
+        boundaries.dedup_by(|a, b| (*a).partial_cmp(&*b) == Some(std::cmp::Ordering::Equal));
         Ok(Self {
             x,
             y,
             fraction,
             midpoints,
+            boundaries,
         })
     }
 
@@ -76,6 +87,10 @@ impl XspicePwl {
         let (value, slope, _) =
             self.local_polynomial(input, |boundary| input.partial_cmp(&boundary));
         (value, slope)
+    }
+
+    pub(super) fn boundaries(&self) -> &[Real] {
+        &self.boundaries
     }
 
     /// Value, first derivative and quadratic coefficient of the selected

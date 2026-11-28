@@ -539,7 +539,13 @@ R4 bb 0 100
     }
     let deck = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
     let config = RunConfig::from_netlist(&deck)?;
-    let mut c = config.prepared_circuit(&deck, &bundle.waveforms)?;
+    let mut c = config.prepared_circuit(
+        &deck,
+        ngspice_rs::devices::subckt::PreparedDeclarations {
+            waveforms: &bundle.waveforms,
+            pwl_resistors: &bundle.pwl_resistors,
+        },
+    )?;
     let op =
         AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
             .resolve()?

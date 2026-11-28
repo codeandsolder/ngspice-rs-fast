@@ -394,6 +394,14 @@ impl Device for Passive {
     fn depends_on_frequency(&self) -> bool {
         self.expression.depends_on_frequency()
     }
+    fn physical_terminal_current(&self, _states: &[Real], branches: &[Real]) -> Option<Real> {
+        if self.law == Law::Derivative {
+            None
+        } else {
+            branches.first().copied()
+        }
+    }
+
     fn state_count(&self) -> usize {
         if self.law.storage() { 2 } else { 0 }
     }
@@ -782,6 +790,9 @@ impl Device for Passive {
             context.linear_static(columns[1], Some(branch), -1.)?;
         }
         let (evaluation, controls) = self.expression.bound_taylor(context)?;
+        if let Some(trace) = &mut context.output.guards {
+            trace.extend(context.device, evaluation.guards)?;
+        }
         let factor = self.expression.checked_factor(context.model.temperature)?;
         let (linear, multiplier) = self.law.constitutive();
         for (&column, coefficient) in columns.iter().zip(linear) {
