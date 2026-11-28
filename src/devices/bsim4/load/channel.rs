@@ -43,7 +43,8 @@ use super::{
 };
 
 use crate::devices::bsim_physics::{
-    effective_overdrive, poly_depletion, rational_floor, reciprocal_floor,
+    channel_conductance, effective_overdrive, impact_ionization, poly_depletion, rational_floor,
+    reciprocal_floor, saturation_shape, series_conductance, substrate_early_voltage,
 };
 use crate::primitives::SpiceResult;
 
@@ -519,7 +520,6 @@ pub(super) fn transport(
     let mut dT2_dVb: f64;
     let mut T3: f64;
     let mut dT3_dVg: f64;
-    let mut dT3_dVd: f64;
     let mut dT3_dVb: f64;
     let mut T4: f64;
     let mut T5: f64;
@@ -593,17 +593,6 @@ pub(super) fn transport(
     let mut dbeta_dVd: f64;
     let mut dbeta_dVb: f64;
     let mut gche: f64;
-    let mut dgche_dVg: f64;
-    let mut dgche_dVd: f64;
-    let mut dgche_dVb: f64;
-    let mut fgche1: f64;
-    let mut dfgche1_dVg: f64;
-    let mut dfgche1_dVd: f64;
-    let mut dfgche1_dVb: f64;
-    let mut fgche2: f64;
-    let mut dfgche2_dVg: f64;
-    let mut dfgche2_dVd: f64;
-    let mut dfgche2_dVb: f64;
     let mut Idl: f64;
     let mut dIdl_dVg: f64;
     let mut dIdl_dVd: f64;
@@ -853,22 +842,7 @@ pub(super) fn transport(
     dEsatL_dVg = T0 * dueff_dVg;
     dEsatL_dVd = T0 * dueff_dVd;
     dEsatL_dVb = T0 * dueff_dVb;
-    a1 = pParam.a1;
-    if a1 == 0.0 {
-        Lambda = pParam.a2;
-        dLambda_dVg = 0.0;
-    } else if a1 > 0.0 {
-        T0 = 1.0 - pParam.a2;
-        T1 = T0 - pParam.a1 * Vgsteff - 0.0001;
-        T2 = sqrt(T1 * T1 + 0.0004 * T0);
-        Lambda = pParam.a2 + T0 - 0.5 * (T1 + T2);
-        dLambda_dVg = 0.5 * pParam.a1 * (1.0 + T1 / T2);
-    } else {
-        T1 = pParam.a2 + pParam.a1 * Vgsteff - 0.0001;
-        T2 = sqrt(T1 * T1 + 0.0004 * pParam.a2);
-        Lambda = 0.5 * (T1 + T2);
-        dLambda_dVg = 0.5 * pParam.a1 * (1.0 + T1 / T2);
-    }
+    (Lambda, dLambda_dVg) = saturation_shape(&Vgsteff, pParam.a1, pParam.a2)?;
     Vgst2Vtm = Vgsteff + 2.0 * Vtm;
     if Rds > 0.0 {
         tmp2 = dRds_dVg / Rds + dWeff_dVg / Weff;
@@ -1007,31 +981,18 @@ pub(super) fn transport(
     dbeta_dVd = CoxeffWovL * dueff_dVd;
     dbeta_dVb = CoxeffWovL * dueff_dVb + T3 * Coxeff * dWeff_dVb;
     here.AbovVgst2Vtm = Abulk / Vgst2Vtm;
-    T0 = 1.0 - 0.5 * Vdseff * here.AbovVgst2Vtm;
-    dT0_dVg =
-        -0.5 * (Abulk * dVdseff_dVg - Abulk * Vdseff / Vgst2Vtm + Vdseff * dAbulk_dVg) / Vgst2Vtm;
-    dT0_dVd = -0.5 * Abulk * dVdseff_dVd / Vgst2Vtm;
-    dT0_dVb = -0.5 * (Abulk * dVdseff_dVb + dAbulk_dVb * Vdseff) / Vgst2Vtm;
-    fgche1 = Vgsteff * T0;
-    dfgche1_dVg = Vgsteff * dT0_dVg + T0;
-    dfgche1_dVd = Vgsteff * dT0_dVd;
-    dfgche1_dVb = Vgsteff * dT0_dVb;
-    T9 = Vdseff / EsatL;
-    fgche2 = 1.0 + T9;
-    dfgche2_dVg = (dVdseff_dVg - T9 * dEsatL_dVg) / EsatL;
-    dfgche2_dVd = (dVdseff_dVd - T9 * dEsatL_dVd) / EsatL;
-    dfgche2_dVb = (dVdseff_dVb - T9 * dEsatL_dVb) / EsatL;
-    gche = beta * fgche1 / fgche2;
-    dgche_dVg = (beta * dfgche1_dVg + fgche1 * dbeta_dVg - gche * dfgche2_dVg) / fgche2;
-    dgche_dVd = (beta * dfgche1_dVd + fgche1 * dbeta_dVd - gche * dfgche2_dVd) / fgche2;
-    dgche_dVb = (beta * dfgche1_dVb + fgche1 * dbeta_dVb - gche * dfgche2_dVb) / fgche2;
-    T0 = 1.0 + gche * Rds;
-    Idl = gche / T0;
-    T1 = (1.0 / T0) / T0;
-    T2 = Idl * Idl;
-    dIdl_dVg = T1 * dgche_dVg - T2 * dRds_dVg;
-    dIdl_dVd = T1 * dgche_dVd;
-    dIdl_dVb = T1 * dgche_dVb - T2 * dRds_dVb;
+    let channel = channel_conductance(&Vgsteff, &Abulk, &Vdseff, &EsatL, &beta, Vtm)?;
+    let [dg, dd, db] = channel.project(&[
+        [1., 0., 0.],
+        [dAbulk_dVg, 0., dAbulk_dVb],
+        [dVdseff_dVg, dVdseff_dVd, dVdseff_dVb],
+        [dEsatL_dVg, dEsatL_dVd, dEsatL_dVb],
+        [dbeta_dVg, dbeta_dVd, dbeta_dVb],
+    ]);
+    gche = channel.value;
+    let series = series_conductance(&gche, &Rds)?;
+    [dIdl_dVg, dIdl_dVd, dIdl_dVb] = series.project(&[[dg, dd, db], [dRds_dVg, 0., dRds_dVb]]);
+    Idl = series.value;
     if pParam.fprout <= 0.0 {
         FP = 1.0;
         dFP_dVg = 0.0;
@@ -1128,26 +1089,17 @@ pub(super) fn transport(
         dVADITS_dVd = 0.0;
         dVADITS_dVg = dVADITS_dVd;
     }
-    if (pParam.pscbe2 > 0.0) && (pParam.pscbe1 >= 0.0) {
-        if diffVds > pParam.pscbe1 * pParam.litl / EXP_THRESHOLD {
-            T0 = pParam.pscbe1 * pParam.litl / diffVds;
-            VASCBE = Leff * exp(T0) / pParam.pscbe2;
-            T1 = T0 * VASCBE / diffVds;
-            dVASCBE_dVg = T1 * dVdseff_dVg;
-            dVASCBE_dVd = -T1 * (1.0 - dVdseff_dVd);
-            dVASCBE_dVb = T1 * dVdseff_dVb;
-        } else {
-            VASCBE = MAX_EXP * Leff / pParam.pscbe2;
-            dVASCBE_dVb = 0.0;
-            dVASCBE_dVd = dVASCBE_dVb;
-            dVASCBE_dVg = dVASCBE_dVd;
-        }
-    } else {
-        VASCBE = MAX_EXP;
-        dVASCBE_dVb = 0.0;
-        dVASCBE_dVd = dVASCBE_dVb;
-        dVASCBE_dVg = dVASCBE_dVd;
-    }
+    let (value, slope) = substrate_early_voltage(
+        &diffVds,
+        Leff,
+        pParam.pscbe1 * pParam.litl,
+        pParam.pscbe2,
+        pParam.pscbe2 > 0. && pParam.pscbe1 >= 0.,
+    )?;
+    VASCBE = value;
+    dVASCBE_dVg = -slope * dVdseff_dVg;
+    dVASCBE_dVd = slope * (1. - dVdseff_dVd);
+    dVASCBE_dVb = -slope * dVdseff_dVb;
     T9 = diffVds / VADIBL;
     T0 = 1.0 + T9;
     Idsa = Idl * T0;
@@ -1180,21 +1132,11 @@ pub(super) fn transport(
         Gbd = Gbb;
         Isub = Gbd;
     } else {
-        T2 = tmp / Leff;
-        if diffVds > pParam.beta0 / EXP_THRESHOLD {
-            T0 = -pParam.beta0 / diffVds;
-            T1 = T2 * diffVds * exp(T0);
-            T3 = T1 / diffVds * (T0 - 1.0);
-            dT1_dVg = T3 * dVdseff_dVg;
-            dT1_dVd = T3 * (dVdseff_dVd - 1.0);
-            dT1_dVb = T3 * dVdseff_dVb;
-        } else {
-            T3 = T2 * MIN_EXP;
-            T1 = T3 * diffVds;
-            dT1_dVg = -T3 * dVdseff_dVg;
-            dT1_dVd = T3 * (1.0 - dVdseff_dVd);
-            dT1_dVb = -T3 * dVdseff_dVb;
-        }
+        let (value, slope) = impact_ionization(&diffVds, tmp / Leff, pParam.beta0)?;
+        T1 = value;
+        dT1_dVg = -slope * dVdseff_dVg;
+        dT1_dVd = slope * (1. - dVdseff_dVd);
+        dT1_dVb = -slope * dVdseff_dVb;
         T4 = Idsa * Vdseff;
         Isub = T1 * T4;
         Gbg = T1 * (dIdsa_dVg * Vdseff + Idsa * dVdseff_dVg) + T4 * dT1_dVg;

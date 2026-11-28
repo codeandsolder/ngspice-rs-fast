@@ -22,7 +22,9 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use crate::devices::bsim_physics::{
-    SaturationRoot, bsim3_junction, poly_depletion, rational_floor, reciprocal_floor, smooth_drain,
+    SaturationRoot, bsim3_junction, channel_conductance, impact_ionization, poly_depletion,
+    rational_floor, reciprocal_floor, saturation_shape, series_conductance, smooth_drain,
+    substrate_early_voltage,
 };
 use crate::primitives::{Real, SpiceResult};
 
@@ -499,23 +501,7 @@ impl DcModel<'_> {
         let desatl_dvd = t0e * dueff_dvd;
         let desatl_dvb = t0e * dueff_dvb;
 
-        let a1v = p.binned.a1;
-        let a2v = p.binned.a2;
-        let (lambda, dlambda_dvg) = if a1v == 0.0 {
-            (a2v, 0.0)
-        } else if a1v > 0.0 {
-            let t0 = 1.0 - a2v;
-            let t1 = a1v.mul_add(-vgsteff, t0) - 0.0001;
-            let t2 = 0.0004f64.mul_add(t0, t1 * t1).sqrt();
-            (
-                a2v + t0 - f64::midpoint(t1, t2),
-                0.5 * a1v * (1.0 + t1 / t2),
-            )
-        } else {
-            let t1 = a1v.mul_add(vgsteff, a2v) - 0.0001;
-            let t2 = 0.0004f64.mul_add(a2v, t1 * t1).sqrt();
-            (f64::midpoint(t1, t2), 0.5 * a1v * (1.0 + t1 / t2))
-        };
+        let (lambda, dlambda_dvg) = saturation_shape(&vgsteff, p.binned.a1, p.binned.a2)?;
 
         let vgst2vtm = 2.0f64.mul_add(vtm, vgsteff);
         let abulk_over_vgst2vtm = abulk / vgst2vtm;
@@ -700,23 +686,16 @@ impl DcModel<'_> {
         let dva_dvd = f64::mul_add(t0a, dt1_dvd, f64::mul_add(t1a, dt0_dvd, dvasat_dvd));
         let dva_dvb = f64::mul_add(t0a, dt1_dvb, f64::mul_add(t1a, dt0_dvb, dvasat_dvb));
 
-        let (vascbe, dvascbe_dvg, dvascbe_dvd, dvascbe_dvb) = if p.binned.pscbe2 > 0.0 {
-            if diff_vds > p.binned.pscbe1 * p.derived.litl / EXP_THRESHOLD {
-                let t0 = p.binned.pscbe1 * p.derived.litl / diff_vds;
-                let vascbe = leff * t0.exp() / p.binned.pscbe2;
-                let t1 = t0 * vascbe / diff_vds;
-                (
-                    vascbe,
-                    t1 * dvdseff_dvg,
-                    -t1 * (1.0 - dvdseff_dvd),
-                    t1 * dvdseff_dvb,
-                )
-            } else {
-                (MAX_EXP * leff / p.binned.pscbe2, 0.0, 0.0, 0.0)
-            }
-        } else {
-            (MAX_EXP, 0.0, 0.0, 0.0)
-        };
+        let (vascbe, slope) = substrate_early_voltage(
+            &diff_vds,
+            leff,
+            p.binned.pscbe1 * p.derived.litl,
+            p.binned.pscbe2,
+            p.binned.pscbe2 > 0.,
+        )?;
+        let dvascbe_dvg = -slope * dvdseff_dvg;
+        let dvascbe_dvd = slope * (1. - dvdseff_dvd);
+        let dvascbe_dvb = -slope * dvdseff_dvb;
 
         // Drain current and its derivatives.
         let coxwovl = cox * weff / leff;
@@ -725,43 +704,20 @@ impl DcModel<'_> {
         let dbeta_dvd = coxwovl * dueff_dvd;
         let dbeta_dvb = coxwovl.mul_add(dueff_dvb, beta * dweff_dvb / weff);
 
-        let t0 = 1.0 - 0.5 * abulk * vdseff / vgst2vtm;
-        let dt0_dvg =
-            -0.5 * f64::mul_add(
-                vdseff,
-                dabulk_dvg,
-                abulk.mul_add(dvdseff_dvg, -(abulk * vdseff / vgst2vtm)),
-            ) / vgst2vtm;
-        let dt0_dvd = -0.5 * abulk * dvdseff_dvd / vgst2vtm;
-        let dt0_dvb = -0.5 * dabulk_dvb.mul_add(vdseff, abulk * dvdseff_dvb) / vgst2vtm;
-
-        let fgche1 = vgsteff * t0;
-        let dfgche1_dvg = f64::mul_add(vgsteff, dt0_dvg, t0);
-        let dfgche1_dvd = vgsteff * dt0_dvd;
-        let dfgche1_dvb = vgsteff * dt0_dvb;
-
-        let t9f = vdseff / esatl;
-        let fgche2 = 1.0 + t9f;
-        let dfgche2_dvg = t9f.mul_add(-desatl_dvg, dvdseff_dvg) / esatl;
-        let dfgche2_dvd = t9f.mul_add(-desatl_dvd, dvdseff_dvd) / esatl;
-        let dfgche2_dvb = t9f.mul_add(-desatl_dvb, dvdseff_dvb) / esatl;
-
-        let gche = beta * fgche1 / fgche2;
-        let dgche_dvg =
-            gche.mul_add(-dfgche2_dvg, fgche1.mul_add(dbeta_dvg, beta * dfgche1_dvg)) / fgche2;
-        let dgche_dvd =
-            gche.mul_add(-dfgche2_dvd, fgche1.mul_add(dbeta_dvd, beta * dfgche1_dvd)) / fgche2;
-        let dgche_dvb =
-            gche.mul_add(-dfgche2_dvb, fgche1.mul_add(dbeta_dvb, beta * dfgche1_dvb)) / fgche2;
-
-        let t0i = gche.mul_add(rds, 1.0);
-        let t9i = vdseff / t0i;
-        let idl = gche * t9i;
-        let didl_dvg =
-            (idl * gche / t0i).mul_add(-drds_dvg, t9i.mul_add(dgche_dvg, gche * dvdseff_dvg) / t0i);
-        let didl_dvd = t9i.mul_add(dgche_dvd, gche * dvdseff_dvd) / t0i;
-        let didl_dvb =
-            (idl * drds_dvb).mul_add(-gche, t9i.mul_add(dgche_dvb, gche * dvdseff_dvb)) / t0i;
+        let channel = channel_conductance(&vgsteff, &abulk, &vdseff, &esatl, &beta, vtm)?;
+        let [dg, dd, db] = channel.project(&[
+            [1., 0., 0.],
+            [dabulk_dvg, 0., dabulk_dvb],
+            [dvdseff_dvg, dvdseff_dvd, dvdseff_dvb],
+            [desatl_dvg, desatl_dvd, desatl_dvb],
+            [dbeta_dvg, dbeta_dvd, dbeta_dvb],
+        ]);
+        let series = series_conductance(&channel.value, &rds)?;
+        let [sg, sd, sb] = series.project(&[[dg, dd, db], [drds_dvg, 0., drds_dvb]]);
+        let idl = series.value * vdseff;
+        let didl_dvg = series.value.mul_add(dvdseff_dvg, sg * vdseff);
+        let didl_dvd = series.value.mul_add(dvdseff_dvd, sd * vdseff);
+        let didl_dvb = series.value.mul_add(dvdseff_dvb, sb * vdseff);
 
         let t9s = diff_vds / va;
         let t0s = 1.0 + t9s;
@@ -802,26 +758,10 @@ impl DcModel<'_> {
         let (isub, gbgs, gbds, gbbs) = if tmp <= 0.0 || p.binned.beta0 <= 0.0 {
             (0.0, 0.0, 0.0, 0.0)
         } else {
-            let t2 = tmp / leff;
-            let (t1, dt1_dvg, dt1_dvd, dt1_dvb) = if diff_vds > p.binned.beta0 / EXP_THRESHOLD {
-                let t0 = -p.binned.beta0 / diff_vds;
-                let t1 = t2 * diff_vds * t0.exp();
-                let t3 = t1 / diff_vds * (t0 - 1.0);
-                (
-                    t1,
-                    t3 * dvdseff_dvg,
-                    t3 * (dvdseff_dvd - 1.0),
-                    t3 * dvdseff_dvb,
-                )
-            } else {
-                let t3 = t2 * MIN_EXP;
-                (
-                    t3 * diff_vds,
-                    -t3 * dvdseff_dvg,
-                    t3 * (1.0 - dvdseff_dvd),
-                    -t3 * dvdseff_dvb,
-                )
-            };
+            let (t1, slope) = impact_ionization(&diff_vds, tmp / leff, p.binned.beta0)?;
+            let dt1_dvg = -slope * dvdseff_dvg;
+            let dt1_dvd = slope * (1. - dvdseff_dvd);
+            let dt1_dvb = -slope * dvdseff_dvb;
             let isub = t1 * idsa;
             let mut gbg = idsa.mul_add(dt1_dvg, t1 * didsa_dvg);
             let mut gbd = idsa.mul_add(dt1_dvd, t1 * didsa_dvd);
