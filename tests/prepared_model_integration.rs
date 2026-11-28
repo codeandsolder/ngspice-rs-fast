@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use model_kernel_api::batch::{BatchOutput, PreparedTile};
+use model_kernel_api::trial::TrialCapabilities;
 use model_kernel_api::{
     ABI_VERSION, Artifact, Binding, Capability, Descriptor, Equation, EquationKind, Error, Kernel,
     Parameter, Point,
@@ -154,6 +155,7 @@ fn descriptor(charge: Capability) -> Descriptor {
             .collect(),
         charge,
         noise: Capability::Computed,
+        trial: TrialCapabilities::ENGINE,
     }
 }
 
@@ -946,6 +948,7 @@ fn electrothermal_descriptor() -> Descriptor {
         .collect(),
         charge: Capability::Computed,
         noise: Capability::Zero,
+        trial: TrialCapabilities::ENGINE,
     }
 }
 
