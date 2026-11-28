@@ -13,6 +13,7 @@ use crate::analysis::RunConfig;
 use crate::analysis::sens::{PhysicalParameter, conditioned_derivative};
 use crate::devices::circuit::{CandidateNumericOverride, Circuit};
 use crate::devices::models::ModelContext;
+use crate::devices::subckt::PreparedDeclarations;
 use crate::devices::sweep::InstanceTarget;
 use crate::netlist::ast::Netlist;
 use crate::netlist::elaborate::{self, SiteKind};
@@ -22,6 +23,7 @@ use crate::netlist::eval::{
 };
 use crate::netlist::expr::ParameterExpression;
 use crate::primitives::{Complex, Real, SourceLoc, SpiceError, SpiceResult};
+use model_normalize_ngspice::{pwl_resistor::PreparedPwlResistor, waveform::PreparedWaveform};
 
 /// What candidate preparation did to the finalized circuit.
 ///
@@ -78,6 +80,8 @@ impl CandidateSite {
 /// are evaluated by the ordinary subcircuit elaborator when affected.
 pub struct CircuitParameterPlan {
     source: Netlist,
+    waveforms: Vec<PreparedWaveform>,
+    pwl_resistors: Vec<PreparedPwlResistor>,
     parameters: ParameterPlan,
     root: ParameterScopeId,
     config: RunConfig,
@@ -97,6 +101,20 @@ impl CircuitParameterPlan {
     /// Ordinary netlist, parameter, option, model or circuit validation; an
     /// unknown/duplicate independent coordinate or dependency scan failure.
     pub fn new(source: Netlist, tunables: &[&str]) -> SpiceResult<Self> {
+        Self::with_declarations(source, tunables, PreparedDeclarations::default())
+    }
+
+    /// Compile one candidate plan with the source-prepared constitutive and
+    /// forcing declarations. Every structural elaboration uses these same
+    /// declarations and binds them against the current candidate scope.
+    ///
+    /// # Errors
+    /// Invalid deck, declarations, parameter scope, or physical preparation.
+    pub fn with_declarations(
+        source: Netlist,
+        tunables: &[&str],
+        declarations: PreparedDeclarations<'_>,
+    ) -> SpiceResult<Self> {
         let mut budget = EvalBudget::for_netlist(&source)?;
         let functions = FunctionScope::for_netlist(&source, &budget)?;
         let mut parameters = ParameterPlan::new();
@@ -120,7 +138,7 @@ impl CircuitParameterPlan {
         );
         let elaborated = elaborate::literalize_with(&source, Arc::clone(&scope), &mut budget)?;
         let config = RunConfig::from_netlist(&source)?;
-        let baseline = config.circuit(&source)?;
+        let baseline = config.prepared_circuit(&source, declarations)?;
         let mut sites = Vec::new();
         for site in &elaborated.sites {
             let expression = &site.expression;
@@ -171,9 +189,17 @@ impl CircuitParameterPlan {
                 .flat_map(elaborate::model_expressions),
             &mut budget,
         )?;
-        let requires_rebuild = !source.subcircuits.is_empty();
+        // These declarations are evaluated inside occurrence preparation,
+        // outside the native site's dependency graph. A numeric overlay
+        // cannot prove that their physical equations remain unchanged.
+        let requires_rebuild = !source.subcircuits.is_empty()
+            || source.prepared_initialization.is_some()
+            || !declarations.waveforms.is_empty()
+            || !declarations.pwl_resistors.is_empty();
         Ok(Self {
             source,
+            waveforms: declarations.waveforms.to_vec(),
+            pwl_resistors: declarations.pwl_resistors.to_vec(),
             parameters,
             root,
             config,
@@ -183,6 +209,28 @@ impl CircuitParameterPlan {
             statistical_model_dependencies,
             requires_rebuild,
         })
+    }
+
+    fn declarations(&self) -> PreparedDeclarations<'_> {
+        PreparedDeclarations {
+            waveforms: &self.waveforms,
+            pwl_resistors: &self.pwl_resistors,
+        }
+    }
+
+    fn elaborate(
+        &self,
+        context: &ModelContext,
+        scope: Arc<crate::netlist::eval::ParamScope>,
+    ) -> SpiceResult<Circuit> {
+        Circuit::from_prepared_netlist_with_limits(
+            &self.source,
+            context,
+            crate::devices::MutualLimits::default(),
+            crate::devices::ElaborationLimits::default(),
+            Some(scope),
+            self.declarations(),
+        )
     }
 
     pub(crate) const fn source(&self) -> &Netlist {
@@ -215,13 +263,7 @@ impl CircuitParameterPlan {
                 .clone(),
         );
         let context = self.config.context().model_context();
-        let baseline = Circuit::from_netlist_with_scoped_limits(
-            &self.source,
-            &context,
-            crate::devices::MutualLimits::default(),
-            crate::devices::ElaborationLimits::default(),
-            Some(scope),
-        )?;
+        let baseline = self.elaborate(&context, scope)?;
         let routes = self
             .sites
             .iter()
@@ -476,13 +518,7 @@ impl CircuitCandidate<'_> {
     pub(super) fn physical_sensitivity_circuit(&self) -> SpiceResult<Circuit> {
         let scope = self.parameters.resolved_scope(self.plan.root)?;
         let context = self.config().context().model_context();
-        Circuit::from_netlist_with_scoped_limits(
-            &self.plan.source,
-            &context,
-            crate::devices::MutualLimits::default(),
-            crate::devices::ElaborationLimits::default(),
-            Some(scope),
-        )
+        self.plan.elaborate(&context, scope)
     }
 
     /// Stable name of one independent root coordinate in plan order.
@@ -790,13 +826,7 @@ impl CircuitCandidate<'_> {
         let scope = parameters.resolved_scope(self.plan.root)?;
         let config = RunConfig::from_netlist_with_scope(&self.plan.source, Arc::clone(&scope))?;
         let context = config.context().model_context();
-        let circuit = Circuit::from_netlist_with_scoped_limits(
-            &self.plan.source,
-            &context,
-            crate::devices::MutualLimits::default(),
-            crate::devices::ElaborationLimits::default(),
-            Some(scope),
-        )?;
+        let circuit = self.plan.elaborate(&context, scope)?;
         Ok(PreparedCandidate {
             context,
             config,

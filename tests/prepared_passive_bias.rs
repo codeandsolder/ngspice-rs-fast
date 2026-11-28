@@ -553,3 +553,58 @@ fn polynomial_exact_history_is_independent_of_reported_bias() {
         }
     }
 }
+
+#[test]
+fn parameter_candidates_rebind_the_source_prepared_bias() {
+    use model_normalize_ngspice::passive_ic::{
+        InitialConditions, PassiveInitialCondition, PassiveKind,
+    };
+    use ngspice_rs::analysis::optimization::parameters::CircuitParameterPlan;
+    use ngspice_rs::netlist::{
+        eval::EvalBudget, prepared_initialization::PreparedInitialConditions,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deck.cir");
+    std::fs::write(
+        &path,
+        "candidate IC\n.param target=1\nv1 in 0 10\nr1 in out 1k\nc1 out 0 1u\n.op\n.end\n",
+    )
+    .unwrap();
+    let mut source = Parser::new().parse_file(&path).unwrap();
+    PreparedInitialConditions::attach(
+        &mut source,
+        dir.path(),
+        InitialConditions {
+            devices: vec![PassiveInitialCondition {
+                artifact: "deck.cir".into(),
+                scope: Vec::new(),
+                device: "c1".into(),
+                kind: PassiveKind::Capacitor,
+                target: Some("{target}".into()),
+                branch: Some("1".into()),
+                mode: None,
+            }],
+            ..InitialConditions::default()
+        },
+        [(AnalysisKind::OperatingPoint, false)],
+    )
+    .unwrap();
+    let plan = CircuitParameterPlan::new(source, &["target"]).unwrap();
+    let mut candidate = plan.session().unwrap();
+    for target in [1., -2., 0., 1.] {
+        candidate
+            .update(&[target], &mut EvalBudget::default())
+            .unwrap();
+        let request = candidate
+            .config()
+            .plan(ngspice_rs::analysis::AnalysisInput::new(
+                AnalysisKind::OperatingPoint,
+            ))
+            .unwrap();
+        let context = candidate.analysis_context();
+        let plot = request.run(candidate.circuit_mut(), &context).unwrap();
+        close(last(&plot, "v(out)"), target, 1e-10);
+        close(last(&plot, "i(c1:bias)"), (10. - target) / 1e3, 1e-10);
+    }
+}
