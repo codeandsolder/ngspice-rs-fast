@@ -18,6 +18,7 @@ fn near(name: &str, actual: f64, reference: f64) {
 #[test]
 fn n_p_vdmos_noise_matches_c47_individual_generators_and_total() {
     // ngspice47 `vdmosnoi.c`: thermal RD, RS, channel, and 1/f.
+    // The producer names C's id and 1overf generators channel and flicker.
     // A drain resistor adds its independent thermal generator. Both N and P
     // versions use mirrored biases and `vto` and have the same spectrum.
     let expected_at_1k = [
@@ -25,8 +26,8 @@ fn n_p_vdmos_noise_matches_c47_individual_generators_and_total() {
         ("inoise_spectrum", 2.288872e-9),
         ("onoise_m1_rd", 4.344423e-11),
         ("onoise_m1_rs", 3.830353e-11),
-        ("onoise_m1_id", 7.060840e-12),
-        ("onoise_m1_1overf", 5.838111e-13),
+        ("onoise_m1_channel", 7.060840e-12),
+        ("onoise_m1_flicker", 5.838111e-13),
         ("onoise_m1", 5.835031e-11),
     ];
     let expected_at_1meg = [
@@ -34,8 +35,8 @@ fn n_p_vdmos_noise_matches_c47_individual_generators_and_total() {
         ("inoise_spectrum", 2.288769e-9),
         ("onoise_m1_rd", 4.344421e-11),
         ("onoise_m1_rs", 3.830037e-11),
-        ("onoise_m1_id", 7.060471e-12),
-        ("onoise_m1_1overf", 1.846076e-14),
+        ("onoise_m1_channel", 7.060471e-12),
+        ("onoise_m1_flicker", 1.846076e-14),
         ("onoise_m1", 5.834525e-11),
     ];
     for (kind, source) in [
@@ -68,8 +69,8 @@ fn electrothermal_and_multiplicity_noise_matches_ngspice47() {
         ("inoise_spectrum", 4.599442e-9),
         ("onoise_m1_rd", 2.215948e-11),
         ("onoise_m1_rs", 1.838298e-11),
-        ("onoise_m1_id", 1.508072e-12),
-        ("onoise_m1_1overf", 1.315865e-13),
+        ("onoise_m1_channel", 1.508072e-12),
+        ("onoise_m1_flicker", 1.315865e-13),
         ("onoise_m1", 2.883172e-11),
     ];
     let multiplier_at_1meg = [
@@ -77,8 +78,8 @@ fn electrothermal_and_multiplicity_noise_matches_ngspice47() {
         ("inoise_spectrum", 4.599407e-9),
         ("onoise_m1_rd", 2.215946e-11),
         ("onoise_m1_rs", 1.838196e-11),
-        ("onoise_m1_id", 1.508021e-12),
-        ("onoise_m1_1overf", 4.160990e-15),
+        ("onoise_m1_channel", 1.508021e-12),
+        ("onoise_m1_flicker", 4.160990e-15),
         ("onoise_m1", 2.883075e-11),
     ];
     let electrothermal_at_1k = [
@@ -86,8 +87,8 @@ fn electrothermal_and_multiplicity_noise_matches_ngspice47() {
         ("inoise_spectrum", 2.298501e-9),
         ("onoise_m1_rd", 4.382065e-11),
         ("onoise_m1_rs", 3.871099e-11),
-        ("onoise_m1_id", 7.284347e-12),
-        ("onoise_m1_1overf", 5.967101e-13),
+        ("onoise_m1_channel", 7.284347e-12),
+        ("onoise_m1_flicker", 5.967101e-13),
         ("onoise_m1", 5.892544e-11),
     ];
     let electrothermal_at_1meg = [
@@ -95,8 +96,8 @@ fn electrothermal_and_multiplicity_noise_matches_ngspice47() {
         ("inoise_spectrum", 2.295411e-9),
         ("onoise_m1_rd", 4.381886e-11),
         ("onoise_m1_rs", 3.871579e-11),
-        ("onoise_m1_id", 7.330526e-12),
-        ("onoise_m1_1overf", 1.898925e-14),
+        ("onoise_m1_channel", 7.330526e-12),
+        ("onoise_m1_flicker", 1.898925e-14),
         ("onoise_m1", 5.892997e-11),
     ];
     for (name, source, expected_first, expected_last) in [
@@ -174,13 +175,13 @@ fn prepared_vdmos_noise_is_separate_for_instances_sharing_one_model() {
                 ("inoise_spectrum", 4.599437e-9),
                 ("onoise_m1_rd", 1.107974e-11),
                 ("onoise_m1_rs", 9.191491e-12),
-                ("onoise_m1_id", 7.540361e-13),
-                ("onoise_m1_1overf", 5.727637e-14),
+                ("onoise_m1_channel", 7.540361e-13),
+                ("onoise_m1_flicker", 5.727637e-14),
                 ("onoise_m1", 1.441583e-11),
                 ("onoise_m2_rd", 1.919067e-11),
                 ("onoise_m2_rs", 1.592013e-11),
-                ("onoise_m2_id", 1.306029e-12),
-                ("onoise_m2_1overf", 1.107257e-13),
+                ("onoise_m2_channel", 1.306029e-12),
+                ("onoise_m2_flicker", 1.107257e-13),
                 ("onoise_m2", 2.496899e-11),
             ],
         ),
@@ -191,13 +192,13 @@ fn prepared_vdmos_noise_is_separate_for_instances_sharing_one_model() {
                 ("inoise_spectrum", 4.599407e-9),
                 ("onoise_m1_rd", 1.107973e-11),
                 ("onoise_m1_rs", 9.190981e-12),
-                ("onoise_m1_id", 7.540103e-13),
-                ("onoise_m1_1overf", 1.811176e-15),
+                ("onoise_m1_channel", 7.540103e-13),
+                ("onoise_m1_flicker", 1.811176e-15),
                 ("onoise_m1", 1.441538e-11),
                 ("onoise_m2_rd", 1.919065e-11),
                 ("onoise_m2_rs", 1.591925e-11),
-                ("onoise_m2_id", 1.305984e-12),
-                ("onoise_m2_1overf", 3.501333e-15),
+                ("onoise_m2_channel", 1.305984e-12),
+                ("onoise_m2_flicker", 3.501333e-15),
                 ("onoise_m2", 2.496816e-11),
             ],
         ),
@@ -229,8 +230,8 @@ fn prepared_vdmos_noise_with_hot_ambient_thermal_and_multiplicity_matches_c47() 
                 ("inoise_spectrum", 4.716335e-9),
                 ("onoise_m1_rd", 2.386967e-11),
                 ("onoise_m1_rs", 1.988229e-11),
-                ("onoise_m1_id", 2.041578e-12),
-                ("onoise_m1_1overf", 1.651474e-13),
+                ("onoise_m1_channel", 2.041578e-12),
+                ("onoise_m1_flicker", 1.651474e-13),
                 ("onoise_m1", 3.113297e-11),
             ],
         ),
@@ -241,8 +242,8 @@ fn prepared_vdmos_noise_with_hot_ambient_thermal_and_multiplicity_matches_c47() 
                 ("inoise_spectrum", 4.715844e-9),
                 ("onoise_m1_rd", 2.386962e-11),
                 ("onoise_m1_rs", 1.988114e-11),
-                ("onoise_m1_id", 2.042306e-12),
-                ("onoise_m1_1overf", 5.224281e-15),
+                ("onoise_m1_channel", 2.042306e-12),
+                ("onoise_m1_flicker", 5.224281e-15),
                 ("onoise_m1", 3.113181e-11),
             ],
         ),
