@@ -1,113 +1,128 @@
 //! Leakage and final current scaling in original C statement order.
 #![expect(
-    non_snake_case,
-    reason = "C-translated equation symbols identify their upstream terms"
-)]
-#![expect(
     clippy::similar_names,
     reason = "C equation names preserve the reference distinctions"
-)]
-#![expect(
-    unused_mut,
-    reason = "reference scratch variables may be assigned on different branches"
-)]
-#![expect(
-    clippy::assign_op_pattern,
-    reason = "retain C expression grouping and operand order"
 )]
 #![expect(
     clippy::float_cmp,
     reason = "C branch predicates compare floating point exactly"
 )]
-#![expect(clippy::manual_range_contains, reason = "retain C comparison ordering")]
 #![expect(
     clippy::too_many_lines,
     reason = "preserve cohesive C physics equation sequence"
 )]
-#![expect(
-    clippy::cognitive_complexity,
-    reason = "retain version-specific reference physics branches"
-)]
 use super::{
     DELTA_3, DELTA_4, EXP_THRESHOLD, EXPL_THRESHOLD, Instance, MAX_EXP, MAX_EXPL, MIN_EXP,
-    MIN_EXPL, Model, SizeParam, exp,
+    MIN_EXPL, Model, SizeParam,
 };
 use super::{
     bias::LoadBias,
     channel::{Electrostatics, Transport},
-    reduction::{mixed, residual},
+    reduction::residual,
 };
+use crate::devices::bsim_physics::thermal_softplus;
+use crate::maths::taylor::{Constitutive, Local};
 use crate::primitives::SpiceResult;
+use std::cmp::Ordering;
 
-/// Source/drain channel-tunneling partition and derivative with respect
-/// to its exponential argument. These are the C regularized fractions,
-/// not renormalized weights: their sum need not be exactly one away from
-/// equilibrium. The terminal stamps conserve the two physical currents.
-struct GatePartition {
-    source: f64,
-    drain: f64,
-    source_slope: f64,
-    drain_slope: f64,
-}
-
-impl GatePartition {
-    fn new(argument: f64) -> Self {
-        const REGULARIZATION: f64 = 1e-4;
-        if argument.is_finite() && argument.abs() > EXP_THRESHOLD {
-            let exponential = if argument > 0. { MAX_EXP } else { MIN_EXP };
+/// Source/drain tunneling fractions. The two regularized fractions are
+/// not renormalized: terminal incidence conserves each physical current.
+fn gate_partition<S: Constitutive>(argument: S) -> SpiceResult<[S; 2]> {
+    const REGULARIZATION: f64 = 1e-4;
+    let above = argument.compare(EXP_THRESHOLD) == Some(Ordering::Greater);
+    let below = argument.compare(-EXP_THRESHOLD) == Some(Ordering::Less);
+    let c = |x| argument.constant(x);
+    let (source, drain, source_slope, drain_slope) =
+        if argument.primal().is_finite() && (above || below) {
+            let exponential = if above { MAX_EXP } else { MIN_EXP };
             let difference = exponential - 1.;
-            let inverse = argument.recip();
-            let normalized = (2. * REGULARIZATION * inverse).mul_add(inverse, 1.);
-            let source_scaled = (difference + REGULARIZATION).mul_add(inverse, -1.) / normalized;
-            let drain_scaled =
-                (REGULARIZATION - difference).mul_add(inverse, exponential) / normalized;
-            return Self {
-                source: source_scaled * inverse,
-                drain: drain_scaled * inverse,
-                source_slope: (-2_f64).mul_add(source_scaled, -1.) * inverse * inverse / normalized,
-                drain_slope: (-2_f64).mul_add(drain_scaled, exponential) * inverse * inverse
-                    / normalized,
-            };
-        }
-        let denominator = argument.mul_add(argument, 2. * REGULARIZATION);
-        if argument.abs() <= 0.5 {
-            small_gate_partition(argument, denominator)
-        } else {
-            let (exponential, derivative) = if argument > EXP_THRESHOLD {
-                (MAX_EXP, 0.)
-            } else if argument < -EXP_THRESHOLD {
-                (MIN_EXP, 0.)
-            } else {
-                let exponential = argument.exp();
-                (exponential, exponential)
-            };
-            let difference = exponential - 1.;
-            let source = (difference - argument + REGULARIZATION) / denominator;
-            let drain = argument.mul_add(exponential, REGULARIZATION - difference) / denominator;
-            let source_slope = (-2. * argument).mul_add(source, derivative - 1.) / denominator;
-            let drain_slope = (-2. * argument)
-                .mul_add(drain, (argument - 1.).mul_add(derivative, exponential))
-                / denominator;
-            Self {
-                source,
-                drain,
+            let inverse = c(1.).divide(&argument)?;
+            let normalized = inverse
+                .clone()
+                .scale(2. * REGULARIZATION)
+                .mul_add(&inverse, &c(1.));
+            let source_scaled = inverse
+                .clone()
+                .scale(difference + REGULARIZATION)
+                .offset(-1.)
+                .divide(&normalized)?;
+            let drain_scaled = inverse
+                .clone()
+                .scale(REGULARIZATION - difference)
+                .offset(exponential)
+                .divide(&normalized)?;
+            let slope_factor = inverse.clone().multiply(&inverse).divide(&normalized)?;
+            let source_slope = source_scaled
+                .clone()
+                .scale(-2.)
+                .offset(-1.)
+                .multiply(&slope_factor);
+            let drain_slope = drain_scaled
+                .clone()
+                .scale(-2.)
+                .offset(exponential)
+                .multiply(&slope_factor);
+            (
+                source_scaled.multiply(&inverse),
+                drain_scaled.multiply(&inverse),
                 source_slope,
                 drain_slope,
+            )
+        } else {
+            let denominator = argument.clone().mul_add(&argument, &c(2. * REGULARIZATION));
+            if argument.primal().abs() <= 0.5 {
+                small_gate_partition(&argument, &denominator)?
+            } else {
+                let (exponential, derivative) = if above {
+                    (c(MAX_EXP), c(0.))
+                } else if below {
+                    (c(MIN_EXP), c(0.))
+                } else {
+                    let exponential = argument.clone().exp();
+                    (exponential.clone(), exponential)
+                };
+                let difference = exponential.clone().offset(-1.);
+                let source = difference
+                    .clone()
+                    .add(&argument.clone().scale(-1.))
+                    .offset(REGULARIZATION)
+                    .divide(&denominator)?;
+                let drain = argument
+                    .clone()
+                    .mul_add(&exponential, &difference.scale(-1.).offset(REGULARIZATION))
+                    .divide(&denominator)?;
+                let source_slope = argument
+                    .clone()
+                    .scale(-2.)
+                    .mul_add(&source, &derivative.clone().offset(-1.))
+                    .divide(&denominator)?;
+                let drain_numerator = argument
+                    .clone()
+                    .offset(-1.)
+                    .mul_add(&derivative, &exponential);
+                let drain_slope = argument
+                    .clone()
+                    .scale(-2.)
+                    .mul_add(&drain, &drain_numerator)
+                    .divide(&denominator)?;
+                (source, drain, source_slope, drain_slope)
             }
-        }
-    }
+        };
+    Ok([
+        argument
+            .clone()
+            .compose_derivative(source.primal(), &source_slope),
+        argument.compose_derivative(drain.primal(), &drain_slope),
+    ])
 }
 
-/// Evaluate the third-order exponential remainder as x³ P(x), avoiding
-/// both expm1 and a loop-carried factorial division in the load hot path.
-/// For |x|<=1/2, the truncation after 15! is below binary64 roundoff.
-/// Factoring x²/denominator before multiplying by x also avoids premature
-/// underflow in the differential partition near equilibrium.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "well-conditioned Taylor polynomial and slope products; measured generic-target software FMA cost exceeds separate operations"
-)]
-fn small_gate_partition(argument: f64, denominator: f64) -> GatePartition {
+/// Third-order exponential remainder x³ P(x). At |x|<=1/2 the error
+/// after 15! is below binary64 rounding. The local slopes retain the
+/// quadratic zero at equilibrium without subtracting nearly equal terms.
+fn small_gate_partition<S: Constitutive>(
+    argument: &S,
+    denominator: &S,
+) -> SpiceResult<(S, S, S, S)> {
     const COEFFICIENTS: [f64; 13] = [
         1. / 1_307_674_368_000.,
         1. / 87_178_291_200.,
@@ -123,56 +138,242 @@ fn small_gate_partition(argument: f64, denominator: f64) -> GatePartition {
         1. / 24.,
         1. / 6.,
     ];
-    let remainder = COEFFICIENTS.into_iter().fold(0_f64, |acc, coefficient| {
-        if cfg!(target_feature = "fma") {
-            acc.mul_add(argument, coefficient)
-        } else {
-            acc * argument + coefficient
-        }
-    });
-    let square = argument * (argument / denominator);
-    let second = 0.5 + argument * remainder;
-    let drain_remainder = 0.5 + (argument - 1.) * remainder;
-    GatePartition {
-        source: 0.5 + argument * square * remainder,
-        drain: 0.5 + argument * square * drain_remainder,
-        source_slope: square * (second - 2. * square * remainder),
-        drain_slope: square * (1. + argument * second - 2. * square * drain_remainder),
-    }
+    let remainder = COEFFICIENTS
+        .into_iter()
+        .fold(argument.constant(0.), |acc, coefficient| {
+            if cfg!(target_feature = "fma") {
+                acc.mul_add(argument, &argument.constant(coefficient))
+            } else {
+                acc.multiply(argument).offset(coefficient)
+            }
+        });
+    let square = argument.clone().divide(denominator)?.multiply(argument);
+    let second = argument
+        .clone()
+        .mul_add(&remainder, &argument.constant(0.5));
+    let drain_remainder = argument
+        .clone()
+        .offset(-1.)
+        .mul_add(&remainder, &argument.constant(0.5));
+    let source = argument
+        .clone()
+        .multiply(&square)
+        .mul_add(&remainder, &argument.constant(0.5));
+    let drain = argument
+        .clone()
+        .multiply(&square)
+        .mul_add(&drain_remainder, &argument.constant(0.5));
+    let source_slope = square
+        .clone()
+        .scale(-2.)
+        .mul_add(&remainder, &second)
+        .multiply(&square);
+    let drain_slope = square
+        .clone()
+        .scale(-2.)
+        .mul_add(
+            &drain_remainder,
+            &argument.clone().multiply(&second).offset(1.),
+        )
+        .multiply(&square);
+    Ok((source, drain, source_slope, drain_slope))
 }
 
-/// The oxide tunneling exponent is scale * (a-b*v)*(1+c*v).
-/// Preserve the physical roots rather than forming the cancellation-prone
-/// expanded quadratic. Return the voltage derivative only on the
-/// differentiable exponential branch (clipped derivatives are exactly zero).
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "the nonfinite fallback retains the reference expanded expression's IEEE propagation"
-)]
-fn tunneling_barrier(voltage: f64, scale: f64, a: f64, b: f64, c: f64) -> (f64, Option<f64>) {
-    let (argument, polynomial_slope) = if [voltage, scale, a, b, c].iter().all(|v| v.is_finite()) {
-        let left = (-b).mul_add(voltage, a);
-        let right = c.mul_add(voltage, 1.);
-        (scale * (left * right), residual([(c, left), (-b, right)]))
+/// Oxide tunneling exponent scale * (a-b*v)*(1+c*v). Factoring retains
+/// both exact roots. Preserve the reference IEEE propagation for
+/// nonfinite scalar inputs and the exact clipped physical derivatives.
+fn tunneling_barrier<S: Constitutive>(
+    voltage: S,
+    scale: f64,
+    a: f64,
+    b: f64,
+    c: f64,
+) -> (S, Option<S>) {
+    let (argument, polynomial_slope) = if [voltage.primal(), scale, a, b, c]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        let left = voltage.constant(-b).mul_add(&voltage, &voltage.constant(a));
+        let right = voltage.constant(c).mul_add(&voltage, &voltage.constant(1.));
+        let slope = voltage.constant(c).mul_add(&left, &right.clone().scale(-b));
+        (left.multiply(&right).scale(scale), slope)
     } else {
         let linear = a * c - b;
         let quadratic = b * c;
-        (
-            scale * (a + linear * voltage - quadratic * voltage * voltage),
-            linear - 2. * quadratic * voltage,
-        )
+        let argument = voltage
+            .clone()
+            .scale(-quadratic)
+            .multiply(&voltage)
+            .add(&voltage.clone().scale(linear))
+            .offset(a)
+            .scale(scale);
+        let slope = voltage.clone().scale(-2. * quadratic).offset(linear);
+        (argument, slope)
     };
-    if argument > EXP_THRESHOLD {
-        (MAX_EXP, None)
-    } else if argument < -EXP_THRESHOLD {
-        (MIN_EXP, None)
+    if argument.compare(EXP_THRESHOLD) == Some(Ordering::Greater) {
+        (argument.constant(MAX_EXP), None)
+    } else if argument.compare(-EXP_THRESHOLD) == Some(Ordering::Less) {
+        (argument.constant(MIN_EXP), None)
     } else {
         let exponential = argument.exp();
-        (exponential, Some(exponential * scale * polynomial_slope))
+        let slope = polynomial_slope.multiply(&exponential).scale(scale);
+        (
+            voltage.compose_derivative(exponential.primal(), &slope),
+            Some(slope),
+        )
     }
 }
 
-/// Gate-induced leakage, tunneling, finger scaling and thermal-noise auxiliaries.
+/// One edge's GIDL/GISL model coefficients.
+struct EdgeLeakage {
+    amplitude: f64,
+    field: f64,
+    body: f64,
+    offset: f64,
+    gate: f64,
+    shift: f64,
+    exponent: f64,
+}
+
+fn edge_leakage<S: Constitutive>(
+    model: &Model,
+    p: &SizeParam,
+    voltage: S,
+    gate: S,
+    gate_partial: f64,
+    junction: S,
+    parameters: EdgeLeakage,
+    oxide: f64,
+) -> SpiceResult<Local<S, 3>> {
+    let c = |x| Local::new(voltage.constant(x), [0.; 3]);
+    let EdgeLeakage {
+        amplitude,
+        field,
+        body,
+        offset,
+        gate: gate_factor,
+        shift,
+        exponent,
+    } = parameters;
+    if amplitude <= 0.
+        || field <= 0.
+        || if model.gidlMod == 0 {
+            body <= 0.
+        } else {
+            body < 0.
+        }
+    {
+        return Ok(c(0.));
+    }
+    let old_model = model.gidlMod == 0;
+    let raw = Local::new(voltage.clone(), [0., 1., 0.]);
+    let gate = Local::new(gate, [gate_partial, 0., 0.]);
+    let gate_factor = if old_model { 1. } else { gate_factor };
+    let material_shift = if model.mtrlMod == 0 { 0. } else { p.vfbsd };
+    let drive = raw
+        .add(&gate.scale(-gate_factor))
+        .offset(material_shift - offset)
+        .scale(oxide.recip());
+    if drive.compare(0.) != Some(Ordering::Greater) {
+        return Ok(c(0.));
+    }
+    let junction = Local::new(junction, [0., if old_model { -1. } else { 0. }, 1.]);
+    if old_model && junction.compare(0.) == Some(Ordering::Greater) {
+        return Ok(c(0.));
+    }
+    let limit = if old_model { 100. } else { EXPL_THRESHOLD };
+    let min_exp = if old_model {
+        3.720_075_976e-44
+    } else {
+        MIN_EXPL
+    };
+    let base = if drive.compare(field / limit) == Some(Ordering::Greater) {
+        let field_exponential = c(field).divide(&drive)?;
+        drive
+            .multiply(&field_exponential.scale(-1.).exp())
+            .scale(amplitude * p.weffCJ)
+    } else {
+        drive.scale(amplitude * p.weffCJ * min_exp)
+    };
+    if old_model {
+        let cubic = junction
+            .clone()
+            .multiply(&junction)
+            .multiply(&junction)
+            .scale(-1.);
+        let factor = cubic.clone().divide(&cubic.offset(body))?;
+        return Ok(base.multiply(&factor));
+    }
+
+    let mut body_argument = junction.offset(-shift);
+    if body_argument.compare(model.gidlclamp) == Some(Ordering::Greater) {
+        // The reference stamp retains the body partial at the clamp;
+        // the actual physical germ is constant there.
+        body_argument.value = body_argument.value.constant(model.gidlclamp);
+    }
+    let sign = body_argument.compare(0.);
+    let enhancement = if body_argument.primal() == 0. {
+        // At a one-sided zero crossing the reciprocal exponential has
+        // either a clipped upper limit or a flat zero germ.
+        match sign {
+            Some(Ordering::Less) if exponent > 0. => c(0.),
+            Some(Ordering::Greater) if exponent < 0. => c(0.),
+            Some(Ordering::Less | Ordering::Greater) if exponent == 0. => c(1.),
+            _ => c(MAX_EXPL),
+        }
+    } else {
+        let argument = c(exponent).divide(&body_argument)?;
+        if argument.compare(EXPL_THRESHOLD) == Some(Ordering::Less) {
+            argument.exp()
+        } else {
+            c(MAX_EXPL)
+        }
+    };
+    Ok(base.multiply(&enhancement))
+}
+
+fn edge_tunneling<S: Constitutive>(
+    voltage: S,
+    shift: f64,
+    amplitude: f64,
+    exponent: f64,
+    barrier: [f64; 3],
+) -> SpiceResult<Local<S, 1>> {
+    let voltage = Local::new(voltage, [1.]);
+    let offset = voltage.clone().offset(-shift);
+    let scale = offset.primal().abs().max(0.01);
+    let normalized = offset.scale(scale.recip());
+    let softened = normalized
+        .clone()
+        .multiply(&normalized)
+        .offset((0.01 / scale).powi(2))
+        .sqrt()?
+        .scale(scale);
+    let [a, b, c] = barrier;
+    let (transmission, _) = tunneling_barrier(softened.clone(), exponent, a, b, c);
+    Ok(voltage
+        .multiply(&softened)
+        .multiply(&transmission)
+        .scale(amplitude))
+}
+
+/// Currents in the reference orientation, including physical finger
+/// multiplicity. Gate-edge and GIDL/GISL currents keep their raw side
+/// orientation; channel and bulk tunneling use the selected source.
+pub(super) struct Leakage<S> {
+    pub(super) channel: S,
+    pub(super) substrate: S,
+    pub(super) gidl: S,
+    pub(super) gisl: S,
+    pub(super) igcs: S,
+    pub(super) igcd: S,
+    pub(super) igs: S,
+    pub(super) igd: S,
+    pub(super) igb: S,
+}
+
+/// Reference load wrapper; all physical current values come from the
+/// constitutive stage shared with Taylor evaluation.
 pub(super) fn evaluate(
     model: &Model,
     here: &mut Instance,
@@ -181,673 +382,284 @@ pub(super) fn evaluate(
     electrostatics: &Electrostatics,
     transport: &Transport,
 ) -> SpiceResult<f64> {
-    let &LoadBias {
+    Ok(evaluate_constitutive(
+        model,
+        here,
+        pParam,
+        [bias.vbs, bias.vgs, bias.vds],
+        electrostatics,
+        transport,
+    )?
+    .channel)
+}
+
+pub(super) fn evaluate_constitutive<S: Constitutive>(
+    model: &Model,
+    here: &mut Instance,
+    p: &SizeParam,
+    [vbs, vgs, vds]: [S; 3],
+    electro: &Electrostatics<S>,
+    transport: &Transport<S>,
+) -> SpiceResult<Leakage<S>> {
+    let nf = here.nf;
+    let oxide = if model.mtrlMod == 0 {
+        3. * electro.toxe
+    } else {
+        model.epsrsub * electro.toxe / electro.epsrox
+    };
+    let vbd = vbs.clone().add(&vds.clone().scale(-1.));
+    let vgd = vgs.clone().add(&vds.clone().scale(-1.));
+    let gidl = edge_leakage(
+        model,
+        p,
+        vds.clone(),
+        electro.vgs_eff_raw.clone(),
+        here.dvgs_eff_dvg,
         vbd,
+        EdgeLeakage {
+            amplitude: p.agidl,
+            field: p.bgidl,
+            body: p.cgidl,
+            offset: p.egidl,
+            gate: p.rgidl,
+            shift: p.fgidl,
+            exponent: p.kgidl,
+        },
+        oxide,
+    )?
+    .scale(nf);
+    let gisl = edge_leakage(
+        model,
+        p,
+        vds.scale(-1.),
+        electro.vgd_eff_raw.clone(),
+        here.dvgd_eff_dvg,
         vbs,
-        vds,
-        vgd,
-        vgs,
-        ..
-    } = bias;
-    let &Electrostatics {
-        Vbs,
-        Vbseff,
-        Vds,
-        Vgs,
-        Vgs_eff,
-        Vgsteff,
-        Vtm,
-        Vtm0,
-        dVbseff_dVb,
-        dVgs_eff_dVg,
-        dVgsteff_dVb,
-        dVgsteff_dVd,
-        dVgsteff_dVg,
-        dVth_dVb,
-        dVth_dVd,
-        epsrox,
-        toxe,
-        ..
-    } = electrostatics;
-    let &Transport {
-        Abulk0_Q,
-        Coxeff,
-        Rds,
-        mut Vdseff,
-        beta,
-        unscaled_drain_current: mut cdrain,
-        dVdseff_dVb,
-        dVdseff_dVd,
-        dVdseff_dVg,
-        gche,
-        ..
-    } = transport;
-    let mut vgs_eff: f64;
-    let mut vgd_eff: f64;
-    let mut dvgs_eff_dvg: f64;
-    let mut dvgd_eff_dvg: f64;
-    let mut dVfbeff_dVg: f64;
-    let mut dVfbeff_dVb: f64;
-    let mut V3: f64;
-    let mut Igidl: f64;
-    let mut Ggidld: f64;
-    let mut Ggidlg: f64;
-    let mut Ggidlb: f64;
-    let mut Voxacc: f64 = 0.0;
-    let mut dVoxacc_dVg: f64 = 0.0;
-    let mut dVoxacc_dVb: f64 = 0.0;
-    let mut Voxdepinv: f64 = 0.0;
-    let mut dVoxdepinv_dVg: f64 = 0.0;
-    let mut dVoxdepinv_dVd: f64 = 0.0;
-    let mut dVoxdepinv_dVb: f64 = 0.0;
-    let mut VxNVt: f64 = 0.0;
-    let mut ExpVxNVt: f64;
-    let mut Vaux: f64 = 0.0;
-    let mut dVaux_dVg: f64 = 0.0;
-    let mut dVaux_dVd: f64 = 0.0;
-    let mut dVaux_dVb: f64 = 0.0;
-    let mut Igc: f64;
-    let mut dIgc_dVg: f64;
-    let mut dIgc_dVd: f64;
-    let mut dIgc_dVb: f64;
-    let mut Igcs: f64;
-    let mut dIgcs_dVg: f64;
-    let mut dIgcs_dVd: f64;
-    let mut dIgcs_dVb: f64;
-    let mut Igcd: f64;
-    let mut dIgcd_dVg: f64;
-    let mut dIgcd_dVd: f64;
-    let mut dIgcd_dVb: f64;
-    let mut Igs: f64;
-    let mut dIgs_dVg: f64;
-    let mut dIgs_dVs: f64;
-    let mut Igd: f64;
-    let mut dIgd_dVg: f64;
-    let mut dIgd_dVd: f64;
-    let mut Igbacc: f64;
-    let mut dIgbacc_dVg: f64;
-    let mut dIgbacc_dVb: f64;
-    let mut Igbinv: f64;
-    let mut dIgbinv_dVg: f64;
-    let mut dIgbinv_dVd: f64;
-    let mut dIgbinv_dVb: f64;
-    let mut Pigcd: f64;
-    let mut dPigcd_dVg: f64;
-    let mut dPigcd_dVd: f64;
-    let mut dPigcd_dVb: f64;
-    let mut Vfb: f64 = 0.0;
-    let mut Vdsat: f64;
-    let mut T0: f64;
-    let mut T1: f64;
-    let mut dT1_dVg: f64;
-    let mut dT1_dVd: f64;
-    let mut T2: f64;
-    let mut dT2_dVg: f64;
-    let mut dT2_dVd: f64;
-    let mut dT2_dVb: f64;
-    let mut T3: f64;
-    let mut T4: f64;
-    let mut T5: f64;
-    let mut T6: f64;
-    let mut dT6_dVg: f64;
-    let mut dT6_dVd: f64;
-    let mut dT6_dVb: f64;
-    let mut T7: f64;
-    let mut dT7_dVg: f64;
-    let mut dT7_dVd: f64;
-    let mut dT7_dVb: f64;
-    let mut T8: f64;
-    let mut T11: f64;
-    let mut T12: f64;
-    let mut T13: f64;
-    let mut T14: f64;
-    let mut tmp: f64;
-    let mut Abulk: f64;
-    let mut Igisl: f64;
-    let mut Ggislg: f64;
-    let mut Ggislb: f64;
-    let mut Ggisls: f64;
-    if model.mtrlMod == 0 {
-        T0 = 3.0 * toxe;
+        EdgeLeakage {
+            amplitude: p.agisl,
+            field: p.bgisl,
+            body: p.cgisl,
+            offset: p.egisl,
+            gate: p.rgisl,
+            shift: p.fgisl,
+            exponent: p.kgisl,
+        },
+        oxide,
+    )?
+    .scale(nf);
+    [here.ggidlg, here.ggidld, here.ggidlb] = gidl.partials;
+    [here.ggislg, here.ggisls, here.ggislb] = gisl.partials;
+    here.ggidls = -(here.ggidlg + here.ggidld + here.ggidlb);
+    here.ggisld = -(here.ggislg + here.ggisls + here.ggislb);
+    let c = |x| Local::new(electro.Vgst.constant(x), [0.; 3]);
+    let thermal = if model.tempMod < 2 {
+        electro.Vtm
     } else {
-        T0 = model.epsrsub * toxe / epsrox;
+        electro.Vtm0
+    };
+    let gate = Local::new(electro.Vgs.clone(), [1., 0., 0.]);
+    let gate_effective = Local::new(electro.Vgs_eff.clone(), [electro.dVgs_eff_dVg, 0., 0.]);
+    let body = Local::new(electro.Vbseff.clone(), [0., 0., 1.]);
+    let raw_body = Local::new(electro.Vbs.clone(), [0., 0., 1.]);
+    let overdrive = Local::new(
+        electro.Vgsteff.clone(),
+        [
+            electro.dVgsteff_dVg,
+            electro.dVgsteff_dVd,
+            electro.dVgsteff_dVb,
+        ],
+    );
+    let mut acc = c(0.);
+    let mut inv = c(0.);
+    if model.igcMod != 0 || model.igbMod != 0 {
+        let flatband = here.vfbzb;
+        let argument = body
+            .clone()
+            .add(&gate_effective.clone().scale(-1.))
+            .offset(flatband - DELTA_3);
+        (acc, _) = super::smooth_positive(argument, DELTA_3 * flatband.abs())?;
+        if acc.compare(0.) == Some(Ordering::Less) {
+            acc = c(0.);
+        }
+        let argument = gate_effective
+            .clone()
+            .add(&body.clone().scale(-1.))
+            .add(&overdrive.clone().scale(-1.))
+            .add(&acc)
+            .offset(-flatband);
+        inv = if p.k1ox == 0. {
+            c(0.)
+        } else if argument.compare(0.) == Some(Ordering::Less) {
+            argument.scale(-1.)
+        } else {
+            super::depletion_charge(p.k1ox, argument)?.0
+        };
+        inv = inv.add(&overdrive);
     }
-    vgs_eff = here.vgs_eff;
-    dvgs_eff_dvg = here.dvgs_eff_dvg;
-    vgd_eff = here.vgd_eff;
-    dvgd_eff_dvg = here.dvgd_eff_dvg;
-    if model.gidlMod == 0 {
-        if model.mtrlMod == 0 {
-            T1 = (vds - vgs_eff - pParam.egidl) / T0;
+    let (igcs, igcd, igs, igd) = if model.igcMod != 0 {
+        let auxiliary_argument = if model.igcMod == 1 {
+            gate_effective
+                .clone()
+                .offset(-f64::from(model.r#type) * here.vth0)
         } else {
-            T1 = (vds - vgs_eff - pParam.egidl + pParam.vfbsd) / T0;
-        }
-        if (pParam.agidl <= 0.0)
-            || (pParam.bgidl <= 0.0)
-            || (T1 <= 0.0)
-            || (pParam.cgidl <= 0.0)
-            || (vbd > 0.0)
-        {
-            Ggidlb = 0.0;
-            Ggidlg = Ggidlb;
-            Ggidld = Ggidlg;
-            Igidl = Ggidld;
-        } else {
-            dT1_dVd = 1.0 / T0;
-            dT1_dVg = -dvgs_eff_dvg * dT1_dVd;
-            T2 = pParam.bgidl / T1;
-            if T2 < 100.0 {
-                Igidl = pParam.agidl * pParam.weffCJ * T1 * exp(-T2);
-                T3 = Igidl * (1.0 + T2) / T1;
-                Ggidld = T3 * dT1_dVd;
-                Ggidlg = T3 * dT1_dVg;
-            } else {
-                Igidl = pParam.agidl * pParam.weffCJ * 3.720_075_976e-44;
-                Ggidld = Igidl * dT1_dVd;
-                Ggidlg = Igidl * dT1_dVg;
-                Igidl *= T1;
-            }
-            T4 = vbd * vbd;
-            T5 = -vbd * T4;
-            T6 = pParam.cgidl + T5;
-            T7 = T5 / T6;
-            T8 = 3.0 * pParam.cgidl * T4 / T6 / T6;
-            Ggidld = residual([(Ggidld, T7), (Igidl, T8)]);
-            Ggidlg = Ggidlg * T7;
-            Ggidlb = -Igidl * T8;
-            Igidl *= T7;
-        }
-        here.Igidl = Igidl;
-        here.ggidld = Ggidld;
-        here.ggidlg = Ggidlg;
-        here.ggidlb = Ggidlb;
-        if model.mtrlMod == 0 {
-            T1 = (-vds - vgd_eff - pParam.egisl) / T0;
-        } else {
-            T1 = (-vds - vgd_eff - pParam.egisl + pParam.vfbsd) / T0;
-        }
-        if (pParam.agisl <= 0.0)
-            || (pParam.bgisl <= 0.0)
-            || (T1 <= 0.0)
-            || (pParam.cgisl <= 0.0)
-            || (vbs > 0.0)
-        {
-            Ggislb = 0.0;
-            Ggislg = Ggislb;
-            Ggisls = Ggislg;
-            Igisl = Ggisls;
-        } else {
-            dT1_dVd = 1.0 / T0;
-            dT1_dVg = -dvgd_eff_dvg * dT1_dVd;
-            T2 = pParam.bgisl / T1;
-            if T2 < 100.0 {
-                Igisl = pParam.agisl * pParam.weffCJ * T1 * exp(-T2);
-                T3 = Igisl * (1.0 + T2) / T1;
-                Ggisls = T3 * dT1_dVd;
-                Ggislg = T3 * dT1_dVg;
-            } else {
-                Igisl = pParam.agisl * pParam.weffCJ * 3.720_075_976e-44;
-                Ggisls = Igisl * dT1_dVd;
-                Ggislg = Igisl * dT1_dVg;
-                Igisl *= T1;
-            }
-            T4 = vbs * vbs;
-            T5 = -vbs * T4;
-            T6 = pParam.cgisl + T5;
-            T7 = T5 / T6;
-            T8 = 3.0 * pParam.cgisl * T4 / T6 / T6;
-            Ggisls = residual([(Ggisls, T7), (Igisl, T8)]);
-            Ggislg = Ggislg * T7;
-            Ggislb = -Igisl * T8;
-            Igisl *= T7;
-        }
-        here.Igisl = Igisl;
-        here.ggisls = Ggisls;
-        here.ggislg = Ggislg;
-        here.ggislb = Ggislb;
-    } else {
-        if model.mtrlMod == 0 {
-            T1 = residual([(-vds, 1.), (-pParam.rgisl, vgd_eff), (-pParam.egisl, 1.)]) / T0;
-        } else {
-            T1 = residual([
-                (-vds, 1.),
-                (-pParam.rgisl, vgd_eff),
-                (-pParam.egisl, 1.),
-                (pParam.vfbsd, 1.),
-            ]) / T0;
-        }
-        if (pParam.agisl <= 0.0) || (pParam.bgisl <= 0.0) || (T1 <= 0.0) || (pParam.cgisl < 0.0) {
-            Ggislb = 0.0;
-            Ggislg = Ggislb;
-            Ggisls = Ggislg;
-            Igisl = Ggisls;
-        } else {
-            dT1_dVd = 1.0 / T0;
-            dT1_dVg = -pParam.rgisl * dT1_dVd * dvgd_eff_dvg;
-            T2 = pParam.bgisl / T1;
-            if T2 < EXPL_THRESHOLD {
-                Igisl = pParam.weffCJ * pParam.agisl * T1 * exp(-T2);
-                T3 = Igisl / T1 * (T2 + 1.0);
-            } else {
-                T3 = pParam.weffCJ * pParam.agisl * MIN_EXPL;
-                Igisl = T3 * T1;
-            }
-            Ggisls = T3 * dT1_dVd;
-            Ggislg = T3 * dT1_dVg;
-            T4 = vbs - pParam.fgisl;
-            if T4 > model.gidlclamp {
-                T4 = model.gidlclamp;
-            }
-            if T4 == 0.0 {
-                T5 = EXPL_THRESHOLD;
-            } else {
-                T5 = pParam.kgisl / T4;
-            }
-            if T5 < EXPL_THRESHOLD {
-                T6 = exp(T5);
-                Ggislb = -Igisl * T6 * T5 / T4;
-            } else {
-                T6 = MAX_EXPL;
-                Ggislb = 0.0;
-            }
-            Ggisls *= T6;
-            Ggislg *= T6;
-            Igisl *= T6;
-        }
-        here.Igisl = Igisl;
-        here.ggisls = Ggisls;
-        here.ggislg = Ggislg;
-        here.ggislb = Ggislb;
-        if model.mtrlMod == 0 {
-            T1 = residual([(vds, 1.), (-pParam.rgidl, vgs_eff), (-pParam.egidl, 1.)]) / T0;
-        } else {
-            T1 = residual([
-                (vds, 1.),
-                (-pParam.rgidl, vgs_eff),
-                (-pParam.egidl, 1.),
-                (pParam.vfbsd, 1.),
-            ]) / T0;
-        }
-        if (pParam.agidl <= 0.0) || (pParam.bgidl <= 0.0) || (T1 <= 0.0) || (pParam.cgidl < 0.0) {
-            Ggidlb = 0.0;
-            Ggidlg = Ggidlb;
-            Ggidld = Ggidlg;
-            Igidl = Ggidld;
-        } else {
-            dT1_dVd = 1.0 / T0;
-            dT1_dVg = -pParam.rgidl * dT1_dVd * dvgs_eff_dvg;
-            T2 = pParam.bgidl / T1;
-            if T2 < EXPL_THRESHOLD {
-                Igidl = pParam.weffCJ * pParam.agidl * T1 * exp(-T2);
-                T3 = Igidl / T1 * (T2 + 1.0);
-            } else {
-                T3 = pParam.weffCJ * pParam.agidl * MIN_EXPL;
-                Igidl = T3 * T1;
-            }
-            Ggidld = T3 * dT1_dVd;
-            Ggidlg = T3 * dT1_dVg;
-            T4 = vbd - pParam.fgidl;
-            if T4 > model.gidlclamp {
-                T4 = model.gidlclamp;
-            }
-            if T4 == 0.0 {
-                T5 = EXPL_THRESHOLD;
-            } else {
-                T5 = pParam.kgidl / T4;
-            }
-            if T5 < EXPL_THRESHOLD {
-                T6 = exp(T5);
-                Ggidlb = -Igidl * T6 * T5 / T4;
-            } else {
-                T6 = MAX_EXPL;
-                Ggidlb = 0.0;
-            }
-            Ggidld *= T6;
-            Ggidlg *= T6;
-            Igidl *= T6;
-        }
-        here.Igidl = Igidl;
-        here.ggidld = Ggidld;
-        here.ggidlg = Ggidlg;
-        here.ggidlb = Ggidlb;
-    }
-    if (model.igcMod != 0) || (model.igbMod != 0) {
-        Vfb = here.vfbzb;
-        V3 = Vfb - Vgs_eff + Vbseff - DELTA_3;
-        (Voxacc, T1) = super::smooth_positive(V3, DELTA_3 * Vfb.abs())?;
-        dVfbeff_dVg = T1 * dVgs_eff_dVg;
-        dVfbeff_dVb = -T1;
-        dVoxacc_dVg = -dVfbeff_dVg;
-        dVoxacc_dVb = -dVfbeff_dVb;
-        if Voxacc < 0.0 {
-            dVoxacc_dVb = 0.0;
-            dVoxacc_dVg = dVoxacc_dVb;
-            Voxacc = dVoxacc_dVg;
-        }
-        T3 = (Vgs_eff - Vfb - Vbseff - Vgsteff) + Voxacc;
-        if pParam.k1ox == 0.0 {
-            dVoxdepinv_dVb = 0.0;
-            dVoxdepinv_dVd = dVoxdepinv_dVb;
-            dVoxdepinv_dVg = dVoxdepinv_dVd;
-            Voxdepinv = dVoxdepinv_dVg;
-        } else if T3 < 0.0 {
-            Voxdepinv = -T3;
-            dVoxdepinv_dVg = -dVgs_eff_dVg + dVfbeff_dVg + dVgsteff_dVg;
-            dVoxdepinv_dVd = dVgsteff_dVd;
-            dVoxdepinv_dVb = dVfbeff_dVb + 1.0 + dVgsteff_dVb;
-        } else {
-            (Voxdepinv, T2) = super::depletion_charge(pParam.k1ox, T3)?;
-            dVoxdepinv_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg);
-            dVoxdepinv_dVd = -T2 * dVgsteff_dVd;
-            dVoxdepinv_dVb = -T2 * (dVfbeff_dVb + 1.0 + dVgsteff_dVb);
-        }
-        Voxdepinv += Vgsteff;
-        dVoxdepinv_dVg += dVgsteff_dVg;
-        dVoxdepinv_dVd += dVgsteff_dVd;
-        dVoxdepinv_dVb += dVgsteff_dVb;
-    }
-    if model.tempMod < 2 {
-        tmp = Vtm;
-    } else {
-        tmp = Vtm0;
-    }
-    if model.igcMod != 0 {
-        T0 = tmp * pParam.nigc;
-        if model.igcMod == 1 {
-            VxNVt = (mixed((1., Vgs_eff), (-f64::from(model.r#type), here.vth0))) / T0;
-            if VxNVt > EXP_THRESHOLD {
-                Vaux = mixed((1., Vgs_eff), (-f64::from(model.r#type), here.vth0));
-                dVaux_dVg = dVgs_eff_dVg;
-                dVaux_dVd = 0.0;
-                dVaux_dVb = 0.0;
-            }
-        } else if model.igcMod == 2 {
-            VxNVt = (Vgs_eff - here.von) / T0;
-            if VxNVt > EXP_THRESHOLD {
-                Vaux = Vgs_eff - here.von;
-                dVaux_dVg = dVgs_eff_dVg;
-                dVaux_dVd = -dVth_dVd;
-                dVaux_dVb = -dVth_dVb;
-            }
-        }
-        if VxNVt < -EXP_THRESHOLD {
-            Vaux = T0 * MIN_EXP.ln_1p();
-            dVaux_dVb = 0.0;
-            dVaux_dVd = dVaux_dVb;
-            dVaux_dVg = dVaux_dVd;
-        } else if (VxNVt >= -EXP_THRESHOLD) && (VxNVt <= EXP_THRESHOLD) {
-            ExpVxNVt = exp(VxNVt);
-            Vaux = T0 * ExpVxNVt.ln_1p();
-            dVaux_dVg = ExpVxNVt / (1.0 + ExpVxNVt);
-            if model.igcMod == 1 {
-                dVaux_dVd = 0.0;
-                dVaux_dVb = 0.0;
-            } else if model.igcMod == 2 {
-                dVaux_dVd = -dVaux_dVg * dVth_dVd;
-                dVaux_dVb = -dVaux_dVg * dVth_dVb;
-            }
-            dVaux_dVg *= dVgs_eff_dVg;
-        }
-        T2 = Vgs * Vaux;
-        dT2_dVg = mixed((1., Vaux), (Vgs, dVaux_dVg));
-        dT2_dVd = Vgs * dVaux_dVd;
-        dT2_dVb = Vgs * dVaux_dVb;
-        T11 = pParam.Aechvb;
-        T12 = pParam.Bechvb;
-        let (barrier, barrier_slope) =
-            tunneling_barrier(Voxdepinv, T12, pParam.aigc, pParam.bigc, pParam.cigc);
-        T6 = barrier;
-        dT6_dVd = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVd);
-        dT6_dVb = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVb);
-        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVg);
-        Igc = T11 * T2 * T6;
-        dIgc_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
-        dIgc_dVd = T11 * residual([(T2, dT6_dVd), (T6, dT2_dVd)]);
-        dIgc_dVb = T11 * residual([(T2, dT6_dVb), (T6, dT2_dVb)]);
-        if model.pigcdGiven {
-            Pigcd = pParam.pigcd;
-            dPigcd_dVb = 0.0;
-            dPigcd_dVd = dPigcd_dVb;
-            dPigcd_dVg = dPigcd_dVd;
-        } else {
-            T11 = -pParam.Bechvb;
-            T12 = Vgsteff + 1.0e-20;
-            T13 = T11 / T12 / T12;
-            T14 = -T13 / T12;
-            Pigcd = T13 * (1.0 - 0.5 * Vdseff / T12);
-            dPigcd_dVg = T14 * (0.5_f64.mul_add(dVdseff_dVg - 3.0 * Vdseff / T12, 2.));
-            dPigcd_dVd = 0.5 * T14 * dVdseff_dVd;
-            dPigcd_dVb = 0.5 * T14 * dVdseff_dVb;
-        }
-        T7 = -Pigcd * Vdseff;
-        dT7_dVg = residual([(-Vdseff, dPigcd_dVg), (-Pigcd, dVdseff_dVg)]);
-        dT7_dVd = residual([
-            (-Vdseff, dPigcd_dVd),
-            (-Pigcd, dVdseff_dVd),
-            (dT7_dVg, dVgsteff_dVd),
-        ]);
-        dT7_dVb = residual([
-            (-Vdseff, dPigcd_dVb),
-            (-Pigcd, dVdseff_dVb),
-            (dT7_dVg, dVgsteff_dVb),
-        ]);
-        dT7_dVg *= dVgsteff_dVg;
-        let partition = GatePartition::new(T7);
-        let source_slope = partition.source_slope;
-        let drain_slope = partition.drain_slope;
-        Igcs = Igc * partition.source;
-        dIgcs_dVg = dIgc_dVg.mul_add(partition.source, Igc * source_slope * dT7_dVg);
-        dIgcs_dVd = dIgc_dVd.mul_add(partition.source, Igc * source_slope * dT7_dVd);
-        dIgcs_dVb = dIgc_dVb.mul_add(partition.source, Igc * source_slope * dT7_dVb);
-        Igcd = Igc * partition.drain;
-        dIgcd_dVg = dIgc_dVg.mul_add(partition.drain, Igc * drain_slope * dT7_dVg);
-        dIgcd_dVd = dIgc_dVd.mul_add(partition.drain, Igc * drain_slope * dT7_dVd);
-        dIgcd_dVb = dIgc_dVb.mul_add(partition.drain, Igc * drain_slope * dT7_dVb);
-        here.Igcs = Igcs;
-        here.gIgcsg = dIgcs_dVg;
-        here.gIgcsd = dIgcs_dVd;
-        here.gIgcsb = dIgcs_dVb * dVbseff_dVb;
-        here.Igcd = Igcd;
-        here.gIgcdg = dIgcd_dVg;
-        here.gIgcdd = dIgcd_dVd;
-        here.gIgcdb = dIgcd_dVb * dVbseff_dVb;
-        T0 = vgs - (pParam.vfbsd + pParam.vfbsdoff);
-        vgs_eff = T0.hypot(0.01);
-        dvgs_eff_dvg = T0 / vgs_eff;
-        T2 = vgs * vgs_eff;
-        dT2_dVg = mixed((vgs, dvgs_eff_dvg), (1., vgs_eff));
-        T11 = pParam.AechvbEdgeS;
-        T12 = pParam.BechvbEdge;
-        let (barrier, barrier_slope) =
-            tunneling_barrier(vgs_eff, T12, pParam.aigs, pParam.bigs, pParam.cigs);
-        T6 = barrier;
-        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dvgs_eff_dvg);
-        Igs = T11 * T2 * T6;
-        dIgs_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
-        dIgs_dVs = -dIgs_dVg;
-        T0 = vgd - (pParam.vfbsd + pParam.vfbsdoff);
-        vgd_eff = T0.hypot(0.01);
-        dvgd_eff_dvg = T0 / vgd_eff;
-        T2 = vgd * vgd_eff;
-        dT2_dVg = mixed((vgd, dvgd_eff_dvg), (1., vgd_eff));
-        T11 = pParam.AechvbEdgeD;
-        let (barrier, barrier_slope) =
-            tunneling_barrier(vgd_eff, T12, pParam.aigd, pParam.bigd, pParam.cigd);
-        T6 = barrier;
-        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dvgd_eff_dvg);
-        Igd = T11 * T2 * T6;
-        dIgd_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
-        dIgd_dVd = -dIgd_dVg;
-        here.Igs = Igs;
-        here.gIgsg = dIgs_dVg;
-        here.gIgss = dIgs_dVs;
-        here.Igd = Igd;
-        here.gIgdg = dIgd_dVg;
-        here.gIgdd = dIgd_dVd;
-    } else {
-        here.gIgcsb = 0.0;
-        here.gIgcsd = here.gIgcsb;
-        here.gIgcsg = here.gIgcsd;
-        here.Igcs = here.gIgcsg;
-        here.gIgcdb = 0.0;
-        here.gIgcdd = here.gIgcdb;
-        here.gIgcdg = here.gIgcdd;
-        here.Igcd = here.gIgcdg;
-        here.gIgss = 0.0;
-        here.gIgsg = here.gIgss;
-        here.Igs = here.gIgsg;
-        here.gIgdd = 0.0;
-        here.gIgdg = here.gIgdd;
-        here.Igd = here.gIgdg;
-    }
-    if model.igbMod != 0 {
-        T0 = tmp * pParam.nigbacc;
-        T1 = -Vgs_eff + Vbseff + Vfb;
-        VxNVt = T1 / T0;
-        if VxNVt > EXP_THRESHOLD {
-            Vaux = T1;
-            dVaux_dVg = -dVgs_eff_dVg;
-            dVaux_dVb = 1.0;
-        } else if VxNVt < -EXP_THRESHOLD {
-            Vaux = T0 * MIN_EXP.ln_1p();
-            dVaux_dVb = 0.0;
-            dVaux_dVg = dVaux_dVb;
-        } else {
-            ExpVxNVt = exp(VxNVt);
-            Vaux = T0 * ExpVxNVt.ln_1p();
-            dVaux_dVb = ExpVxNVt / (1.0 + ExpVxNVt);
-            dVaux_dVg = -dVaux_dVb * dVgs_eff_dVg;
-        }
-        T2 = (Vgs - Vbs) * Vaux;
-        dT2_dVg = mixed((1., Vaux), (Vgs - Vbs, dVaux_dVg));
-        dT2_dVb = mixed((-1., Vaux), (Vgs - Vbs, dVaux_dVb));
-        T11 = 4.97232e-7 * pParam.weff * pParam.leff * pParam.ToxRatio;
-        T12 = -7.45669e11 * toxe;
-        let (barrier, barrier_slope) =
-            tunneling_barrier(Voxacc, T12, pParam.aigbacc, pParam.bigbacc, pParam.cigbacc);
-        T6 = barrier;
-        dT6_dVb = barrier_slope.map_or(0., |slope| slope * dVoxacc_dVb);
-        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dVoxacc_dVg);
-        Igbacc = T11 * T2 * T6;
-        dIgbacc_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
-        dIgbacc_dVb = T11 * residual([(T2, dT6_dVb), (T6, dT2_dVb)]);
-        T0 = tmp * pParam.nigbinv;
-        T1 = Voxdepinv - pParam.eigbinv;
-        VxNVt = T1 / T0;
-        if VxNVt > EXP_THRESHOLD {
-            Vaux = T1;
-            dVaux_dVg = dVoxdepinv_dVg;
-            dVaux_dVd = dVoxdepinv_dVd;
-            dVaux_dVb = dVoxdepinv_dVb;
-        } else if VxNVt < -EXP_THRESHOLD {
-            Vaux = T0 * MIN_EXP.ln_1p();
-            dVaux_dVb = 0.0;
-            dVaux_dVd = dVaux_dVb;
-            dVaux_dVg = dVaux_dVd;
-        } else {
-            ExpVxNVt = exp(VxNVt);
-            Vaux = T0 * ExpVxNVt.ln_1p();
-            dVaux_dVg = ExpVxNVt / (1.0 + ExpVxNVt);
-            dVaux_dVd = dVaux_dVg * dVoxdepinv_dVd;
-            dVaux_dVb = dVaux_dVg * dVoxdepinv_dVb;
-            dVaux_dVg *= dVoxdepinv_dVg;
-        }
-        T2 = (Vgs - Vbs) * Vaux;
-        dT2_dVg = mixed((1., Vaux), (Vgs - Vbs, dVaux_dVg));
-        dT2_dVd = (Vgs - Vbs) * dVaux_dVd;
-        dT2_dVb = mixed((-1., Vaux), (Vgs - Vbs, dVaux_dVb));
-        T11 *= 0.75610;
-        T12 *= 1.31724;
-        let (barrier, barrier_slope) = tunneling_barrier(
-            Voxdepinv,
-            T12,
-            pParam.aigbinv,
-            pParam.bigbinv,
-            pParam.cigbinv,
+            let threshold = Local::new(
+                electro.Vth.clone(),
+                [0., electro.dVth_dVd, electro.dVth_dVb],
+            );
+            gate_effective.clone().add(&threshold.scale(-1.))
+        };
+        let (auxiliary, _, _) = thermal_softplus(&auxiliary_argument, &c(1.), thermal * p.nigc)?;
+        let (barrier, _) = tunneling_barrier(inv.clone(), p.Bechvb, p.aigc, p.bigc, p.cigc);
+        let igc = gate
+            .clone()
+            .multiply(&auxiliary)
+            .multiply(&barrier)
+            .scale(p.Aechvb * nf);
+        let effective = Local::new(
+            transport.Vdseff.clone(),
+            [
+                transport.dVdseff_dVg * electro.dVgsteff_dVg,
+                transport
+                    .dVdseff_dVg
+                    .mul_add(electro.dVgsteff_dVd, transport.dVdseff_dVd),
+                transport
+                    .dVdseff_dVg
+                    .mul_add(electro.dVgsteff_dVb, transport.dVdseff_dVb),
+            ],
         );
-        T6 = barrier;
-        dT6_dVd = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVd);
-        dT6_dVb = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVb);
-        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVg);
-        Igbinv = T11 * T2 * T6;
-        dIgbinv_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
-        dIgbinv_dVd = T11 * residual([(T2, dT6_dVd), (T6, dT2_dVd)]);
-        dIgbinv_dVb = T11 * residual([(T2, dT6_dVb), (T6, dT2_dVb)]);
-        here.Igb = Igbinv + Igbacc;
-        here.gIgbg = dIgbinv_dVg + dIgbacc_dVg;
-        here.gIgbd = dIgbinv_dVd;
-        here.gIgbb = (dIgbinv_dVb + dIgbacc_dVb) * dVbseff_dVb;
+        let partition_coefficient = if model.pigcdGiven {
+            c(p.pigcd)
+        } else {
+            let width = overdrive.clone().offset(1e-20);
+            let coefficient = c(-p.Bechvb).divide(&width)?.divide(&width)?;
+            coefficient.multiply(&effective.clone().scale(-0.5).divide(&width)?.offset(1.))
+        };
+        let [source_fraction, drain_fraction] =
+            gate_partition(partition_coefficient.multiply(&effective).scale(-1.))?;
+        let source = igc.clone().multiply(&source_fraction);
+        let drain = igc.multiply(&drain_fraction);
+        let shift = p.vfbsd + p.vfbsdoff;
+        let igs = edge_tunneling(
+            vgs,
+            shift,
+            p.AechvbEdgeS * nf,
+            p.BechvbEdge,
+            [p.aigs, p.bigs, p.cigs],
+        )?;
+        let igd = edge_tunneling(
+            vgd,
+            shift,
+            p.AechvbEdgeD * nf,
+            p.BechvbEdge,
+            [p.aigd, p.bigd, p.cigd],
+        )?;
+        (source, drain, igs, igd)
     } else {
-        here.gIgbb = 0.0;
-        here.gIgbs = here.gIgbb;
-        here.gIgbd = here.gIgbs;
-        here.gIgbg = here.gIgbd;
-        here.Igb = here.gIgbg;
-    }
-    if here.nf != 1.0 {
-        cdrain *= here.nf;
-        here.gds *= here.nf;
-        here.gm *= here.nf;
-        here.gmbs *= here.nf;
-        here.IdovVds *= here.nf;
-        here.gbbs *= here.nf;
-        here.gbgs *= here.nf;
-        here.gbds *= here.nf;
-        here.csub *= here.nf;
-        here.Igidl *= here.nf;
-        here.ggidld *= here.nf;
-        here.ggidlg *= here.nf;
-        here.ggidlb *= here.nf;
-        here.Igisl *= here.nf;
-        here.ggisls *= here.nf;
-        here.ggislg *= here.nf;
-        here.ggislb *= here.nf;
-        here.Igcs *= here.nf;
-        here.gIgcsg *= here.nf;
-        here.gIgcsd *= here.nf;
-        here.gIgcsb *= here.nf;
-        here.Igcd *= here.nf;
-        here.gIgcdg *= here.nf;
-        here.gIgcdd *= here.nf;
-        here.gIgcdb *= here.nf;
-        here.Igs *= here.nf;
-        here.gIgsg *= here.nf;
-        here.gIgss *= here.nf;
-        here.Igd *= here.nf;
-        here.gIgdg *= here.nf;
-        here.gIgdd *= here.nf;
-        here.Igb *= here.nf;
-        here.gIgbg *= here.nf;
-        here.gIgbd *= here.nf;
-        here.gIgbb *= here.nf;
-    }
-    here.ggidls = -(here.ggidld + here.ggidlg + here.ggidlb);
-    here.ggisld = -(here.ggisls + here.ggislg + here.ggislb);
-    here.gIgbs = -(here.gIgbg + here.gIgbd + here.gIgbb);
+        (
+            c(0.),
+            c(0.),
+            Local::new(electro.Vgst.constant(0.), [0.]),
+            Local::new(electro.Vgst.constant(0.), [0.]),
+        )
+    };
+    let [here_g, here_d, here_b] = igcs.partials;
+    here.gIgcsg = here_g;
+    here.gIgcsd = here_d;
+    here.gIgcsb = here_b * electro.dVbseff_dVb;
+    let [here_g, here_d, here_b] = igcd.partials;
+    here.gIgcdg = here_g;
+    here.gIgcdd = here_d;
+    here.gIgcdb = here_b * electro.dVbseff_dVb;
     here.gIgcss = -(here.gIgcsg + here.gIgcsd + here.gIgcsb);
     here.gIgcds = -(here.gIgcdg + here.gIgcdd + here.gIgcdb);
-    here.cd = cdrain;
+    here.gIgsg = igs.partials[0];
+    here.gIgss = -here.gIgsg;
+    here.gIgdg = igd.partials[0];
+    here.gIgdd = -here.gIgdg;
+
+    let igb = if model.igbMod != 0 {
+        let gate_bulk = gate.add(&raw_body.scale(-1.));
+        let accumulation_argument = body.add(&gate_effective.scale(-1.)).offset(here.vfbzb);
+        let (acc_auxiliary, _, _) =
+            thermal_softplus(&accumulation_argument, &c(1.), thermal * p.nigbacc)?;
+        let prefactor = 4.97232e-7 * p.weff * p.leff * p.ToxRatio * nf;
+        let exponent = -7.45669e11 * electro.toxe;
+        let (barrier, _) = tunneling_barrier(acc, exponent, p.aigbacc, p.bigbacc, p.cigbacc);
+        let accumulation = gate_bulk
+            .clone()
+            .multiply(&acc_auxiliary)
+            .multiply(&barrier)
+            .scale(prefactor);
+        let inversion_argument = inv.clone().offset(-p.eigbinv);
+        let (inv_auxiliary, _, _) =
+            thermal_softplus(&inversion_argument, &c(1.), thermal * p.nigbinv)?;
+        let (barrier, _) =
+            tunneling_barrier(inv, exponent * 1.31724, p.aigbinv, p.bigbinv, p.cigbinv);
+        accumulation.add(
+            &gate_bulk
+                .multiply(&inv_auxiliary)
+                .multiply(&barrier)
+                .scale(prefactor * 0.75610),
+        )
+    } else {
+        c(0.)
+    };
+    let [gg, gd, gb] = igb.partials;
+    here.gIgbg = gg;
+    here.gIgbd = gd;
+    here.gIgbb = gb * electro.dVbseff_dVb;
+    here.gIgbs = -(here.gIgbg + here.gIgbd + here.gIgbb);
+    let result = Leakage {
+        channel: transport.unscaled_drain_current.clone().scale(nf),
+        substrate: transport.substrate_current.clone().scale(nf),
+        gidl: gidl.value,
+        gisl: gisl.value,
+        igcs: igcs.value,
+        igcd: igcd.value,
+        igs: igs.value,
+        igd: igd.value,
+        igb: igb.value,
+    };
+    here.cd = result.channel.primal();
+    here.csub = result.substrate.primal();
+    here.Igidl = result.gidl.primal();
+    here.Igisl = result.gisl.primal();
+    here.Igcs = result.igcs.primal();
+    here.Igcd = result.igcd.primal();
+    here.Igs = result.igs.primal();
+    here.Igd = result.igd.primal();
+    here.Igb = result.igb.primal();
+    here.gds *= nf;
+    here.gm *= nf;
+    here.gmbs *= nf;
+    here.IdovVds *= nf;
+    here.gbbs *= nf;
+    here.gbgs *= nf;
+    here.gbds *= nf;
+    // Noise auxiliaries are observations, not part of F or Q.
     if model.tnoiMod == 0 {
-        Abulk = Abulk0_Q * pParam.abulkCVfactor;
-        Vdsat = Vgsteff / Abulk;
-        Vdseff = if Vds == 0. {
+        let bulk = transport.Abulk0_Q.primal() * p.abulkCVfactor;
+        let overdrive = electro.Vgsteff.primal();
+        let saturation = overdrive / bulk;
+        let drain = electro.Vds.primal();
+        let effective = if drain == 0. {
             0.
         } else {
-            super::smooth_drain(Vdsat, Vds, DELTA_4)?.effective
+            super::smooth_drain(saturation, drain, DELTA_4)?.effective
         };
-        T0 = Abulk * Vdseff;
-        T1 = 12.0 * ((-0.5_f64).mul_add(T0, Vgsteff) + 1.0e-20);
-        T2 = Vdseff / T1;
-        T3 = T0 * T2;
-        here.qinv = Coxeff
-            * pParam.weffCV
-            * here.nf
-            * pParam.leffCV
-            * (residual([(Vgsteff, 1.), (-0.5, T0), (Abulk, T3)]));
+        let weighted = bulk * effective;
+        let width = 12. * ((-0.5_f64).mul_add(weighted, overdrive) + 1e-20);
+        let correction = weighted * (effective / width);
+        here.qinv = transport.Coxeff.primal()
+            * p.weffCV
+            * nf
+            * p.leffCV
+            * residual([(overdrive, 1.), (-0.5, weighted), (bulk, correction)]);
     } else if model.tnoiMod == 2 {
-        here.noiGd0 = here.nf * beta * Vgsteff / (gche.mul_add(Rds, 1.));
+        here.noiGd0 = nf * transport.beta.primal() * electro.Vgsteff.primal()
+            / transport.gche.primal().mul_add(transport.Rds.primal(), 1.);
     }
-    Ok(cdrain)
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -896,11 +708,11 @@ mod tests {
     #[test]
     fn partition_retains_the_tiny_derivative_at_half_partition() {
         for argument in [-1e-18, 1e-18] {
-            let p = GatePartition::new(argument);
-            assert_eq!(p.source, 0.5);
-            assert_eq!(p.drain, 0.5);
-            assert!((p.source_slope / 2.5e-33 - 1.).abs() < 8. * f64::EPSILON);
-            assert!((p.drain_slope / 5e-33 - 1.).abs() < 8. * f64::EPSILON);
+            let [source, drain] = gate_partition(Local::new(argument, [1.])).unwrap();
+            assert_eq!(source.value, 0.5);
+            assert_eq!(drain.value, 0.5);
+            assert!((source.partials[0] / 2.5e-33 - 1.).abs() < 8. * f64::EPSILON);
+            assert!((drain.partials[0] / 5e-33 - 1.).abs() < 8. * f64::EPSILON);
         }
     }
 
@@ -909,33 +721,25 @@ mod tests {
         for argument in [
             -100., -35., -33., -0.51, -0.49, -0.1, 0., 0.1, 0.49, 0.51, 33., 35., 100.,
         ] {
-            let p = GatePartition::new(argument);
+            let [source, drain] = gate_partition(Local::new(argument, [1.])).unwrap();
             let h = 1e-5;
-            let lo = GatePartition::new(argument - h);
-            let hi = GatePartition::new(argument + h);
-            let lo_half = GatePartition::new(argument - 0.5 * h);
-            let hi_half = GatePartition::new(argument + 0.5 * h);
-            let richardson = |lower: f64, upper: f64, half_lower: f64, half_upper: f64| {
-                (4. * (half_upper - half_lower) / h - (upper - lower) / (2. * h)) / 3.
-            };
-            for (slope, difference) in [
-                (
-                    p.source_slope,
-                    richardson(lo.source, hi.source, lo_half.source, hi_half.source),
-                ),
-                (
-                    p.drain_slope,
-                    richardson(lo.drain, hi.drain, lo_half.drain, hi_half.drain),
-                ),
-            ] {
+            let [lo, hi, lo_half, hi_half] =
+                [-h, h, -0.5 * h, 0.5 * h].map(|delta| gate_partition(argument + delta).unwrap());
+            for (index, slope) in [source.partials[0], drain.partials[0]]
+                .into_iter()
+                .enumerate()
+            {
+                let difference = (4. * (hi_half[index] - lo_half[index]) / h
+                    - (hi[index] - lo[index]) / (2. * h))
+                    / 3.;
                 assert!(
                     (slope - difference).abs() < 1e-6 * slope.abs() + 1e-8,
                     "{argument}: {slope:e}, {difference:e}"
                 );
             }
         }
-        let extreme = GatePartition::new(1e200);
-        assert!(extreme.source.is_finite() && extreme.source < 0.);
-        assert!(extreme.drain.is_finite() && extreme.drain > 0.);
+        let [source, drain] = gate_partition(1e200).unwrap();
+        assert!(source.is_finite() && source < 0.);
+        assert!(drain.is_finite() && drain > 0.);
     }
 }

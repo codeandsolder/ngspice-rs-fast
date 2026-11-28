@@ -12,9 +12,9 @@ use crate::primitives::SpiceResult;
 /// Body-source and body-drain voltage, selecting bulk-resistance internal
 /// nodes when present. Both are already polarity-normalized and limited.
 #[derive(Clone, Copy)]
-pub(super) struct JunctionBias {
-    pub(super) source: f64,
-    pub(super) drain: f64,
+pub(super) struct JunctionBias<S = f64> {
+    pub(super) source: S,
+    pub(super) drain: S,
 }
 
 /// Temperature-prepared diode quantities for one physical junction.
@@ -276,6 +276,17 @@ pub(super) fn current(
     ckt: &dyn LoadCkt,
     bias: JunctionBias,
 ) -> SpiceResult<()> {
+    current_constitutive(model, here, size, ckt.gmin(), bias)?;
+    Ok(())
+}
+
+pub(super) fn current_constitutive<S: Constitutive>(
+    model: &Model,
+    here: &mut Instance,
+    size: &SizeParam,
+    gmin: f64,
+    bias: JunctionBias<S>,
+) -> SpiceResult<[S; 2]> {
     let gate_perimeter = size.weffCJ * here.nf;
     let source_saturation = if here.Aseff <= 0. && here.Pseff <= 0. {
         0.
@@ -317,14 +328,16 @@ pub(super) fn current(
         reverse_current: here.IVjdmRev,
         reverse_slope: here.DslpRev,
     };
-    if let Some((current, slope)) = source.evaluate(model.dioMod, &bias.source, ckt.gmin())? {
-        here.cbs = current;
-        here.gbs = slope;
-    }
-    if let Some((current, slope)) = drain.evaluate(model.dioMod, &bias.drain, ckt.gmin())? {
-        here.cbd = current;
-        here.gbd = slope;
-    }
+    let (source_current, source_slope) = source
+        .evaluate(model.dioMod, &bias.source, gmin)?
+        .ok_or_else(|| {
+            crate::primitives::SpiceError::circuit("invalid BSIM4 junction diode mode")
+        })?;
+    let (drain_current, drain_slope) = drain
+        .evaluate(model.dioMod, &bias.drain, gmin)?
+        .ok_or_else(|| {
+            crate::primitives::SpiceError::circuit("invalid BSIM4 junction diode mode")
+        })?;
     let source_tunnels = [
         (here.SjctTempRevSatCur, model.njtsstemp, model.vtss),
         (here.SswTempRevSatCur, model.njtsswstemp, model.vtssws),
@@ -335,23 +348,34 @@ pub(super) fn current(
         (here.DswTempRevSatCur, model.njtsswdtemp, model.vtsswd),
         (here.DswgTempRevSatCur, model.njtsswgdtemp, model.vtsswgd),
     ];
-    for (voltage, terms, current, slope) in [
-        (bias.source, source_tunnels, &mut here.cbs, &mut here.gbs),
-        (bias.drain, drain_tunnels, &mut here.cbd, &mut here.gbd),
-    ] {
-        let evaluate = |(density, emission, threshold)| {
-            let (difference, derivative) =
-                reverse_tunneling(voltage, model.vtm0 * emission, threshold)?;
-            Ok::<_, crate::primitives::SpiceError>((density * difference, density * derivative))
+    let apply_tunnels =
+        |voltage: S, terms: [(f64, f64, f64); 3], current: S, slope: S| -> SpiceResult<(S, S)> {
+            let evaluate = |(density, emission, threshold)| {
+                let (difference, derivative) =
+                    reverse_tunneling(voltage.clone(), model.vtm0 * emission, threshold)?;
+                Ok::<_, crate::primitives::SpiceError>((
+                    difference.scale(density),
+                    derivative.scale(density),
+                ))
+            };
+            let [area, sidewall, gate] = terms.map(evaluate);
+            let (area, area_slope) = area?;
+            let (sidewall, sidewall_slope) = sidewall?;
+            let (gate, gate_slope) = gate?;
+            Ok((
+                current.add(&area.add(&sidewall).add(&gate).scale(-1.)),
+                slope.add(&area_slope.add(&sidewall_slope).add(&gate_slope)),
+            ))
         };
-        let [area, sidewall, gate] = terms.map(evaluate);
-        let (area, area_slope) = area?;
-        let (sidewall, sidewall_slope) = sidewall?;
-        let (gate, gate_slope) = gate?;
-        *current -= area + sidewall + gate;
-        *slope += area_slope + sidewall_slope + gate_slope;
-    }
-    Ok(())
+    let (source, source_slope) =
+        apply_tunnels(bias.source, source_tunnels, source_current, source_slope)?;
+    let (drain, drain_slope) =
+        apply_tunnels(bias.drain, drain_tunnels, drain_current, drain_slope)?;
+    here.cbs = source.primal();
+    here.gbs = source_slope.primal();
+    here.cbd = drain.primal();
+    here.gbd = drain_slope.primal();
+    Ok([source, drain])
 }
 
 /// Evaluate depletion charge and capacitance (C's finished label).
@@ -362,7 +386,20 @@ pub(super) fn charge(
     ckt: &mut dyn LoadCkt,
     bias: JunctionBias,
 ) -> SpiceResult<()> {
-    let (_, source_capacitance) = depletion(
+    charge_constitutive(model, here, size, bias, |slot, charge| {
+        ckt.set_state0(slot, *charge)
+    })?;
+    Ok(())
+}
+
+pub(super) fn charge_constitutive<S: Constitutive>(
+    model: &Model,
+    here: &mut Instance,
+    size: &SizeParam,
+    bias: JunctionBias<S>,
+    mut record: impl FnMut(usize, &S),
+) -> SpiceResult<[S; 2]> {
+    let (source_charge, source_capacitance) = depletion(
         &bias.source,
         [
             JunctionCapacitance {
@@ -381,10 +418,10 @@ pub(super) fn charge(
                 grading: model.SbulkJctGateSideGradingCoeff,
             },
         ],
-        |charge| ckt.set_state0(state::QBS, *charge),
+        |charge| record(state::QBS, charge),
     )?;
-    here.capbs = source_capacitance;
-    let (_, drain_capacitance) = depletion(
+    here.capbs = source_capacitance.primal();
+    let (drain_charge, drain_capacitance) = depletion(
         &bias.drain,
         [
             JunctionCapacitance {
@@ -403,10 +440,10 @@ pub(super) fn charge(
                 grading: model.DbulkJctGateSideGradingCoeff,
             },
         ],
-        |charge| ckt.set_state0(state::QBD, *charge),
+        |charge| record(state::QBD, charge),
     )?;
-    here.capbd = drain_capacitance;
-    Ok(())
+    here.capbd = drain_capacitance.primal();
+    Ok([source_charge, drain_charge])
 }
 
 #[cfg(test)]

@@ -45,6 +45,8 @@ pub(super) struct Electrostatics<S = f64> {
     pub(super) Vds: S,
     pub(super) Vgs: S,
     pub(super) Vgs_eff: S,
+    pub(super) vgs_eff_raw: S,
+    pub(super) vgd_eff_raw: S,
     pub(super) Vgst: S,
     pub(super) Vgsteff: S,
     pub(super) Vth: S,
@@ -271,9 +273,9 @@ pub(super) fn electrostatics_constitutive<S: Constitutive>(
     here.dvgs_eff_dvg = dvgs_eff_dvg.primal();
     here.dvgd_eff_dvg = dvgd_eff_dvg.primal();
     let (Vgs_eff, dVgs_eff_dVg) = if here.mode > 0 {
-        (vgs_eff, here.dvgs_eff_dvg)
+        (vgs_eff.clone(), here.dvgs_eff_dvg)
     } else {
-        (vgd_eff, here.dvgd_eff_dvg)
+        (vgd_eff.clone(), here.dvgd_eff_dvg)
     };
     let Vgst = Vgs_eff.clone().add(&Vth.clone().scale(-1.));
     let (Vgsteff, voltage_partial, factor_partial) = effective_overdrive(
@@ -301,6 +303,8 @@ pub(super) fn electrostatics_constitutive<S: Constitutive>(
         Vds,
         Vgs,
         Vgs_eff,
+        vgs_eff_raw: vgs_eff,
+        vgd_eff_raw: vgd_eff,
         Vgst,
         Vgsteff,
         Vth,
