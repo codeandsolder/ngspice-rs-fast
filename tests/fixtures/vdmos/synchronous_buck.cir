@@ -1,0 +1,54 @@
+Ngspice 47 synchronous buck with P and N VDMOS electrothermal devices
+.options temp=27 method=trap reltol=1e-5 abstol=1e-12 gmin=1e-12
+Vdc vin 0 12
+Vgh gh 0 PULSE(12 6 0 50n 50n 4.2u 10u)
+Vgl gl 0 PULSE(0 6 4.6u 50n 50n 4.5u 10u)
+Mhi sw gh vin hj hc high thermal
+Mlo sw gl 0 lj lc low thermal
+.model high vdmosp(vto=-3 kp=8 rd=0.03 rs=0.02 rg=0.5 cgs=500p cgdmax=500p cgdmin=100p cjo=200p tt=50n vp=0.35 rthjc=1.2 rthca=7 cthj=1m)
+.model low vdmos(vto=3 kp=12 rd=0.02 rs=0.01 rg=0.5 cgs=500p cgdmax=500p cgdmin=100p cjo=200p tt=50n vp=0.35 rthjc=0.9 rthca=6 cthj=1m)
+Lout sw out 150u
+Cout out 0 100u
+Rload out 0 10
+.control
+tran 50n 200u 0 50n
+meas tran vo20 find v(out) at=20u
+meas tran vo50 find v(out) at=50u
+meas tran vo100 find v(out) at=100u
+meas tran vo150 find v(out) at=150u
+meas tran vo200 find v(out) at=200u
+meas tran sw41 find v(sw) at=40.1u
+meas tran sw45 find v(sw) at=44.5u
+meas tran sw49 find v(sw) at=49.5u
+meas tran ih40 find i(vdc) at=40.1u
+meas tran ih45 find i(vdc) at=44.5u
+meas tran tjh200 find v(hj) at=200u
+meas tran tch200 find v(hc) at=200u
+meas tran tjl200 find v(lj) at=200u
+meas tran tcl200 find v(lc) at=200u
+* Waveform moments; RMS uses a piecewise-linear waveform integral.
+meas tran vo_mean avg v(out)
+meas tran vo_rms rms v(out)
+meas tran sw_mean avg v(sw)
+meas tran sw_rms rms v(sw)
+meas tran supply_mean avg i(vdc)
+meas tran supply_rms rms i(vdc)
+meas tran inductor_mean avg i(lout)
+meas tran inductor_rms rms i(lout)
+meas tran high_gate_rms rms i(vgh)
+meas tran low_gate_rms rms i(vgl)
+let tjh_rise = v(hj)-27
+let tch_rise = v(hc)-27
+let tjl_rise = v(lj)-27
+let tcl_rise = v(lc)-27
+meas tran tjh_mean avg tjh_rise
+meas tran tjh_rms rms tjh_rise
+meas tran tch_mean avg tch_rise
+meas tran tch_rms rms tch_rise
+meas tran tjl_mean avg tjl_rise
+meas tran tjl_rms rms tjl_rise
+meas tran tcl_mean avg tcl_rise
+meas tran tcl_rms rms tcl_rise
+quit
+.endc
+.end

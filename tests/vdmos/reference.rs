@@ -1,0 +1,661 @@
+//! Circuit-coupled VDMOS DC goldens from ngspice 47.
+use super::{ReferencePlot, run_one};
+use ngspice_rs::primitives::SpiceResult;
+
+fn run(source: &str) -> SpiceResult<ReferencePlot> {
+    run_one(source, "op")
+}
+fn close(name: &str, actual: f64, c: f64) {
+    let tolerance = 2e-4_f64.mul_add(c.abs(), 1e-5);
+    assert!(
+        (actual - c).abs() <= tolerance,
+        "{name} Rust {actual:e}, ngspice47 {c:e}, tolerance {tolerance:e}"
+    );
+}
+#[test]
+fn circuit_coupled_vdmos_nmos_pmos_series_and_diode() {
+    for (name, source, drain, supply_current) in [
+        (
+            "N",
+            include_str!("../fixtures/vdmos/n_load.cir"),
+            0.06158834,
+            -1.19384,
+        ),
+        (
+            "P",
+            include_str!("../fixtures/vdmos/p_load.cir"),
+            -0.126767,
+            1.187323,
+        ),
+        (
+            "series",
+            include_str!("../fixtures/vdmos/n_series.cir"),
+            0.3009264,
+            -1.16991,
+        ),
+        (
+            "diode",
+            include_str!("../fixtures/vdmos/n_diode.cir"),
+            -0.598882,
+            0.01117514,
+        ),
+    ] {
+        let plot = run(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let v = plot
+            .value("v(drain)", 0)
+            .unwrap_or_else(|| panic!("{name}: missing Vdrain"));
+        let i = plot
+            .value("i(vdd)", 0)
+            .unwrap_or_else(|| panic!("{name}: missing source current"));
+        close(&format!("{name} Vdrain"), v.re, drain);
+        close(&format!("{name} supply current"), i.re, supply_current);
+    }
+}
+fn ac(source: &str, frequency: &str) -> SpiceResult<ReferencePlot> {
+    run_one(source, &format!("ac lin 1 {frequency} {frequency}"))
+}
+
+#[test]
+fn native_circuit_coupled_small_signal_n_p_and_series() {
+    for (name, source, real, imag) in [
+        (
+            "N",
+            include_str!("../fixtures/vdmos/n_ac.cir"),
+            -0.0652793,
+            7.197459e-5,
+        ),
+        (
+            "P",
+            include_str!("../fixtures/vdmos/p_ac.cir"),
+            -0.143518,
+            1.673841e-4,
+        ),
+        (
+            "series",
+            include_str!("../fixtures/vdmos/n_series_ac.cir"),
+            -0.0777147,
+            4.281995e-4,
+        ),
+    ] {
+        let plot = ac(source, "100k").unwrap_or_else(|error| panic!("AC {name}: {error}"));
+        let v = plot
+            .value("v(drain)", 0)
+            .unwrap_or_else(|| panic!("AC {name}: missing drain"));
+        close(&format!("AC {name} real"), v.re, real);
+        close(&format!("AC {name} imaginary"), v.im, imag);
+    }
+}
+
+fn transient(source: &str, timing: &str) -> SpiceResult<ReferencePlot> {
+    run_one(source, &format!("tran {timing}"))
+}
+
+fn interpolation(plot: &ReferencePlot, variable: &str, at: f64) -> f64 {
+    for current in 1..plot.point_count() {
+        let t0 = plot.value("time", current - 1).unwrap().re;
+        let t1 = plot.value("time", current).unwrap().re;
+        if t0 <= at && at <= t1 {
+            let y0 = plot.value(variable, current - 1).unwrap().re;
+            let y1 = plot.value(variable, current).unwrap().re;
+            return (at - t0).mul_add((y1 - y0) / (t1 - t0), y0);
+        }
+    }
+    // Adaptive runs may represent the exact requested tstop one or two ULPs
+    // below the decimal literal used to request the final checkpoint.
+    let last = plot.point_count() - 1;
+    let time = plot.value("time", last).unwrap().re;
+    if (at - time).abs() <= 64.0 * f64::EPSILON * at.abs().max(time.abs()) {
+        return plot.value(variable, last).unwrap().re;
+    }
+    panic!("requested time {at:e} not covered by transient result (last {time:e})")
+}
+
+#[test]
+fn circuit_coupled_n_p_gate_switching_matches_ngspice47_charge_transient() {
+    for (name, source, expected) in [
+        (
+            "N",
+            include_str!("../fixtures/vdmos/n_switch.cir"),
+            [
+                12.0, 12.0022, 0.0637966, 0.0615883, 0.2853, 3.01956, 10.3514,
+            ],
+        ),
+        (
+            "P",
+            include_str!("../fixtures/vdmos/p_switch.cir"),
+            [
+                -12.0, -12.0022, -4.88255, -0.126767, -0.354727, -3.07363, -10.3614,
+            ],
+        ),
+    ] {
+        let plot = transient(source, "5n 6u 0 5n")
+            .unwrap_or_else(|error| panic!("transient {name}: {error}"));
+        assert!(
+            plot.point_count() >= 100,
+            "{name}: transient waveform truncated"
+        );
+        for (time, reference) in [0.5e-6, 1.03e-6, 1.2e-6, 2e-6, 3.03e-6, 3.3e-6, 5e-6]
+            .into_iter()
+            .zip(expected)
+        {
+            let actual = interpolation(&plot, "v(drain)", time);
+            let tolerance = 4e-3_f64.mul_add(f64::abs(reference), 0.04);
+            assert!(
+                (actual - reference).abs() <= tolerance,
+                "transient {name} t={time:e}: Rust {actual:e}, C47 {reference:e}, tol {tolerance:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn circuit_coupled_soft_recovery_n_p_matches_ngspice47_transient() {
+    let times = [180e-9, 201e-9, 207e-9, 220e-9, 260e-9, 400e-9];
+    let n_voltage = [
+        -0.549495, -0.504010, 0.0924717, 0.0995240, 0.0998249, 0.0999947,
+    ];
+    let n_supply = [
+        0.00168459,
+        -0.280033,
+        -0.0250944,
+        -0.00158655,
+        -0.000583648,
+        -0.0000176238,
+    ];
+    for (name, deck, sign) in [
+        ("N", include_str!("../fixtures/vdmos/n_recovery.cir"), 1.0),
+        ("P", include_str!("../fixtures/vdmos/p_recovery.cir"), -1.0),
+    ] {
+        let plot = transient(deck, "0.5n 700n 0 0.5n")
+            .unwrap_or_else(|error| panic!("recovery {name}: {error}"));
+        assert!(
+            plot.point_count() > 500,
+            "{name}: truncated recovery waveform"
+        );
+        for (index, t) in times.into_iter().enumerate() {
+            let v = interpolation(&plot, "v(d)", t);
+            let i = interpolation(&plot, "i(vdrive)", t);
+            let reference_v: f64 = sign * n_voltage[index];
+            let reference_i: f64 = sign * n_supply[index];
+            let v_tolerance = 0.015_f64.mul_add(reference_v.abs(), 0.002);
+            let i_tolerance = 0.08_f64.mul_add(reference_i.abs(), 3e-6);
+            assert!(
+                (v - reference_v).abs() <= v_tolerance,
+                "{name} reverse-recovery V(d) t={t:e}: Rust {v:e}, C {reference_v:e}, tol {v_tolerance:e}"
+            );
+            assert!(
+                (i - reference_i).abs() <= i_tolerance,
+                "{name} reverse-recovery I(vdrive) t={t:e}: Rust {i:e}, C {reference_i:e}, tol {i_tolerance:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dynamic_soft_recovery_small_signal_matches_ngspice47() {
+    for (name, source) in [
+        ("N", include_str!("../fixtures/vdmos/n_recovery_ac.cir")),
+        ("P", include_str!("../fixtures/vdmos/p_recovery_ac.cir")),
+    ] {
+        for (frequency, real_ref, imaginary_ref) in [
+            ("1Meg", 0.9789868, -0.0131346),
+            ("10Meg", 0.9518050, -0.0708756),
+        ] {
+            let plot = ac(source, frequency)
+                .unwrap_or_else(|error| panic!("Qp AC {name} {frequency}: {error}"));
+            let voltage = plot
+                .value("v(d)", 0)
+                .unwrap_or_else(|| panic!("Qp AC {name} {frequency}: no drain result"));
+            let tolerance = 5e-4;
+            assert!(
+                (voltage.re - real_ref).abs() < tolerance,
+                "Qp AC {name} {frequency}: real Rust {} C {real_ref}",
+                voltage.re
+            );
+            assert!(
+                (voltage.im - imaginary_ref).abs() < tolerance,
+                "Qp AC {name} {frequency}: imag Rust {} C {imaginary_ref}",
+                voltage.im
+            );
+        }
+    }
+}
+
+#[test]
+fn electrothermal_junction_case_dc_matches_ngspice47() {
+    for (name, source, junction, case, drain_supply_current) in [
+        (
+            "N",
+            include_str!("../fixtures/vdmos/thermal_dc_n.cir"),
+            35.79102,
+            34.32585,
+            -4.883899,
+        ),
+        (
+            "P",
+            include_str!("../fixtures/vdmos/thermal_dc_p.cir"),
+            31.48895,
+            30.74079,
+            2.493859,
+        ),
+    ] {
+        let plot = run(source).unwrap_or_else(|error| panic!("thermal DC {name}: {error}"));
+        for (label, reference) in [
+            ("v(junction)", junction),
+            ("v(case)", case),
+            ("i(vd)", drain_supply_current),
+        ] {
+            let actual = plot
+                .value(label, 0)
+                .unwrap_or_else(|| panic!("{name} thermal DC missing {label}"))
+                .re;
+            close(&format!("thermal {name} {label}"), actual, reference);
+        }
+    }
+}
+
+#[test]
+fn producer_allocated_thermal_terminals_match_explicit_terminals() {
+    let source = include_str!("../fixtures/vdmos/thermal_dc_n.cir");
+    let implicit = source.replace("M1 d g 0 junction case dut thermal", "M1 d g 0 dut thermal");
+    let explicit = run(source).unwrap();
+    let implicit = run(&implicit).unwrap();
+    for (a, b) in [
+        ("i(vd)", "i(vd)"),
+        ("v(junction)", "v(m1-thermal-junction)"),
+        ("v(case)", "v(m1-thermal-case)"),
+    ] {
+        let expected = explicit.value(a, 0).unwrap().re;
+        let actual = implicit.value(b, 0).unwrap().re;
+        assert!(
+            (actual - expected).abs() <= 1e-10 * expected.abs() + 1e-10,
+            "implicit {b}: {actual:e} vs explicit {a}: {expected:e}"
+        );
+    }
+}
+
+#[test]
+fn electrothermal_junction_case_switching_transient_matches_ngspice47() {
+    let checkpoint_times = [50e-6, 110e-6, 500e-6, 1e-3, 1.1e-3, 1.8e-3];
+    for (name, deck, junctions, cases) in [
+        (
+            "N",
+            include_str!("../fixtures/vdmos/thermal_switch_n.cir"),
+            [27.0, 27.1503, 31.4068, 33.9530, 32.8857, 28.8328],
+            [27.0, 27.1253, 30.6723, 32.7942, 31.9048, 28.5274],
+        ),
+        (
+            "P",
+            include_str!("../fixtures/vdmos/thermal_switch_p.cir"),
+            [27.0, 27.0752, 29.2181, 30.5202, 29.9798, 27.9279],
+            [27.0, 27.0627, 28.8484, 29.9335, 29.4832, 27.7733],
+        ),
+    ] {
+        let plot = transient(deck, "1u 2m 0 1u")
+            .unwrap_or_else(|error| panic!("thermal transient {name}: {error}"));
+        assert!(
+            plot.point_count() > 1000,
+            "{name}: truncated thermal waveform"
+        );
+        for (variable, expected) in [("v(junction)", junctions), ("v(case)", cases)] {
+            for (time, reference) in checkpoint_times.into_iter().zip(expected) {
+                let actual = interpolation(&plot, variable, time);
+                let tolerance = 0.12;
+                assert!(
+                    (actual - reference).abs() < tolerance,
+                    "{name} thermal transient {variable} at {time:e}: Rust {actual:e}, ngspice47 {reference:e}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn electrothermal_small_signal_is_derivative_of_its_dc_residual() {
+    // ngspice 47's vdmosacld.c reverses the electrothermal power-Jacobian
+    // signs versus vdmosload.c: at f→0 its AC junction temperature has the
+    // opposite sign to its own DC finite-difference slope. Preserve the
+    // *physical* DC/AC consistency rather than reproduce that C defect.
+    for (name, dc_source, ac_source, base_gate, c_junction_slope) in [
+        (
+            "N",
+            include_str!("../fixtures/vdmos/thermal_dc_n.cir"),
+            include_str!("../fixtures/vdmos/thermal_ac_n.cir"),
+            4.0,
+            9.92,
+        ),
+        (
+            "P",
+            include_str!("../fixtures/vdmos/thermal_dc_p.cir"),
+            include_str!("../fixtures/vdmos/thermal_ac_p.cir"),
+            -4.0,
+            -5.165,
+        ),
+    ] {
+        let gate = format!("Vg g 0 {base_gate}");
+        let mut dc_points = Vec::new();
+        for step in [-0.001, 0.001] {
+            let source = dc_source.replace(&gate, &format!("Vg g 0 {}", base_gate + step));
+            let plot = run(&source).unwrap_or_else(|error| panic!("{name} derivative DC: {error}"));
+            dc_points.push(["v(junction)", "v(case)", "i(vd)"].map(|key| {
+                plot.value(key, 0)
+                    .unwrap_or_else(|| panic!("missing DC {key}"))
+                    .re
+            }));
+        }
+        let ac_low =
+            ac(ac_source, "1mHz").unwrap_or_else(|error| panic!("{name} thermal AC: {error}"));
+        let ac_100 =
+            ac(ac_source, "100").unwrap_or_else(|error| panic!("{name} thermal 100Hz: {error}"));
+        for (index, key) in ["v(junction)", "v(case)", "i(vd)"].into_iter().enumerate() {
+            let finite_difference = (dc_points[1][index] - dc_points[0][index]) / 0.002;
+            let low = ac_low
+                .value(key, 0)
+                .unwrap_or_else(|| panic!("missing AC {key}"));
+            let tol = 0.007_f64.mul_add(finite_difference.abs(), 0.005);
+            assert!(
+                (low.re - finite_difference).abs() < tol,
+                "{name} {key}: low-frequency AC {} vs DC derivative {} (tol {})",
+                low.re,
+                finite_difference,
+                tol
+            );
+            assert!(
+                low.im.abs() < 1e-3,
+                "{name} {key}: low-frequency imaginary component {}",
+                low.im
+            );
+            if index < 2 {
+                let finite_100 = ac_100.value(key, 0).unwrap();
+                assert!(
+                    finite_100.re * finite_difference > 0.0,
+                    "{name} {key}: thermal AC changes DC response sign"
+                );
+                assert!(
+                    finite_100.im * finite_difference < 0.0,
+                    "{name} {key}: thermal RC phase leads rather than lags"
+                );
+            }
+        }
+        let c_error = 0.008_f64.mul_add(f64::abs(c_junction_slope), 0.04);
+        let got = (dc_points[1][0] - dc_points[0][0]) / 0.002;
+        assert!(
+            (got - c_junction_slope).abs() < c_error,
+            "{name} DC slope {got} disagrees with native ngspice47 {c_junction_slope}"
+        );
+    }
+}
+
+#[test]
+fn simultaneous_electrothermal_and_soft_recovery_states_match_ngspice47() {
+    let times = [180e-6, 202e-6, 210e-6, 240e-6, 350e-6];
+    let junction = [27.1822, 27.1763, 27.1543, 27.0936, 27.0150];
+    let case = [27.1518, 27.1469, 27.1285, 27.0780, 27.0125];
+    let currents = [-0.0437920, -0.00592598, -3.27612e-6];
+    for (name, source, sign) in [
+        (
+            "N",
+            include_str!("../fixtures/vdmos/thermal_recovery_n.cir"),
+            1.0,
+        ),
+        (
+            "P",
+            include_str!("../fixtures/vdmos/thermal_recovery_p.cir"),
+            -1.0,
+        ),
+    ] {
+        let plot = transient(source, "100n 400u 0 100n maxsteps=10000")
+            .unwrap_or_else(|error| panic!("combined Qp/thermal {name}: {error}"));
+        assert!(
+            plot.point_count() > 2000,
+            "{name}: short combined transient"
+        );
+        for (variable, expected) in [("v(junction)", junction), ("v(case)", case)] {
+            for (time, reference) in times.into_iter().zip(expected) {
+                let actual = interpolation(&plot, variable, time);
+                assert!(
+                    (actual - reference).abs() < 0.035,
+                    "{name} combined {variable} at {time:e}: Rust {actual:e} C47 {reference:e}"
+                );
+            }
+        }
+        for (time, reference) in [202e-6, 210e-6, 240e-6].into_iter().zip(currents) {
+            let actual = interpolation(&plot, "i(vdrive)", time);
+            let target = sign * reference;
+            let tolerance = 0.06_f64.mul_add(f64::abs(target), 2e-5);
+            assert!(
+                (actual - target).abs() < tolerance,
+                "{name} combined I(vdrive) at {time:e}: Rust {actual:e} C47 {target:e} tol {tolerance:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coupled_thermal_recovery_dc_initialization_matches_ngspice47() {
+    for (name, source, sign) in [
+        (
+            "N",
+            include_str!("../fixtures/vdmos/thermal_recovery_n.cir"),
+            1.0,
+        ),
+        (
+            "P",
+            include_str!("../fixtures/vdmos/thermal_recovery_p.cir"),
+            -1.0,
+        ),
+    ] {
+        let plot = run(source).unwrap_or_else(|error| panic!("{name} steady Qp/Tj: {error}"));
+        for (variable, reference) in [
+            ("v(junction)", 27.1822),
+            ("v(case)", 27.1518),
+            ("i(vdrive)", sign * 0.0477631),
+        ] {
+            let actual = plot
+                .value(variable, 0)
+                .unwrap_or_else(|| panic!("missing {variable}"))
+                .re;
+            let tol = 1e-3_f64.mul_add(f64::abs(reference), 0.00005);
+            assert!(
+                (actual - reference).abs() < tol,
+                "{name} Qp+thermal DC {variable}: Rust {actual:e} C47 {reference:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn long_transit_time_qp_without_thermal_stays_at_steady_state() {
+    let standalone = include_str!("../fixtures/vdmos/thermal_recovery_n.cir")
+        .replace("M1 d g 0 junction case dut thermal", "M1 d g 0 dut");
+    let plot = transient(&standalone, "100n 10u 0 100n maxsteps=2000")
+        .unwrap_or_else(|error| panic!("long-TT Qp transient: {error}"));
+    let initial = plot.value("i(vdrive)", 0).unwrap().re;
+    let final_current = plot.value("i(vdrive)", plot.point_count() - 1).unwrap().re;
+    assert!(
+        plot.point_count() > 80,
+        "Qp transient did not cover steady bias"
+    );
+    assert!(
+        (final_current - initial).abs() < initial.abs() * 0.005 + 1e-6,
+        "Qp state drift at constant prescribed bias: initial {initial:e}, final {final_current:e}"
+    );
+}
+
+/// Moments of the piecewise-linear adaptive output, without giving dense
+/// switching-edge samples more weight than the remaining waveform.
+fn waveform_moments(plot: &ReferencePlot, variable: &str, baseline: f64) -> [f64; 2] {
+    let mut time = plot.value("time", 0).unwrap().re;
+    let initial_time = time;
+    let mut value = plot.value(variable, 0).unwrap().re - baseline;
+    let mut area = 0.;
+    let mut square_area = 0.;
+    for index in 1..plot.point_count() {
+        let next_time = plot.value("time", index).unwrap().re;
+        let next = plot.value(variable, index).unwrap().re - baseline;
+        let delta = next_time - time;
+        assert!(delta >= 0., "nonmonotone adaptive time grid");
+        area = delta.mul_add(f64::midpoint(value, next), area);
+        let mean_square = (value.mul_add(value, value * next) + next * next) / 3.;
+        square_area = delta.mul_add(mean_square, square_area);
+        time = next_time;
+        value = next;
+    }
+    let duration = time - initial_time;
+    assert!(duration > 0., "empty waveform interval");
+    [area / duration, (square_area / duration).sqrt()]
+}
+
+fn buck_metric(
+    variable: &str,
+    metric: &str,
+    actual: f64,
+    expected: f64,
+    absolute: f64,
+    relative: f64,
+) {
+    let tolerance = relative.mul_add(expected.abs(), absolute);
+    println!(
+        "buck {variable} {metric}: Rust {actual:.9e}, C47 {expected:.9e}, tol {tolerance:.3e}"
+    );
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "buck {variable} {metric}: Rust {actual:e}, C47 {expected:e}, tol {tolerance:e}"
+    );
+}
+
+#[test]
+fn synchronous_buck_with_two_thermal_vdmos_matches_ngspice47() {
+    // A physically connected 100 kHz synchronous converter: driven P-channel
+    // high-side + N-channel low-side VDMOS, finite deadtime, both MOSFETs'
+    // electrothermal networks, 150 µH / 100 µF filter and 10-ohm load.
+    // ngspice47 (SPARSE 1.3, trap, reltol=1e-5) yields 24,008 adaptive
+    // points in 200 us. Check switching-level, filter, source and thermal
+    // behavior rather than an isolated prepared-model kernel.
+    let deck = include_str!("../fixtures/vdmos/synchronous_buck.cir");
+    let plot = transient(deck, "50n 200u 0 50n maxsteps=100000")
+        .unwrap_or_else(|error| panic!("100 kHz synchronous buck: {error}"));
+    assert!(plot.point_count() >= 2500, "buck waveform truncated");
+    for (variable, reference) in [
+        (
+            "v(out)",
+            [
+                (20e-6, 0.0853037),
+                (50e-6, 0.447204),
+                (100e-6, 1.58197),
+                (150e-6, 3.17382),
+                (200e-6, 4.93615),
+            ]
+            .as_slice(),
+        ),
+        (
+            "v(sw)",
+            [
+                (40.1e-6, 11.8759),
+                (44.5e-6, -0.845986),
+                (49.5e-6, -0.845854),
+            ]
+            .as_slice(),
+        ),
+        (
+            "i(vdc)",
+            [(40.1e-6, -1.34205), (44.5e-6, -1.77360e-7)].as_slice(),
+        ),
+    ] {
+        for &(at, expected) in reference {
+            let observed = interpolation(&plot, variable, at);
+            let tolerance = 0.015_f64.mul_add(f64::abs(expected), 0.03);
+            assert!(
+                (observed - expected).abs() < tolerance,
+                "100 kHz buck {variable} t={at:e}: Rust {observed:e}, ngspice47 {expected:e}, tol {tolerance:e}"
+            );
+        }
+    }
+    // Compare thermal rise rather than absolute Celsius: a tolerance scaled
+    // by 27 C would allow the entire self-heating contribution to disappear.
+    // C47 max-step 50/25/12.5 ns refinement (same reltol) agrees to < 1 uK
+    // for the final rise; allow independent solver and integration differences.
+    for (variable, final_rise, mean_rise, rms_rise) in [
+        ("v(hj)", 0.079_086_403, 0.025_877_960, 0.035_975_750),
+        ("v(hc)", 0.067_512_783, 0.022_090_941, 0.030_711_006),
+        ("v(lj)", 0.098_567_674, 0.033_071_018, 0.044_479_255),
+        ("v(lc)", 0.085_711_021, 0.028_757_407, 0.038_677_613),
+    ] {
+        buck_metric(
+            variable,
+            "final rise",
+            interpolation(&plot, variable, 200e-6) - 27.,
+            final_rise,
+            0.001,
+            0.03,
+        );
+        let [mean, rms] = waveform_moments(&plot, variable, 27.);
+        buck_metric(variable, "mean rise", mean, mean_rise, 0.0005, 0.03);
+        buck_metric(variable, "RMS rise", rms, rms_rise, 0.0005, 0.03);
+    }
+    // Independently integrate the complete adaptive C reference waveform,
+    // not merely a handful of favorable switching checkpoints.
+    for (variable, mean_reference, rms_reference) in [
+        ("v(out)", 1.882_503_100, 2.424_752_769),
+        ("v(sw)", 4.802_208_910, 7.654_169_645),
+        ("i(vdc)", -1.110_684_303, 1.890_567_851),
+        ("i(lout)", 2.656_324_967, 2.914_575_332),
+    ] {
+        let [mean, rms] = waveform_moments(&plot, variable, 0.);
+        buck_metric(variable, "mean", mean, mean_reference, 0.001, 0.015);
+        buck_metric(variable, "RMS", rms, rms_reference, 0.001, 0.015);
+    }
+    for (variable, reference) in [("i(vgh)", 0.023_464_078), ("i(vgl)", 0.017_008_851)] {
+        let [_, rms] = waveform_moments(&plot, variable, 0.);
+        buck_metric(variable, "RMS gate current", rms, reference, 0.0002, 0.03);
+    }
+}
+
+#[test]
+fn gate_temperature_candidate_batch_matches_ngspice47() {
+    // Fifteen independently evaluated candidates share one prepared model
+    // but have different Vgate and circuit temperature. No mutable accepted
+    // state or temperature-dependent derived coefficients may leak between
+    // candidates. C47's nested DC sweep has gate as the fast axis.
+    let plot = run_one(
+        include_str!("../fixtures/vdmos/parameter_sweep.cir"),
+        "dc Vgate 2 6 1 TEMP 0 100 50",
+    )
+    .unwrap();
+    assert_eq!(plot.point_count(), 15);
+    let expected_v = [
+        11.90083, 11.38415, 0.2920180, 0.2616401, 0.2525052, 11.90083, 11.49447, 0.3089050,
+        0.2692531, 0.2574616, 11.90083, 11.57031, 0.3274860, 0.2775041, 0.2628228,
+    ];
+    let expected_i = [
+        -0.00991736,
+        -0.0615850,
+        -1.17080,
+        -1.17384,
+        -1.17475,
+        -0.00991736,
+        -0.0505531,
+        -1.16911,
+        -1.17307,
+        -1.17425,
+        -0.00991736,
+        -0.0429691,
+        -1.16725,
+        -1.17225,
+        -1.17372,
+    ];
+    for (index, (v, i)) in expected_v.into_iter().zip(expected_i).enumerate() {
+        let observed_v = plot.value("v(drain)", index).unwrap().re;
+        let observed_i = plot.value("i(vdd)", index).unwrap().re;
+        let tolerance_v = 0.004_f64.mul_add(f64::abs(v), 0.008);
+        let tolerance_i = 0.004_f64.mul_add(f64::abs(i), 0.00015);
+        assert!(
+            (observed_v - v).abs() < tolerance_v,
+            "candidate {index} V(drain): Rust {observed_v:e} C47 {v:e}"
+        );
+        assert!(
+            (observed_i - i).abs() < tolerance_i,
+            "candidate {index} I(Vdd): Rust {observed_i:e} C47 {i:e}"
+        );
+    }
+}
