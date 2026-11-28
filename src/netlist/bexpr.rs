@@ -269,6 +269,7 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "max",
     "ddt",
     "sampled_current",
+    "branch_or_sampled_current",
     "ternary_fcn",
     "gauss",
 ];
@@ -278,6 +279,7 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
 pub(crate) enum DynamicOperator {
     Derivative,
     SampledCurrent,
+    BranchOrSampledCurrent,
 }
 
 impl DynamicOperator {
@@ -285,6 +287,7 @@ impl DynamicOperator {
         match name {
             "ddt" => Some(Self::Derivative),
             "sampled_current" => Some(Self::SampledCurrent),
+            "branch_or_sampled_current" => Some(Self::BranchOrSampledCurrent),
             _ => None,
         }
     }

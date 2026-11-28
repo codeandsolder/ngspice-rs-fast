@@ -288,6 +288,15 @@ isolated sine-driven network. The first tiny transient steps alone cannot
 establish a previous-accepted-point policy. The experiments qualify the
 converged residual and zero AC tangent, not LTspice's exact iteration count.
 
+`branch_or_sampled_current(i(instance))` selects the exact instantaneous
+branch policy for voltage sources, voltage-output E/H/B devices and inductor
+windings; other current observations use the sampled policy. This explicit
+selection happens after macro and hierarchy resolution, before any artificial
+sense branch can obscure the original target's kind. Inside a prepared
+sampling expression a macro formal in `i(formal)` binds to its actual device
+name; native unwrapped `i(formal)` retains literal-name semantics. Stateless
+samples of the same resolved current coordinate share one private signal.
+
 Both forms share existing physical branch coordinates or a single ideal
 sensing branch after lexical and hierarchy expansion. `pn_control=1` selects
 the physical port of a prepared passive network independently of

@@ -874,6 +874,50 @@ impl Resolver<'_> {
     }
 }
 
+/// Explicit prepared sampling permits a macro's formal to name its actual
+/// device argument. Native unwrapped i(name) retains ngspice's literal-name
+/// behavior. A user-defined i or sampling function takes lexical precedence.
+fn prepared_sample_operand(
+    operand: &Expr,
+    formals: &[String],
+    arguments: &[BExpr],
+    functions: Option<&FunctionScope>,
+) -> SpiceResult<Option<BExpr>> {
+    let ExprKind::UserCall {
+        name,
+        arguments: probes,
+    } = &operand.kind
+    else {
+        return Ok(None);
+    };
+    if name != "i" || functions.is_some_and(|scope| scope.get(name).is_some()) {
+        return Ok(None);
+    }
+    let [probe] = probes.as_slice() else {
+        return Ok(None);
+    };
+    let ExprKind::Identifier(target) = &probe.kind else {
+        return Ok(None);
+    };
+    let Some(index) = formals.iter().position(|formal| formal == target) else {
+        return Ok(None);
+    };
+    let mut actual = &arguments[index];
+    while let BExprKind::Group(inner) = &actual.kind {
+        actual = inner;
+    }
+    let BExprKind::Name(name) = &actual.kind else {
+        return Err(parse_error(
+            &actual.span,
+            "prepared current reference formal requires a device name".into(),
+        ));
+    };
+    Ok(Some(BExpr {
+        kind: BExprKind::Current(name.clone()),
+        span: actual.span.clone(),
+    }))
+}
+
 /// Converts a numparam `.func` body into a behavioural tree, binding formals.
 /// `v(name[, name])`/`i(name)` calls in a body name nodes/sources literally:
 /// C does not substitute formals inside them (verified with the C binary).
@@ -940,10 +984,26 @@ fn from_numparam(
             name,
             arguments: operands,
         } => {
-            if functions.is_none_or(|scope| scope.get(name).is_none())
-                && let Some(kind) = circuit_quantity(name, operands)
-            {
+            let builtin = functions.is_none_or(|scope| scope.get(name).is_none());
+            if builtin && let Some(kind) = circuit_quantity(name, operands) {
                 kind
+            } else if builtin
+                && matches!(
+                    crate::netlist::bexpr::DynamicOperator::from_name(name),
+                    Some(
+                        crate::netlist::bexpr::DynamicOperator::SampledCurrent
+                            | crate::netlist::bexpr::DynamicOperator::BranchOrSampledCurrent
+                    )
+                )
+                && let [operand] = operands.as_slice()
+                && let Some(current) =
+                    prepared_sample_operand(operand, formals, arguments, functions)?
+            {
+                budget.charge(depth + 1, 1, &current.span.start)?;
+                BExprKind::Call {
+                    name: name.clone(),
+                    arguments: vec![current],
+                }
             } else {
                 BExprKind::Call {
                     name: name.clone(),

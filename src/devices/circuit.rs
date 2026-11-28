@@ -4859,7 +4859,7 @@ impl Circuit {
             instances,
             &self.nodes,
             models,
-            self.devices.iter().map(|device| device.name()),
+            &self.devices,
             limits.devices.saturating_sub(existing.devices),
             resistors,
         )?;

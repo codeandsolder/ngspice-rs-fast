@@ -69,6 +69,7 @@ fn dynamic_operator(expr: &BExpr) -> Option<DynamicOperator> {
 struct CurrentTargets {
     probes: BTreeSet<usize>,
     zero: BTreeSet<String>,
+    instantaneous: BTreeSet<String>,
 }
 
 // A source-prepared storage network with resolved m=0 has no physical
@@ -85,6 +86,13 @@ fn removed_network(instance: &DeviceInstance) -> SpiceResult<bool> {
         return Ok(crate::devices::factory::scalar_number(m)? == 0.);
     }
     Ok(false)
+}
+
+/// A genuine voltage-imposing or winding branch, not merely an internal
+/// constitutive row or an artificial observation probe. This selection is
+/// intentionally independent of the factory's current-coordinate allocation.
+fn is_instantaneous_branch(designator: char, voltage_output: bool) -> bool {
+    matches!(designator, 'v' | 'e' | 'h' | 'l') || (designator == 'b' && voltage_output)
 }
 
 /// A physical output current coordinate supplied by the selected factory.
@@ -126,6 +134,7 @@ fn measured_targets(
     instances: &[DeviceInstance],
     models: &crate::devices::models::ModelResolver<'_>,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
+    existing: &[crate::devices::ElaboratedDevice],
 ) -> SpiceResult<CurrentTargets> {
     let mut referenced = BTreeMap::new();
     for expression in instances.iter().flat_map(expressions) {
@@ -141,6 +150,14 @@ fn measured_targets(
         return Ok(CurrentTargets::default());
     }
     let mut targets = CurrentTargets::default();
+    for device in existing {
+        let name = device.name().to_ascii_lowercase();
+        if referenced.contains_key(&name)
+            && is_instantaneous_branch(device.designator(), device.findable_branch().is_some())
+        {
+            targets.instantaneous.insert(name);
+        }
+    }
     for (index, instance) in instances.iter().enumerate() {
         let name = instance.name.to_ascii_lowercase();
         let Some(location) = referenced.get(&name) else {
@@ -148,8 +165,15 @@ fn measured_targets(
         };
         if removed_network(instance)? {
             targets.zero.insert(name);
-        } else if !resistors.contains_key(&instance.name) && !has_native_current(instance, models)?
-        {
+            continue;
+        }
+        if is_instantaneous_branch(
+            instance.designator,
+            instance.parameters.iter().any(|p| p.name == "v"),
+        ) {
+            targets.instantaneous.insert(name);
+        }
+        if !resistors.contains_key(&instance.name) && !has_native_current(instance, models)? {
             // A series probe reads the first physical terminal. A terminal-less
             // object or a collapsed/unknown port cannot be sensed this way.
             if instance.nodes.is_empty() || (instance.designator == 'a' && instance.model.is_some())
@@ -177,11 +201,11 @@ pub(in crate::devices) struct ExpandedInstances<'a> {
     pub probe_aliases: Vec<String>,
 }
 
-pub(in crate::devices) fn expand<'a, 'n>(
+pub(in crate::devices) fn expand<'a>(
     instances: &'a [DeviceInstance],
     nodes: &NodeTable,
     models: &crate::devices::models::ModelResolver<'_>,
-    existing_names: impl Iterator<Item = &'n str>,
+    existing: &[crate::devices::ElaboratedDevice],
     capacity: usize,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
 ) -> SpiceResult<ExpandedInstances<'a>> {
@@ -189,26 +213,35 @@ pub(in crate::devices) fn expand<'a, 'n>(
     let CurrentTargets {
         probes: measured,
         zero,
-    } = measured_targets(instances, models, resistors)?;
+        instantaneous,
+    } = measured_targets(instances, models, resistors, existing)?;
     if count == 0 && measured.is_empty() && zero.is_empty() {
         return Ok(ExpandedInstances {
             instances: Cow::Borrowed(instances),
             probe_aliases: Vec::new(),
         });
     }
+    // Selection may remove wrappers, zero-copy reads become constants, and
+    // stateless samples of a single control row share one signal. Reserve an
+    // upper bound but enforce the device budget on actual materialization.
     let total = instances
         .len()
-        .checked_add(count)
-        .and_then(|total| total.checked_add(measured.len()))
-        .filter(|&total| total <= capacity)
-        .ok_or_else(|| {
-            SpiceError::circuit("dynamic expression exceeds device elaboration limit")
-        })?;
-    let (occupied_nodes, occupied_devices) = occupied_names(instances, nodes, existing_names);
+        .saturating_add(count)
+        .saturating_add(measured.len())
+        .min(capacity);
+    let (occupied_nodes, occupied_devices) = occupied_names(
+        instances,
+        nodes,
+        existing.iter().map(|device| device.name()),
+    );
     let mut expansion = Expansion {
         nodes: occupied_nodes,
         devices: occupied_devices,
         zero_currents: zero,
+        instantaneous,
+        renames: BTreeMap::new(),
+        sampled_nodes: BTreeMap::new(),
+        capacity,
         serial: 0,
         output: Vec::new(),
     };
@@ -221,12 +254,13 @@ pub(in crate::devices) fn expand<'a, 'n>(
         .try_reserve_exact(measured.len())
         .map_err(|error| SpiceError::circuit(format!("current probe allocation: {error}")))?;
     let mut senses = BTreeMap::new();
-    let mut renames = BTreeMap::new();
     for index in measured {
         let (node, source) = expansion.names("sense", 'v')?;
         probe_aliases.push(node.clone());
         let original = &instances[index];
-        renames.insert(original.name.to_ascii_lowercase(), source.clone());
+        expansion
+            .renames
+            .insert(original.name.to_ascii_lowercase(), source.clone());
         senses.insert(
             index,
             DeviceInstance {
@@ -249,21 +283,14 @@ pub(in crate::devices) fn expand<'a, 'n>(
         let mut instance = instance.clone();
         for parameter in &mut instance.parameters {
             if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
-                expression.root.visit_mut(&mut |expr| {
-                    if let BExprKind::Current(name) = &mut expr.kind
-                        && let Some(source) = renames.get(&name.to_ascii_lowercase())
-                    {
-                        name.clone_from(source);
-                    }
-                });
                 expansion.extract(&mut expression.root)?;
             }
         }
         if let Some(sense) = senses.remove(&index) {
             instance.nodes[0].clone_from(&sense.nodes[1]);
-            expansion.output.push(sense);
+            expansion.push(sense)?;
         }
-        expansion.output.push(instance);
+        expansion.push(instance)?;
     }
     Ok(ExpandedInstances {
         instances: Cow::Owned(expansion.output),
@@ -325,11 +352,28 @@ struct Expansion {
     nodes: BTreeSet<String>,
     devices: BTreeSet<String>,
     zero_currents: BTreeSet<String>,
+    instantaneous: BTreeSet<String>,
+    renames: BTreeMap<String, String>,
+    sampled_nodes: BTreeMap<String, String>,
+    capacity: usize,
     serial: usize,
     output: Vec<DeviceInstance>,
 }
 
 impl Expansion {
+    fn push(&mut self, device: DeviceInstance) -> SpiceResult<()> {
+        if self.output.len() >= self.capacity {
+            return Err(SpiceError::circuit(
+                "dynamic expression exceeds device elaboration limit",
+            ));
+        }
+        self.output.try_reserve(1).map_err(|error| {
+            SpiceError::circuit(format!("dynamic expression allocation: {error}"))
+        })?;
+        self.output.push(device);
+        Ok(())
+    }
+
     fn names(&mut self, prefix: &str, designator: char) -> SpiceResult<(String, String)> {
         loop {
             let serial = self.serial;
@@ -354,12 +398,18 @@ impl Expansion {
             }
             match dynamic_operator(expr) {
                 Some(DynamicOperator::Derivative) => result = self.extract_derivative(expr),
-                Some(DynamicOperator::SampledCurrent) => result = self.extract_sample(expr),
+                Some(DynamicOperator::SampledCurrent) => result = self.extract_sample(expr, false),
+                Some(DynamicOperator::BranchOrSampledCurrent) => {
+                    result = self.extract_sample(expr, true)
+                }
                 None => {
-                    if let BExprKind::Current(name) = &expr.kind
-                        && self.zero_currents.contains(&name.to_ascii_lowercase())
-                    {
-                        expr.kind = zero_current();
+                    if let BExprKind::Current(name) = &mut expr.kind {
+                        let key = name.to_ascii_lowercase();
+                        if self.zero_currents.contains(&key) {
+                            expr.kind = zero_current();
+                        } else if let Some(source) = self.renames.get(&key) {
+                            name.clone_from(source);
+                        }
                     }
                 }
             }
@@ -367,11 +417,11 @@ impl Expansion {
         result
     }
 
-    fn extract_sample(&mut self, expr: &mut BExpr) -> SpiceResult<()> {
+    fn extract_sample(&mut self, expr: &mut BExpr, preserve_branch: bool) -> SpiceResult<()> {
         let invalid = || {
             SpiceError::parse(
                 expr.span.start.clone(),
-                "sampled_current takes one physical current reference, sampled_current(i(instance))",
+                "current sampling takes one physical current reference i(instance)",
             )
         };
         let BExprKind::Call { arguments, .. } = &expr.kind else {
@@ -387,26 +437,40 @@ impl Expansion {
         let BExprKind::Current(name) = &argument.kind else {
             return Err(invalid());
         };
-        if self.zero_currents.contains(&name.to_ascii_lowercase()) {
+        let key = name.to_ascii_lowercase();
+        if self.zero_currents.contains(&key) {
             expr.kind = zero_current();
             return Ok(());
         }
-        let (node, device) = self.names("sampled_current", 'b')?;
-        let location = expr.span.start.clone();
-        self.output.push(DeviceInstance {
-            code_ports: Vec::new(),
-            name: device,
-            designator: 'b',
-            nodes: vec![node.clone()],
-            model: None,
-            parameters: vec![ParameterAssignment {
-                name: super::sampled::MARKER.to_owned(),
-                value: name.clone(),
-                kind: ParameterKind::Instance,
-                location: location.clone(),
-            }],
-            location,
-        });
+        if preserve_branch && self.instantaneous.contains(&key) {
+            // Classification preceded sensing aliases: an observation-only
+            // source cannot acquire a voltage-imposing branch policy.
+            expr.kind = BExprKind::Current(self.renames.get(&key).cloned().unwrap_or(key));
+            return Ok(());
+        }
+        let name = self.renames.get(&key).cloned().unwrap_or(key);
+        let node = if let Some(node) = self.sampled_nodes.get(&name) {
+            node.clone()
+        } else {
+            let (node, device) = self.names("sampled_current", 'b')?;
+            let location = expr.span.start.clone();
+            self.push(DeviceInstance {
+                code_ports: Vec::new(),
+                name: device,
+                designator: 'b',
+                nodes: vec![node.clone()],
+                model: None,
+                parameters: vec![ParameterAssignment {
+                    name: super::sampled::MARKER.to_owned(),
+                    value: name.clone(),
+                    kind: ParameterKind::Instance,
+                    location: location.clone(),
+                }],
+                location,
+            })?;
+            self.sampled_nodes.insert(name, node.clone());
+            node
+        };
         expr.kind = BExprKind::Voltage {
             positive: node,
             negative: None,
@@ -433,7 +497,7 @@ impl Expansion {
         let (node, device) = self.names("dynamic", 'b')?;
         let location = expr.span.start.clone();
         let span = input.span.clone();
-        self.output.push(DeviceInstance {
+        self.push(DeviceInstance {
             code_ports: Vec::new(),
             name: device,
             designator: 'b',
@@ -451,7 +515,7 @@ impl Expansion {
                 location: location.clone(),
             }],
             location,
-        });
+        })?;
         expr.kind = BExprKind::Voltage {
             positive: node,
             negative: None,

@@ -249,6 +249,8 @@ fn malformed_sampling_is_not_silently_converted_to_a_static_expression() {
         "sampled_current(i(v1)+1)",
         "sampled_current(i(v1),i(v1))",
         "sampled_current(i(missing))",
+        "branch_or_sampled_current(0)",
+        "branch_or_sampled_current(i(missing))",
     ] {
         let text = format!("invalid sample\nv1 a 0 1\nr1 a 0 1\nb1 b 0 v={expression}\n.end\n");
         assert!(
@@ -256,4 +258,58 @@ fn malformed_sampling_is_not_silently_converted_to_a_static_expression() {
             "accepted {expression}"
         );
     }
+}
+
+#[test]
+fn selection_uses_actual_macro_target_before_sensing_aliases() -> SpiceResult<()> {
+    // The same source macro reads both genuine voltage-imposing branches
+    // and observation-only currents. Scope and actual argument selection
+    // precede insertion of artificial sense sources.
+    let mut c = circuit(
+        "target selection\nv1 drive 0 dc 2 ac 1\nr1 drive p 3\nr2 p 0 5\nc1 drive 0 2u\nr3 drive a 1\nl1 a 0 3m\nbv out 0 v=2*v(drive)\nr4 out 0 3\nbi 0 load i=v(drive)\nr5 load 0 1\n.func read(x) {branch_or_sampled_current(i(x))}\n.func nested(y) {read(y)}\nbr r 0 v=nested(r2)\nbc cap 0 v=read(c1)\nbl ind 0 v=read(l1)\nbvmon volt 0 v=read(bv)\nbimon curr 0 v=read(bi)\nbsmon src 0 v=read(v1)\nbslive srclive 0 v=i(v1)\nbrlive rlive 0 v=i(r2)\nbrepeat repeat 0 v=sampled_current(i(r2))\nbforced forced 0 v=sampled_current(i(v1))\n.end\n",
+    )?;
+    let op = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+    for (name, value) in [
+        ("v(r)", 0.25),
+        ("v(cap)", 0.),
+        ("v(ind)", 2.),
+        ("v(volt)", -4. / 3.),
+        ("v(curr)", 2.),
+        ("v(repeat)", 0.25),
+    ] {
+        close(op.value(name, 0).unwrap(), Complex::real(value));
+    }
+    close(
+        op.value("v(src)", 0).unwrap(),
+        op.value("v(srclive)", 0).unwrap(),
+    );
+    close(
+        op.value("v(forced)", 0).unwrap(),
+        op.value("v(src)", 0).unwrap(),
+    );
+    let ac = run(&mut c, AnalysisKind::Ac, &["lin", "1", "1000", "1000"])?;
+    for name in ["v(r)", "v(cap)", "v(curr)", "v(repeat)", "v(forced)"] {
+        close(ac.value(name, 0).unwrap(), Complex::real(0.));
+    }
+    close(ac.value("v(rlive)", 0).unwrap(), Complex::real(0.125));
+    close(ac.value("v(volt)", 0).unwrap(), Complex::real(-2. / 3.));
+    let omega_l = std::f64::consts::TAU * 1000. * 3e-3;
+    close(
+        ac.value("v(ind)", 0).unwrap(),
+        Complex::new(1., -omega_l) / Complex::real(1. + omega_l * omega_l),
+    );
+    close(
+        ac.value("v(src)", 0).unwrap(),
+        ac.value("v(srclive)", 0).unwrap(),
+    );
+    // Repeated reads of r2 share a stateless sample coordinate; the forced
+    // v1 sample does not change ordinary v1 observation semantics.
+    assert_eq!(
+        c.devices()
+            .iter()
+            .filter(|d| d.name().starts_with("b__sampled_current_"))
+            .count(),
+        4
+    );
+    Ok(())
 }
