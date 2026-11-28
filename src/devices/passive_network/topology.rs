@@ -13,15 +13,139 @@ pub(in crate::devices) struct ReferenceGraph {
     coupled: BTreeSet<String>,
 }
 
+/// Retain the selected topology across incremental edits. An edit that
+/// changes a selection must re-elaborate the original occurrence graph.
+#[derive(Default)]
+pub(in crate::devices) struct TopologyChoices {
+    voltage: BTreeMap<String, bool>,
+    winding: BTreeMap<String, bool>,
+}
+
+impl TopologyChoices {
+    pub(in crate::devices) fn is_empty(&self) -> bool {
+        self.voltage.is_empty() && self.winding.is_empty()
+    }
+
+    pub(in crate::devices) fn check_append(&self, graph: &ReferenceGraph) -> SpiceResult<()> {
+        for (choices, references) in [
+            (&self.voltage, &graph.controls),
+            (&self.winding, &graph.coupled),
+        ] {
+            if let Some(name) = references
+                .iter()
+                .find(|name| choices.get(*name) == Some(&false))
+            {
+                return Err(SpiceError::circuit(format!(
+                    "electrical reference changes deferred topology of {name}; re-elaborate the deck"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::devices) fn check_device(
+        &self,
+        device: &dyn crate::devices::Device,
+    ) -> SpiceResult<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        let mut graph = ReferenceGraph::default();
+        graph.include_device(device);
+        self.check_append(&graph)
+    }
+
+    pub(in crate::devices) fn check_replacement(
+        &self,
+        previous: &dyn crate::devices::Device,
+        replacement: &dyn crate::devices::Device,
+    ) -> SpiceResult<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        self.check_device(replacement)?;
+        let name = previous.name().to_ascii_lowercase();
+        let mut old = ReferenceGraph::default();
+        old.include_device(previous);
+        let mut new = ReferenceGraph::default();
+        new.include_device(replacement);
+        if self.voltage.contains_key(&name)
+            || self.winding.contains_key(&name)
+            || old
+                .controls
+                .difference(&new.controls)
+                .any(|name| self.voltage.contains_key(name))
+            || old
+                .coupled
+                .difference(&new.coupled)
+                .any(|name| self.winding.contains_key(name))
+        {
+            return Err(SpiceError::circuit(
+                "replacement changes a deferred network recipe or its reference graph; re-elaborate the deck",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(in crate::devices) fn extend(&mut self, choices: Self) {
+        self.voltage.extend(choices.voltage);
+        self.winding.extend(choices.winding);
+    }
+}
+
 impl ReferenceGraph {
-    pub(in crate::devices) fn collect(instances: &[DeviceInstance]) -> Self {
-        let mut graph = Self::default();
-        if !instances.iter().any(|instance| {
+    pub(in crate::devices) fn include_device(&mut self, device: &dyn crate::devices::Device) {
+        self.controls.extend(
+            device
+                .controlling_sources()
+                .iter()
+                .map(|reference| reference.name.to_ascii_lowercase()),
+        );
+        if let Some(coupling) = device.mutual_coupling() {
+            self.coupled.extend(
+                coupling
+                    .inductors
+                    .iter()
+                    .map(|reference| reference.name.to_ascii_lowercase()),
+            );
+        }
+    }
+
+    pub(in crate::devices) fn choices(&self, instances: &[DeviceInstance]) -> TopologyChoices {
+        let mut choices = TopologyChoices::default();
+        for instance in instances {
+            let name = instance.name.to_ascii_lowercase();
+            for parameter in &instance.parameters {
+                match parameter.name.as_str() {
+                    "pn_ccontrol" => {
+                        choices
+                            .voltage
+                            .insert(name.clone(), self.controls.contains(&name));
+                    }
+                    "pn_rseries_uncoupled" => {
+                        choices
+                            .winding
+                            .insert(name.clone(), self.coupled.contains(&name));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        choices
+    }
+
+    pub(in crate::devices) fn has_selectors(instances: &[DeviceInstance]) -> bool {
+        instances.iter().any(|instance| {
             instance
                 .parameters
                 .iter()
                 .any(|p| matches!(p.name.as_str(), "pn_ccontrol" | "pn_rseries_uncoupled"))
-        }) {
+        })
+    }
+
+    pub(in crate::devices) fn collect(instances: &[DeviceInstance], required: bool) -> Self {
+        let mut graph = Self::default();
+        if !required {
             return graph;
         }
         for instance in instances {

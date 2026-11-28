@@ -160,6 +160,7 @@ pub struct Circuit {
     nodes: NodeTable,
     devices: Vec<ElaboratedDevice>,
     bindings: TopologyBindings,
+    deferred_topology: super::passive_network::topology::TopologyChoices,
     mutual_limits: MutualLimits,
     elaboration_limits: ElaborationLimits,
     binned_deck: Option<Arc<BinnedDeck>>,
@@ -1462,11 +1463,13 @@ impl Circuit {
     /// # Errors
     /// Unknown ordinal, or replacement of a generated/private-node device.
     pub fn replace_device(&mut self, index: usize, device: Box<dyn Device>) -> SpiceResult<()> {
-        let origin = &self
+        let previous = self
             .devices
             .get(index)
-            .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?
-            .origin;
+            .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?;
+        self.deferred_topology
+            .check_replacement(previous.as_ref(), device.as_ref())?;
+        let origin = &previous.origin;
         if !origin.internal_nodes.is_empty()
             || origin.generated_by.is_some()
             || self
@@ -2804,6 +2807,7 @@ impl Circuit {
     ///
     /// [`SpiceError::Circuit`] on a dangling terminal or a duplicate name.
     pub fn add_device(&mut self, device: Box<dyn Device>) -> SpiceResult<()> {
+        self.deferred_topology.check_device(device.as_ref())?;
         for terminal in device.terminals() {
             if self.nodes.node(*terminal).is_none() {
                 return Err(SpiceError::circuit(format!(
@@ -2868,6 +2872,7 @@ impl Circuit {
             let mut staged = Vec::new();
             reserve(&mut staged, generated.len(), None)?;
             for device in generated {
+                self.deferred_topology.check_device(device.as_ref())?;
                 if !seen.insert(device.name().to_lowercase()) {
                     return Err(SpiceError::circuit(format!(
                         "duplicate instance name '{}'",
@@ -4860,7 +4865,19 @@ impl Circuit {
     ) -> SpiceResult<()> {
         let existing = self.elaboration_size()?;
         let limits = self.elaboration_limits;
-        let graph = super::passive_network::topology::ReferenceGraph::collect(instances);
+        use super::passive_network::topology::ReferenceGraph;
+        let new_selectors = ReferenceGraph::has_selectors(instances);
+        let mut graph = ReferenceGraph::collect(
+            instances,
+            new_selectors || !self.deferred_topology.is_empty(),
+        );
+        self.deferred_topology.check_append(&graph)?;
+        if new_selectors {
+            for device in &self.devices {
+                graph.include_device(device.as_ref());
+            }
+        }
+        let choices = graph.choices(instances);
         let instances = crate::devices::behavioural::dynamic::expand(
             instances,
             &self.nodes,
@@ -4912,6 +4929,7 @@ impl Circuit {
             self.invalidate_topology();
         }
         self.devices.extend(staged);
+        self.deferred_topology.extend(choices);
         Ok(())
     }
 

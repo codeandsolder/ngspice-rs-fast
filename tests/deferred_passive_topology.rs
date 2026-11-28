@@ -120,3 +120,47 @@ fn descendant_references_select_only_the_actual_occurrence() -> SpiceResult<()> 
     }
     Ok(())
 }
+
+#[test]
+fn incremental_references_cannot_invalidate_selected_topology() -> SpiceResult<()> {
+    use ngspice_rs::devices::{Circuit, ModelContext, ModelResolver};
+
+    let parse = |body: &str| {
+        Parser::new().parse_deck(&parse_deck_text(
+            Path::new("deferred-edit.cir"),
+            &format!("Deferred edits\n{body}\n.end\n"),
+        ))
+    };
+    for (initial, edit) in [
+        (
+            "v1 p 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nr1 p 0 3",
+            "f1 q 0 v1 1\nr2 q 0 1k",
+        ),
+        (
+            "l1 p 0 3m pn_rseries_uncoupled=1m\nr1 p 0 3",
+            "l2 q 0 3m\nk1 l1 l2 0",
+        ),
+    ] {
+        let initial = parse(initial)?;
+        let mut circuit = Circuit::from_netlist(&initial)?;
+        let edit = parse(edit)?;
+        let nodes = circuit.nodes().nodes().to_vec();
+        let devices = circuit.device_count();
+        let error = circuit.add_instances(
+            &edit.devices,
+            &ModelResolver::new(&edit.models)?,
+            &ModelContext::default(),
+        );
+        assert!(error.is_err_and(|e| e.to_string().contains("re-elaborate")));
+        assert_eq!(circuit.nodes().nodes(), nodes);
+        assert_eq!(circuit.device_count(), devices);
+        let unrelated = parse("rnew q 0 1k")?;
+        circuit.add_instances(
+            &unrelated.devices,
+            &ModelResolver::new(&unrelated.models)?,
+            &ModelContext::default(),
+        )?;
+        circuit.finalize()?;
+    }
+    Ok(())
+}
