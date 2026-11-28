@@ -1294,7 +1294,9 @@ impl Device for LossyLine {
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         match context.mode {
-            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
+            AnalysisMode::OperatingPoint
+            | AnalysisMode::DcSweep
+            | AnalysisMode::Instantaneous { .. } => {
                 self.dc_entries(context.gmin).stamp(context)?;
             }
             AnalysisMode::Transient { time, .. } => {

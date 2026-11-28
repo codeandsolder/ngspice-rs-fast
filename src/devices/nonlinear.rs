@@ -8,8 +8,8 @@
 //! high-injection knees (IKF/IKR/IKP) and the transit-time/series-resistance
 //! temperature coefficients, and the `.noise` generators of `dionoise.c`
 //! (series-resistance thermal, junction shot and KF/AF flicker noise).
-//! Soft reverse recovery, a separate sidewall series
-//! resistance, self-heating, level-3 geometry and SOA setters fail
+//! Soft reverse recovery uses an independent conservative charge state.
+//! Separate sidewall series resistance, self-heating, level-3 geometry and SOA setters fail
 //! with [`SpiceError::NotYetPorted`] before node interning; unknown setters
 //! remain unsupported errors. The instance `off` flag follows `dioload.c`
 //! (`MODEINITJCT`/`MODEINITFIX` hold at 0 V). The `uic` initial load starts
@@ -38,7 +38,9 @@ use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 pub(super) mod charge;
+mod recovery;
 mod sens;
+pub(super) mod taylor;
 pub(super) mod thermal;
 use thermal::{
     BOLTZMANN, DerivedCache, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureKey, band_gap,
@@ -102,6 +104,8 @@ static MODEL: ScalarSchema<'static> = ScalarSchema::new(&[
     scalar("trs2", Unit::InverseKelvinSquared, Domain::Finite, Some(0.)),
     scalar("tnom", Unit::Celsius, Domain::Temperature, None),
     scalar("tt", Unit::Second, Domain::NonNegative, Some(0.)),
+    scalar("vp", Unit::Dimensionless, Domain::NonNegative, Some(0.)),
+    scalar("qpscale", Unit::Dimensionless, Domain::Positive, Some(1e6)),
     scalar("ttt1", Unit::InverseKelvin, Domain::Finite, Some(0.)),
     scalar("ttt2", Unit::InverseKelvinSquared, Domain::Finite, Some(0.)),
     scalar("cjo", Unit::Farad, Domain::NonNegative, Some(0.)),
@@ -177,14 +181,6 @@ const MODEL_PENDING: &[(&str, &str)] = &[
     (
         "rsw",
         "src/spicelib/devices/dio/diosetup.c, dioload.c (separate sidewall series resistance)",
-    ),
-    (
-        "vp",
-        "src/spicelib/devices/dio/dioload.c, diotemp.c (soft reverse recovery)",
-    ),
-    (
-        "qpscale",
-        "src/spicelib/devices/dio/dioload.c, diotemp.c (soft reverse recovery)",
     ),
     ("rth0", "src/spicelib/devices/dio/dioload.c (self-heating)"),
     ("cth0", "src/spicelib/devices/dio/dioload.c (self-heating)"),
@@ -333,6 +329,7 @@ pub struct Diode {
     model: String,
     terminals: Vec<NodeId>,
     junction: [NodeId; 2],
+    recovery_node: Option<recovery::RecoveryBinding>,
     parameters: DiodeParameters,
     derived: DerivedCache<DiodeThermalKey, Thermal>,
     /// `off` and the instance `ic` (C `DIOoff`, `DIOinitCond`). The `ic`
@@ -439,6 +436,8 @@ struct DiodeModelParameters {
     trs1: Real,
     trs2: Real,
     tt: Real,
+    vp: Real,
+    qpscale: Real,
     ttt1: Real,
     ttt2: Real,
     cjo: Real,
@@ -615,8 +614,16 @@ impl Diode {
             thermal.conductance
         };
         let (mut gd, mut cd) = (p.junction.conductance, p.junction.current);
-        let branch =
-            charge::ChargeBranch::new(DIODE_CHARGE_SLOT, p.junction.charge, p.junction.capacitance);
+        let recovery = self.recovery(thermal);
+        let branch = if recovery.is_some() {
+            charge::ChargeBranch::new(
+                DIODE_CHARGE_SLOT,
+                p.depletion_charge,
+                p.depletion_capacitance,
+            )
+        } else {
+            charge::ChargeBranch::new(DIODE_CHARGE_SLOT, p.junction.charge, p.junction.capacitance)
+        };
         if let Some(coefficients) = context.integration {
             let crate::devices::AnalysisMode::Transient { dt, .. } = context.mode else {
                 return Err(SpiceError::circuit("junction companion outside transient"));
@@ -651,6 +658,9 @@ impl Diode {
             (prime, pos, -gspr),
             (prime, neg, -gd),
         ])?;
+        if let Some(recovery) = recovery {
+            recovery.stamp(context, self.junction, p.junction, v)?;
+        }
         limiter.finish(&mut context.states, &[(DIODE_VOLTAGE_SLOT, v)])
     }
 
@@ -761,11 +771,24 @@ impl DiodeInput {
         } else {
             external[0]
         };
+        let recovery_node = if self.parameters.model.vp > 0. && self.parameters.model.tt > 0. {
+            let name = format!("{}#qp", self.name);
+            if nodes.get(&name).is_some() {
+                return Err(SpiceError::circuit("diode recovery-node name collision"));
+            }
+            let qp = nodes.intern(&name)?;
+            nodes.set_kind(qp, NodeKind::Internal)?;
+            terminals.push(qp);
+            Some(recovery::RecoveryBinding::new(qp, &self.parameters.model))
+        } else {
+            None
+        };
         Ok(Diode {
             name: self.name,
             model: self.model,
             terminals,
             junction: [positive, external[1]],
+            recovery_node,
             parameters: self.parameters,
             derived: self.derived,
             initial: self.initial,
@@ -904,6 +927,8 @@ impl DiodeParameters {
                 trs1: read("trs")?,
                 trs2: read("trs2")?,
                 tt: read("tt")?,
+                vp: read("vp")?,
+                qpscale: read("qpscale")?,
                 ttt1: read("ttt1")?,
                 ttt2: read("ttt2")?,
                 cjo: read("cjo")?,
@@ -1282,6 +1307,8 @@ struct DiodePoint {
     junction: JunctionPoint,
     ac_conductance: Real,
     ac_capacitance: Real,
+    depletion_charge: Real,
+    depletion_capacitance: Real,
 }
 impl Thermal {
     /// `dioload.c`'s junction voltage for this load: `tVcrit` in
@@ -1371,8 +1398,8 @@ impl Thermal {
         Ok(())
     }
 
-    /// `dioload.c` currents and charges at junction voltage `vd` (no RSW, no
-    /// soft recovery, no self-heating).
+    /// `dioload.c` currents and equilibrium charges at junction voltage `vd`
+    /// (no RSW or self-heating). Active recovery uses the separate depletion fields.
     fn point(&self, vd: Real, gmin: Real) -> SpiceResult<DiodePoint> {
         let point = self.point_unchecked(vd, gmin)?;
         point.junction.validate()?;
@@ -1497,6 +1524,8 @@ impl Thermal {
             },
             ac_conductance,
             ac_capacitance: ac_diffusion_capacitance + capacitance + capacitance_sw,
+            depletion_charge: charge + charge_sw,
+            depletion_capacitance: capacitance + capacitance_sw,
         };
         Ok(point)
     }
@@ -1791,6 +1820,12 @@ impl Device for Diode {
         ] {
             setup.nodes(row, col);
         }
+        if let Some(binding) = self.recovery_node {
+            let qp = binding.node;
+            for (row, col) in [(qp, qp), (qp, prime), (qp, neg), (prime, qp), (neg, qp)] {
+                setup.nodes(row, col);
+            }
+        }
         Ok(true)
     }
     fn observation_parameter(
@@ -1846,6 +1881,14 @@ impl Device for Diode {
     fn terminals(&self) -> &[NodeId] {
         &self.terminals
     }
+    fn external_terminals(&self) -> &[NodeId] {
+        &self.terminals[..2]
+    }
+    fn constitutive_nodes(&self) -> &[NodeId] {
+        self.recovery_node
+            .as_ref()
+            .map_or(&[], |binding| std::slice::from_ref(&binding.node))
+    }
     fn is_nonlinear(&self) -> bool {
         true
     }
@@ -1854,10 +1897,17 @@ impl Device for Diode {
     }
     fn state_count(&self) -> usize {
         // Charge, its derivative and the limited junction voltage.
-        DIODE_STATE_COUNT
+        DIODE_STATE_COUNT + usize::from(self.recovery_node.is_some()) * 2
     }
     fn truncation_slot(&self) -> Option<usize> {
         Some(0)
+    }
+    fn truncation_slots(&self) -> Vec<usize> {
+        if self.recovery_node.is_some() {
+            vec![DIODE_CHARGE_SLOT, recovery::CHARGE_SLOT]
+        } else {
+            vec![DIODE_CHARGE_SLOT]
+        }
     }
     /// `dio.c` `DIOpTable`: AREA, PJ (alias PERIM), M, TEMP and DTEMP, which
     /// `diotemp.c` re-derives completely (`dctrcurv.c` `DCTsetInstParam`).
@@ -1958,6 +2008,7 @@ impl Device for Diode {
             model: self.model.clone(),
             terminals: self.terminals.clone(),
             junction: self.junction,
+            recovery_node: self.recovery_node,
             parameters: p,
             derived: DerivedCache::from_value(DiodeThermalKey::context(context), thermal),
             initial,
@@ -1985,6 +2036,73 @@ impl Device for Diode {
         let evaluation = sample.evaluate(context.gmin)?;
         self.commit_load(context, &evaluation)
     }
+    fn convergence_test(
+        &self,
+        context: &crate::devices::traits::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        if self.recovery_node.is_none() {
+            return Ok(false);
+        }
+        let thermal = self.thermal(context.model_context)?;
+        let voltage = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
+        let current = thermal
+            .point(voltage, context.model_context.gmin)?
+            .junction
+            .current;
+        self.recovery(&thermal).map_or(Ok(false), |recovery| {
+            recovery.not_converged(context, current)
+        })
+    }
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        use crate::devices::traits::PhysicalChargeHistory;
+        visit(PhysicalChargeHistory {
+            slot: DIODE_CHARGE_SLOT,
+            nodes: self.junction,
+            scale: 1.,
+        })?;
+        if self.recovery_node.is_some() {
+            visit(PhysicalChargeHistory {
+                slot: recovery::CHARGE_SLOT,
+                nodes: self.junction,
+                scale: 1. - self.parameters.model.vp,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
+    fn assemble_nonlinear_charge(
+        &self,
+        context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        let voltage = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
+        let thermal = self.thermal(context.model)?;
+        let point = thermal.point(voltage, context.model.gmin)?;
+        if let Some(recovery) = self.recovery(&thermal) {
+            context.branch(
+                self.junction,
+                point.depletion_charge,
+                point.depletion_capacitance,
+            )?;
+            recovery.assemble_charge(context, self.junction)
+        } else {
+            context.branch(
+                self.junction,
+                point.junction.charge,
+                point.junction.capacitance,
+            )
+        }
+    }
+
     /// `dioacld.c`: series conductance, C's small-signal junction conductance
     /// and `j*omega` times its small-signal capacitance at the bias point.
     fn assemble_small_signal(
@@ -2012,7 +2130,12 @@ impl Device for Diode {
             )?;
         }
         context.nodal(self.junction, p.ac_conductance, false)?;
-        context.nodal(self.junction, p.ac_capacitance, true)
+        if let Some(recovery) = self.recovery(&thermal) {
+            context.nodal(self.junction, p.depletion_capacitance, true)?;
+            recovery.assemble_linear(context, self.junction, p.ac_conductance)
+        } else {
+            context.nodal(self.junction, p.ac_capacitance, true)
+        }
     }
 
     /// Pole-zero load: C `diopzld.c` equals the AC load with `s` for `j omega`.
@@ -2044,6 +2167,12 @@ impl Device for Diode {
         use crate::devices::distortion::{
             Control, DeviceDistortion, DistortionTerm, Response, Taylor,
         };
+        if self.recovery_node.is_some() {
+            return Err(SpiceError::not_yet_ported(
+                "diode soft-recovery distortion",
+                "src/spicelib/devices/dio/diodisto.c",
+            ));
+        }
         let p = &self.parameters;
         let t = self.thermal(context.model_context)?;
         let vd = context.voltage(self.junction[0])? - context.voltage(self.junction[1])?;
@@ -2251,6 +2380,103 @@ mod tests {
                 p.capacitance
             );
         }
+    }
+
+    #[test]
+    fn diode_taylor_reconstructs_physical_scalar_equations() -> SpiceResult<()> {
+        use crate::maths::taylor::Jet;
+        for (model, instance) in [
+            ("is=1e-18 n=10", ""),
+            (
+                "is=1e-14 n=1.1 bv=5.1 ibv=5m nbv=1.4 tcv=2m cjo=30p vj=0.7 m=0.4 tt=5n",
+                "",
+            ),
+            (
+                "is=1e-14 jsw=2e-15 ns=1.6 cjsw=4p vjsw=0.8 mjsw=0.3 fcs=0.4 bv=5.1",
+                "pj=10",
+            ),
+            (
+                "is=1e-14 jsw=2e-15 cjsw=4p vjsw=0.8 mjsw=0.3 fcs=0.4 ikp=1u",
+                "pj=10 m=2",
+            ),
+            ("isr=1e-11 nr=2.2 vj=0.8 m=0.4 cjo=5p", ""),
+            (
+                "jtun=1e-13 jtunsw=1e-14 ntun=20 xtitun=2 keg=0.9 bv=7",
+                "pj=4",
+            ),
+            ("ikf=1m ikr=1n is=1e-12", ""),
+            (
+                "isr=1e-11 jtun=1e-12 ikf=1m ikr=1u bv=5.1 jsw=1e-15 ns=1.2",
+                "pj=4",
+            ),
+        ] {
+            for temperature in [-40., 27., 100.] {
+                let thermal = thermal(model, instance, temperature);
+                let edges = [
+                    thermal.bottom.threshold,
+                    thermal.sidewall.threshold,
+                    -3. * thermal.n * thermal.vt,
+                    -3. * thermal.ns.unwrap_or(thermal.n) * thermal.vt,
+                    -thermal.breakdown.unwrap_or(Real::INFINITY),
+                ];
+                let voltages = [-9., -6.2, -5.4, -5., -3., -0.5, -0.05, 0.1, 0.4, 0.62, 0.75];
+                for voltage in voltages.into_iter().chain(edges[..2].iter().copied()) {
+                    for direction in [-1., 1.] {
+                        // Each Taylor germ belongs to its own analytic
+                        // interval. In particular C is continuous but its
+                        // higher derivatives change at FC*VJ. Evaluating a
+                        // right-hand germ at negative time is not a valid
+                        // oracle at that boundary.
+                        let step = edges
+                            .iter()
+                            .map(|edge| (edge - voltage) * direction)
+                            .filter(|&distance| distance > 0.)
+                            .fold(1e-4_f64, |step, distance| step.min(distance * 0.5));
+                        let slope = step * direction;
+                        let v = Jet::affine(12, voltage, slope);
+                        let (current, charge) = thermal.taylor(&v, 1e-12, false)?;
+                        for t in [0., 0.25, 0.5] {
+                            let expected =
+                                thermal.point(slope.mul_add(t, voltage), 1e-12)?.junction;
+                            let at = |jet: &Jet| {
+                                jet.coefficients()
+                                    .iter()
+                                    .rev()
+                                    .fold(0_f64, |sum, coefficient| sum.mul_add(t, *coefficient))
+                            };
+                            let close = |kind: &str, actual: Real, expected: Real| {
+                                assert!(
+                                    (actual - expected).abs()
+                                        <= 2e-11 * actual.abs().max(expected.abs()).max(1e-30),
+                                    "{model} {temperature} {voltage} {slope} {t} {kind}: {actual:e} vs {expected:e}"
+                                );
+                            };
+                            close("I", at(&current.value), expected.current);
+                            close("G", at(&current.slope), expected.conductance);
+                            close("Q", at(&charge.value), expected.charge);
+                            close("C", at(&charge.slope), expected.capacitance);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diode_taylor_exponential_coefficients_survive_scaled_overflow() -> SpiceResult<()> {
+        use crate::maths::taylor::Jet;
+        let v = Jet::affine(8, 720., 0.25);
+        let law = super::taylor::exponential(&v, 1., 1e-300);
+        let scaled = 4.920_700_930_263_816e12;
+        let mut expected = scaled;
+        for (k, coefficient) in law.slope.coefficients().iter().enumerate() {
+            if k != 0 {
+                expected *= 0.25 / k as Real;
+            }
+            assert!((coefficient / expected - 1.).abs() < 2e-13);
+        }
+        Ok(())
     }
 
     #[test]
@@ -2581,7 +2807,6 @@ mod tests {
     fn unported_and_invalid_setters_fail_explicitly() {
         for (model, instance) in [
             ("rsw=1", ""),
-            ("vp=1 tt=1n", ""),
             ("rth0=10", ""),
             ("bv_max=10", ""),
             ("xom=1e4", ""),

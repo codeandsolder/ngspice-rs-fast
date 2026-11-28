@@ -9,6 +9,8 @@
 //! `dcValue`/`dcGiven`), temperature, resistor and instance-parameter values
 //! travel in an immutable per-point `ModelContext`, and every point runs
 //! `NIiter`, linear circuits included. See `docs/port/DC_SWEEPS.md`.
+mod binning;
+
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
 use crate::devices::{Circuit, InstanceTarget, ModelContext};
@@ -65,6 +67,8 @@ pub enum ParameterRoute {
     /// Any other supported parameter: a per-point device replacement
     /// ([`crate::devices::Device::with_instance_parameter`]).
     Device,
+    /// Written geometry of a binned model, requiring fresh setup.
+    Geometry,
 }
 impl SweepTarget {
     /// The scale vector of a sweep whose first (inner) axis is this target,
@@ -456,13 +460,14 @@ enum Written<'a> {
     /// `@instance[r|resistance]` of a resistor.
     Resistance(&'a str, InstanceTarget),
     /// `@instance[parameter]` that the device replaces itself.
-    Device(&'a str, InstanceTarget),
+    Device(&'a str, InstanceTarget, &'a str),
+    Geometry(&'a str, &'a str),
     /// `@instance[parameter]` left for the source table (`dc`, current `c`)
     /// or for an explicit rejection.
     Other(&'a str, &'a str),
 }
 impl<'a> Written<'a> {
-    fn classify(circuit: &Circuit, target: &'a AxisTarget) -> Self {
+    fn classify(circuit: &'a Circuit, target: &'a AxisTarget) -> Self {
         let (instance, parameter) = match target {
             AxisTarget::Temperature => return Self::Temperature,
             AxisTarget::Name(name) => return Self::Name(name),
@@ -471,13 +476,25 @@ impl<'a> Written<'a> {
                 parameter,
             } => (instance.as_str(), parameter.as_str()),
         };
+        if let Some(keyword) = ["l", "w", "nf", "wnflag"]
+            .into_iter()
+            .find(|key| parameter.eq_ignore_ascii_case(key))
+            && circuit
+                .binned_deck()
+                .is_some_and(|deck| deck.contains(instance, keyword))
+        {
+            return Self::Geometry(instance, keyword);
+        }
         if (parameter.eq_ignore_ascii_case("r") || parameter.eq_ignore_ascii_case("resistance"))
             && let Ok(target) = circuit.bind_resistor_target(instance)
         {
             return Self::Resistance(instance, target);
         }
         if let Ok(target) = circuit.bind_instance_target(instance, parameter) {
-            return Self::Device(instance, target);
+            let name = circuit.devices()[target.device()]
+                .numeric_parameter_name(target.parameter())
+                .unwrap_or(parameter);
+            return Self::Device(instance, target, name);
         }
         Self::Other(instance, parameter)
     }
@@ -486,8 +503,8 @@ impl<'a> Written<'a> {
         match self {
             Self::Temperature => "temp".into(),
             Self::Name(name) | Self::Resistance(name, _) => name.to_ascii_lowercase(),
-            Self::Device(name, target) => {
-                format!("@{}[{}]", name.to_ascii_lowercase(), target.parameter())
+            Self::Device(name, _, parameter) | Self::Geometry(name, parameter) => {
+                format!("@{}[{parameter}]", name.to_ascii_lowercase())
             }
             Self::Other(name, parameter) => match parameter.to_ascii_lowercase().as_str() {
                 "dc" | "c" => name.to_ascii_lowercase(),
@@ -551,10 +568,22 @@ fn resolve_target(
             ),
             AxisBinding::Resistor(target),
         ),
-        Written::Device(_, target) => (
+        Written::Geometry(name, keyword) => (
+            parameter(
+                circuit
+                    .device(name)
+                    .ok_or_else(|| unsupported("missing binned instance"))?
+                    .name()
+                    .to_owned(),
+                keyword,
+                ParameterRoute::Geometry,
+            ),
+            AxisBinding::Geometry,
+        ),
+        Written::Device(_, target, keyword) => (
             parameter(
                 instance_name(target.device()),
-                target.parameter(),
+                keyword,
                 ParameterRoute::Device,
             ),
             AxisBinding::Device(target),
@@ -597,6 +626,7 @@ enum AxisBinding {
     Resistor(InstanceTarget),
     Device(InstanceTarget),
     Source(InstanceTarget),
+    Geometry,
 }
 
 impl AxisBinding {
@@ -605,11 +635,11 @@ impl AxisBinding {
     }
 
     const fn changes_physics(self) -> bool {
-        matches!(self, Self::Temperature | Self::Device(_))
+        matches!(self, Self::Temperature | Self::Device(_) | Self::Geometry)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BoundAxis {
     spec: SweepSpec,
     binding: AxisBinding,
@@ -637,7 +667,11 @@ pub fn resolve(
     };
     let prepared = circuit.prepare_run();
     let axes = bind_axes(circuit, axes)?;
-    validate_start(&prepared, &axes, context.model_context())?;
+    if binning::active(&axes) {
+        binning::validate_start(circuit, &axes, context.model_context())?;
+    } else {
+        validate_start(&prepared, &axes, context.model_context())?;
+    }
     Ok(axes.into_iter().map(|axis| axis.spec).collect())
 }
 
@@ -721,19 +755,19 @@ fn point_context<'a>(
             AxisBinding::Resistor(target) => {
                 model = model.with_resistor_override(target.at_resistance(value)?)?;
             }
-            AxisBinding::Source(_) | AxisBinding::Device(_) => {}
+            AxisBinding::Source(_) | AxisBinding::Device(_) | AxisBinding::Geometry => {}
         }
     }
     // Preserve the temperature-first and source-last setter ordering. The
     // topology ordinal, canonical keyword and route never change per point.
     for (axis, value) in axes.iter().zip(values) {
         if let AxisBinding::Device(target) = axis.binding {
-            model = model.with_instance_override(target.at(value)?)?;
+            model = model.with_instance_override(target.at_source(value, model.geometry_scale)?)?;
         }
     }
     for (axis, value) in axes.iter().zip(values) {
         if let AxisBinding::Source(target) = axis.binding {
-            model = model.with_instance_override(target.at(value)?)?;
+            model = model.with_instance_override(target.at_source(value, model.geometry_scale)?)?;
             sources[source_count] = (circuit.devices()[target.device()].name(), value);
             source_count += 1;
         }
@@ -960,6 +994,38 @@ pub(super) fn run(
 ) -> SpiceResult<()> {
     circuit.finalize()?;
     let circuit: &Circuit = circuit;
+    let axes = bind_axes(circuit, sweep)?;
+    if binning::active(&axes) {
+        return binning::run(
+            circuit,
+            request,
+            context,
+            sweep,
+            &axes,
+            point_iterations,
+            sink,
+        );
+    }
+    run_fixed(
+        circuit,
+        request,
+        context,
+        sweep,
+        &axes,
+        point_iterations,
+        sink,
+    )
+}
+
+fn run_fixed(
+    circuit: &Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    sweep: &DcSweepPlan,
+    axes: &[BoundAxis],
+    point_iterations: Option<usize>,
+    sink: &mut dyn crate::analysis::PointSink,
+) -> SpiceResult<()> {
     // Everything that can be rejected is rejected before the first sample.
     let hints = crate::analysis::initial::resolve(circuit, request)?;
     // cktload.c forces .nodeset rows in the MODEINITJCT/MODEINITFIX loads
@@ -969,7 +1035,6 @@ pub(super) fn run(
         nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
     };
     let prepared = circuit.prepare_run();
-    let axes = bind_axes(circuit, sweep)?;
     let settings = request.dc_settings();
     let warm_settings = warm_start_settings(point_iterations, settings);
     let solver = SweepSolver {
@@ -979,7 +1044,7 @@ pub(super) fn run(
         nodes: &nodes,
     };
     let grids = &sweep.grids;
-    preflight(&solver.prepared, &axes, grids, context).map_err(|error| match error {
+    preflight(&solver.prepared, axes, grids, context).map_err(|error| match error {
         SpiceError::Numerical { context, message } => {
             SpiceError::circuit(format!("DC sweep input validation ({context}): {message}"))
         }
@@ -1021,7 +1086,7 @@ pub(super) fn run(
         for inner_value in inner.clone() {
             let point_context = point_context(
                 circuit,
-                &axes,
+                axes,
                 [inner_value, outer_value],
                 context.model_context(),
             )?;

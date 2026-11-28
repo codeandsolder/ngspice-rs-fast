@@ -283,7 +283,7 @@ fn model_selectors_and_geometry_rebuild_and_failure_is_atomic() {
     session
         .update(&[2., 1e-14, 27.], &mut EvalBudget::default())
         .unwrap();
-    assert_eq!(session.topology(), CandidateTopology::Rebuilt);
+    assert_eq!(session.topology(), CandidateTopology::Reused);
 }
 
 #[test]
@@ -315,6 +315,7 @@ fn scoped_functions_and_aliases_bind_only_true_transitive_inputs() {
         .add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: Some(functions),
                 bindings: &[],
                 cards: &source.params,
@@ -435,4 +436,151 @@ fn benchmark_repeated_candidate_preparation() {
             reused.as_secs_f64() / scalar.as_secs_f64()
         );
     }
+}
+
+#[test]
+fn hidden_runtime_passive_dependencies_invalidate_only_changed_laws() {
+    let plan = CircuitParameterPlan::new(
+        deck(
+            ".options seed=17 reltol=1e-8\n.param drive=2 a=500 b=500 gain={a+b} unused=1\n.func law(x) {gain*(1+v(in))}\nv1 in 0 {drive}\nr1 in 0 {law(unused)}",
+        ),
+        &["drive", "a", "b", "unused"],
+    )
+    .unwrap();
+    let mut session = plan.session().unwrap();
+    for (values, topology) in [
+        ([3., 600., 400., 7.], CandidateTopology::Reused),
+        ([3., 1000., 500., 7.], CandidateTopology::Rebuilt),
+        ([2., 500., 500., 1.], CandidateTopology::Reused),
+    ] {
+        session.update(&values, &mut EvalBudget::default()).unwrap();
+        assert_eq!(session.topology(), topology);
+        let context = session.analysis_context();
+        let op = AnalysisInput::new(AnalysisKind::OperatingPoint)
+            .resolve()
+            .unwrap();
+        let actual = op.run(session.circuit_mut(), &context).unwrap();
+        let [drive, a, b, _] = values;
+        close(
+            actual.value("i(v1)", 0).unwrap().re,
+            -drive / ((a + b) * (1. + drive)),
+        );
+    }
+}
+
+#[test]
+fn lexically_static_passive_records_the_actual_numeric_expression() {
+    let plan = CircuitParameterPlan::new(
+        deck(".param gain=1000\n.func v(x) {gain*x}\nv1 a 0 2\nr1 a 0 {v(2)}"),
+        &["gain"],
+    )
+    .unwrap();
+    let mut session = plan.session().unwrap();
+    for gain in [2000., 500., 1000.] {
+        session.update(&[gain], &mut EvalBudget::default()).unwrap();
+        assert_eq!(session.topology(), CandidateTopology::Reused);
+        let context = session.analysis_context();
+        let op = AnalysisInput::new(AnalysisKind::OperatingPoint)
+            .resolve()
+            .unwrap();
+        let plot = op.run(session.circuit_mut(), &context).unwrap();
+        close(plot.value("i(v1)", 0).unwrap().re, -1. / gain);
+    }
+}
+
+#[test]
+fn embedded_numparam_and_lowered_source_coefficients_invalidate_compiled_laws() {
+    let plan = CircuitParameterPlan::new(
+        deck(".param drive=0.5 gain=2\nv1 in 0 {drive}\nb1 out 0 v=pwl(v(in),0,0,1,{gain})\ne1 polyout 0 poly(1) in 0 0 {gain}"),
+        &["drive", "gain"],
+    ).unwrap();
+    let mut session = plan.session().unwrap();
+    for (values, topology) in [
+        ([0.25, 2.], CandidateTopology::Reused),
+        ([0.25, 3.], CandidateTopology::Rebuilt),
+        ([0.5, 2.], CandidateTopology::Reused),
+    ] {
+        session.update(&values, &mut EvalBudget::default()).unwrap();
+        assert_eq!(session.topology(), topology);
+        let context = session.analysis_context();
+        let op = AnalysisInput::new(AnalysisKind::OperatingPoint)
+            .resolve()
+            .unwrap();
+        let plot = op.run(session.circuit_mut(), &context).unwrap();
+        for name in ["v(out)", "v(polyout)"] {
+            close(plot.value(name, 0).unwrap().re, values[0] * values[1]);
+        }
+    }
+}
+
+#[test]
+fn only_effective_option_dependencies_invalidate_baseline_configuration() {
+    let plan = CircuitParameterPlan::new(
+        deck(".param drive=1 a=10 b=17 temperature={a+b}\n.options temp={temperature} seed=17\nv1 in 0 {drive}\nr1 in 0 1k"),
+        &["drive", "a", "b"],
+    ).unwrap();
+    let mut session = plan.session().unwrap();
+    for (values, topology) in [
+        ([2., 11., 16.], CandidateTopology::Reused),
+        ([2., 11., 20.], CandidateTopology::Rebuilt),
+        ([3., 10., 17.], CandidateTopology::Reused),
+    ] {
+        session.update(&values, &mut EvalBudget::default()).unwrap();
+        assert_eq!(session.topology(), topology);
+        assert_eq!(session.model_context().temperature, values[1] + values[2]);
+        let context = session.analysis_context();
+        let op = AnalysisInput::new(AnalysisKind::OperatingPoint)
+            .resolve()
+            .unwrap();
+        let plot = op.run(session.circuit_mut(), &context).unwrap();
+        close(plot.value("v(in)", 0).unwrap().re, values[0]);
+    }
+}
+
+/// Diagnostic: repeated prepared candidates with a fixed, lexically defined
+/// nonlinear law, versus fresh parsed and elaborated decks.
+#[test]
+#[ignore = "opt-in nonlinear candidate preparation benchmark"]
+fn benchmark_behavioural_candidate_preparation() {
+    use std::fmt::Write as _;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    const COUNT: u32 = 256;
+    let mut body = String::from(
+        ".options seed=17 reltol=1e-8\n.func law(x) {gain*(1+v(in))}\nv1 in 0 {drive}\n",
+    );
+    for index in 0..64 {
+        writeln!(body, "r{index} in 0 {{law({index})}}").unwrap();
+    }
+    let source = |drive: f64| deck(&format!(".param drive={drive:.17e} gain=1000\n{body}"));
+    let start = Instant::now();
+    let plan = CircuitParameterPlan::new(source(1.), &["drive"]).unwrap();
+    let compile = start.elapsed();
+    let mut session = plan.session().unwrap();
+    let mut prepared = Duration::ZERO;
+    let mut scalar = Duration::ZERO;
+    for index in 0..COUNT {
+        let drive = f64::from(index).mul_add(0.005, 1.);
+        let start = Instant::now();
+        black_box(
+            session
+                .update(&[drive], &mut EvalBudget::default())
+                .unwrap(),
+        );
+        prepared += start.elapsed();
+        assert_eq!(session.topology(), CandidateTopology::Reused);
+        let start = Instant::now();
+        let fresh = source(drive);
+        let config = ngspice_rs::analysis::RunConfig::from_netlist(&fresh).unwrap();
+        black_box(config.circuit(&fresh).unwrap());
+        scalar += start.elapsed();
+    }
+    println!(
+        "workload=behavioural_candidate_prepare,devices=65,candidates={COUNT},compile_ns={},prepared_ns={},fresh_ns={},ratio={:.5}",
+        compile.as_nanos(),
+        prepared.as_nanos(),
+        scalar.as_nanos(),
+        prepared.as_secs_f64() / scalar.as_secs_f64()
+    );
 }

@@ -18,10 +18,10 @@ use crate::netlist::ast::{
     AnalysisCard, ArgumentExpression, DeviceInstance, FourierCard, FuncCard, FuncParameter,
     FunctionWaveform, GlobalCard, GlobalNode, IncludeDirective, InitialCondition, LibrarySection,
     MeasureCard, MeasureEvent, MeasureRequest, MeasureStatistic, MeasureTransition, MeasureWindow,
-    ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue, OptionCard, OptionSetting,
-    OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, PositionedValue,
-    PrintCard, PulseWaveform, PwlPoint, RequestedVector, SaveCard, ScopedCard, ScopedCardKind,
-    SourceFunction, SourceWaveform, Subcircuit, VectorRequest,
+    ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue, NumericVectorEntry, OptionCard,
+    OptionSetting, OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind,
+    PositionedValue, PrintCard, PulseWaveform, PwlPoint, RequestedVector, SaveCard, ScopedCard,
+    ScopedCardKind, SourceFunction, SourceWaveform, Subcircuit, VectorRequest,
 };
 use crate::netlist::bexpr::{
     BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, TableTransfer,
@@ -131,8 +131,10 @@ semantic_leaves!(
     u32,
     Real,
     PathBuf,
+    crate::netlist::prepared_initialization::PreparedInitialConditions,
     AnalysisKind,
     SourceFunction,
+    crate::netlist::ast::StochasticFunction,
     ScopedCardKind,
     RequestedVector,
     MeasureStatistic,
@@ -211,9 +213,10 @@ macro_rules! semantic_struct {
 
 // Scope order is compared first, including structural terminators and
 // indexes, then the typed payload vectors in stable diagnostic order.
-semantic_struct!(Netlist { title, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets } ignore { path, location });
+semantic_struct!(Netlist { auto_gnd, title, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets, prepared_initialization } ignore { path, location });
 semantic_struct!(Subcircuit { name, terminals, parameters, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets, output, measurements, fourier } ignore { end_location, location });
-semantic_struct!(DeviceInstance { name, designator, nodes, model, parameters } ignore { location });
+semantic_leaves!(crate::netlist::ast::CodePort);
+semantic_struct!(DeviceInstance { name, designator, nodes, code_ports, model, parameters } ignore { location });
 semantic_struct!(ModelCard { name, base, level, parameters } ignore { location });
 semantic_struct!(IncludeDirective { path, resolved_path, section, selected_section } ignore { path_spelling, location });
 semantic_struct!(LibrarySection { name } ignore { opening, closing });
@@ -229,6 +232,7 @@ semantic_struct!(GlobalNode { name } ignore { location });
 semantic_struct!(NodeHintCard { entries } ignore { location });
 semantic_struct!(NodeHint { node, value } ignore { node_location, value_location, location });
 semantic_struct!(PositionedValue { text } ignore { location });
+semantic_struct!(NumericVectorEntry { source, expression } ignore {});
 semantic_struct!(InitialCondition { name, value } ignore {});
 semantic_struct!(PulseWaveform { initial, pulsed, delay, rise, fall, width, period, count } ignore {});
 semantic_struct!(FunctionWaveform { function, values } ignore {});
@@ -337,7 +341,9 @@ impl Semantic for ParameterAssignment {
             .map_err(|diff| diff.field("kind"))?;
         // Only the structured components carry semantics for vectors.
         match kind {
-            ParameterKind::Waveform(_) | ParameterKind::InitialConditions(_) => Ok(()),
+            ParameterKind::Waveform(_)
+            | ParameterKind::InitialConditions(_)
+            | ParameterKind::NumericVector(_) => Ok(()),
             ParameterKind::Scalar
             | ParameterKind::Textual
             | ParameterKind::Flag
@@ -459,6 +465,7 @@ semantic_enum!(BExprKind {
 semantic_enum!(ParameterKind {
     Scalar,
     Textual,
+    NumericVector(entries: rentries),
     Flag,
     Instance,
     Expression(expression: rexpression),
@@ -471,6 +478,7 @@ semantic_enum!(SourceWaveform {
     Pulse(pulse: rpulse),
     Function(function: rfunction),
     Pwl(points: rpoints),
+    Stochastic { function: rfunction, values: rvalues },
 });
 
 semantic_enum!(NodeHintValue {

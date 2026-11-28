@@ -36,7 +36,7 @@ env:
 
 jobs:
   strict-rust:
-    name: Strict Rust and workflow policy
+    name: Shared strict Rust release gate
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@cb9083676196a8ec3bf013e7253907b2759020c7 # main
     with:
       allow-test-panics: true
@@ -44,15 +44,25 @@ jobs:
   verify:
     needs: strict-rust
     name: Release gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Resolve repository Rust pin
+      - name: Check release dependency quarantine
+        uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@9c14ef2d72423958c56944febc620ec50f01d65a # main
+        with:
+          base-ref: refs/remotes/origin/${{ github.event.repository.default_branch }}
+          hours: "72"
+          lockfile: auto
+
+      - name: Resolve quarantined repository compiler
         id: compiler
         uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
@@ -64,25 +74,21 @@ jobs:
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
+        with:
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
 
-      - name: Read crate version
+      - name: Read and validate crate version
         id: version
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 --locked \
-            | jq -r '.packages[] | select(.name == "ngspice-rs") | .version')
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Cargo.toml version: $version"
-
-      - name: Check tag matches Cargo.toml
-        if: github.ref_type == 'tag'
+        shell: bash
         env:
-          TAG: ${{ github.ref_name }}
-          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          if [ "$TAG" != "v$VERSION" ]; then
-            echo "::error::Tag $TAG does not match Cargo.toml version $VERSION"
-            exit 1
-          fi
+          version=$(bash .github/scripts/release-version.sh "$TAG")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release archive contracts
+        shell: bash
+        run: bash .github/scripts/test-release-package.sh
 
       - name: Run workspace tests and doctests
         run: cargo test --workspace --locked
@@ -102,9 +108,9 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: verify
-    if: github.ref_type == 'tag' || inputs.dry-run == false
-    runs-on: ubuntu-latest
+    needs: [strict-rust, verify]
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.dry-run == false)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment:
       name: crates-io
@@ -114,9 +120,11 @@ jobs:
       id-token: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Resolve repository Rust pin
+      - name: Resolve quarantined repository compiler
         id: compiler
         uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
@@ -127,10 +135,12 @@ jobs:
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
+        with:
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
 
       - name: Authenticate with crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
 
       - name: Publish ngspice-rs
         run: cargo publish --locked --package ngspice-rs

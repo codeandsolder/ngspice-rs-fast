@@ -46,6 +46,12 @@ pub(super) struct LoadBias {
     pub(super) vses: f64,
 }
 
+/// First-order extrapolation in differences preserves constant history
+/// and avoids cancellation of two large weighted history values.
+fn extrapolate(previous: f64, older: f64, ratio: f64) -> f64 {
+    ratio.mul_add(previous - older, previous)
+}
+
 /// Select C's prior state or trial voltage, then limit junctions where enabled.
 pub(super) fn select(model: &Model, here: &Instance, ckt: &mut dyn LoadCkt) -> LoadBias {
     let mut vses: f64 = 0.0;
@@ -141,7 +147,7 @@ pub(super) fn select(model: &Model, here: &Instance, ckt: &mut dyn LoadCkt) -> L
             vds = 0.1;
             vdes = 0.11;
             vses = -0.01;
-            vgms = f64::from(model.r#type) * here.vth0 + 0.1;
+            vgms = f64::from(model.r#type).mul_add(here.vth0, 0.1);
             vges = vgms;
             vgs = vges;
             vsbs = 0.0;
@@ -163,30 +169,30 @@ pub(super) fn select(model: &Model, here: &Instance, ckt: &mut dyn LoadCkt) -> L
         if (ckt.mode() & mode::MODEINITPRED) != 0 {
             xfact = ckt.delta() / ckt.delta_old(1);
             ckt.set_state0(state::VDS, ckt.state1(state::VDS));
-            vds = (1.0 + xfact) * (ckt.state1(state::VDS)) - (xfact * (ckt.state2(state::VDS)));
+            vds = extrapolate(ckt.state1(state::VDS), ckt.state2(state::VDS), xfact);
             ckt.set_state0(state::VGS, ckt.state1(state::VGS));
-            vgs = (1.0 + xfact) * (ckt.state1(state::VGS)) - (xfact * (ckt.state2(state::VGS)));
+            vgs = extrapolate(ckt.state1(state::VGS), ckt.state2(state::VGS), xfact);
             ckt.set_state0(state::VGES, ckt.state1(state::VGES));
-            vges = (1.0 + xfact) * (ckt.state1(state::VGES)) - (xfact * (ckt.state2(state::VGES)));
+            vges = extrapolate(ckt.state1(state::VGES), ckt.state2(state::VGES), xfact);
             ckt.set_state0(state::VGMS, ckt.state1(state::VGMS));
-            vgms = (1.0 + xfact) * (ckt.state1(state::VGMS)) - (xfact * (ckt.state2(state::VGMS)));
+            vgms = extrapolate(ckt.state1(state::VGMS), ckt.state2(state::VGMS), xfact);
             ckt.set_state0(state::VBS, ckt.state1(state::VBS));
-            vbs = (1.0 + xfact) * (ckt.state1(state::VBS)) - (xfact * (ckt.state2(state::VBS)));
+            vbs = extrapolate(ckt.state1(state::VBS), ckt.state2(state::VBS), xfact);
             ckt.set_state0(state::VBD, ckt.state0(state::VBS) - ckt.state0(state::VDS));
             ckt.set_state0(state::VDBS, ckt.state1(state::VDBS));
-            vdbs = (1.0 + xfact) * (ckt.state1(state::VDBS)) - (xfact * (ckt.state2(state::VDBS)));
+            vdbs = extrapolate(ckt.state1(state::VDBS), ckt.state2(state::VDBS), xfact);
             ckt.set_state0(
                 state::VDBD,
                 ckt.state0(state::VDBS) - ckt.state0(state::VDS),
             );
             ckt.set_state0(state::VSBS, ckt.state1(state::VSBS));
-            vsbs = (1.0 + xfact) * (ckt.state1(state::VSBS)) - (xfact * (ckt.state2(state::VSBS)));
+            vsbs = extrapolate(ckt.state1(state::VSBS), ckt.state2(state::VSBS), xfact);
             ckt.set_state0(state::VSES, ckt.state1(state::VSES));
-            vses = (1.0 + xfact) * (ckt.state1(state::VSES)) - (xfact * (ckt.state2(state::VSES)));
+            vses = extrapolate(ckt.state1(state::VSES), ckt.state2(state::VSES), xfact);
             ckt.set_state0(state::VDES, ckt.state1(state::VDES));
-            vdes = (1.0 + xfact) * (ckt.state1(state::VDES)) - (xfact * (ckt.state2(state::VDES)));
+            vdes = extrapolate(ckt.state1(state::VDES), ckt.state2(state::VDES), xfact);
             ckt.set_state0(state::QDEF, ckt.state1(state::QDEF));
-            qdef = (1.0 + xfact) * (ckt.state1(state::QDEF)) - (xfact * (ckt.state2(state::QDEF)));
+            qdef = extrapolate(ckt.state1(state::QDEF), ckt.state2(state::QDEF), xfact);
         } else {
             vds = f64::from(model.r#type)
                 * (ckt.rhs_old(here.dNodePrime) - ckt.rhs_old(here.sNodePrime));
@@ -376,4 +382,19 @@ pub(super) fn commit(here: &Instance, ckt: &mut dyn LoadCkt, bias: &LoadBias) {
     ckt.set_state0(state::VSES, vses);
     ckt.set_state0(state::VDES, vdes);
     ckt.set_state0(state::QDEF, qdef);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extrapolate;
+
+    #[test]
+    fn predictor_preserves_constant_and_small_history_changes() {
+        for ratio in [0., 0.1, 1., 1e6, 1e16] {
+            assert_eq!(extrapolate(0.125, 0.125, ratio), 0.125);
+        }
+        let older = 1_f64.next_down();
+        assert_eq!(extrapolate(1., older, 2_f64.powi(53)), 2.);
+        assert_eq!(extrapolate(0.5, 0.25, 2.), 1.);
+    }
 }

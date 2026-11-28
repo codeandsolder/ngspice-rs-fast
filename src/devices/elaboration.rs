@@ -4,7 +4,7 @@ use super::{
     txl::TxlPlan,
     urc::UrcPlan,
 };
-use crate::netlist::ast::DeviceInstance;
+use crate::netlist::ast::{CodePortKind, DeviceInstance};
 use crate::primitives::{NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 use std::collections::BTreeSet;
 
@@ -189,6 +189,7 @@ pub(super) struct PlannedBatch<'a> {
     pub(super) expansions: Vec<PlannedExpansion>,
     pub(super) devices: usize,
     pub(super) deck_nodes: BTreeSet<String>,
+    pub(super) resistors: Option<&'a super::pwl_resistor::BoundResistors>,
 }
 
 impl<'a> PlannedBatch<'a> {
@@ -228,7 +229,18 @@ impl<'a> PlannedBatch<'a> {
         }
         let deck_nodes = instances
             .iter()
-            .flat_map(|i| &i.nodes)
+            .filter(|instance| !super::behavioural::dynamic::is_generated(instance))
+            .flat_map(|i| {
+                i.nodes.iter().chain(
+                    i.code_ports
+                        .iter()
+                        .flat_map(|port| &port.terminals)
+                        .filter(|terminal| terminal.kind != CodePortKind::Digital)
+                        .flat_map(|terminal| {
+                            std::iter::once(&terminal.positive).chain(terminal.negative.iter())
+                        }),
+                )
+            })
             .map(|name| NodeTable::canonical_name(name, nodes.auto_gnd()))
             .collect();
         Ok(Self {
@@ -236,6 +248,7 @@ impl<'a> PlannedBatch<'a> {
             expansions,
             devices: known.devices - existing.devices,
             deck_nodes,
+            resistors: None,
         })
     }
 }

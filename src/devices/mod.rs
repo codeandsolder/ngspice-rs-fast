@@ -47,10 +47,14 @@ pub mod bjt;
 pub mod breaks;
 pub mod bsim3;
 pub mod bsim4;
+mod bsim_model_inputs;
 pub use breaks::{BreakTable, SourceBreaks};
 pub mod circuit;
+pub mod code_model;
 pub mod controlled;
+pub mod cpl;
 pub mod delay;
+pub mod digital_bridge;
 pub mod distortion;
 mod elaboration;
 mod factory;
@@ -76,7 +80,14 @@ pub mod noise;
 pub mod nonlinear;
 pub mod nport;
 pub mod passive;
+pub mod passive_bias;
+pub mod physical_dae;
+pub mod prepared_model;
+pub mod prepared_waveform;
 pub mod pulse;
+mod pwl_resistor;
+pub mod rf_passive;
+mod simetrix_diode;
 pub use passive::PassiveParameters;
 pub mod schema;
 pub mod sensitivity;
@@ -87,6 +98,7 @@ pub use models::{
 pub mod ltra;
 pub mod registry;
 pub mod sources;
+pub mod stochastic;
 pub mod subckt;
 pub mod sweep;
 pub mod switch;
@@ -125,9 +137,11 @@ pub use sweep::{
 };
 pub use switch::{Switch, SwitchKind, SwitchState};
 pub use traits::{
-    AcceptContext, AnalysisMode, ControlReference, ConvergenceContext, Device, InductanceValue,
-    MnaUnknowns, MutualCoupling, MutualTerm, StampContext, StorageElement, StorageKind,
-    TruncationContext,
+    AcceptContext, AnalysisMode, BranchQuantity, ControlReference, ConvergenceContext,
+    ConvergenceKind, Device, InductanceValue, InitialCoordinate, InitialCoordinateHistory,
+    InitialExpressionStorage, InitialStoragePolicy, InitialStorageRow, InitialVoltageLaw,
+    InitialVoltageRelation, InitialVoltageStorage, MnaUnknowns, MutualCoupling, MutualTerm,
+    StampContext, StorageElement, StorageKind, TruncationContext,
 };
 
 /// The C reference for the device framework, used in `NotYetPorted` errors.

@@ -538,3 +538,62 @@ fn hfet_alias_series_parameters_remain_unobservable() {
         }
     }
 }
+
+/// Independently differentiate both intrinsic channels at three temperatures.
+#[test]
+fn both_channel_derivatives_across_temperature() {
+    use ngspice_rs::devices::ModelContext;
+
+    for level in [5, 6] {
+        for temperature in [-25., 27., 85.] {
+            let context = ModelContext::new(temperature, 27.);
+            let leakage = if level == 5 {
+                "js1d=0 js2d=0 js1s=0 js2s=0"
+            } else {
+                "js=0"
+            };
+            for (family, polarity) in [("nhfet", 1.), ("phfet", -1.)] {
+                for parameters in ["", "eta2=1.5 d2=0.1u"] {
+                    let c = circuit(&format!(
+                        "vd d 0 1\nvg g 0 0\nz1 d g 0 model l=2u w=20u\n\
+                 .model model {family} level={level} {parameters} {leakage} ggr=0 rdi=5 rsi=7"
+                    ))
+                    .unwrap();
+                    let device = c.device("z1").unwrap();
+                    let drain = c.nodes().get("d").unwrap();
+                    let gate = c.nodes().get("g").unwrap();
+                    let observe = |key: &str, vgs: f64, vds: f64| {
+                        device
+                            .observation_operating(
+                                key,
+                                &context,
+                                &|node| {
+                                    if node == drain {
+                                        polarity * vds
+                                    } else if node == gate {
+                                        polarity * vgs
+                                    } else {
+                                        0.
+                                    }
+                                },
+                                false,
+                            )
+                            .unwrap()
+                            .unwrap()
+                    };
+                    for vgs in [-0.8, -0.3, 0., 0.25, 0.6, 1.] {
+                        for vds in [0.001, 0.1, 0.8, 2.] {
+                            let h = 1e-6;
+                            let gm = (observe("cd", vgs + h, vds) - observe("cd", vgs - h, vds))
+                                / (2. * h);
+                            let gds = (observe("cd", vgs, vds + h) - observe("cd", vgs, vds - h))
+                                / (2. * h);
+                            close(observe("gm", vgs, vds), gm, 2e-6, 1e-18);
+                            close(observe("gds", vgs, vds), gds, 2e-6, 1e-18);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

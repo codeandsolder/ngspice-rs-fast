@@ -321,6 +321,36 @@ impl ComplexMatrix {
         }
     }
 
+    /// Bind already assembled complex coefficients in stable element-ID order.
+    /// # Errors
+    /// Mismatched coefficient count or nonfinite values.
+    pub(crate) fn from_bound_values(
+        pattern: Arc<Pattern>,
+        values: Vec<Complex>,
+        pivot: PivotTolerances,
+    ) -> SpiceResult<Self> {
+        if values.len() != pattern.len() || values.iter().any(|v| !v.is_finite()) {
+            return Err(numerical(
+                "complex assembly",
+                "invalid bound complex values",
+            ));
+        }
+        Ok(Self {
+            n: pattern.order(),
+            assembly: Assembly::Bound { pattern, values },
+            pivot,
+            names: None,
+        })
+    }
+
+    /// Borrow bound original coefficients in their stable creation order.
+    pub(crate) fn bound_coefficients(&self) -> Option<(&Arc<Pattern>, &[Complex])> {
+        match &self.assembly {
+            Assembly::Bound { pattern, values } => Some((pattern, values)),
+            Assembly::Standalone(_) => None,
+        }
+    }
+
     /// Assembles `A + j omega E`, preserving cancellations and checking
     /// overflow. The pivot tolerances are `a`'s.
     /// # Errors
@@ -524,16 +554,11 @@ impl ComplexMatrix {
     /// Structurally or numerically singular matrix.
     pub fn factorize_new_matrix(&self) -> SpiceResult<ComplexLu> {
         let mut sparse = self.fresh_frame()?;
-        if !sparse.fully_translated() {
-            // A circuit's matrix follows C (see `maths::linear`).
-            if self.names.is_none() && matches!(self.assembly, Assembly::Standalone(_)) {
-                return Err(numerical(
-                    "complex sparse LU",
-                    "singular matrix: an unknown has no matrix entries",
-                ));
-            }
-            crate::maths::linear::warn_untranslated(&sparse, self.names.as_ref());
-        }
+        crate::maths::linear::require_translated(
+            "complex sparse LU",
+            &sparse,
+            self.names.as_ref(),
+        )?;
         let status = sparse.order_and_factor(self.pivot.relative, self.pivot.absolute);
         check_status("complex sparse LU", status, &sparse, self.names.as_ref())?;
         Ok(ComplexLu {
@@ -569,7 +594,6 @@ impl ComplexMatrix {
             &mut sparse,
             self.pivot,
             self.names.as_ref(),
-            self.names.is_some(),
         )?;
         Ok(ComplexLu {
             n: self.n,

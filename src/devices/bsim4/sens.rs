@@ -39,10 +39,6 @@
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
-#![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"
 )] // C's member names.
@@ -524,6 +520,16 @@ impl SensitivityKernel for Bsim4Sensitivity<'_> {
     }
 }
 
+/// C rejects invalid effective geometry after these separate rounding
+/// steps; FMA could make a finite negative span where C produces -infinity.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserve C BSIM4 effective-geometry zero and overflow boundaries"
+)]
+fn c_effective_span(extent: Real, side_loss: Real) -> Real {
+    extent - 2.0 * side_loss
+}
+
 /// The `pParam` `b4temp.c` leaves when one of its effective-geometry checks
 /// fails (lines after `if (Size_Not_Found)`): a zeroed allocation holding the
 /// members assigned before the first failing check, in C's arithmetic.
@@ -549,23 +555,23 @@ fn rejected_size(m: &Model, h: &Instance) -> SizeParam {
     let tmp2 = m.Wlc / T2 + m.Wwc / T3 + m.Wwlc / (T2 * T3);
     p.dwc = m.dwc + tmp2;
     p.dwj = m.dwj + tmp2;
-    p.leff = Lnew - 2.0 * p.dl;
+    p.leff = c_effective_span(Lnew, p.dl);
     if p.leff <= 0.0 {
         return p;
     }
-    p.weff = Wnew - 2.0 * p.dw;
+    p.weff = c_effective_span(Wnew, p.dw);
     if p.weff <= 0.0 {
         return p;
     }
-    p.leffCV = Lnew - 2.0 * p.dlc;
+    p.leffCV = c_effective_span(Lnew, p.dlc);
     if p.leffCV <= 0.0 {
         return p;
     }
-    p.weffCV = Wnew - 2.0 * p.dwc;
+    p.weffCV = c_effective_span(Wnew, p.dwc);
     if p.weffCV <= 0.0 {
         return p;
     }
-    p.weffCJ = Wnew - 2.0 * p.dwj;
+    p.weffCJ = c_effective_span(Wnew, p.dwj);
     p
 }
 
@@ -667,5 +673,24 @@ impl Device for ResetBsim4 {
             &h,
             &prepared.size,
         )
+    }
+}
+
+#[cfg(test)]
+mod rounding_tests {
+    use super::c_effective_span;
+
+    #[test]
+    fn c_effective_geometry_preserves_zero_and_nonfinite_rejection_boundaries() {
+        let half = 0.5_f64;
+        let exact = 2. * half;
+        let one_ulp_below = f64::from_bits(exact.to_bits() - 1);
+        let one_ulp_above = f64::from_bits(exact.to_bits() + 1);
+        assert!(c_effective_span(one_ulp_below, half) < 0.);
+        assert_eq!(c_effective_span(exact, half).to_bits(), 0_f64.to_bits());
+        assert!(c_effective_span(one_ulp_above, half) > 0.);
+
+        assert_eq!(c_effective_span(f64::MAX, 1e308), f64::NEG_INFINITY);
+        assert!((-2.0_f64).mul_add(1e308, f64::MAX).is_finite());
     }
 }

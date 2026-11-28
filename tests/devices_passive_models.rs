@@ -22,7 +22,7 @@ fn parameters(n: &Netlist, index: usize) -> Result<PassiveParameters, SpiceError
     ModelResolver::new(&n.models)?
         .resolve(&n.devices[index])?
         .unwrap()
-        .passive_parameters(&n.devices[index])
+        .passive_parameters(&n.devices[index], 1.)
 }
 fn effective(body: &str) -> Result<f64, SpiceError> {
     parameters(&deck(body), 0)?.effective_value(&ModelContext::default())
@@ -356,6 +356,7 @@ fn real_stamp_uses_explicit_temperature_and_initial_conditions_remain_visible() 
         reltol: ngspice_rs::devices::DEFAULT_RELTOL,
         frequency: 0.,
         mode: AnalysisMode::OperatingPoint,
+        bias_analysis: None,
         branches: 0..0,
         controls: &[],
         mutual: &[],

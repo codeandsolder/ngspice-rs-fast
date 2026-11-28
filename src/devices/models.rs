@@ -52,6 +52,8 @@ pub enum ModelFamily {
     Inductor,
     /// Junction diode.
     Diode,
+    /// Explicit source-selected `SIMetrix` level-1 diode.
+    SimetrixDiodeLevel1,
     /// NPN classic BJT.
     Npn,
     /// PNP classic BJT.
@@ -62,6 +64,8 @@ pub enum ModelFamily {
     Pmos,
     /// Voltage-controlled switch (`sw`, `sw/sw.c`).
     Switch,
+    /// Explicit prepared `LTspice` voltage-controlled switch.
+    LtspiceSwitch,
     /// Current-controlled switch (`csw`, `csw/csw.c`).
     CurrentSwitch,
     /// N-channel JFET (`njf`; level 1 `jfet/`, level 2 `jfet2/`).
@@ -76,11 +80,21 @@ pub enum ModelFamily {
     Ltra,
     /// Single lossy transmission line (TXL, `inp2y.c`).
     Txl,
+    /// Distributed multiconductor cable (`P`, C `cpl`).
+    Cpl,
     /// N-channel MESFET/HFET family (`nmf`; level 1 `mes/`, levels 2-4
     /// `mesa/`, 5 `hfet1/`, 6 `hfet2/`).
     Nmf,
     /// P-channel MESFET/HFET family (`pmf`; levels as for [`Self::Nmf`]).
     Pmf,
+    /// XSPICE rational transfer function (`s_xfer`).
+    RationalTransfer,
+    /// Native hybrid analog receiver/event logic.
+    LogicEvent,
+    /// Native ideal logic voltage bridge.
+    LogicVoltage,
+    /// Timed conductance switch.
+    TimedSwitch,
 }
 
 impl ModelFamily {
@@ -92,17 +106,24 @@ impl ModelFamily {
             "c" => Some(Self::Capacitor),
             "l" => Some(Self::Inductor),
             "d" => Some(Self::Diode),
+            model_kernel_diode::MODEL_FAMILY => Some(Self::SimetrixDiodeLevel1),
             "npn" => Some(Self::Npn),
             "pnp" => Some(Self::Pnp),
             "nmos" => Some(Self::Nmos),
             "pmos" => Some(Self::Pmos),
             "sw" => Some(Self::Switch),
+            "ltspice_switch" => Some(Self::LtspiceSwitch),
             "csw" => Some(Self::CurrentSwitch),
             "njf" => Some(Self::Njf),
             "pjf" => Some(Self::Pjf),
             "urc" => Some(Self::Urc),
             "ltra" => Some(Self::Ltra),
             "txl" => Some(Self::Txl),
+            "cpl" | "cpllines" => Some(Self::Cpl),
+            "s_xfer" => Some(Self::RationalTransfer),
+            "preprocess_logic_event" => Some(Self::LogicEvent),
+            "preprocess_logic_voltage" => Some(Self::LogicVoltage),
+            "preprocess_timed_switch" => Some(Self::TimedSwitch),
             // `inpdomod.c` accepts the HFET spellings as the same families;
             // `level` then selects the device (5 is `hfet1/`, 6 `hfet2/`).
             "nmf" | "nhfet" => Some(Self::Nmf),
@@ -119,15 +140,19 @@ impl ModelFamily {
             Self::Resistor => 'r',
             Self::Capacitor => 'c',
             Self::Inductor => 'l',
-            Self::Diode => 'd',
+            Self::Diode | Self::SimetrixDiodeLevel1 => 'd',
             Self::Npn | Self::Pnp => 'q',
             Self::Nmos | Self::Pmos => 'm',
-            Self::Switch => 's',
+            Self::Switch | Self::LtspiceSwitch => 's',
             Self::CurrentSwitch => 'w',
             Self::Njf | Self::Pjf => 'j',
             Self::Urc => 'u',
             Self::Ltra => 'o',
             Self::Txl => 'y',
+            Self::Cpl => 'p',
+            Self::RationalTransfer | Self::LogicEvent | Self::LogicVoltage | Self::TimedSwitch => {
+                'a'
+            }
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -145,6 +170,8 @@ pub enum ModelBackend {
     Inductor,
     /// Junction diode.
     Diode,
+    /// Explicit source-selected `SIMetrix` level-1 diode.
+    SimetrixDiodeLevel1,
     /// Gummel-Poon.
     Bjt,
     /// MOS1.
@@ -175,6 +202,8 @@ pub enum ModelBackend {
     Hfet2,
     /// Voltage-controlled switch.
     Switch,
+    /// Explicit prepared `LTspice` voltage-controlled switch.
+    LtspiceSwitch,
     /// Current-controlled switch.
     CurrentSwitch,
     /// Uniform RC expansion.
@@ -183,6 +212,16 @@ pub enum ModelBackend {
     Ltra,
     /// TXL lossy line.
     Txl,
+    /// Multiconductor coupled transmission line.
+    Cpl,
+    /// Native rational transfer model.
+    RationalTransfer,
+    /// Native hybrid event logic.
+    LogicEvent,
+    /// Native ideal logic voltage bridge.
+    LogicVoltage,
+    /// Timed conductance switch.
+    TimedSwitch,
 }
 
 /// Authoritative backend catalog entry. Selector aliases are the C levels
@@ -191,6 +230,7 @@ pub(crate) struct BackendSpec {
     pub(crate) backend: ModelBackend,
     pub(crate) name: &'static str,
     pub(crate) selectors: &'static [u8],
+    family: Option<ModelFamily>,
 }
 
 impl BackendSpec {
@@ -199,7 +239,13 @@ impl BackendSpec {
             backend,
             name,
             selectors,
+            family: None,
         }
+    }
+
+    const fn for_family(mut self, family: ModelFamily) -> Self {
+        self.family = Some(family);
+        self
     }
 }
 
@@ -211,7 +257,19 @@ impl ModelBackend {
             'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
             'c' => const { &[BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1])] },
             'l' => const { &[BackendSpec::new(Self::Inductor, "Scalar inductor", &[1])] },
-            'd' => const { &[BackendSpec::new(Self::Diode, "Junction diode", &[1])] },
+            'd' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Diode, "Junction diode", &[1]),
+                        BackendSpec::new(
+                            Self::SimetrixDiodeLevel1,
+                            "SIMetrix diode (explicit simetrix_diode_level1 family)",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::SimetrixDiodeLevel1),
+                    ]
+                }
+            }
             'q' => const { &[BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2])] },
             'm' => {
                 const {
@@ -246,11 +304,11 @@ impl ModelBackend {
             }
             's' => {
                 const {
-                    &[BackendSpec::new(
-                        Self::Switch,
-                        "Voltage-controlled switch",
-                        &[1],
-                    )]
+                    &[
+                        BackendSpec::new(Self::Switch, "Voltage-controlled switch", &[1]),
+                        BackendSpec::new(Self::LtspiceSwitch, "Prepared LTspice switch", &[1, 2])
+                            .for_family(ModelFamily::LtspiceSwitch),
+                    ]
                 }
             }
             'w' => {
@@ -265,19 +323,39 @@ impl ModelBackend {
             'u' => const { &[BackendSpec::new(Self::Urc, "Uniform RC expansion", &[1])] },
             'o' => const { &[BackendSpec::new(Self::Ltra, "Lossy line", &[1])] },
             'y' => const { &[BackendSpec::new(Self::Txl, "TXL lossy line", &[1])] },
+            'p' => const { &[BackendSpec::new(Self::Cpl, "Coupled line", &[1])] },
+            'a' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
+                        BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
+                            .for_family(ModelFamily::LogicEvent),
+                        BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
+                            .for_family(ModelFamily::LogicVoltage),
+                        BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
+                            .for_family(ModelFamily::TimedSwitch),
+                    ]
+                }
+            }
             _ => &[],
         }
     }
 
     fn select(family: ModelFamily, selector: u8) -> Option<Self> {
-        Self::catalog(family.designator())
+        let catalog = Self::catalog(family.designator());
+        // An explicitly selected family owns its selectors: it must never
+        // fall back to a native backend when its requested level is absent.
+        let explicit = catalog.iter().any(|spec| spec.family == Some(family));
+        catalog
             .iter()
-            .find(|spec| spec.selectors.contains(&selector))
+            .find(|spec| {
+                spec.family == explicit.then_some(family) && spec.selectors.contains(&selector)
+            })
             .map(|spec| spec.backend)
     }
 
     pub(super) const fn requires_model(designator: char) -> bool {
-        !matches!(designator.to_ascii_lowercase(), 'r' | 'c' | 'l')
+        !matches!(designator.to_ascii_lowercase(), 'r' | 'c' | 'l' | 'a')
             && !Self::catalog(designator).is_empty()
     }
 }
@@ -309,6 +387,10 @@ pub(super) enum PreparationKey {
     Inputs,
     Scalar(usize),
     Nominal(u64),
+    PreparedTopology {
+        series: bool,
+        absolute_temperature: bool,
+    },
 }
 
 type PreparationCell<T> = OnceLock<SpiceResult<Arc<T>>>;
@@ -716,6 +798,32 @@ impl<'a> ResolvedModel<'a> {
     }
 }
 
+/// Physical topology augmentation requested by the deck.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TopologyShunts {
+    /// Noiseless resistance from every analog voltage node to ground (ohms).
+    pub resistance: Option<Real>,
+    /// Capacitance from every parsed voltage node to ground (farads).
+    pub capacitance: Real,
+}
+
+impl TopologyShunts {
+    pub(crate) fn validate(self) -> SpiceResult<()> {
+        if self
+            .resistance
+            .is_some_and(|r| !r.is_finite() || r <= 0. || !r.recip().is_finite())
+        {
+            return Err(SpiceError::circuit(
+                "rshunt must be positive and finite with finite conductance",
+            ));
+        }
+        if !self.capacitance.is_finite() || self.capacitance < 0. {
+            return Err(SpiceError::circuit("cshunt must be finite and nonnegative"));
+        }
+        Ok(())
+    }
+}
+
 /// Device-owned context, intentionally independent of analysis. Analysis
 /// consumers can pass their temperature settings explicitly when factories land.
 ///
@@ -723,6 +831,8 @@ impl<'a> ResolvedModel<'a> {
 /// resistor and instance-parameter overrides here (see [`crate::devices::sweep`]) instead of mutating devices.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelContext {
+    /// Enclosing analysis for resolved, bias-only passive initialization.
+    pub bias_analysis: Option<crate::primitives::AnalysisKind>,
     /// Use SPICE3 MOS1 flicker noise (`mos1noi.c`, newcompat.s3).
     pub spice3_noise: bool,
     /// Circuit temperature, degrees Celsius (instance TEMP default).
@@ -741,6 +851,10 @@ pub struct ModelContext {
     /// artificial nodal continuation conductance of DC gmin stepping. Default
     /// [`DEFAULT_GMIN`]; must be finite and nonnegative.
     pub gmin: Real,
+    /// Physical shunts used at topology elaboration.
+    pub shunts: TopologyShunts,
+    /// Global source geometry scale, applied only when resolving setters.
+    pub geometry_scale: Real,
     /// Resolved circuit relative tolerance (C `CKTreltol`), used by device preparation.
     /// Independent of analysis-local Newton tolerance overrides.
     pub reltol: Real,
@@ -782,12 +896,18 @@ impl ModelContext {
             resistor_overrides: [None; MAX_RESISTOR_OVERRIDES],
             instance_overrides: [None; MAX_INSTANCE_OVERRIDES],
             gmin: DEFAULT_GMIN,
+            shunts: TopologyShunts {
+                resistance: None,
+                capacitance: 0.,
+            },
+            geometry_scale: 1.,
             reltol: DEFAULT_RELTOL,
             frequency: 0.,
             spice3_noise: false,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             source_factor: 1.,
             noise_analysis: false,
+            bias_analysis: None,
         }
     }
 
@@ -920,6 +1040,15 @@ impl ModelContext {
     }
 
     pub(crate) fn validate(&self, location: &SourceLoc) -> SpiceResult<()> {
+        self.shunts
+            .validate()
+            .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))?;
+        if !self.geometry_scale.is_finite() || self.geometry_scale <= 0. {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "geometry scale must be finite and positive",
+            ));
+        }
         temperature_kelvin(self.temperature, location)?;
         temperature_kelvin(self.nominal_temperature, location)?;
         if !(self.frequency.is_finite() && self.frequency >= 0.) {
@@ -1062,17 +1191,41 @@ const fn mos_level_reference(selector: u8) -> &'static str {
     }
 }
 
-fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> {
+struct LevelSetters<'a> {
+    first: Option<(Real, u8, &'a SourceLoc)>,
+    last: Option<u8>,
+}
+
+fn level_setters(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSetters<'_>> {
     let mut first = None;
     let mut last = None;
     for p in &card.parameters {
         if p.name.eq_ignore_ascii_case("level") {
             let raw = finite_literal(p)?;
+            if family == ModelFamily::SimetrixDiodeLevel1 && raw.to_bits() != 1_f64.to_bits() {
+                return Err(SpiceError::parse(
+                    p.location.clone(),
+                    format!("SIMetrix diode requires LEVEL=1, got {raw}"),
+                ));
+            }
+            if family == ModelFamily::LtspiceSwitch
+                && ![1_f64.to_bits(), 2_f64.to_bits()].contains(&raw.to_bits())
+            {
+                return Err(SpiceError::parse(
+                    p.location.clone(),
+                    format!("LTspice switch requires LEVEL=1 or LEVEL=2, got {raw}"),
+                ));
+            }
             let integer = rounded_level(raw, &p.location)?;
             first.get_or_insert((raw, integer, &p.location));
             last = Some(integer);
         }
     }
+    Ok(LevelSetters { first, last })
+}
+
+fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> {
+    let LevelSetters { first, last } = level_setters(card, family)?;
     let raw = first.map(|(raw, _, _)| raw);
     if card.level != raw {
         return Err(SpiceError::parse(
@@ -1085,6 +1238,8 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
     // Preserve the first rounded selector, including aliases. Fixed-backend
     // families have separate level setter policy.
     let (selector, valid_setter, applied) = match family {
+        // LTspice applies ordered level setters, retaining the last one.
+        ModelFamily::LtspiceSwitch => (last.unwrap_or(1), true, last),
         ModelFamily::Npn
         | ModelFamily::Pnp
         | ModelFamily::Nmos

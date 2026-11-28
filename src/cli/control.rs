@@ -8,18 +8,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
-use crate::analysis::control::vectors::{self, SpectrumWindow, TransformBudget};
+use crate::analysis::control::vectors::{self, TransformBudget};
 use crate::analysis::control::{
     ControlBatchBudget, ControlBatchCards, ControlPlot, ControlSession,
 };
 use crate::analysis::optimization::parameters::CircuitParameterPlan;
+use crate::analysis::spectrum::{
+    SpectrumLength, SpectrumNormalization, SpectrumSettings, SpectrumWindow,
+};
 use crate::analysis::{Variable, measure};
 use crate::netlist::ast::{
-    AnalysisCard, FourierCard, MeasureCard, Netlist, OutputCards, ScopedCardKind,
+    AnalysisCard, FourierCard, MeasureCard, Netlist, OptionCard, OutputCards, ScopedCardKind,
 };
 use crate::netlist::eval::{EvalBudget, EvalLimits, ParamBinding, ParamScope};
-use crate::netlist::parser::{control_analysis, control_measure, parse_control_expression};
-use crate::netlist::{DotCommand, ParameterExpression, Parser, RawCard, SourceLimits};
+use crate::netlist::parser::{
+    control_analysis, control_measure, control_options, parse_control_expression,
+};
+use crate::netlist::{
+    DotCommand, ParameterExpression, Parser, RawCard, SourceAdmission, SourceLimits,
+};
 use crate::primitives::{AnalysisKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// Independent work and storage bounds for one script invocation.
@@ -82,6 +89,7 @@ enum Operation {
     Let(String, Scalar),
     AlterParameter(String, Scalar),
     AlterInstance(String, Option<String>, Scalar),
+    Options(Box<OptionCard>),
     Reset,
     Run,
     Analysis(Box<AnalysisCard>),
@@ -120,7 +128,7 @@ enum EchoPart {
 #[derive(Clone, Copy)]
 enum Transform {
     Linearize(Option<u32>),
-    Spectrum,
+    Spectrum(SpectrumLength, SpectrumNormalization),
 }
 
 enum Condition {
@@ -396,6 +404,48 @@ fn linearize_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation>
     Ok(Operation::Transform(Transform::Linearize(points), vectors))
 }
 
+fn spectrum_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation> {
+    let mut length = None;
+    let mut normalization = None;
+    let mut names = Vec::new();
+    for arg in rest.split_ascii_whitespace().map(str::to_ascii_lowercase) {
+        if let Some((key, value)) = arg.split_once('=') {
+            match key {
+                "length" if length.is_none() => {
+                    length = Some(match value {
+                        "exact" => SpectrumLength::Exact,
+                        "padded" => SpectrumLength::Padded,
+                        _ => return Err(error(location, "FFT length must be exact or padded")),
+                    });
+                }
+                "mode" if normalization.is_none() => {
+                    normalization = Some(match value {
+                        "amplitude" => SpectrumNormalization::Amplitude,
+                        "power" => SpectrumNormalization::Power,
+                        "psd" => SpectrumNormalization::Density,
+                        _ => {
+                            return Err(error(
+                                location,
+                                "FFT mode must be amplitude, power or psd",
+                            ));
+                        }
+                    });
+                }
+                _ => return Err(error(location, "unknown or repeated FFT option")),
+            }
+        } else {
+            names.push(arg);
+        }
+    }
+    Ok(Operation::Transform(
+        Transform::Spectrum(
+            length.unwrap_or_default(),
+            normalization.unwrap_or_default(),
+        ),
+        names,
+    ))
+}
+
 fn set_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation> {
     if let Some((name, value)) = rest.split_once('=') {
         if name.trim().eq_ignore_ascii_case("specwindow") {
@@ -528,6 +578,10 @@ impl Compiler<'_> {
                 Ok(Operation::Let(name, value))
             }
             "alter" => instance_assignment(rest, location),
+            "option" | "options" => Ok(Operation::Options(Box::new(control_options(
+                card,
+                self.auto_gnd,
+            )?))),
             "alterparam" => {
                 let (name, value) = assignment(rest, location)?;
                 self.tunables.insert(name.clone());
@@ -568,12 +622,7 @@ impl Compiler<'_> {
                 Ok(Operation::Print(values))
             }
             "linearize" => linearize_command(rest, location),
-            "fft" => Ok(Operation::Transform(
-                Transform::Spectrum,
-                rest.split_ascii_whitespace()
-                    .map(str::to_ascii_lowercase)
-                    .collect(),
-            )),
+            "fft" => spectrum_command(rest, location),
             "set" => set_command(rest, location),
             "setplot" => {
                 if rest.is_empty() || rest.contains(char::is_whitespace) {
@@ -932,22 +981,30 @@ impl State<'_, '_> {
             cells: self.limits.cells - self.cells,
             work: self.remaining_transform_work,
         };
-        let result = if let Transform::Linearize(points) = transform {
-            let grid = current
-                .grid
-                .ok_or_else(|| error(location, "linearize needs a transient plot"))?;
-            let plot = vectors::linearize(&current.plot, grid, points, names, &mut budget)?;
-            ControlPlot {
-                kind: AnalysisKind::Transient,
-                grid: Some(grid),
-                plot,
+        let result = match transform {
+            Transform::Linearize(points) => {
+                let grid = current
+                    .grid
+                    .ok_or_else(|| error(location, "linearize needs a transient plot"))?;
+                let plot = vectors::linearize(&current.plot, grid, points, names, &mut budget)?;
+                ControlPlot {
+                    kind: AnalysisKind::Transient,
+                    grid: Some(grid),
+                    plot,
+                }
             }
-        } else {
-            let plot = vectors::fft(&current.plot, names, self.window, &mut budget)?;
-            ControlPlot {
-                kind: AnalysisKind::Fourier,
-                grid: None,
-                plot,
+            Transform::Spectrum(length, normalization) => {
+                let settings = SpectrumSettings {
+                    window: self.window,
+                    length,
+                    normalization,
+                };
+                let plot = vectors::fft(&current.plot, names, settings, &mut budget)?;
+                ControlPlot {
+                    kind: AnalysisKind::Fourier,
+                    grid: None,
+                    plot,
+                }
             }
         };
         self.remaining_transform_work = budget.work;
@@ -1216,6 +1273,26 @@ impl State<'_, '_> {
                     self.limits.instance_edits,
                 )?;
             }
+            Operation::Options(card) => {
+                let mut resolved = card.as_ref().clone();
+                for setting in &mut resolved.settings {
+                    if let Some(expression) = setting.expression.take() {
+                        let value = self.evaluate(&expression)?;
+                        let positioned = setting
+                            .value
+                            .as_mut()
+                            .ok_or_else(|| error(location, "missing option value"))?;
+                        positioned.text = crate::netlist::elaborate::format_literal(value);
+                    } else if let Some(positioned) = &mut setting.value
+                        && positioned.text.starts_with('$')
+                    {
+                        let value =
+                            self.evaluate(&*expression(&positioned.text, &positioned.location)?)?;
+                        positioned.text = crate::netlist::elaborate::format_literal(value);
+                    }
+                }
+                self.session.apply_options(&resolved)?;
+            }
             Operation::Reset => {
                 self.session.alter_parameters(
                     self.pending
@@ -1262,8 +1339,25 @@ pub fn run_file(
     limits: ScriptLimits,
     output: &mut dyn Write,
 ) -> SpiceResult<ScriptReport> {
-    let parsed =
-        Parser::with_auto_gnd(auto_gnd).parse_control_file(path, SourceLimits::default())?;
+    run_file_with_admission(path, auto_gnd, limits, None, output)
+}
+
+/// Compile and execute a control deck with optional explicit source admission.
+///
+/// # Errors
+/// Admission, script parsing, compilation or execution failures.
+pub fn run_file_with_admission(
+    path: &Path,
+    auto_gnd: bool,
+    limits: ScriptLimits,
+    admission: Option<&SourceAdmission>,
+    output: &mut dyn Write,
+) -> SpiceResult<ScriptReport> {
+    let parsed = Parser::with_auto_gnd(auto_gnd).parse_control_file_with_admission(
+        path,
+        SourceLimits::default(),
+        admission,
+    )?;
     let program = Program::compile(&parsed.netlist, auto_gnd)?;
     let tunables: Vec<_> = program.tunables.iter().map(String::as_str).collect();
     let analyses = parsed.netlist.analyses.clone();

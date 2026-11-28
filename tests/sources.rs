@@ -606,3 +606,38 @@ fn root_can_select_its_own_section_without_reinterpreting_the_title() {
         4
     );
 }
+
+#[test]
+fn resolved_sources_elaborate_in_root_and_subcircuit_scopes() {
+    use ngspice_rs::analysis::RunConfig;
+    let files = Files::new();
+    let text = "divider\nv1 in 0 2\n.subckt divider a b\n.include body.inc\n.ends\nx1 in out divider\n.lib resistors.lib tt\n.op\n.end\n";
+    let root = files.write("main.cir", text);
+    files.write("body.inc", "r1 a b 1k\n");
+    files.write("resistors.lib", ".lib tt\nr2 out 0 1k\n.endl tt\n");
+    let netlist = Parser::new().parse_file(&root).unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let plot = config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    assert!((plot.value("v(out)", 0).unwrap().re - 1.).abs() < 1e-12);
+    assert_eq!(netlist.includes.len(), 1);
+    assert_eq!(netlist.subcircuits[0].includes.len(), 1);
+    for source in [
+        text,
+        "unresolved body\nv1 in 0 2\n.subckt divider a b\n.include body.inc\n.ends\nx1 in out divider\nr2 out 0 1k\n.op\n.end\n",
+    ] {
+        let syntax = Parser::new()
+            .parse_deck(&parse_deck_text(&root, source))
+            .unwrap();
+        let config = RunConfig::from_netlist(&syntax).unwrap();
+        let error = config.circuit(&syntax).unwrap_err();
+        assert!(
+            error.to_string().contains("unresolved source directive"),
+            "{error}"
+        );
+    }
+}

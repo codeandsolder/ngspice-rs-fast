@@ -8,7 +8,7 @@ use winnow::combinator::{cut_err, opt};
 use crate::netlist::ast::{InitialCondition, ParameterAssignment, ParameterKind};
 
 use super::grammar::{Input, Result, keyword};
-use super::syntax::equals;
+use super::syntax::{Value, equals, literal};
 use super::vector::{numeric, positioned};
 
 pub(super) fn vector(input: &mut Input<'_>) -> Result<ParameterAssignment> {
@@ -31,14 +31,16 @@ pub(super) fn vector_with_components(
     let token = keyword("ic").parse_next(input)?;
     cut_err(|input: &mut Input<'_>| {
         opt(equals).parse_next(input)?;
-        let vector = numeric(input, components.len())?;
+        let vector = numeric(input, components.len(), |input| {
+            literal(input).map(Value::Literal)
+        })?;
         let values = vector
             .values
             .iter()
             .zip(components)
             .map(|(value, name)| InitialCondition {
                 name: (*name).to_owned(),
-                value: positioned(value),
+                value: positioned(value.token()),
             })
             .collect();
         Ok(ParameterAssignment {

@@ -10,6 +10,10 @@ const K_OVER_Q: f64 = 1.38064852e-23 / 1.6021766208e-19;
 const GMIN: f64 = 1e-12;
 
 fn simulate(body: &str) -> Plot {
+    simulate_observed(body, &[])
+}
+
+fn simulate_observed(body: &str, observations: &[String]) -> Plot {
     let n = Parser::new()
         .parse_deck(&parse_deck_text(
             Path::new("diode_physics.cir"),
@@ -18,6 +22,7 @@ fn simulate(body: &str) -> Plot {
         .unwrap();
     let config = RunConfig::from_netlist(&n).unwrap();
     let mut circuit = config.circuit(&n).unwrap();
+    circuit.set_observations(observations).unwrap();
     let request = config.plan_for(&n.analyses[0]).unwrap();
     request.run(&mut circuit, &config.context()).unwrap()
 }
@@ -214,5 +219,296 @@ fn reused_circuit_rederives_breakdown_at_the_resolved_reltol() {
             ..config.context()
         };
         assert!(plan.run(&mut circuit, &invalid).is_err());
+    }
+}
+
+#[test]
+fn soft_recovery_ac_has_the_physical_relaxation_pole() {
+    // Independently eliminate the charge coordinate from
+    // q + VP*TT*dq/dt = TT*I(v). The signed input admittance is
+    // G * [1 + (1-VP)*s*TT/(1+VP*s*TT)] with CJO=0.
+    for (temp, vp, scale) in [
+        (27., 0., 1e6),
+        (27., 0.01, 1e6),
+        (27., 0.05, 1.),
+        (27., 0.05, 1e6),
+        (27., 0.05, 1e9),
+        (27., 1., 1e6),
+        (77., 0.05, 1e6),
+    ] {
+        let p = simulate(&format!(
+            ".options temp={temp} reltol=1e-9 vntol=1e-12 abstol=1e-15\n\
+             v1 a 0 dc 0.7 ac 1\nd1 a 0 dm\n\
+             .model dm d(is=1e-14 tt=100n ttt1=0.003 ttt2=1e-5 vp={vp} qpscale={scale})\n\
+             .ac dec 3 10k 10g"
+        ));
+        let t = temp + 273.15;
+        let vt = K_OVER_Q * t;
+        let is = 1e-14 * ((t / 300.15 - 1.) * 1.11 / vt + 3. * (t / 300.15).ln()).exp();
+        let g = is * (0.7 / vt).exp() / vt + GMIN;
+        let dt = temp - 27.;
+        let tt = 100e-9 * (1. + 0.003 * dt + 1e-5 * dt * dt);
+        for k in 0..p.point_count() {
+            let wtt = std::f64::consts::TAU * real(&p, "frequency", k) * tt;
+            let x = vp * wtt;
+            let denom = 1. + x * x;
+            let re = g * (1. + (1. - vp) * wtt * x / denom);
+            let im = g * (1. - vp) * wtt / denom;
+            let measured = p.value("i(v1)", k).unwrap();
+            let bound = 2e-6 * re.hypot(im) + 1e-12;
+            assert!(
+                (measured.re + re).hypot(measured.im + im) < bound,
+                "T={temp} VP={vp} scale={scale} wTT={wtt}: {measured:?} vs {}, {}",
+                -re,
+                -im
+            );
+        }
+    }
+}
+
+#[test]
+fn inactive_recovery_reduces_to_the_original_junction_without_an_auxiliary_node() {
+    let run = |parameters: &str| {
+        simulate(&format!(
+            "v1 a 0 dc .7 ac 1\nd1 a 0 dm\n.model dm d(is=1e-14 cjo=1p {parameters})\n.ac dec 3 1k 1g"
+        ))
+    };
+    for (lhs, rhs) in [("tt=100n", "tt=100n vp=0"), ("tt=0", "tt=0 vp=0.05")] {
+        let a = run(lhs);
+        let b = run(rhs);
+        assert_eq!(a.column("i(v1)").unwrap(), b.column("i(v1)").unwrap());
+        assert!(b.column("v(d1#qp)").is_none());
+    }
+}
+
+#[test]
+fn soft_recovery_transient_conserves_physical_charge_independent_of_coordinate_scale() {
+    // An ideal voltage source holds the junction at 0.7 V before a finite
+    // ramp to 0.2 V. The inhomogeneous recovery ODE can be integrated
+    // analytically over the ramp, followed by exponential relaxation.
+    let tt: f64 = 100e-9;
+    let vp = 0.05;
+    let tau = vp * tt;
+    let vt = K_OVER_Q * 300.15;
+    let saturation = 1e-14;
+    let initial_v = 0.7;
+    let final_v = 0.2;
+    let ramp_start = 100e-9;
+    let ramp_duration = 1e-9;
+    let ramp_end = ramp_start + ramp_duration;
+    let rate = (initial_v - final_v) / ramp_duration;
+    let k = rate / vt;
+    let decay = (-ramp_duration / tau).exp();
+    let current = |v: f64| saturation * (v / vt).exp_m1() + GMIN * v;
+    let initial_q = tt * current(initial_v);
+    let exponential =
+        saturation * (initial_v / vt).exp() * ((-k * ramp_duration).exp() - decay) / (1. - k * tau);
+    let linear = GMIN * (final_v + rate * tau - (initial_v + rate * tau) * decay);
+    let final_q = initial_q * decay + tt * (exponential - saturation * (1. - decay) + linear);
+    let equilibrium = tt * current(final_v);
+    let excess = |t: f64| (final_q - equilibrium) * (-(t - ramp_end) / tau).exp();
+    for method in ["trap", "gear"] {
+        for scale in [1., 1e6, 1e9] {
+            let p = simulate(&format!(
+                "v1 a 0 pwl(0 0.7 100n 0.7 101n 0.2 160n 0.2)\n\
+                 d1 a 0 dm\n.model dm d(is=1e-14 tt=100n vp={vp} qpscale={scale})\n\
+                 .options method={method} reltol=1e-6 vntol=1e-9 abstol=1e-14\n\
+                 .tran 50p 160n 0 50p"
+            ));
+            let time = p.column("time").unwrap();
+            let input = p.column("i(v1)").unwrap();
+            let first = time.partition_point(|v| v.re < ramp_end + 0.25e-9);
+            assert!(first + 1 < time.len());
+            let mut integral = 0.;
+            let conduction = current(final_v);
+            for i in first..time.len() {
+                let expected = (1. - vp) * excess(time[i].re) / tau;
+                let recovery = input[i].re + conduction;
+                assert!(
+                    (recovery - expected).abs() <= 2e-3 * expected.abs() + 1e-8,
+                    "{method} scale={scale} t={}: {recovery} vs {expected}",
+                    time[i].re
+                );
+                if i > first {
+                    let previous = input[i - 1].re + conduction;
+                    integral += 0.5 * (recovery + previous) * (time[i].re - time[i - 1].re);
+                }
+            }
+            let expected = (1. - vp) * (excess(time[first].re) - excess(time.last().unwrap().re));
+            assert!(
+                (integral - expected).abs() <= 2e-3 * expected.abs(),
+                "{method} scale={scale}: integrated {integral} vs {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn soft_recovery_approaches_the_instantaneous_diffusion_limit() {
+    let run = |vp: f64| {
+        simulate(&format!(
+            "v1 a 0 dc .7 ac 1\nd1 a 0 dm\n.model dm d(is=1e-14 tt=100n vp={vp})\n.ac dec 3 1k 1meg"
+        ))
+    };
+    let baseline = run(0.);
+    let small = run(1e-8);
+    for point in 0..baseline.point_count() {
+        let want = baseline.value("i(v1)", point).unwrap();
+        let actual = small.value("i(v1)", point).unwrap();
+        assert!(
+            (actual - want).magnitude() <= 2e-8 * want.magnitude(),
+            "point={point}: {actual:?} vs {want:?}"
+        );
+    }
+}
+
+#[test]
+fn soft_recovery_observations_are_external_terminal_quantities() {
+    for rs in [0., 10.] {
+        let n = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("diode_recovery_observations.cir"),
+                &format!(
+                    "diode recovery observations\nv1 a 0 pulse(1 -1 20n 1n 1n 2u 5u)\n\
+                     d1 a 0 dm\n.model dm d(is=1e-14 tt=100n vp=.05 rs={rs} cjo=1p)\n\
+                     .options reltol=1e-6 vntol=1n abstol=1e-14\n\
+                     .save v(a) i(v1) @d1[i] @d1[p]\n.tran 100p 100n 0 100p\n.end\n"
+                ),
+            ))
+            .unwrap();
+        let config = RunConfig::from_netlist(&n).unwrap();
+        let mut circuit = config.circuit(&n).unwrap();
+        circuit
+            .set_observations(&["@d1[i]".into(), "@d1[p]".into()])
+            .unwrap();
+        let request = config.plan_for(&n.analyses[0]).unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
+        for point in 0..plot.point_count() {
+            let current = real(&plot, "@d1[i]", point);
+            let input = real(&plot, "i(v1)", point);
+            let power = real(&plot, "@d1[p]", point);
+            let voltage = real(&plot, "v(a)", point);
+            assert!((current + input).abs() <= 1e-12 + 1e-6 * input.abs());
+            assert!((power - voltage * current).abs() <= 1e-12 + 1e-6 * power.abs());
+        }
+    }
+}
+
+#[test]
+fn physical_derivative_chain_with_native_diode_preserves_kcl() {
+    for method in ["gear", "trap"] {
+        let p = simulate(&format!(
+            "v1 in 0 PWL(0 2 1m 3)\nb1 first 0 v=1m*ddt(v(in))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\nd1 in 0 dm\n.model dm d(is=1e-18 n=10)\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 50u 0 1u uic"
+        ));
+        let vt = 10. * K_OVER_Q * 300.15;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let v = 1000_f64.mul_add(t, 2.);
+            let current = 1e-18 * (v / vt).exp_m1() + GMIN * v;
+            assert!((real(&p, "v(in)", i) - v).abs() < 1e-11);
+            assert!((real(&p, "v(first)", i) - 1.).abs() < 1e-10);
+            assert!(real(&p, "v(out)", i).abs() < 1e-10);
+            assert!((real(&p, "i(v1)", i) + current).abs() < 1e-17);
+        }
+    }
+}
+
+#[test]
+fn physical_derivative_chain_with_charged_diode_preserves_kcl() {
+    for method in ["gear", "trap"] {
+        let p = simulate(&format!(
+            "v1 in 0 PWL(0 -0.4 1m 0.6)\nb1 first 0 v=1m*ddt(v(in))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\nd1 in 0 dm\n.model dm d(is=1e-12 n=10 cjo=20p vj=0.8 m=0.4 tt=5n)\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 50u 0 1u uic"
+        ));
+        let vt = 10. * K_OVER_Q * 300.15;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let v = 1000_f64.mul_add(t, -0.4);
+            let current = 1e-12 * (v / vt).exp_m1() + GMIN * v;
+            let conductance = 1e-12 / vt * (v / vt).exp() + GMIN;
+            let cap = 20e-12 * (1. - v / 0.8).powf(-0.4) + 5e-9 * conductance;
+            assert!((real(&p, "v(first)", i) - 1.).abs() < 1e-10);
+            assert!(real(&p, "v(out)", i).abs() < 1e-10);
+            assert!((real(&p, "i(v1)", i) + current + 1000. * cap).abs() < 1e-15);
+        }
+    }
+}
+
+#[test]
+fn device_local_diode_charges_on_shared_node_have_independent_history() {
+    // The two depletion charges share a KCL row but have separate companion
+    // histories. At M=0 their sum is a linear capacitor; the reverse leakage
+    // is negligible, and the gmin term is included in the closed form.
+    for method in ["gear", "trap"] {
+        let p = simulate(&format!(
+            "v1 in 0 PWL(0 0 1m 1)\nr1 in a 1k\nd1 0 a dm1\nd2 0 a dm2\n.model dm1 d(is=1e-18 n=10 cjo=0.3u m=0)\n.model dm2 d(is=1e-18 n=10 cjo=0.7u m=0)\nb1 first 0 v=1m*ddt(v(a))\nb2 out 0 v=1m*ddt(v(first))\nr2 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 100u 0 1u uic"
+        ));
+        let dc_gain = 1. / (1. + 2. * GMIN * 1000.);
+        let tau = 1e-3 * dc_gain;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let e = (-t / tau).exp();
+            let v = 1000. * dc_gain * (t + tau * (e - 1.));
+            let first = dc_gain * (1. - e);
+            let second = 1e-3 * dc_gain / tau * e;
+            assert!((real(&p, "v(a)", i) - v).abs() < 1e-6);
+            assert!((real(&p, "v(first)", i) - first).abs() < 1e-6);
+            assert!((real(&p, "v(out)", i) - second).abs() < 1e-6);
+        }
+    }
+}
+
+#[test]
+fn diode_recovery_state_participates_in_physical_derivative_array() {
+    for method in ["gear", "trap"] {
+        let p = simulate_observed(
+            &format!(
+                "v1 in 0 PWL(0 0 1u 0.05)\nd1 in 0 dm\n.model dm d(is=1e-8 tt=1u vp=0.5 qpscale=1e6)\nb1 first 0 v=1u*ddt(v(in))\nb2 out 0 v=1u*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 10n 0.5u 0 10n uic"
+            ),
+            &["@d1[i]".into(), "@d1[p]".into()],
+        );
+        let slope = 50_000.;
+        let a = slope / (K_OVER_Q * 300.15);
+        let tau = 0.5e-6;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let exponential = (a * t).exp();
+            let decay = (-t / tau).exp();
+            let current = 1e-8 * (a * t).exp_m1() + GMIN * slope * t;
+            let qdot = 1e-6 * 1e-8 * a / (1. + a * tau) * (exponential - decay)
+                + 1e-6 * GMIN * slope * (1. - decay);
+            assert!((real(&p, "v(first)", i) - 0.05).abs() < 1e-10);
+            assert!(real(&p, "v(out)", i).abs() < 1e-10);
+            assert!((real(&p, "i(v1)", i) + current + 0.5 * qdot).abs() < 2e-12);
+            assert!((real(&p, "@d1[i]", i) + real(&p, "i(v1)", i)).abs() < 1e-13);
+            assert!(
+                (real(&p, "@d1[p]", i) - real(&p, "@d1[i]", i) * real(&p, "v(in)", i)).abs()
+                    < 1e-15
+            );
+        }
+    }
+}
+
+#[test]
+fn derivative_array_diode_observation_respects_ground_and_series_nodes() {
+    for resistance in [0., 10.] {
+        for reverse in [false, true] {
+            for method in ["gear", "trap"] {
+                let (terminals, sign) = if reverse { ("0 in", -1.) } else { ("in 0", 1.) };
+                let p = simulate_observed(
+                    &format!(
+                        "v1 in 0 PWL(0 0 1m 1)\nd1 {terminals} dm\n.model dm d(is=1e-12 n=10 cjo=20p rs={resistance})\nb1 first 0 v=1m*ddt(v(in))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 20u 0 1u uic"
+                    ),
+                    &["@d1[i]".into(), "@d1[p]".into()],
+                );
+                for i in 0..p.point_count() {
+                    let expected = -sign * real(&p, "i(v1)", i);
+                    assert!((real(&p, "@d1[i]", i) - expected).abs() < 2e-13);
+                    assert!(
+                        (real(&p, "@d1[p]", i) - expected * sign * real(&p, "v(in)", i)).abs()
+                            < 1e-15
+                    );
+                }
+            }
+        }
     }
 }

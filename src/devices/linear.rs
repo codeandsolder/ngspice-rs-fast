@@ -64,6 +64,8 @@ pub enum Waveform {
     },
     /// Validated PWL knots, with optional C delay and repetition.
     Pwl(PwlSource),
+    /// Explicit sided forcing from a resolved prepared source declaration.
+    Prepared(crate::devices::prepared_waveform::PreparedForcing),
     /// A fully specified periodic pulse; see [`Pulse`].
     Pulse(Pulse),
     /// A PULSE as written, with C's analysis-dependent defaults still pending.
@@ -75,8 +77,20 @@ pub enum Waveform {
     /// SIN/EXP/SFFM/AM as written, with C's analysis-dependent defaults
     /// pending; resolved like [`Waveform::PulseDefaults`].
     FunctionDefaults(FunctionSpec),
+    /// Deterministic time-domain noise or held random forcing.
+    Stochastic(crate::devices::stochastic::StochasticWaveform),
 }
 impl Waveform {
+    // The preceding non-PORT source remains the baseline of a PORT sum.
+    // Its sided startup and exact-event semantics survive composition.
+    pub(super) fn prepared_base(&self) -> Option<&super::prepared_waveform::PreparedForcing> {
+        match self {
+            Self::Prepared(forcing) => Some(forcing),
+            Self::PortSeries { baseline, .. } => baseline.prepared_base(),
+            _ => None,
+        }
+    }
+
     /// Checks finite values and strictly increasing nonnegative knot times.
     /// # Errors
     /// Invalid source data.
@@ -98,11 +112,12 @@ impl Waveform {
             }
             // Pulse and PWL/function values are only constructed through
             // validating constructors, so they need no further checks here.
-            Self::Pulse(_) | Self::Pwl(_) | Self::Function(_) => true,
+            Self::Pulse(_) | Self::Pwl(_) | Self::Function(_) | Self::Prepared(_) => true,
             Self::FunctionDefaults(spec) => {
                 spec.validate()?;
                 true
             }
+            Self::Stochastic(process) => process.spec().validate().is_ok(),
         };
         if !valid {
             return Err(SpiceError::circuit("invalid source waveform"));
@@ -132,10 +147,13 @@ impl Waveform {
     /// are not.
     #[must_use = "the result determines whether segment endpoint samples suffice to reconstruct the waveform"]
     pub const fn is_piecewise_linear(&self) -> bool {
-        !matches!(
-            self,
-            Self::Function(_) | Self::FunctionDefaults(_) | Self::PortSeries { .. }
-        )
+        match self {
+            Self::Prepared(forcing) => forcing.is_piecewise_linear(),
+            _ => !matches!(
+                self,
+                Self::Function(_) | Self::FunctionDefaults(_) | Self::PortSeries { .. }
+            ),
+        }
     }
 
     /// The value C loads in OP/DC analyses when the source has no explicit DC
@@ -154,6 +172,8 @@ impl Waveform {
                 Ok(spec.initial)
             }
             Self::FunctionDefaults(spec) => spec.time_zero(),
+            Self::Stochastic(process) => Ok(process.time_zero()),
+            Self::Prepared(forcing) => Ok(forcing.dc()),
             other => other.value_at(0., Limit::Left),
         }
     }
@@ -187,8 +207,10 @@ impl Waveform {
                 if before_jump { *before } else { *after }
             }
             Self::Pwl(pwl) => return pwl.value_at(t, limit),
+            Self::Prepared(forcing) => return forcing.value_at(t, limit),
             Self::Pulse(pulse) => return pulse.value_at(t, limit),
             Self::Function(function) => return function.value_at(t, limit),
+            Self::Stochastic(process) => return process.value_at(t, limit),
             Self::PulseDefaults(_) => {
                 return Err(SpiceError::circuit(
                     "PULSE defaults (TR/TF/PW/PER) are unresolved; bind transient timing first",
@@ -220,6 +242,109 @@ impl Waveform {
             Self::PulseDefaults(spec) => spec.resolve(timing)?.value_at(t, limit),
             Self::FunctionDefaults(spec) => spec.resolve(timing)?.value_at(t, limit),
             other => other.value_at(t, limit),
+        }
+    }
+
+    /// Physical one-sided value, including zero-duration pulse edges and
+    /// PWL repetition jumps. This selects the mathematical limit rather
+    /// than the reference simulator's single landing sample.
+    ///
+    /// # Errors
+    /// Invalid time or unresolved waveform defaults.
+    pub fn physical_value_at(&self, t: Real, limit: Limit) -> SpiceResult<Real> {
+        match self {
+            Self::Pwl(pwl) => Ok(pwl.local_affine(t, 0., limit)?.0),
+            Self::Pulse(pulse) => Ok(pulse.local_affine(t, 0., limit)?.0),
+            Self::PortSeries { baseline, tones } => Ok(baseline.physical_value_at(t, limit)?
+                + tones.iter().map(|(a, w)| a * (w * t).cos()).sum::<Real>()),
+            other => other.value_at(t, limit),
+        }
+    }
+
+    /// Analytic local Taylor coefficients of a resolved waveform.
+    ///
+    /// Coefficient k is the derivative of order k times scale^k / k!.
+    /// The chosen side determines the polynomial at corners or jumps.
+    /// Stochastic forcing has no general classical Taylor expansion.
+    ///
+    /// # Errors
+    /// Nonfinite time, invalid scale, excessive order, unresolved waveform
+    /// defaults, stochastic forcing or unrepresentable coefficients.
+    pub fn taylor_at(
+        &self,
+        t: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> SpiceResult<Vec<Real>> {
+        if !t.is_finite()
+            || !scale.is_finite()
+            || scale <= 0.
+            || order > crate::maths::taylor::MAX_ORDER
+        {
+            return Err(SpiceError::circuit(
+                "invalid waveform Taylor expansion request",
+            ));
+        }
+        self.jet(t, scale, order, limit)?.finish()
+    }
+
+    fn jet(
+        &self,
+        t: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> SpiceResult<crate::maths::taylor::Jet> {
+        use crate::maths::taylor::Jet;
+        if order == 0 {
+            return Ok(Jet::constant(0, self.physical_value_at(t, limit)?));
+        }
+        Ok(match self {
+            Self::Pwl(pwl) => {
+                let (value, slope) = pwl.local_affine(t, scale, limit)?;
+                Jet::affine(order, value, slope)
+            }
+            Self::Pulse(pulse) => {
+                let (value, slope) = pulse.local_affine(t, scale, limit)?;
+                Jet::affine(order, value, slope)
+            }
+            Self::Function(function) => function.jet(t, scale, order, limit)?,
+            Self::Prepared(forcing) => forcing.jet(t, scale, order, limit)?,
+            Self::PortSeries { baseline, tones } => {
+                let mut result = baseline.jet(t, scale, order, limit)?;
+                for &(amplitude, frequency) in tones {
+                    result = result.add(
+                        &Jet::affine(order, frequency * t, frequency * scale)
+                            .sin_cos()
+                            .1
+                            .scale(amplitude),
+                    );
+                }
+                result.with_value(self.physical_value_at(t, limit)?)
+            }
+            Self::Stochastic(_) => {
+                return Err(SpiceError::circuit(
+                    "stochastic forcing has no general classical Taylor expansion",
+                ));
+            }
+            other => Jet::constant(order, other.value_at(t, limit)?),
+        })
+    }
+
+    pub(super) fn physical_value_at_timed(
+        &self,
+        t: Real,
+        limit: Limit,
+        timing: &TransientTiming,
+    ) -> SpiceResult<Real> {
+        match self {
+            Self::PortSeries { baseline, tones } => Ok(baseline
+                .physical_value_at_timed(t, limit, timing)?
+                + tones.iter().map(|(a, w)| a * (w * t).cos()).sum::<Real>()),
+            Self::PulseDefaults(spec) => Ok(spec.resolve(timing)?.local_affine(t, 0., limit)?.0),
+            Self::FunctionDefaults(spec) => spec.resolve(timing)?.value_at(t, limit),
+            other => other.physical_value_at(t, limit),
         }
     }
 
@@ -263,6 +388,16 @@ impl Waveform {
             Self::Pwl(pwl) => {
                 return Ok(WaveformBreakpoints(Inner::Pwl(pwl.breakpoints_in(t0, t1)?)));
             }
+            Self::Prepared(forcing) => {
+                return Ok(WaveformBreakpoints(Inner::Prepared(
+                    forcing.breakpoints_in(t0, t1)?,
+                )));
+            }
+            Self::Stochastic(process) => {
+                return Ok(WaveformBreakpoints(Inner::Stochastic(
+                    process.events(t0, t1)?,
+                )));
+            }
             Self::Function(function) => (function.corners(), WaveformEventKind::FunctionCorner),
             Self::PulseDefaults(_) | Self::FunctionDefaults(_) => {
                 return Err(SpiceError::circuit(
@@ -304,6 +439,12 @@ pub enum WaveformEventKind {
     StepJump,
     /// SIN/EXP/SFFM/AM delay or slope corner; C does not request a breakpoint.
     FunctionCorner,
+    /// Physical white/colored noise knot or random-held sample.
+    StochasticSample,
+    /// Explicit prepared knot or startup-hold boundary.
+    PreparedKnot,
+    /// Exact RTS transition time.
+    StochasticTelegraph,
 }
 
 impl WaveformEventKind {
@@ -320,6 +461,9 @@ impl WaveformEventKind {
                 | Self::PwlKnot
                 | Self::PwlRepeatBoundary
                 | Self::StepJump
+                | Self::PreparedKnot
+                | Self::StochasticSample
+                | Self::StochasticTelegraph
         )
     }
 }
@@ -356,6 +500,8 @@ enum Inner {
     Fixed(std::vec::IntoIter<WaveformEvent>),
     Pulse(crate::devices::pulse::PulseBreakpoints),
     Pwl(crate::devices::functions::PwlBreakpoints),
+    Stochastic(crate::devices::stochastic::StochasticEvents),
+    Prepared(crate::devices::prepared_waveform::PreparedEvents),
 }
 impl WaveformBreakpoints {
     /// Advance the same sequence as the time-only iterator, retaining event
@@ -365,6 +511,18 @@ impl WaveformBreakpoints {
             Inner::Fixed(it) => it.next(),
             Inner::Pulse(it) => it.next_event(),
             Inner::Pwl(it) => it.next_event(),
+            Inner::Prepared(it) => it.next(),
+            Inner::Stochastic(it) => it.next_event().map(|event| WaveformEvent {
+                time: event.time,
+                kind: match event.kind {
+                    crate::devices::stochastic::StochasticEventKind::Sample => {
+                        WaveformEventKind::StochasticSample
+                    }
+                    crate::devices::stochastic::StochasticEventKind::Telegraph => {
+                        WaveformEventKind::StochasticTelegraph
+                    }
+                },
+            }),
         }
     }
 }
@@ -610,9 +768,29 @@ impl LinearSystem {
     /// # Errors
     /// Nonfinite time, unresolved PULSE defaults or a nonfinite source sum.
     pub fn transient_rhs(&self, t: Real, limit: Limit) -> SpiceResult<Vector> {
+        self.transient_rhs_with(|waveform| waveform.value_at(t, limit))
+    }
+
+    pub(crate) fn transient_startup_rhs(&self) -> SpiceResult<Vector> {
+        self.transient_rhs_with(|waveform| {
+            waveform.value_at(
+                0.,
+                if waveform.prepared_base().is_some() {
+                    Limit::Right
+                } else {
+                    Limit::Left
+                },
+            )
+        })
+    }
+
+    fn transient_rhs_with(
+        &self,
+        value: impl Fn(&Waveform) -> SpiceResult<Real>,
+    ) -> SpiceResult<Vector> {
         let mut rhs = Vector::zeros(self.a.rows());
         for s in &self.sources {
-            let value = s.waveform.value_at(t, limit)?;
+            let value = value(&s.waveform)?;
             for (r, sign) in &s.rows {
                 rhs.add_to(*r, sign * value)?;
             }
@@ -622,6 +800,52 @@ impl LinearSystem {
         }
         Ok(rhs)
     }
+    /// Independent forcing Taylor coefficients in original equation rows.
+    ///
+    /// The waveform defaults must already be bound to transient timing.
+    /// Each output vector is the forcing coefficient for one Taylor degree.
+    ///
+    /// # Errors
+    /// Invalid Taylor request, unsupported waveform derivative, invalid
+    /// equation row, or nonfinite aggregate forcing.
+    pub fn transient_taylor_rhs(
+        &self,
+        t: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> SpiceResult<Vec<Vector>> {
+        if !t.is_finite()
+            || !scale.is_finite()
+            || scale <= 0.
+            || order > crate::maths::taylor::MAX_ORDER
+        {
+            return Err(SpiceError::circuit(
+                "invalid forcing Taylor expansion request",
+            ));
+        }
+        let mut coefficients = Vec::with_capacity(order + 1);
+        for _ in 0..=order {
+            coefficients.push(Vector::from(crate::primitives::filled_vec(
+                self.a.rows(),
+                0.,
+                "independent forcing Taylor coefficients",
+            )?));
+        }
+        for source in &self.sources {
+            let jet = source.waveform.taylor_at(t, scale, order, limit)?;
+            for (rhs, value) in coefficients.iter_mut().zip(jet) {
+                for &(row, sign) in &source.rows {
+                    rhs.add_to(row, sign * value)?;
+                }
+            }
+        }
+        if coefficients.iter().any(|rhs| !rhs.is_finite()) {
+            return Err(SpiceError::circuit("nonfinite forcing Taylor expansion"));
+        }
+        Ok(coefficients)
+    }
+
     /// Clear the assembled operators and forcing, retaining outer storage.
     pub(crate) fn clear(&mut self) {
         self.a.clear();
@@ -870,6 +1094,57 @@ pub(crate) fn branch_stamp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_series_inherits_prepared_startup_and_exact_events() {
+        use model_normalize_ngspice::waveform::{Forcing, Knot, ResolvedWaveform};
+        let baseline = Waveform::Prepared(
+            super::super::prepared_waveform::PreparedForcing::new(ResolvedWaveform {
+                dc: 3.,
+                startup: 3.,
+                forcing: Forcing::PiecewiseLinear {
+                    knots: vec![
+                        Knot {
+                            time: 0.,
+                            left: 2.,
+                            right: 3.,
+                        },
+                        Knot {
+                            time: 1.,
+                            left: 3.,
+                            right: 4.,
+                        },
+                    ],
+                    repeat: None,
+                },
+                idle_in_pop: false,
+            })
+            .unwrap(),
+        );
+        let wave = Waveform::PortSeries {
+            baseline: Box::new(baseline),
+            tones: vec![(5., 7.)],
+        };
+        let mut system = LinearSystem::new(1);
+        let mut rows = SourceRows::new();
+        rows.push(0, 1.).unwrap();
+        system.sources.push(LinearSource {
+            name: Arc::new("vport".to_owned()),
+            kind: SourceKind::Voltage,
+            rows,
+            dc: 8.,
+            ac: Complex::real(0.),
+            waveform: Arc::new(wave),
+        });
+        assert_eq!(system.transient_startup_rhs().unwrap().as_slice(), &[8.]);
+        assert_eq!(
+            system.transient_rhs(0., Limit::Left).unwrap().as_slice(),
+            &[7.]
+        );
+        let breaks = crate::devices::breaks::SourceBreaks::new(&system);
+        assert!(breaks.has_exact());
+        assert_eq!(breaks.next_exact(0., 2.).unwrap(), Some(1.));
+    }
 
     fn scan_merge(mut sources: Vec<std::iter::Peekable<WaveformBreakpoints>>) -> Vec<u64> {
         let mut result = Vec::new();

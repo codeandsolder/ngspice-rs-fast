@@ -36,7 +36,9 @@
 //! `ASRCfindBr`). C would also invent an unstamped branch for a current B
 //! source; the port reports that reference as not findable instead.
 
+pub(super) mod dynamic;
 pub mod program;
+pub mod rlc;
 pub mod xspice;
 
 use crate::maths::{SparseMatrix, Vector};
@@ -143,6 +145,24 @@ impl Linearization<'_> {
             equivalent -= value * gradient;
         }
         factor * equivalent
+    }
+
+    /// Predict the physical output at the new iterate using the tangent
+    /// at the loaded iterate. Differences avoid subtracting the absolute
+    /// affine intercept from large, nearly equal coordinate terms.
+    fn predict(&self, solution: &Vector, factor: Real) -> Real {
+        self.evaluation
+            .gradient
+            .iter()
+            .zip(self.values)
+            .zip(self.columns)
+            .fold(
+                factor * self.evaluation.value,
+                |output, ((gradient, old), column)| {
+                    let new = column.and_then(|row| solution.get(row)).unwrap_or(0.);
+                    (factor * gradient).mul_add(new - old, output)
+                },
+            )
     }
 }
 
@@ -265,6 +285,48 @@ impl Behavioural {
         })
     }
 
+    fn bound_taylor(
+        &self,
+        context: &crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<(program::TaylorEvaluation, Vec<Option<usize>>)> {
+        let mut columns = Vec::with_capacity(self.variables.len());
+        for variable in &self.variables {
+            columns.push(match *variable {
+                Variable::Node(node) => context.unknowns.node_row(node),
+                Variable::Branch(index) => Some(*context.controls.get(index).ok_or_else(|| {
+                    SpiceError::circuit(format!("{}: unbound Taylor current control", self.name))
+                })?),
+            });
+        }
+        let variables = columns
+            .iter()
+            .map(|&column| context.variable(column))
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let values = variables
+            .iter()
+            .map(crate::maths::taylor::Jet::value)
+            .collect::<Vec<_>>();
+        let model = context.model;
+        let result = self
+            .program
+            .evaluate_taylor(
+                &Environment {
+                    values: &values,
+                    time: context.time.value(),
+                    temperature: model.temperature,
+                    gmin: model.gmin,
+                    frequency: 2. * std::f64::consts::PI * model.frequency
+                        / 2.
+                        / std::f64::consts::PI,
+                },
+                &variables,
+                context.time,
+                context.output.guards.is_some(),
+            )
+            .map_err(|error| self.evaluation_error(error))?;
+        Ok((result, columns))
+    }
+
     fn evaluation_error(&self, error: SpiceError) -> SpiceError {
         match error {
             SpiceError::Numerical { message, .. } => SpiceError::Numerical {
@@ -371,6 +433,19 @@ impl Behavioural {
 }
 
 impl Device for Behavioural {
+    fn initial_voltage_relations(
+        &self,
+        _inductors_short: bool,
+    ) -> Vec<crate::devices::InitialVoltageRelation> {
+        (self.output == BehaviouralOutput::Voltage)
+            .then(|| crate::devices::InitialVoltageRelation {
+                terminals: [self.terminals[0], self.terminals[1]],
+                law: crate::devices::InitialVoltageLaw::Controlled,
+            })
+            .into_iter()
+            .collect()
+    }
+
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
         let factor = self.checked_factor(context.temperature)?;
         // An expression depending only on the environment and ground has a
@@ -399,37 +474,86 @@ impl Device for Behavioural {
         crate::devices::setup::CDeviceType::Asrc
     }
 
-    /// One trial slot: the expression value of the last load (C
-    /// `ASRCprev_value`).
+    fn physical_terminal_current(&self, states: &[Real], branches: &[Real]) -> Option<Real> {
+        match self.output {
+            BehaviouralOutput::Voltage => branches.first().copied(),
+            BehaviouralOutput::Current => states.first().copied(),
+        }
+    }
+
+    /// One trial slot: the physical output at the last load.
     fn state_count(&self) -> usize {
         1
     }
 
-    /// `ASRCconvTest` (`asrcconv.c`): the expression at the new iterate
-    /// against its value at the last load, within `reltol` and `vntol` (a
-    /// voltage source) or `abstol` (a current source).
+    /// Check the physical output change and Newton linearisation defect.
+    /// Unlike the raw expression comparison in C's `ASRCconvTest`, this
+    /// uses amperes or volts independently of the expression's scale or
+    /// whether an external current probe allocates a branch unknown.
     fn convergence_test(
         &self,
         context: &crate::devices::ConvergenceContext<'_>,
     ) -> SpiceResult<bool> {
-        self.with_linearization(
+        let factor = self.checked_factor(context.model_context.temperature)?;
+        let output = self.with_linearization(
             context.solution,
             context.unknowns,
             context.controls,
             context.time,
             context.model_context,
-            |linearization| {
-                let rhs = linearization.evaluation.value;
-                let prev = context.states.first().copied().unwrap_or(0.);
-                let absolute = match self.output {
-                    BehaviouralOutput::Voltage => context.vntol,
-                    BehaviouralOutput::Current => context.abstol,
+            |linearization| Ok(factor * linearization.evaluation.value),
+        )?;
+        let previous = context
+            .states
+            .first()
+            .copied()
+            .ok_or_else(|| SpiceError::circuit("missing behavioural trial output"))?;
+        let absolute = match self.output {
+            BehaviouralOutput::Voltage => context.vntol,
+            BehaviouralOutput::Current => context.abstol,
+        };
+        let differs = |a: Real, b: Real| {
+            !a.is_finite()
+                || !b.is_finite()
+                || (a - b).abs() > context.reltol.mul_add(a.abs().max(b.abs()), absolute)
+        };
+        if differs(output, previous) {
+            return Ok(true);
+        }
+
+        // Equal endpoint function values do not imply a correct tangent.
+        // Re-evaluate only once the physical output-change test has passed.
+        let predicted = self.with_linearization(
+            context.previous,
+            context.unknowns,
+            context.controls,
+            context.time,
+            context.model_context,
+            |linearization| Ok(linearization.predict(context.solution, factor)),
+        )?;
+        if differs(output, predicted) {
+            return Ok(true);
+        }
+        if self.output == BehaviouralOutput::Voltage {
+            let terminal_voltage = |solution: &Vector| {
+                let voltage = |node| {
+                    context
+                        .unknowns
+                        .node_row(node)
+                        .and_then(|row| solution.get(row))
+                        .unwrap_or(0.)
                 };
-                let relative = context.reltol * rhs.abs().max(prev.abs());
-                let tol = relative + absolute;
-                Ok((prev - rhs).abs() > tol)
-            },
-        )
+                voltage(self.terminals[0]) - voltage(self.terminals[1])
+            };
+            // The returned Newton point is the loaded iterate, not just
+            // the newly calculated one. Both must satisfy the source law.
+            if differs(previous, terminal_voltage(context.previous))
+                || differs(output, terminal_voltage(context.solution))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// `asrcset.c`: a voltage source's branch elements, then one column per
@@ -571,6 +695,10 @@ impl Device for Behavioural {
         usize::from(self.output == BehaviouralOutput::Voltage)
     }
 
+    fn control_branch(&self, target: &dyn Device) -> Option<usize> {
+        target.expression_current_branch()
+    }
+
     fn controlling_sources(&self) -> &[ControlReference] {
         &self.controls
     }
@@ -600,7 +728,7 @@ impl Device for Behavioural {
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let time = match context.mode {
-            AnalysisMode::Transient { time, .. } => time,
+            AnalysisMode::Transient { time, .. } | AnalysisMode::Instantaneous { time } => time,
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => 0.,
             AnalysisMode::Ac { .. } => {
                 return Err(SpiceError::circuit(format!(
@@ -617,8 +745,9 @@ impl Device for Behavioural {
             time,
             &context.model_context(),
             |linearization| {
-                // ASRCprev_value remains the raw, unscaled expression value.
-                context.states.set(0, linearization.evaluation.value)?;
+                context
+                    .states
+                    .set(0, factor * linearization.evaluation.value)?;
                 let branch = (!context.branches.is_empty()).then_some(context.branches.start);
                 self.stamp_into(
                     context.matrix,
@@ -630,6 +759,50 @@ impl Device for Behavioural {
                 )
             },
         )
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        let (evaluation, columns) = self.bound_taylor(context)?;
+        if let Some(trace) = &mut context.output.guards {
+            trace.extend(context.device, evaluation.guards)?;
+        }
+        let factor = self.checked_factor(context.model.temperature)?;
+        context.candidate_state(0, factor * evaluation.value.coefficients()[0])?;
+        let p = context.unknowns.node_row(self.terminals[0]);
+        let n = context.unknowns.node_row(self.terminals[1]);
+        let outputs = match self.output {
+            BehaviouralOutput::Voltage => {
+                let k = Some(
+                    context
+                        .branch
+                        .ok_or_else(|| SpiceError::circuit("missing Taylor voltage branch"))?,
+                );
+                context.linear_static(p, k, 1.)?;
+                context.linear_static(n, k, -1.)?;
+                context.linear_static(k, p, 1.)?;
+                context.linear_static(k, n, -1.)?;
+                [(k, -1.), (None, 0.)]
+            }
+            BehaviouralOutput::Current => [(p, 1.), (n, -1.)],
+        };
+        for (row, sign) in outputs {
+            context.static_value(row, &evaluation.value, sign * factor)?;
+            for (&column, gradient) in columns.iter().zip(&evaluation.gradient) {
+                context.static_gradient(row, column, gradient, sign * factor)?;
+            }
+        }
+        Ok(())
+    }
+
+    // The retained physical output is an algebraic observation, not a charge.
+    fn assemble_nonlinear_charge(
+        &self,
+        _context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        Ok(())
     }
 
     /// The bias-point Jacobian (`ASRCacLoad`): real, frequency independent.
@@ -810,6 +983,19 @@ pub(crate) fn instantiate(
         ));
     }
     let (output, tree, scale) = parse_parameters(instance)?;
+    Ok(Box::new(bind_expression(
+        instance, nodes, output, tree, scale,
+    )?))
+}
+
+fn bind_expression(
+    instance: &DeviceInstance,
+    nodes: &mut NodeAppend<'_>,
+    output: BehaviouralOutput,
+    tree: &BehaviouralExpression,
+    scale: BehaviouralScale,
+) -> SpiceResult<Behavioural> {
+    let location = &instance.location;
     let program = Program::compile(&tree.root)?;
     nodes.transaction(|nodes| {
         let positive = nodes.intern(&instance.nodes[0])?;
@@ -842,7 +1028,7 @@ pub(crate) fn instantiate(
                 }
             }
         }
-        Ok(Box::new(Behavioural {
+        Ok(Behavioural {
             name: instance.name.clone(),
             designator: instance.designator,
             output,
@@ -852,7 +1038,7 @@ pub(crate) fn instantiate(
             program,
             workspace: RefCell::default(),
             scale,
-        }) as Box<dyn Device>)
+        })
     })
 }
 

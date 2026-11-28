@@ -1,14 +1,16 @@
 //! Reusable structural parameter scheduling and isolated candidate values.
 
+use super::statistics::PreparedSite;
 use super::{
     Bindings, DefinitionState, DependencyReference, EvalBudget, Failure, FunctionScope,
     ParamBinding, ParamScope, ParamState, RefScan, ScopeDefinitions, collect_definitions,
     evaluate_definition, evaluate_root,
 };
 use crate::netlist::ast::ParamCard;
-use crate::netlist::expr::ParameterExpression;
+use crate::netlist::bexpr::{BExpr, BExprKind, SPECIAL_NAMES};
+use crate::netlist::expr::{Expr, ParameterExpression};
 use crate::primitives::ascii::folded;
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -53,9 +55,14 @@ pub struct BoundExpression {
     scope: ParameterScopeId,
     direct: HashMap<String, usize>,
     inputs: Vec<usize>,
+    statistical: Option<PreparedSite>,
 }
 
 impl BoundExpression {
+    pub(crate) const fn at(mut self, site: Option<PreparedSite>) -> Self {
+        self.statistical = site;
+        self
+    }
     /// The indexes in [`ParameterPlan::inputs`] that may affect this site.
     #[must_use = "the indexes identify which candidate coordinates can affect this expression"]
     pub fn inputs(&self) -> &[usize] {
@@ -75,6 +82,16 @@ impl BoundExpression {
         })
     }
 
+    /// Compare the actual resolved slots with their baseline values. An
+    /// independent coordinate whose change cancels in a derived parameter
+    /// does not invalidate a compiled law.
+    pub(crate) fn changed_from_baseline(&self, candidate: &CandidateParameters<'_>) -> bool {
+        self.direct.values().any(|&index| {
+            candidate.values[index].map(Real::to_bits)
+                != candidate.plan.nodes[index].baseline.map(Real::to_bits)
+        })
+    }
+
     /// Whether the candidate can change this site relative to the baseline.
     /// The full candidate vector uses the plan's original input ordering.
     #[must_use = "the predicate determines whether candidate inputs can affect this site"]
@@ -91,6 +108,8 @@ impl BoundExpression {
 pub struct ParameterScopeSpec<'a> {
     /// Parent parameter scope, if any.
     pub parent: Option<ParameterScopeId>,
+    /// Stable physical X-instance name within the parent (none for root).
+    pub instance: Option<&'a str>,
     /// Lexically visible functions; pass the definition's function scope for instances.
     pub functions: Option<Arc<FunctionScope>>,
     /// Pre-evaluated formal or instance bindings.
@@ -199,6 +218,54 @@ impl ParameterPlan {
         expression: &ParameterExpression,
         budget: &mut EvalBudget,
     ) -> SpiceResult<BoundExpression> {
+        self.bind_references(scope, std::iter::empty(), [&expression.root], budget)
+    }
+
+    /// Bind a group of numeric expressions as a single dependency set.
+    pub(crate) fn bind_expressions<'a>(
+        &self,
+        scope: ParameterScopeId,
+        expressions: impl IntoIterator<Item = &'a ParameterExpression>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<BoundExpression> {
+        self.bind_references(
+            scope,
+            std::iter::empty(),
+            expressions.into_iter().map(|expression| &expression.root),
+            budget,
+        )
+    }
+
+    /// Bind the union of the static reads in already macro-expanded runtime
+    /// laws. Circuit quantities are not parameter reads. Embedded numparam
+    /// values keep their own lexical function semantics.
+    pub(crate) fn bind_behavioural(
+        &self,
+        scope: ParameterScopeId,
+        laws: &[BExpr],
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<BoundExpression> {
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        for law in laws {
+            law.visit(&mut |node| match &node.kind {
+                BExprKind::Name(name) if !SPECIAL_NAMES.contains(&name.as_str()) => {
+                    names.push((name.as_str(), &node.span.start));
+                }
+                BExprKind::Value(value) => values.push(&value.root),
+                _ => {}
+            });
+        }
+        self.bind_references(scope, names, values, budget)
+    }
+
+    fn bind_references<'a>(
+        &self,
+        scope: ParameterScopeId,
+        names: impl IntoIterator<Item = (&'a str, &'a SourceLoc)>,
+        expressions: impl IntoIterator<Item = &'a Expr>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<BoundExpression> {
         let baseline = self
             .baseline(scope)
             .ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))?;
@@ -211,14 +278,20 @@ impl ParameterPlan {
         };
         let mut direct = HashMap::new();
         let mut undefined = None;
-        scan.refs(&expression.root, 0, &mut |name, location| {
+        let mut record = |name: &str, location: &SourceLoc| {
             if let Some(index) = self.lookup_slot(Some(scope), name) {
                 direct.insert(folded(name).into_owned(), index);
             } else if undefined.is_none() {
                 undefined = Some((name.to_owned(), location.clone()));
             }
-        })
-        .map_err(Failure::into_error)?;
+        };
+        for (name, location) in names {
+            record(name, location);
+        }
+        for expression in expressions {
+            scan.refs(expression, 0, &mut record)
+                .map_err(Failure::into_error)?;
+        }
         if let Some((name, location)) = undefined {
             return Err(SpiceError::parse(
                 location,
@@ -248,6 +321,7 @@ impl ParameterPlan {
             scope,
             direct,
             inputs,
+            statistical: None,
         })
     }
 
@@ -326,6 +400,7 @@ impl ParameterPlan {
             definitions,
             sequence,
             budget,
+            spec.instance,
         )?);
         for (node, entry) in nodes.iter_mut().zip(baseline.entries()) {
             if let ParamState::Resolved(value) = entry.state {
@@ -493,6 +568,7 @@ impl CandidateParameters<'_> {
                 entries,
                 active: planned.baseline.active.clone(),
                 functions: planned.baseline.functions.clone(),
+                realization: planned.baseline.realization,
             }));
         }
         parent.ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))
@@ -532,6 +608,7 @@ impl CandidateParameters<'_> {
             expression,
             &|name| self.get(scope, name),
             baseline.functions.as_deref(),
+            baseline.realization,
             budget,
         )
         .map_err(Failure::into_error)
@@ -561,6 +638,7 @@ impl CandidateParameters<'_> {
                     .and_then(|&index| self.values[index])
             },
             baseline.functions.as_deref(),
+            baseline.realization.at(bound.statistical),
             budget,
         )
         .map_err(Failure::into_error)
@@ -631,6 +709,7 @@ impl CandidateParameters<'_> {
                 expression,
                 &lookup,
                 scope.baseline.functions.as_deref(),
+                scope.baseline.realization,
                 budget,
                 &entry.name,
                 &entry.location,

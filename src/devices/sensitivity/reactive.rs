@@ -90,6 +90,7 @@ pub(in crate::devices) struct ReactiveSensitivity<'a> {
     circuit_kelvin: Real,
     nominal_kelvin: Real,
     inputs: PassiveInputs<'a>,
+    hard_branch: bool,
 }
 
 impl<'a> ReactiveSensitivity<'a> {
@@ -99,6 +100,7 @@ impl<'a> ReactiveSensitivity<'a> {
         terminals: [NodeId; 2],
         inputs: PassiveInputs<'a>,
         context: &crate::devices::ModelContext,
+        hard_branch: bool,
     ) -> Self {
         Self {
             kind,
@@ -107,6 +109,7 @@ impl<'a> ReactiveSensitivity<'a> {
             circuit_kelvin: context.temperature + CELSIUS_TO_KELVIN,
             nominal_kelvin: context.nominal_temperature + CELSIUS_TO_KELVIN,
             inputs,
+            hard_branch,
         }
     }
 
@@ -453,6 +456,7 @@ impl SensitivityKernel for ReactiveSensitivity<'_> {
             terminals: self.terminals,
             value,
             m,
+            hard_branch: self.hard_branch,
         })))
     }
 }
@@ -467,6 +471,7 @@ struct ReactiveStandIn {
     value: Real,
     /// The instance multiplier.
     m: Real,
+    hard_branch: bool,
 }
 
 impl Device for ReactiveStandIn {
@@ -486,7 +491,7 @@ impl Device for ReactiveStandIn {
     }
 
     fn branch_currents(&self) -> usize {
-        usize::from(self.kind == ReactiveKind::Inductor)
+        usize::from(self.kind == ReactiveKind::Inductor || self.hard_branch)
     }
 
     fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
@@ -498,12 +503,15 @@ impl Device for ReactiveStandIn {
 
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         match self.kind {
-            ReactiveKind::Capacitor => crate::devices::rlc::assemble_capacitor_ac(
-                self.terminals,
-                self.value,
-                self.m,
-                context,
-            ),
+            ReactiveKind::Capacitor => {
+                crate::devices::passive_bias::release_capacitor_branch(self.hard_branch, context)?;
+                crate::devices::rlc::assemble_capacitor_ac(
+                    self.terminals,
+                    self.value,
+                    self.m,
+                    context,
+                )
+            }
             ReactiveKind::Inductor => crate::devices::rlc::assemble_inductor_ac(
                 self.terminals,
                 self.value,

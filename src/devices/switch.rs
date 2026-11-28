@@ -67,15 +67,19 @@
 //! does in C. Assemblies without a supplied state use the instance flag's
 //! DC conductance instead.
 
+mod ltspice;
+
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseFamily, NoiseKind, NoiseSource};
-use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
+use crate::devices::schema::{
+    ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit, ScalarValues,
+};
 use crate::devices::state::IterationPhase;
 use crate::devices::traits::{ControlReference, Device, StampContext, TruncationContext};
-use crate::devices::{LinearContext, ModelContext, ResolvedModel};
+use crate::devices::{LinearContext, ModelContext, ModelFamily, ResolvedModel};
 
 /// Which switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +178,10 @@ struct SwitchModel {
     on_conductance: Real,
     /// `1/ROFF`; `None` selects the load's `gmin` (`SW_OFF_CONDUCTANCE`).
     off_conductance: Option<Real>,
+    /// Explicit source-selected constitutive law; None retains native SW/CSW.
+    ltspice: Option<ltspice::Law>,
+    /// Level-1 transient series inductance, zero for ordinary native switches.
+    series_inductance: Real,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +216,7 @@ impl SwitchModel {
     }
 }
 
-fn schema(kind: SwitchKind) -> &'static ScalarSchema<'static> {
+fn schema(kind: SwitchKind, ltspice: bool) -> &'static ScalarSchema<'static> {
     const SW: &[ScalarParameter] = &[
         ScalarParameter {
             name: "vt",
@@ -261,8 +269,48 @@ fn schema(kind: SwitchKind) -> &'static ScalarSchema<'static> {
             default: None,
         },
     ];
+    const LTSPICE: &[ScalarParameter] = &[
+        SW[0],
+        SW[1],
+        ScalarParameter {
+            domain: ScalarDomain::Positive,
+            ..SW[2]
+        },
+        ScalarParameter {
+            domain: ScalarDomain::Positive,
+            ..SW[3]
+        },
+        ScalarParameter {
+            name: "ilimit",
+            unit: ScalarUnit::Ampere,
+            domain: ScalarDomain::Finite,
+            default: None,
+        },
+        ScalarParameter {
+            name: "lser",
+            unit: ScalarUnit::Henry,
+            domain: ScalarDomain::Finite,
+            default: Some(0.),
+        },
+        ScalarParameter {
+            name: "vser",
+            unit: ScalarUnit::Volt,
+            domain: ScalarDomain::Finite,
+            default: Some(0.),
+        },
+        ScalarParameter {
+            name: "epsilon",
+            unit: ScalarUnit::Volt,
+            domain: ScalarDomain::Finite,
+            default: Some(0.),
+        },
+    ];
+    static LTSPICE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(LTSPICE);
     static SW_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(SW);
     static CSW_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(CSW);
+    if ltspice {
+        return &LTSPICE_SCHEMA;
+    }
     match kind {
         SwitchKind::Voltage => &SW_SCHEMA,
         SwitchKind::Current => &CSW_SCHEMA,
@@ -292,19 +340,79 @@ const STATE: usize = 0;
 /// State slot of the control value.
 const CONTROL: usize = 1;
 
+fn resolve_ltspice_law(
+    model: &ResolvedModel<'_>,
+    values: &ScalarValues,
+    hysteresis: Real,
+    oneway: bool,
+) -> SpiceResult<ltspice::Law> {
+    let card = model.card();
+    let get = |name: &str| values.get(name).map(|value| value.value);
+    let level = model.levels().selector;
+    if level == 2 && get("lser").unwrap_or(0.) != 0. {
+        return Err(SpiceError::Unsupported {
+            feature: "LTspice level-2 switch does not support Lser".into(),
+            location: Some(card.location.clone()),
+        });
+    }
+    let offset = get("vser").unwrap_or(0.);
+    let epsilon = get("epsilon").unwrap_or(0.);
+    let direction = if level == 2 {
+        let epsilon = epsilon.max(0.);
+        if oneway || offset > 0. || epsilon > 0. {
+            ltspice::Direction::OneWay { offset, epsilon }
+        } else {
+            ltspice::Direction::Bidirectional
+        }
+    } else {
+        if oneway || epsilon != 0. {
+            return Err(SpiceError::Unsupported {
+                feature: "LTspice level-1 switch does not support oneway or epsilon".into(),
+                location: Some(card.location.clone()),
+            });
+        }
+        if offset == 0. {
+            ltspice::Direction::Bidirectional
+        } else {
+            ltspice::Direction::Offset(offset)
+        }
+    };
+    if level == 2 && hysteresis == 0. {
+        return Err(SpiceError::Unsupported {
+            feature: "LTspice level-2 switch with zero transition width".into(),
+            location: Some(card.location.clone()),
+        });
+    }
+    Ok(ltspice::Law::new(
+        level,
+        hysteresis,
+        get("ilimit"),
+        direction,
+    ))
+}
+
 /// Read the model setters and preserve the written values for sensitivity.
 fn resolve_switch_model(
     kind: SwitchKind,
     model: &ResolvedModel<'_>,
 ) -> SpiceResult<(SwitchModel, crate::devices::sensitivity::SwitchValues)> {
     let card = model.card();
+    let is_ltspice = model.family() == ModelFamily::LtspiceSwitch;
     let mut setters = Vec::new();
+    let mut oneway = false;
     for parameter in &card.parameters {
         if parameter.kind == ParameterKind::Flag && parameter.name == kind.base() {
             // SW_MOD_SW / CSW_CSW: "just says that this is a switch".
             continue;
         }
+        if is_ltspice && parameter.kind == ParameterKind::Flag && parameter.name == "oneway" {
+            oneway = true;
+            continue;
+        }
         if parameter.name.eq_ignore_ascii_case("level") {
+            if is_ltspice {
+                continue;
+            }
             return Err(SpiceError::Unsupported {
                 feature: format!(
                     "'level' on {} model '{}' (C ignores it with a warning)",
@@ -316,7 +424,7 @@ fn resolve_switch_model(
         }
         setters.push(parameter);
     }
-    let values = schema(kind).validate(setters, &card.location)?;
+    let values = schema(kind, is_ltspice).validate(setters, &card.location)?;
     let (threshold, hysteresis) = match kind {
         SwitchKind::Voltage => ("vt", "vh"),
         SwitchKind::Current => ("it", "ih"),
@@ -350,11 +458,23 @@ fn resolve_switch_model(
         on: written_value("ron"),
         off: written_value("roff"),
     };
+    let hysteresis = get(hysteresis).unwrap_or(0.);
+    let ltspice = is_ltspice
+        .then(|| resolve_ltspice_law(model, &values, hysteresis, oneway))
+        .transpose()?;
     let parameters = SwitchModel {
         threshold: get(threshold).unwrap_or(0.),
-        hysteresis: get(hysteresis).unwrap_or(0.),
+        hysteresis,
         on_conductance: conductance("ron")?.unwrap_or(1.),
-        off_conductance: conductance("roff")?,
+        // Level 2 has an independent 10 MΩ default (verified at two gmin
+        // values); level 1 and native switches use the circuit gmin.
+        off_conductance: conductance("roff")?.or_else(|| {
+            ltspice
+                .filter(|law| law.transfer == ltspice::Transfer::Arctangent)
+                .map(|_| 1e-7)
+        }),
+        ltspice,
+        series_inductance: get("lser").unwrap_or(0.),
     };
     Ok((parameters, written))
 }
@@ -429,11 +549,22 @@ impl Switch {
             ));
         }
         let terminals = nodes.transaction(|staged| {
-            let terminals = instance
+            let mut terminals = instance
                 .nodes
                 .iter()
                 .map(|node| staged.intern(node))
                 .collect::<SpiceResult<Vec<_>>>()?;
+            if parameters.series_inductance != 0. {
+                let label = format!("{}#lser", instance.name);
+                if staged.get(&label).is_some() {
+                    return Err(SpiceError::circuit(format!(
+                        "hidden coordinate collision: {label}"
+                    )));
+                }
+                let node = staged.intern(&label)?;
+                staged.set_kind(node, crate::primitives::NodeKind::Internal)?;
+                terminals.push(node);
+            }
             Ok(terminals)
         })?;
         Ok(Box::new(Self {
@@ -492,6 +623,8 @@ impl Switch {
                 hysteresis,
                 on_conductance: on,
                 off_conductance: Some(off),
+                ltspice: None,
+                series_inductance: 0.,
             },
             ..self.clone()
         })
@@ -559,7 +692,7 @@ impl Switch {
     ) -> SpiceResult<SwitchState> {
         // Select the state retained *inside* the band according to the
         // solver phase, independently of the physical control thresholds.
-        let positive = self.model.hysteresis > 0.;
+        let positive = self.model.hysteresis > 0. || self.model.ltspice.is_some();
         let inside = match phase {
             IterationPhase::Junction | IterationPhase::Fix => {
                 return Ok(self.flag_state(control));
@@ -608,7 +741,7 @@ impl Switch {
     ) -> SpiceResult<bool> {
         if let Some(states) = states {
             let state = self
-                .stored(states.get(STATE).copied(), what)?
+                .stored(states.get(self.switch_slot(STATE)).copied(), what)?
                 .ok_or_else(|| {
                     SpiceError::circuit(format!("{}: missing {what} state", self.name))
                 })?;
@@ -628,6 +761,153 @@ impl Switch {
     fn stored(&self, value: Option<Real>, what: &str) -> SpiceResult<Option<SwitchState>> {
         value.map(|code| self.decode(code, what)).transpose()
     }
+
+    const fn discrete(&self) -> bool {
+        match self.model.ltspice {
+            Some(law) => law.discrete(),
+            None => true,
+        }
+    }
+
+    fn load_state(
+        &self,
+        context: &mut StampContext<'_>,
+        control: Real,
+    ) -> SpiceResult<SwitchState> {
+        let accepted = self
+            .stored(
+                context.states.accepted(1, self.switch_slot(STATE)),
+                "accepted",
+            )?
+            .unwrap_or(SwitchState::ReallyOff);
+        let iterate = self.stored(context.states.iterate(self.switch_slot(STATE)), "iterate")?;
+        let phase = context.states.phase();
+        let state = self.decide(phase, control, accepted, iterate)?;
+        if phase == IterationPhase::Float && iterate != Some(state) {
+            context.states.report_nonconvergence()?;
+        }
+        context.states.set(self.switch_slot(STATE), state.code())?;
+        context.states.set(self.switch_slot(CONTROL), control)?;
+        Ok(state)
+    }
+
+    fn series(&self) -> Option<crate::devices::rlc::ReactiveLoad<'_>> {
+        self.terminals
+            .get(4)
+            .map(|&internal| crate::devices::rlc::ReactiveLoad {
+                bias: None,
+                name: &self.name,
+                terminals: [self.terminals[0], internal],
+                value: self.model.series_inductance,
+                initial: None,
+            })
+    }
+
+    const fn storage_slots(&self) -> usize {
+        if self.model.series_inductance == 0. {
+            0
+        } else {
+            crate::devices::rlc::REACTIVE_STATE_COUNT
+        }
+    }
+
+    const fn switch_slot(&self, slot: usize) -> usize {
+        self.storage_slots() + slot
+    }
+
+    fn conducting_terminals(&self) -> [NodeId; 2] {
+        [
+            self.terminals.get(4).copied().unwrap_or(self.terminals[0]),
+            self.terminals[1],
+        ]
+    }
+
+    fn ltspice_point(
+        &self,
+        law: ltspice::Law,
+        voltage: Real,
+        control: Real,
+        closed: bool,
+        gmin: Real,
+    ) -> SpiceResult<ltspice::Point> {
+        law.evaluate(
+            ltspice::Conductance {
+                on: self.model.on_conductance,
+                off: self.model.off_conductance.unwrap_or(gmin),
+                threshold: self.model.threshold,
+                width: self.model.hysteresis.abs(),
+                gmin,
+            },
+            ltspice::Bias { voltage, control },
+            closed,
+        )
+    }
+
+    fn ltspice_closed(
+        &self,
+        law: ltspice::Law,
+        states: Option<&[Real]>,
+        control: Real,
+    ) -> SpiceResult<bool> {
+        if !law.discrete() {
+            return Ok(false);
+        }
+        match self.model.region(control) {
+            BandRegion::Above => return Ok(true),
+            BandRegion::Below => return Ok(false),
+            BandRegion::Inside => {}
+        }
+        if let Some(states) = states {
+            let state = self
+                .stored(states.get(self.switch_slot(STATE)).copied(), "LTspice bias")?
+                .ok_or_else(|| SpiceError::circuit("missing LTspice bias state"))?;
+            return Ok(state.is_closed());
+        }
+        Ok(self.initially_on)
+    }
+
+    fn ltspice_bias(&self, node: impl Fn(NodeId) -> Real) -> (Real, Real) {
+        let [p, n] = self.conducting_terminals();
+        (
+            node(p) - node(n),
+            node(self.terminals[2]) - node(self.terminals[3]),
+        )
+    }
+
+    fn ltspice_entries(&self, jacobian: ltspice::Jacobian) -> [(NodeId, NodeId, Real); 8] {
+        let [p, n] = self.conducting_terminals();
+        let [cp, cn] = [self.terminals[2], self.terminals[3]];
+        let g = jacobian.voltage;
+        let gm = jacobian.control;
+        [
+            (p, p, g),
+            (p, n, -g),
+            (n, p, -g),
+            (n, n, g),
+            (p, cp, gm),
+            (p, cn, -gm),
+            (n, cp, -gm),
+            (n, cn, gm),
+        ]
+    }
+
+    fn stamp_ltspice(
+        &self,
+        context: &mut StampContext<'_>,
+        voltage: Real,
+        control: Real,
+        point: ltspice::Point,
+    ) -> SpiceResult<()> {
+        context.stamp_fixed(self.ltspice_entries(point.jacobian))?;
+        // A*x = b, with b = J*x - I(x).
+        let rhs = point.jacobian.control.mul_add(
+            control,
+            point.jacobian.voltage.mul_add(voltage, -point.current),
+        );
+        let [p, n] = self.conducting_terminals();
+        context.stamp_rhs(p, rhs)?;
+        context.stamp_rhs(n, -rhs)
+    }
 }
 
 impl Device for Switch {
@@ -636,11 +916,22 @@ impl Device for Switch {
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        let [p, n] = [self.terminals[0], self.terminals[1]];
+        if let Some(series) = self.series() {
+            let branch = setup.branch(0)?;
+            setup.inductor(series.terminals[0], series.terminals[1], branch);
+        }
+        let [p, n] = self.conducting_terminals();
         setup.nodes(p, p);
         setup.nodes(p, n);
         setup.nodes(n, p);
         setup.nodes(n, n);
+        if self.model.ltspice.is_some() {
+            for row in [p, n] {
+                for col in [self.terminals[2], self.terminals[3]] {
+                    setup.nodes(row, col);
+                }
+            }
+        }
         Ok(true)
     }
     /// Linear in `.disto`: C gives this device no distortion routine
@@ -650,6 +941,16 @@ impl Device for Switch {
         &self,
         _context: &crate::devices::distortion::DistortionContext<'_>,
     ) -> crate::primitives::SpiceResult<crate::devices::distortion::DeviceDistortion> {
+        if self
+            .model
+            .ltspice
+            .is_some_and(|law| !law.discrete() || law.limit.is_some())
+        {
+            return Err(SpiceError::Unsupported {
+                feature: "LTspice nonlinear switch distortion".into(),
+                location: None,
+            });
+        }
         Ok(crate::devices::distortion::DeviceDistortion::Linear)
     }
 
@@ -665,6 +966,57 @@ impl Device for Switch {
         &self.terminals
     }
 
+    fn external_terminals(&self) -> &[NodeId] {
+        let count = if self.kind == SwitchKind::Voltage {
+            4
+        } else {
+            2
+        };
+        &self.terminals[..count]
+    }
+
+    fn branch_currents(&self) -> usize {
+        usize::from(self.model.series_inductance != 0.)
+    }
+
+    fn expression_current_branch(&self) -> Option<usize> {
+        (self.model.series_inductance != 0.).then_some(0)
+    }
+
+    fn truncation_slot(&self) -> Option<usize> {
+        (self.model.series_inductance != 0.).then_some(crate::devices::rlc::QUANTITY)
+    }
+
+    fn storage_element(
+        &self,
+        _context: &ModelContext,
+    ) -> Option<SpiceResult<crate::devices::traits::StorageElement>> {
+        self.series().map(|series| {
+            Ok(crate::devices::traits::StorageElement {
+                kind: crate::devices::traits::StorageKind::Inductor,
+                value: series.value,
+                initial: None,
+            })
+        })
+    }
+
+    fn initial_voltage_relations(
+        &self,
+        inductors_short: bool,
+    ) -> Vec<crate::devices::traits::InitialVoltageRelation> {
+        if let Some(series) = self.series().filter(|_| inductors_short) {
+            return vec![crate::devices::traits::InitialVoltageRelation {
+                terminals: series.terminals,
+                law: crate::devices::traits::InitialVoltageLaw::Fixed(0.),
+            }];
+        }
+        Vec::new()
+    }
+
+    fn small_signal_uses_trial_state(&self) -> bool {
+        self.model.ltspice.is_some() && self.discrete()
+    }
+
     fn controlling_sources(&self) -> &[ControlReference] {
         &self.control
     }
@@ -674,11 +1026,11 @@ impl Device for Switch {
     }
 
     fn has_discrete_state(&self) -> bool {
-        true
+        self.discrete()
     }
 
     fn state_count(&self) -> usize {
-        2
+        self.storage_slots() + if self.discrete() { 2 } else { 0 }
     }
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
@@ -693,17 +1045,17 @@ impl Device for Switch {
             |row| context.row_value(row),
             context.controls,
         )?;
-        let accepted = self
-            .stored(context.states.accepted(1, STATE), "accepted")?
-            .unwrap_or(SwitchState::ReallyOff);
-        let iterate = self.stored(context.states.iterate(STATE), "iterate")?;
-        let phase = context.states.phase();
-        let state = self.decide(phase, control, accepted, iterate)?;
-        if phase == IterationPhase::Float && iterate != Some(state) {
-            context.states.report_nonconvergence()?;
+        if let Some(law) = self.model.ltspice {
+            if let Some(series) = self.series() {
+                series.stamp_inductor(context)?;
+            }
+            let closed = law.discrete() && self.load_state(context, control)?.is_closed();
+            let [p, n] = self.conducting_terminals();
+            let voltage = context.node_voltage(p) - context.node_voltage(n);
+            let point = self.ltspice_point(law, voltage, control, closed, context.gmin)?;
+            return self.stamp_ltspice(context, voltage, control, point);
         }
-        context.states.set(STATE, state.code())?;
-        context.states.set(CONTROL, control)?;
+        let state = self.load_state(context, control)?;
         let g = self.conductance(state.is_closed(), context.gmin);
         crate::devices::linear::nodal_stamp(
             context.matrix,
@@ -713,11 +1065,80 @@ impl Device for Switch {
         )
     }
 
+    fn convergence_test(
+        &self,
+        context: &crate::devices::traits::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        let Some(law) = self.model.ltspice else {
+            return Ok(false);
+        };
+        let (voltage, control) = self.ltspice_bias(|node| context.voltage(node));
+        let closed = self.ltspice_closed(law, Some(context.states), control)?;
+        let (prior_v, prior_c) = self.ltspice_bias(|node| {
+            context
+                .unknowns
+                .node_row(node)
+                .and_then(|row| context.previous.get(row))
+                .unwrap_or(0.)
+        });
+        let prior_closed = self.ltspice_closed(law, Some(context.states), prior_c)?;
+        let point =
+            self.ltspice_point(law, voltage, control, closed, context.model_context.gmin)?;
+        let prior = self.ltspice_point(
+            law,
+            prior_v,
+            prior_c,
+            prior_closed,
+            context.model_context.gmin,
+        )?;
+        let predicted = prior.jacobian.control.mul_add(
+            control - prior_c,
+            prior
+                .jacobian
+                .voltage
+                .mul_add(voltage - prior_v, prior.current),
+        );
+        let tol = context
+            .reltol
+            .mul_add(point.current.abs().max(predicted.abs()), context.abstol);
+        Ok((predicted - point.current).abs() > tol)
+    }
+
+    fn assemble_nonlinear_charge(
+        &self,
+        context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        if self.model.ltspice.is_none() {
+            return Err(SpiceError::Unsupported {
+                feature: format!("nonlinear frequency-domain charge for {}", self.name),
+                location: None,
+            });
+        }
+        if let Some(series) = self.series() {
+            let row = context
+                .branch
+                .ok_or_else(|| SpiceError::circuit("missing Lser branch"))?;
+            let current = context
+                .state
+                .get(row)
+                .ok_or_else(|| SpiceError::circuit("missing Lser current"))?;
+            context.charge.add_to(row, -series.value * current)?;
+            context.jacobian.add(row, row, -series.value)?;
+        }
+        Ok(())
+    }
+
     /// `.sens`: C's switch model records ([`crate::devices::sensitivity`]).
     fn sensitivity(
         &self,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
+        if self.model.ltspice.is_some() {
+            return Err(SpiceError::Unsupported {
+                feature: "LTspice switch model sensitivity".into(),
+                location: None,
+            });
+        }
         Ok(Box::new(
             crate::devices::sensitivity::SwitchSensitivity::new(self, context),
         ))
@@ -728,6 +1149,32 @@ impl Device for Switch {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
+        if let Some(law) = self.model.ltspice {
+            if let Some(series) = self.series() {
+                // Independently observed LTspice 24.0.12 AC ignores Lser,
+                // although its transient equation includes the inductance.
+                context.branch(series.terminals)?;
+            }
+            let (voltage, control) = self.ltspice_bias(|node| {
+                context
+                    .unknowns
+                    .node_row(node)
+                    .and_then(|row| bias.get(row))
+                    .unwrap_or(0.)
+            });
+            let closed = self.ltspice_closed(law, context.states, control)?;
+            let point =
+                self.ltspice_point(law, voltage, control, closed, context.model_context.gmin)?;
+            for (row, col, value) in self.ltspice_entries(point.small_signal) {
+                if let (Some(row), Some(col)) = (
+                    context.unknowns.node_row(row),
+                    context.unknowns.node_row(col),
+                ) {
+                    context.system.a.add(row, col, value)?;
+                }
+            }
+            return Ok(());
+        }
         let closed = self.small_signal_closed(context.states, "small-signal", || {
             let unknowns = context.unknowns;
             self.control_value(
@@ -759,21 +1206,29 @@ impl Device for Switch {
         context: &NoiseContext<'_>,
         sources: &mut Vec<NoiseSource>,
     ) -> SpiceResult<DeviceNoise<'_>> {
-        let closed = self.small_signal_closed(context.states, "noise", || {
-            self.control_value(
-                |node| context.voltage(node),
-                |row| {
-                    context.bias.get(row).ok_or_else(|| {
-                        SpiceError::circuit("bias row out of range for a switch control")
-                    })
-                },
-                context.controls,
-            )
-        })?;
-        let conductance = self.conductance(closed, context.model_context.gmin);
+        let conductance = if let Some(law) = self.model.ltspice {
+            let (voltage, control) = self.ltspice_bias(|node| context.voltage(node));
+            let closed = self.ltspice_closed(law, context.states, control)?;
+            self.ltspice_point(law, voltage, control, closed, context.model_context.gmin)?
+                .small_signal
+                .voltage
+        } else {
+            let closed = self.small_signal_closed(context.states, "noise", || {
+                self.control_value(
+                    |node| context.voltage(node),
+                    |row| {
+                        context.bias.get(row).ok_or_else(|| {
+                            SpiceError::circuit("bias row out of range for a switch control")
+                        })
+                    },
+                    context.controls,
+                )
+            })?;
+            self.conductance(closed, context.model_context.gmin)
+        };
         sources.extend([NoiseSource::new(
             "",
-            [self.terminals[0], self.terminals[1]],
+            self.conducting_terminals(),
             NoiseKind::Thermal {
                 conductance,
                 temperature: context.circuit_kelvin(),
@@ -790,14 +1245,17 @@ impl Device for Switch {
     }
 
     fn timestep_limit(&self, context: &TruncationContext<'_>) -> SpiceResult<Option<Real>> {
-        if self.kind == SwitchKind::Current {
+        if !self.discrete() || self.kind == SwitchKind::Current {
             // cswtrunc.c reads a control slot CSWload never writes.
             return Ok(None);
         }
         let (Some(code), Some(control), Some(previous)) = (
-            context.trial.get(STATE).copied(),
-            context.trial.get(CONTROL).copied(),
-            context.accepted.and_then(|a| a.get(CONTROL)).copied(),
+            context.trial.get(self.switch_slot(STATE)).copied(),
+            context.trial.get(self.switch_slot(CONTROL)).copied(),
+            context
+                .accepted
+                .and_then(|a| a.get(self.switch_slot(CONTROL)))
+                .copied(),
         ) else {
             return Ok(None);
         };
@@ -855,6 +1313,8 @@ mod tests {
                 hysteresis,
                 on_conductance: 1.,
                 off_conductance: None,
+                ltspice: None,
+                series_inductance: 0.,
             },
             initially_on: on,
             written: crate::devices::sensitivity::SwitchValues::default(),

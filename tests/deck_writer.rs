@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ngspice_rs::netlist::ast::{
-    Netlist, ParameterKind, PositionedValue, ScopedCardKind, SourceWaveform,
+    Netlist, NumericVectorEntry, ParameterKind, PositionedValue, ScopedCardKind, SourceWaveform,
 };
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::netlist::{Parser, semantic_diff, semantic_eq, write_netlist};
@@ -147,7 +147,7 @@ fn waveform_omissions_stay_omitted() {
         other => panic!("{other:?}"),
     };
     assert!(pulse(&second, 0).delay.is_none() && pulse(&second, 0).period.is_none());
-    assert_eq!(pulse(&second, 1).delay.unwrap().text, "1n");
+    assert_eq!(pulse(&second, 1).delay.unwrap().source.text, "1n");
     assert!(pulse(&second, 1).rise.is_none() && pulse(&second, 1).fall.is_none());
 }
 
@@ -190,7 +190,7 @@ fn scope_order_forward_models_and_nested_scopes() {
             ScopedCardKind::End
         ]
     );
-    let expected = "t\nx0 a 0 outer k=2 k={base*2}\n\
+    let expected = "t\nx0 a gnd outer k=2 k={base*2}\n\
         .subckt outer a b params: k=1k k=base\n  .model dm d\n  x1 a b inner t='k + 1'\n\
         \x20 .subckt inner 1 0\n    d1 1 0 dm\n  .ends inner\n  r1 a b 1k\n  .param local={k*2} z=3\n.ends outer\n\
         .subckt inner a b\n  r9 a b 1\n.ends inner\n.op\n.end\n";
@@ -487,9 +487,12 @@ fn unrepresentable_asts_are_explicit_errors() {
     let mut n = base.clone();
     if let ParameterKind::Waveform(SourceWaveform::Pulse(p)) = &mut n.devices[0].parameters[0].kind
     {
-        p.fall = Some(PositionedValue {
-            text: "1".into(),
-            location: p.initial.location.clone(),
+        p.fall = Some(NumericVectorEntry {
+            source: PositionedValue {
+                text: "1".into(),
+                location: p.initial.source.location.clone(),
+            },
+            expression: None,
         });
         p.rise = None;
     }
@@ -580,7 +583,7 @@ fn source_functions_pulse_count_and_pwl_options_round_trip() {
     else {
         panic!("PULSE AST")
     };
-    assert_eq!(pulse.count.as_ref().unwrap().text, "5");
+    assert_eq!(pulse.count.as_ref().unwrap().source.text, "5");
     let names: Vec<_> = second.devices[6]
         .parameters
         .iter()
@@ -711,7 +714,7 @@ fn generated_device_cards_retain_source_order_and_provenance() {
         }
     }
     assert_eq!(indices, (0..lowered.devices.len()).collect::<Vec<_>>());
-    assert_eq!(option_at, Some(3)); // r1, generated current probe, b1
+    assert_eq!(option_at, Some(2)); // r1, b1; probes bind after elaboration
     assert!(lowered.devices.len() > input.devices.len());
     for card in &lowered.cards {
         if let ScopedCardKind::Device(index) = card.kind {
@@ -737,12 +740,7 @@ fn nested_included_expansions_have_distinct_ordinals_and_shared_source_provenanc
     let input = Parser::new().parse_file(&main).unwrap();
     let lowered = lower_nonlinear_sources(&input).unwrap();
 
-    for (serial, (before, after)) in input
-        .subcircuits
-        .iter()
-        .zip(&lowered.subcircuits)
-        .enumerate()
-    {
+    for (before, after) in input.subcircuits.iter().zip(&lowered.subcircuits) {
         let original_cards: Vec<_> = before
             .cards
             .iter()
@@ -754,13 +752,12 @@ fn nested_included_expansions_have_distinct_ordinals_and_shared_source_provenanc
             .filter(|card| matches!(card.kind, ScopedCardKind::Device(_)))
             .collect();
         assert_eq!(original_cards.len(), 2);
-        assert_eq!(generated_cards.len(), 4);
-        assert_eq!(after.devices[0].nodes[0], format!("a_vmeas_{serial}"));
-        assert_eq!(after.devices[1].name, "v_r1");
-        assert_eq!(after.devices[2].name, "e1");
-        assert_eq!(after.devices[3].name, "be1");
+        assert_eq!(generated_cards.len(), 3);
+        assert_eq!(after.devices[0].nodes[0], "a");
+        assert_eq!(after.devices[1].name, "e1");
+        assert_eq!(after.devices[2].name, "be1");
         for (index, card) in generated_cards.iter().enumerate() {
-            let original = original_cards[index / 2];
+            let original = original_cards[usize::from(index != 0)];
             assert_eq!(card.kind, ScopedCardKind::Device(index));
             assert_eq!(card.source, original.source);
             assert_eq!(card.include_chain, original.include_chain);
@@ -1019,4 +1016,13 @@ fn nested_writer_checks_depth_and_preserves_exact_normalization() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("depth limit"), "{error}");
+}
+
+#[test]
+fn expression_waveform_coefficients_round_trip_with_typed_trees() {
+    let (written, _, _) = round_trip(
+        "typed sources\n.param a=2 s=0.125\nv1 a 0 pulse({a},'a*2', {s})\ni1 b 0 pwl(0 0 {s} {a/2}) td={-s/2}\nv2 c 0 sine({a} 1 {1/s})\nv3 d 0 exp(0 {a} {s})\nv4 e 0 am(0 {a})\ni2 f 0 sffm(0 {a})\nv5 g 0 trnoise({a} {s})\ni3 h 0 trrandom(1 {s} 0 {a})\n.end\n",
+    );
+    assert!(written.contains("pulse({a} 'a*2' {s})"), "{written}");
+    assert!(written.contains("pwl(0 0 {s} {a/2})"), "{written}");
 }

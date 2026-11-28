@@ -13,11 +13,14 @@ use winnow::combinator::{alt, cut_err, opt, peek, repeat};
 use winnow::error::ErrMode;
 use winnow::token::any;
 
-use crate::netlist::ast::{ModelCard, ParameterAssignment, ParameterKind};
+use crate::devices::code_model::source::SourceModel;
+use crate::netlist::ast::{
+    ModelCard, NumericVectorEntry, ParameterAssignment, ParameterKind, PositionedValue,
+};
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, gap, keyword};
-use super::syntax::{equals, malformed, name, named, punctuation, value};
+use super::syntax::{Value, equals, malformed, name, named, punctuation, value};
 
 pub(super) fn model_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     keyword(".model").parse_next(input)?;
@@ -66,26 +69,10 @@ fn model_body(input: &mut Input<'_>) -> Result<ParsedCard> {
 
 fn model_base<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
     let base = peek(name("model type")).parse_next(input)?;
-    if !matches!(
-        base.text.to_ascii_lowercase().as_str(),
-        "d" | "npn" | "pnp" | "nmos" | "pmos" | "r" | "res" | "c" | "l" | "sw" | "csw" | "urc"
-            // JFET (`jfet/jfet.c`; level 2 is `jfet2/`).
-            | "njf" | "pjf"
-            // Lossy transmission line (`ltra/ltra.c`).
-            | "ltra" | "txl"
-            // MESFET (`mes/mes.c`) and its `inpdomod.c` HFET spellings; the
-            // level selects `mesa/`, `hfet1/` or `hfet2/`.
-            | "nmf" | "pmf" | "nhfet" | "phfet"
-    ) {
-        if base.is_keyword("cpl") || base.is_keyword("cpllines") {
-            return Err(gap(
-                input,
-                "CPL coupled lines (src/spicelib/parser/inp2p.c; devices/cpl/)",
-            ));
-        }
+    if crate::devices::ModelFamily::from_base(&base.text).is_none() {
         return Err(gap(
             input,
-            "model family outside D/BJT/MOS/JFET/MESFET/R/C/L/SW/CSW/URC/TXL scalar syntax",
+            "model family outside registered scalar and vector model syntax",
         ));
     }
     any.parse_next(input)
@@ -96,6 +83,9 @@ fn parameters(input: &mut Input<'_>, base: &str) -> Result<Vec<ParameterAssignme
         0..,
         alt((
             punctuation(TokenKind::Comma).value(None),
+            (|input: &mut Input<'_>| cpl_vector(input, base)).map(Some),
+            (|input: &mut Input<'_>| code_vector(input, base)).map(Some),
+            (|input: &mut Input<'_>| code_boolean(input, base)).map(Some),
             (|input: &mut Input<'_>| super::flags::model(input, base)).map(Some),
             (|input: &mut Input<'_>| version_assignment(input, base)).map(Some),
             scalar_assignment.map(Some),
@@ -216,4 +206,245 @@ fn invalid_parameter(input: &mut Input<'_>) -> Result<Option<ParameterAssignment
         return Err(gap(input, "non-scalar model parameters"));
     }
     Err(malformed(input, "expected a scalar model assignment"))
+}
+
+/// Upper-triangular CPL numeric-vector setter in physical conductor order.
+/// Retains every source span and bracket expression for literalization.
+fn cpl_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
+    peek(any.verify(|token: &Token| {
+        matches!(base, "cpl" | "cpllines")
+            && token.kind == TokenKind::Word
+            && ["r", "l", "g", "c"]
+                .iter()
+                .any(|name| token.is_keyword(name))
+    }))
+    .parse_next(input)?;
+    let setter = any.parse_next(input)?;
+    opt(equals).parse_next(input)?;
+    let mut entries = Vec::new();
+    while let Some(token) = input.input.first() {
+        if token.kind == TokenKind::RParen
+            || (token.kind == TokenKind::Word
+                && ["r", "l", "g", "c", "length", "sections"]
+                    .iter()
+                    .any(|name| token.is_keyword(name)))
+        {
+            break;
+        }
+        if token.kind == TokenKind::Comma {
+            any.parse_next(input)?;
+            continue;
+        }
+        let component = cut_err(value).parse_next(input)?;
+        let (source, expression) = match component {
+            Value::Literal(token) => (token, None),
+            Value::Expression(token, expression) => (token, Some(expression)),
+        };
+        entries.push(NumericVectorEntry {
+            source: PositionedValue {
+                text: source.text.clone(),
+                location: source.location.clone(),
+            },
+            expression,
+        });
+        if entries.len() > 528 {
+            return Err(malformed(
+                input,
+                "CPL matrix vector exceeds 32-conductor bound",
+            ));
+        }
+    }
+    if entries.is_empty() {
+        return Err(malformed(
+            input,
+            "CPL R/L/G/C requires at least one numeric coefficient",
+        ));
+    }
+    let text = entries
+        .iter()
+        .map(|entry| entry.source.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(ParameterAssignment {
+        name: setter.text.to_ascii_lowercase(),
+        value: text,
+        kind: ParameterKind::NumericVector(entries),
+        location: setter.location.clone(),
+    })
+}
+
+/// XSPICE uses square brackets, which are otherwise valid parts of node
+/// names. Parse delimiters only at the model-vector site; no global token
+/// splitting changes bus node names. Numeric and expression entries retain
+/// exact physical spans.
+const fn boolean_literal(text: &str) -> Option<&'static str> {
+    if text.eq_ignore_ascii_case("true") {
+        Some("1")
+    } else if text.eq_ignore_ascii_case("false") {
+        Some("0")
+    } else {
+        None
+    }
+}
+
+fn code_boolean(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
+    let Some(setter) = input.input.first() else {
+        return Err(winnow::error::ErrMode::Backtrack(Failure(
+            crate::primitives::SpiceError::circuit("expected boolean setter"),
+        )));
+    };
+    let shape = SourceModel::from_base(base)
+        .and_then(|schema| schema.parameter(&setter.text.to_ascii_lowercase()));
+    let value_index = 1 + usize::from(
+        input
+            .input
+            .get(1)
+            .is_some_and(|token| token.kind == TokenKind::Equals),
+    );
+    let literal = input
+        .input
+        .get(value_index)
+        .and_then(|token| boolean_literal(&token.text));
+    if shape != Some(crate::devices::code_model::source::ParameterShape::Boolean)
+        || literal.is_none()
+    {
+        return Err(winnow::error::ErrMode::Backtrack(Failure(
+            crate::primitives::SpiceError::circuit("not a boolean literal setter"),
+        )));
+    }
+    let setter = any.parse_next(input)?;
+    opt(equals).parse_next(input)?;
+    any.parse_next(input)?;
+    Ok(ParameterAssignment {
+        name: setter.text.to_ascii_lowercase(),
+        value: literal.unwrap_or_default().into(),
+        kind: ParameterKind::Scalar,
+        location: setter.location.clone(),
+    })
+}
+
+fn code_vector_entry(
+    input: &mut Input<'_>,
+    token: &Token,
+    text: &str,
+    prefix: usize,
+    closed: bool,
+    boolean: bool,
+) -> Result<NumericVectorEntry> {
+    if prefix == 0
+        && !closed
+        && matches!(token.kind, TokenKind::Expression(_) | TokenKind::Quoted(_))
+    {
+        let Value::Expression(source, expression) = value(input)? else {
+            return Err(malformed(
+                input,
+                "invalid code-model coefficient expression",
+            ));
+        };
+        return Ok(NumericVectorEntry {
+            source: PositionedValue {
+                text: source.text.clone(),
+                location: source.location.clone(),
+            },
+            expression: Some(expression),
+        });
+    }
+    let text = if boolean {
+        boolean_literal(text).unwrap_or(text)
+    } else {
+        text
+    };
+    if text.contains(['[', ']'])
+        || !crate::primitives::parse_spice_number(text).is_some_and(f64::is_finite)
+    {
+        return Err(malformed(input, "expected finite code-model coefficient"));
+    }
+    let position = token.position().advance(prefix).location();
+    let entry = NumericVectorEntry {
+        source: PositionedValue {
+            text: text.to_owned(),
+            location: position,
+        },
+        expression: None,
+    };
+    any.parse_next(input)?;
+    Ok(entry)
+}
+
+fn code_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
+    peek(any.verify(|token: &Token| {
+        SourceModel::from_base(base)
+            .and_then(|schema| schema.parameter(&token.text.to_ascii_lowercase()))
+            .is_some_and(crate::devices::code_model::source::ParameterShape::vector)
+    }))
+    .parse_next(input)?;
+    let setter = any.parse_next(input)?;
+    let boolean = SourceModel::from_base(base)
+        .and_then(|schema| schema.parameter(&setter.text.to_ascii_lowercase()))
+        .is_some_and(crate::devices::code_model::source::ParameterShape::boolean);
+    opt(equals).parse_next(input)?;
+    cut_err(|input: &mut Input<'_>| {
+        let mut entries = Vec::new();
+        let mut first = true;
+        let mut comma = false;
+        loop {
+            let tokens = input.input.clone();
+            let token = tokens
+                .first()
+                .ok_or_else(|| malformed(input, "unterminated code-model coefficient vector"))?;
+            let text = if first {
+                token
+                    .text
+                    .strip_prefix('[')
+                    .ok_or_else(|| malformed(input, "expected '[' at start of code-model vector"))?
+            } else {
+                token.text.as_str()
+            };
+            let prefix = usize::from(first);
+            first = false;
+            let (text, closed) = text
+                .strip_suffix(']')
+                .map_or((text, false), |text| (text, true));
+            if text.is_empty() {
+                any.parse_next(input)?;
+                if closed {
+                    if comma {
+                        return Err(malformed(input, "missing coefficient after comma"));
+                    }
+                    break;
+                }
+                if prefix == 1 {
+                    continue;
+                }
+                return Err(malformed(input, "empty code-model vector token"));
+            }
+            if token.kind == TokenKind::Comma {
+                if comma || entries.is_empty() {
+                    return Err(malformed(input, "misplaced coefficient comma"));
+                }
+                any.parse_next(input)?;
+                comma = true;
+                continue;
+            }
+            entries.push(code_vector_entry(
+                input, token, text, prefix, closed, boolean,
+            )?);
+            comma = false;
+            if closed {
+                break;
+            }
+        }
+        let value = entries
+            .iter()
+            .map(|entry| entry.source.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(ParameterAssignment {
+            name: setter.text.to_ascii_lowercase(),
+            value,
+            kind: ParameterKind::NumericVector(entries),
+            location: setter.location.clone(),
+        })
+    })
+    .parse_next(input)
 }

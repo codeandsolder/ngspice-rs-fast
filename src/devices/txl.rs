@@ -329,9 +329,9 @@ impl Device for Txl {
         let a = ctx.branch(0)?;
         let b = ctx.branch(1)?;
         let (values, rhs) = match ctx.mode {
-            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
-                (self.dc_values(ctx.gmin), [0.; 2])
-            }
+            AnalysisMode::OperatingPoint
+            | AnalysisMode::DcSweep
+            | AnalysisMode::Instantaneous { .. } => (self.dc_values(ctx.gmin), [0.; 2]),
             AnalysisMode::Ac { .. } => return Err(self.unsupported("AC/SP")),
             AnalysisMode::Transient { time, dt } => {
                 let history = ctx.states.delay_history().ok_or_else(|| {

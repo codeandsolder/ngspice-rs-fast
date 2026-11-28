@@ -713,8 +713,6 @@ fn subcircuit_and_x_values_use_parsed_expressions_or_stay_textual() {
 #[test]
 fn unsupported_expression_sites_stay_explicit_gaps() {
     for card in [
-        "V1 a 0 pulse({v1} 1 0)",
-        "V1 a 0 pwl(0 {v1})",
         "Q1 c b e qm ic={vbe},0.1\n.model qm npn",
         ".model nm nmos level={lv}",
         ".model nm nmos level='lv'",

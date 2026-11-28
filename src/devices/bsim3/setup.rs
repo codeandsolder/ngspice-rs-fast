@@ -175,7 +175,8 @@ macro_rules! define_binned_parameters {
         }
 
         impl BinnedParameters {
-            const fn new(model: &ModelValues, inv_l: Real, inv_w: Real, inv_lw: Real) -> Self {
+            #[expect(clippy::suboptimal_flops, reason = "C binning uses separately rounded products and left-associated additions")]
+const fn new(model: &ModelValues, inv_l: Real, inv_w: Real, inv_lw: Real) -> Self {
                 Self {
                     $($base: model.$area.value.mul_add(
                         inv_lw,

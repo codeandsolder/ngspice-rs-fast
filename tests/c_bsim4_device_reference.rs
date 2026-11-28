@@ -222,3 +222,29 @@ fn nested_temperature_and_width_sweeps_match_c() {
         }
     }
 }
+
+/// Both source/drain orientations through a real operating point and the
+/// independent C complex-frequency response, across all model selectors.
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; BSIM4 forward/reverse AC response"]
+fn bsim4_forward_reverse_ac_matches_c() {
+    let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
+    assert!(binary.is_absolute());
+    for (variant, extra) in VARIANTS {
+        for reverse in [false, true] {
+            let label = format!("{variant}-ac-reverse-{reverse}");
+            let deck = amplifier(extra, ".ac dec 3 1e3 1e11");
+            let deck = if reverse {
+                deck.replace("m1 d g 0 b", "m1 0 g d b")
+            } else {
+                deck
+            };
+            let c = c_plots(&binary, &deck, &label);
+            let rust = rust_plots(&deck);
+            assert_eq!(c.len(), rust.len(), "{label}: plot count");
+            for (c, rust) in c.iter().zip(&rust) {
+                compare(c, rust, &label);
+            }
+        }
+    }
+}

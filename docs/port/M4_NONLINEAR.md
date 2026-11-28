@@ -103,8 +103,18 @@ circuit RELTOL also reaches isolated sensitivity replays and prepared
 sweep loads. The analysis-local Newton `rtol` override changes solver
 convergence, not the circuit thermal derivation (#63).
 
-Not yet ported (`SpiceError::NotYetPorted`, naming the C file): soft reverse
-recovery (`VP`, `QPSCALE`), separate sidewall resistance (`RSW`), self-heating
+Soft reverse recovery uses a separately integrated diffusion charge q:
+q + VP*TT(T)*dq/dt = TT(T)*I(v), with terminal displacement current
+(1-VP)*dq/dt in addition to depletion current. DC and small-signal assembly
+use the same relaxation equation. VP defaults to zero; if VP or TT is zero,
+the original junction charge and topology are retained. QPSCALE controls
+only the numerical coordinate (default 1e6), not the physical charge or
+relaxation time. The ngspice 47 reference does not recognize QPSCALE;
+coordinate scaling is independently qualified. Sensitivity replays retain the original recovery coordinate and equation
+normalization. Active recovery distortion is explicitly unsupported.
+
+Not yet ported (`SpiceError::NotYetPorted`, naming the C file): separate
+sidewall resistance (`RSW`), self-heating
 (`RTH0`, `CTH0`, instance `THERMAL`), level-3 geometry (`LM`/`LP`/`WM`/`WP`,
 `XOM`/`XOI`/`XM`/`XP`/`XW`, instance `W`/`L`), SOA limits
 (`FV_MAX`, `BV_MAX`, `ID_MAX`, `TE_MAX`, `PD_MAX`), C's common-characteristic sidewall current in

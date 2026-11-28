@@ -13,7 +13,7 @@
 //!   inductance) and T (lossless transmission line), built from the card
 //!   alone by [`Registry::instantiate`];
 //! - **bounded**: D/Q/M/J/Z (diode, Gummel-Poon BJT, MOS1/MOS2/MOS3/MOS6/MOS9,
-//!   JFET levels 1-2, MESFET level 1 and MESA level 2), S/W
+//!   JFET levels 1-2, MESFET level 1 and MESA level 2), P/CPL coupled lines, S/W
 //!   switches, X subcircuit instances and U uniform RC lines (expanded into
 //!   generated R/C/D elements), which need the deck (a `.model` card or a
 //!   `.subckt` definition) and are built by [`crate::devices::Circuit::from_netlist`]
@@ -85,7 +85,9 @@ impl DeviceSupport {
         let designator = designator.to_ascii_lowercase();
         if crate::devices::factory::CARD_FACTORY.contains(&designator) {
             Self::Ported
-        } else if designator == 'x' || crate::devices::ModelBackend::requires_model(designator) {
+        } else if matches!(designator, 'x' | 'a')
+            || crate::devices::ModelBackend::requires_model(designator)
+        {
             Self::Bounded
         } else {
             Self::Pending
@@ -416,7 +418,7 @@ mod tests {
             assert!(registry.contains(*designator), "missing {designator}");
         }
         assert_eq!(registry.ported_count(), 12);
-        assert_eq!(registry.bounded_count(), 11);
+        assert_eq!(registry.bounded_count(), 13);
         assert_eq!(registry.len(), super::BUILTINS.len());
         for entry in registry.entries() {
             assert!(!entry.description.is_empty(), "{entry:?}");

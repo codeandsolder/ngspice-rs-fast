@@ -102,6 +102,54 @@ impl ResistorOverride {
 /// can override at once (a two-axis `.dc` can sweep two `@inst[param]` targets).
 pub const MAX_INSTANCE_OVERRIDES: usize = 2;
 
+/// A bound instance setter. Native families have compile-time canonical
+/// names; prepared families bind a descriptor ordinal, never a runtime string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ParameterKey {
+    /// Canonical setter of an in-tree device.
+    Native(&'static str),
+    /// Stable parameter ordinal of an immutable prepared artifact.
+    Prepared(usize),
+}
+
+/// Dimensional transformation applied to a raw source instance setter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometryScale {
+    /// The parameter is already in its physical unit.
+    Identity,
+    /// A length (including perimeter).
+    Length,
+    /// An area.
+    Area,
+}
+impl GeometryScale {
+    /// MOS geometry setter convention used by MOS1/2/3 and BSIM.
+    pub(crate) fn mos(name: &str) -> Self {
+        match name {
+            "l" | "w" | "pd" | "ps" => Self::Length,
+            "ad" | "as" => Self::Area,
+            _ => Self::Identity,
+        }
+    }
+
+    /// Resolve once, before binding an immutable physical override.
+    /// # Errors
+    /// Nonfinite input or result, or invalid global scale.
+    pub fn resolve(self, value: Real, scale: Real) -> crate::primitives::SpiceResult<Real> {
+        let result = match self {
+            Self::Identity => value,
+            Self::Length => value * scale,
+            Self::Area => value * scale * scale,
+        };
+        if !scale.is_finite() || scale <= 0. || !value.is_finite() || !result.is_finite() {
+            return Err(crate::primitives::SpiceError::circuit(
+                "invalid geometry scale or setter conversion overflow",
+            ));
+        }
+        Ok(result)
+    }
+}
+
 /// A value-independent instance parameter binding in a finalized topology.
 ///
 /// The canonical keyword comes from the device's existing setter registry.
@@ -110,20 +158,23 @@ pub const MAX_INSTANCE_OVERRIDES: usize = 2;
 pub struct InstanceTarget {
     topology: TopologyId,
     device: usize,
-    parameter: &'static str,
+    parameter: ParameterKey,
+    geometry_scale: GeometryScale,
 }
 
 impl InstanceTarget {
-    pub(crate) const fn new(topology: TopologyId, device: usize, parameter: &'static str) -> Self {
+    pub(crate) const fn new(
+        topology: TopologyId,
+        device: usize,
+        parameter: ParameterKey,
+        geometry_scale: GeometryScale,
+    ) -> Self {
         Self {
             topology,
             device,
             parameter,
+            geometry_scale,
         }
-    }
-
-    pub(super) const fn topology(self) -> TopologyId {
-        self.topology
     }
 
     /// Device ordinal in the finalized circuit.
@@ -133,12 +184,23 @@ impl InstanceTarget {
     }
 
     /// Canonical alias-folded keyword.
-    #[must_use = "the canonical keyword identifies the parameter to override"]
-    pub const fn parameter(self) -> &'static str {
+    #[must_use = "the parameter key identifies which instance property is varied"]
+    pub const fn parameter(self) -> ParameterKey {
         self.parameter
     }
 
-    /// Bind a candidate scalar without looking up its name again.
+    /// Bind a raw source scalar using the current geometry scale.
+    /// # Errors
+    /// Invalid scale or nonfinite conversion.
+    pub fn at_source(
+        self,
+        value: Real,
+        scale: Real,
+    ) -> crate::primitives::SpiceResult<InstanceOverride> {
+        self.at(self.geometry_scale.resolve(value, scale)?)
+    }
+
+    /// Bind an already resolved physical scalar without looking up its name again.
     /// Physical validation is performed against the effective model context.
     ///
     /// # Errors
@@ -150,7 +212,9 @@ impl InstanceTarget {
             ));
         }
         Ok(InstanceOverride {
-            target: self,
+            topology: self.topology,
+            device: self.device,
+            parameter: self.parameter,
             value,
         })
     }
@@ -161,7 +225,7 @@ impl InstanceTarget {
         self,
         supplied: Real,
     ) -> crate::primitives::SpiceResult<ResistorOverride> {
-        if self.parameter != "resistance"
+        if self.parameter != ParameterKey::Native("resistance")
             || !supplied.is_finite()
             || supplied == 0.
             || !(1. / supplied).is_finite()
@@ -179,31 +243,34 @@ impl InstanceTarget {
 /// overrides cannot be applied to a structurally different circuit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InstanceOverride {
-    target: InstanceTarget,
+    topology: TopologyId,
+    device: usize,
+    parameter: ParameterKey,
     value: Real,
 }
 
 impl InstanceOverride {
     pub(super) const fn topology(self) -> TopologyId {
-        self.target.topology()
+        self.topology
     }
 
-    /// The value-independent typed target.
-    #[must_use = "the typed target identifies the instance and parameter independently of its value"]
-    pub const fn target(self) -> InstanceTarget {
-        self.target
+    /// Does this resolved override refer to the same finalized setter?
+    pub(crate) fn matches_target(self, target: InstanceTarget) -> bool {
+        self.topology == target.topology
+            && self.device == target.device
+            && self.parameter == target.parameter
     }
 
     /// The overridden device's ordinal.
     #[must_use = "the device index locates the instance receiving the override"]
     pub const fn device(&self) -> usize {
-        self.target.device()
+        self.device
     }
 
     /// The canonical (lowercase, alias-folded) parameter keyword.
-    #[must_use = "the canonical keyword identifies the parameter receiving the override"]
-    pub const fn parameter(&self) -> &'static str {
-        self.target.parameter()
+    #[must_use = "the parameter key identifies the instance property receiving the override"]
+    pub const fn parameter(&self) -> ParameterKey {
+        self.parameter
     }
 
     /// Value in the setter's own unit (Celsius for temperature).

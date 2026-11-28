@@ -260,3 +260,36 @@ because C `raw_read()` executes command headers that do not begin with its
 simulator name. The actual Rust writer and version remain explicit.
 Process tests cover selection precedence, multi-plot binary readback, and live
 C loading of the unmodified binary output.
+
+## Optional source preprocessing Command (#197)
+
+Every file-based CLI command accepts an explicitly configured external source
+transformation via `--preprocess-command /absolute/path/to/adapter` and
+repeatable `--preprocess-arg <arg>` options.
+
+The executable is an absolute path. Every supplied argument is literal,
+including arguments beginning with a dash. The final argument is the canonical
+original source pathname. The command receives the source's raw bytes on stdin
+and must emit its complete replacement UTF-8 source on stdout; stderr is
+reserved for diagnostics. No command line is interpreted by a shell.
+By default its working directory is the original source's containing directory.
+Without an explicit executable, ordinary plaintext processing is unchanged.
+
+Semantic parsing, simulation and control execution run the command once per
+unique canonical source during deck admission, including linked include and
+library files. Multiple visits or sections share one transformed snapshot.
+Relative directives use the canonical source directory passed to the command; the ordinary
+resolver still selects sections, tracks include chains and detects cycles.
+Locations refer to physical lines in the admitted replacement text at the
+original source path. Summary, cards and tokens admit only the root, as before.
+
+The library exposes `netlist::SourceAdmission` and the public configuration,
+process-limit and cancellation types in `netlist::source::admission`, along
+with `Parser::parse_file_with_admission`,
+`Parser::parse_control_file_with_admission` and corresponding CLI runners.
+Original input, replacement output, diagnostics and process time are bounded.
+The solver's source byte budget additionally charges original and replacement
+bytes for each logical file visit, including repeated sections. Output is
+capped by the remaining aggregate budget before the command starts.
+Any admission failure stops processing; simulation retains its atomic output
+guarantee.

@@ -37,10 +37,13 @@ pub mod bias;
 mod companion;
 pub mod config;
 pub mod control;
+pub mod cosim;
+pub mod digital;
 pub mod disto;
 pub mod driver;
 pub mod fourier;
 mod frequency;
+pub mod harmonic_balance;
 mod initial;
 mod linear;
 pub mod measure;
@@ -49,21 +52,28 @@ pub mod noise;
 pub mod optimization;
 mod ordered_samples;
 mod output_probe;
+pub mod periodic_noise;
 mod periodic_orbit;
+pub mod periodic_small_signal;
 mod plan;
 mod pss;
 mod pz;
 pub mod rawfile;
 mod reduction;
 pub mod results;
+pub mod rf_network;
 pub mod selection;
 mod sens;
 mod sparam;
+pub mod spectrum;
 pub mod sweep;
 mod tf;
 pub mod touchstone;
 
-pub use companion::{TransientPlan, TransientStats, companion_transient, companion_transient_into};
+pub use companion::{
+    TransientPlan, TransientStats, companion_transient, companion_transient_into,
+    mixed_signal_transient, mixed_signal_transient_into,
+};
 pub use config::{
     AppliedOption, DcOptions, IgnoredOption, PlanningLimits, RunConfig, RunOverrides,
     TransientSettings,

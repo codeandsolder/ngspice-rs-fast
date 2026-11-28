@@ -164,7 +164,7 @@ impl Bsim4 {
             ));
         }
         let params = super::model_parameters(model)?;
-        let inputs = params.instance_parameters(instance, 1.)?;
+        let inputs = params.instance_parameters(instance, context.geometry_scale)?;
         let has_start_settings = inputs
             .applied()
             .iter()
@@ -575,7 +575,7 @@ fn load_mode(context: &StampContext<'_>) -> SpiceResult<(u32, bool)> {
     }
     let uic = if states.uic() { mode::MODEUIC } else { 0 };
     let base = match context.mode {
-        AnalysisMode::OperatingPoint => mode::MODEDCOP,
+        AnalysisMode::OperatingPoint | AnalysisMode::Instantaneous { .. } => mode::MODEDCOP,
         AnalysisMode::DcSweep => mode::MODEDCTRANCURVE,
         AnalysisMode::Transient { .. } => mode::MODETRAN,
         AnalysisMode::Ac { .. } => {
@@ -1266,6 +1266,17 @@ impl Device for Bsim4 {
 
     /// Every real instance setter of `b4.c`'s table (`DCTfindInstParam`
     /// accepts any settable instance parameter).
+    fn parameter_geometry_scale(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+    ) -> crate::devices::sweep::GeometryScale {
+        use crate::devices::sweep::{GeometryScale, ParameterKey};
+        match key {
+            ParameterKey::Native(name) => GeometryScale::mos(name),
+            ParameterKey::Prepared(_) => GeometryScale::Identity,
+        }
+    }
+
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
         let p = super::DEVICE.instance.get(keyword)?;
         (p.input_type == super::InputType::Real
@@ -1547,6 +1558,20 @@ mod tests {
         negative.apply(&mut instance).unwrap();
         assert_eq!(instance.l.to_bits(), negative.bits);
         assert!(instance.lGiven);
+    }
+
+    #[test]
+    fn zero_integration_retains_signed_zero_and_nonfinite_propagation() {
+        let (conductance, current, derivative) = zero_coefficient_integrate(-1., -0., -0.);
+        assert_eq!(conductance.to_bits(), (-0_f64).to_bits());
+        assert_eq!(current.to_bits(), 0_f64.to_bits());
+        assert_eq!(derivative.to_bits(), (-0_f64).to_bits());
+        let (conductance, current, derivative) = zero_coefficient_integrate(f64::INFINITY, 1., 2.);
+        assert!(conductance.is_nan());
+        assert_eq!(current.to_bits(), 0_f64.to_bits());
+        assert_eq!(derivative.to_bits(), 0_f64.to_bits());
+        let (_, current, derivative) = zero_coefficient_integrate(1., f64::INFINITY, 1.);
+        assert!(current.is_nan() && derivative.is_nan());
     }
 
     #[test]

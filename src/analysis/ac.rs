@@ -214,13 +214,9 @@ impl<'a> SmallSignal<'a> {
         // CKTstate1 is still the zero ("really off") vector: the AC conductance of
         // a switch is that of the accepted history, not of the converged
         // operating point (`swacload.c`/`cswacld.c`). The operating point's own
-        // trial state is therefore deliberately not used here.
-        let history = circuit.state_history()?;
-        let state1 = circuit.bind_state(
-            history
-                .accepted(1)
-                .map_or_else(|| vec![0.; history.len()], <[Real]>::to_vec),
-        )?;
+        // trial state is therefore used only by devices whose explicitly
+        // selected constitutive law requires it (e.g. LTspice switches).
+        let state1 = circuit.bias_small_signal_snapshot(&solved.trial)?;
         let system = prepared.small_signal_system_at(
             &context.model_context(),
             &solved.values,
@@ -318,10 +314,14 @@ impl<'a> SmallSignal<'a> {
     ) -> SpiceResult<R> {
         if self.varies {
             let model = context.model_context().with_frequency(f);
-            self.previous = self
-                .start
-                .solve_from(&self.prepared, &model, &self.settings, &self.previous)?
-                .values;
+            let solved =
+                self.start
+                    .solve_from(&self.prepared, &model, &self.settings, &self.previous)?;
+            self.state1 = self
+                .prepared
+                .circuit()
+                .bias_small_signal_snapshot(&solved.trial)?;
+            self.previous = solved.values;
             // C repeats MODEINITSMSIG after every frequency-dependent CKTop.
             // Preserve its carried device slots for the next bias and analysis.
             self.prepared

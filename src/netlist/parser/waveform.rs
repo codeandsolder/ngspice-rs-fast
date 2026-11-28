@@ -6,14 +6,14 @@ use winnow::combinator::{alt, cut_err, opt};
 use winnow::token::any;
 
 use crate::netlist::ast::{
-    FunctionWaveform, ParameterAssignment, ParameterKind, PulseWaveform, PwlPoint, SourceWaveform,
-    WaveformKind,
+    FunctionWaveform, NumericVectorEntry, ParameterAssignment, ParameterKind, PulseWaveform,
+    PwlPoint, SourceWaveform, WaveformKind,
 };
 
 use crate::netlist::token::Token;
 
 use super::grammar::{Input, Result, keyword};
-use super::syntax::{equals, malformed, named, value};
+use super::syntax::{Value, equals, malformed, named, value};
 use super::vector::{numeric, positioned};
 
 /// The vector-valued transient setters of `vsrc.c`/`isrc.c` (`IF_REALVEC`).
@@ -29,7 +29,7 @@ pub(super) fn parameters(input: &mut Input<'_>) -> Result<Vec<ParameterAssignmen
         // SFFM/AM ones; more would be silently ignored there, so they are a
         // syntax error here. PWL is bounded to 2048 pairs. Runtime
         // restrictions (times, slopes, defaults) are not syntax.
-        let vector = numeric(input, kind.maximum_fields())?;
+        let vector = numeric(input, kind.maximum_fields(), value)?;
         if vector.values.len() < 2 {
             return Err(malformed(
                 input,
@@ -40,18 +40,18 @@ pub(super) fn parameters(input: &mut Input<'_>) -> Result<Vec<ParameterAssignmen
             WaveformKind::Function(function) => {
                 SourceWaveform::Function(Box::new(FunctionWaveform {
                     function,
-                    values: vector
-                        .values
-                        .iter()
-                        .map(|&token| positioned(token))
-                        .collect(),
+                    values: vector.values.iter().map(coefficient).collect(),
                 }))
             }
+            WaveformKind::Stochastic(function) => SourceWaveform::Stochastic {
+                function,
+                values: vector.values.iter().map(coefficient).collect(),
+            },
             WaveformKind::Pulse => {
-                let value = |index: usize| vector.values.get(index).map(|&token| positioned(token));
+                let value = |index: usize| vector.values.get(index).map(coefficient);
                 SourceWaveform::Pulse(Box::new(PulseWaveform {
-                    initial: positioned(vector.values[0]),
-                    pulsed: positioned(vector.values[1]),
+                    initial: coefficient(&vector.values[0]),
+                    pulsed: coefficient(&vector.values[1]),
                     delay: value(2),
                     rise: value(3),
                     fall: value(4),
@@ -72,8 +72,8 @@ pub(super) fn parameters(input: &mut Input<'_>) -> Result<Vec<ParameterAssignmen
                     pairs
                         .iter()
                         .map(|[time, value]| PwlPoint {
-                            time: positioned(time),
-                            value: positioned(value),
+                            time: coefficient(time),
+                            value: coefficient(value),
                         })
                         .collect(),
                 )
@@ -100,4 +100,14 @@ pub(super) fn pwl_options(input: &mut Input<'_>) -> Result<Vec<ParameterAssignme
         token.location.clone(),
         value,
     )])
+}
+
+fn coefficient(value: &Value<'_>) -> NumericVectorEntry {
+    NumericVectorEntry {
+        source: positioned(value.token()),
+        expression: match value {
+            Value::Literal(_) => None,
+            Value::Expression(_, expression) => Some(expression.clone()),
+        },
+    }
 }

@@ -17,7 +17,8 @@
 use crate::devices::ifparam::{Device, ParameterTable};
 use std::sync::Arc;
 
-use crate::devices::models::{ModelFamily, PreparationKey, ResolvedModel};
+use crate::devices::bsim_model_inputs::{self, OrderedModelInputs};
+use crate::devices::models::{PreparationKey, ResolvedModel};
 use crate::devices::schema::temperature_kelvin;
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
@@ -137,11 +138,7 @@ impl ModelParameters {
                 "BSIM4 needs three or four terminals: drain, gate, source[, bulk]",
             ));
         }
-        let mut inputs = Inputs::new(&DEVICE, false);
-        for p in self.instance_defaults.iter().chain(&instance.parameters) {
-            inputs.apply(p, scale)?;
-        }
-        Ok(inputs)
+        bsim_model_inputs::instance_inputs(&DEVICE, &self.instance_defaults, instance, scale)
     }
 }
 
@@ -164,40 +161,17 @@ fn parse_model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParamet
             "BSIM4 input schema requires NMOS/PMOS level 14 or 54",
         ));
     }
-    let mut result = ModelParameters {
-        inputs: Inputs::new(&DEVICE, true),
-        polarity: if model.family() == ModelFamily::Nmos {
-            1
-        } else {
-            -1
-        },
-        instance_defaults: Arc::from([]),
+    let OrderedModelInputs {
+        inputs,
+        polarity,
+        instance_defaults,
+    } = bsim_model_inputs::dispatch(&DEVICE, model)?;
+    Ok(ModelParameters {
+        inputs,
+        polarity,
+        instance_defaults,
         location: model.card().location.clone(),
-    };
-    let mut defaults = Vec::new();
-    for p in &model.card().parameters {
-        if p.name.eq_ignore_ascii_case("level") {
-            continue;
-        }
-        if DEVICE.model.get(&p.name).is_some() {
-            result.inputs.apply(p, 1.)?;
-            if p.name.eq_ignore_ascii_case("nmos") {
-                result.polarity = 1;
-            }
-            if p.name.eq_ignore_ascii_case("pmos") {
-                result.polarity = -1;
-            }
-        } else {
-            let mut check = Inputs::new(&DEVICE, false);
-            check.apply(p, 1.)?;
-            if !p.name.eq_ignore_ascii_case("m") {
-                defaults.push(p.clone());
-            }
-        }
-    }
-    defaults.reverse();
-    result.instance_defaults = defaults.into();
-    Ok(result)
+    })
 }
 
 /// Select the BSIM4 directory from the **first** VERSION token, as

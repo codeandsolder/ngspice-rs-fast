@@ -33,6 +33,158 @@ use crate::primitives::{Node, NodeId, NodeTable, Real, SourceLoc, SpiceError, Sp
 use crate::devices::linear::Forcing;
 use crate::devices::state::DeviceState;
 
+/// Device-local physical charge history and its electrical incidence.
+///
+/// The stored rate is multiplied by `scale` and enters the positive node,
+/// leaving the negative node. Internal state equations are not terminals.
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicalChargeHistory {
+    /// Local charge slot, followed immediately by its physical time derivative.
+    pub slot: usize,
+    /// Positive and negative electrical nodes of the charge contribution.
+    pub nodes: [NodeId; 2],
+    /// Conversion from device-local charge to signed electrical charge.
+    pub scale: Real,
+}
+
+/// Physical nonlinear charge and its exact Jacobian in MNA coordinates.
+/// This is independent of the time integration formula and AC's historical
+/// small-signal linearization conventions.
+pub struct ChargeContext<'a> {
+    /// Effective model parameters and temperatures.
+    pub model: &'a crate::devices::ModelContext,
+    /// Physical node and branch numbering.
+    pub unknowns: &'a MnaUnknowns,
+    /// This device's first branch row, when allocated.
+    pub branch: Option<usize>,
+    /// Bound rows of branch-current controls, in expression order.
+    pub controls: &'a [usize],
+    /// State at which to evaluate the constitutive law.
+    pub state: &'a Vector,
+    /// Absolute time of the constitutive law evaluation.
+    pub time: Real,
+    /// Signed charge and flux residual by equation row.
+    pub charge: &'a mut Vector,
+    /// Exact derivative of that residual.
+    pub jacobian: &'a mut SparseMatrix,
+}
+
+impl ChargeContext<'_> {
+    /// Read the physical voltage of a node; ground is exactly zero.
+    #[must_use = "the node potential is needed to evaluate the device at the current state"]
+    pub fn voltage(&self, node: NodeId) -> Real {
+        self.unknowns
+            .node_row(node)
+            .and_then(|row| self.state.get(row))
+            .unwrap_or(0.)
+    }
+
+    /// Add an off-diagonal derivative of a charge branch with respect to
+    /// a distinct control voltage. The signed four-terminal stamp preserves
+    /// both charge conservation and invariance under a common-mode shift.
+    ///
+    /// # Errors
+    /// Nonfinite derivative or invalid row/column.
+    pub fn coupling(
+        &mut self,
+        output: [NodeId; 2],
+        control: [NodeId; 2],
+        derivative: Real,
+    ) -> SpiceResult<()> {
+        if !derivative.is_finite() {
+            return Err(SpiceError::circuit("nonfinite nonlinear charge coupling"));
+        }
+        for (node, sign) in [(output[0], 1.), (output[1], -1.)] {
+            if let Some(row) = self.unknowns.node_row(node) {
+                for (node, weight) in [(control[0], 1.), (control[1], -1.)] {
+                    if let Some(col) = self.unknowns.node_row(node) {
+                        self.jacobian.add(row, col, sign * weight * derivative)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish a two-terminal charge law, positive from the first node to
+    /// the second, with its derivative with respect to their voltage.
+    ///
+    /// # Errors
+    /// Nonfinite constitutive law or invalid matrix dimensions.
+    pub fn branch(
+        &mut self,
+        terminals: [NodeId; 2],
+        charge: Real,
+        capacitance: Real,
+    ) -> SpiceResult<()> {
+        if !charge.is_finite() || !capacitance.is_finite() {
+            return Err(SpiceError::circuit("nonfinite nonlinear charge law"));
+        }
+        for (node, signed) in [(terminals[0], charge), (terminals[1], -charge)] {
+            if let Some(row) = self.unknowns.node_row(node) {
+                self.charge.add_to(row, signed)?;
+            }
+        }
+        crate::devices::linear::nodal_stamp(self.jacobian, self.unknowns, terminals, capacitance)
+    }
+}
+
+/// Physical convergence tolerance of an MNA coordinate. Auxiliary
+/// constitutive coordinates are checked through their device's physical
+/// residual, not an arbitrary tolerance in amperes or volts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceKind {
+    /// Voltage-like coordinate.
+    Voltage,
+    /// Current-like coordinate.
+    Current,
+    /// Auxiliary coordinate governed by the device convergence test.
+    Constitutive,
+}
+
+/// Observable physical meaning of a device-local MNA coordinate.
+/// Auxiliary states are not terminal currents merely because their rows
+/// are allocated in the branch part of the MNA layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchQuantity {
+    /// Oriented terminal current.
+    Current,
+    /// Differential capacitor voltage rate.
+    VoltageRate,
+    /// Differential inductor current rate.
+    CurrentRate,
+    /// Explicit physical charge coordinate.
+    Charge,
+    /// Stored input of a differentiator (arbitrary expression units).
+    ExpressionState,
+    /// Normalized transfer state driven by a voltage input.
+    VoltageState(usize),
+    /// Normalized transfer state driven by a current input.
+    CurrentState(usize),
+    /// Oriented current at the transfer's sensing input.
+    InputCurrent,
+    /// Auxiliary capacitor voltage-constraint branch, zero outside bias.
+    BiasCurrent,
+}
+
+impl BranchQuantity {
+    /// Plot vector identity and unit for this coordinate.
+    #[must_use]
+    pub fn observation(self, name: &str) -> (String, &'static str) {
+        match self {
+            Self::Current => (format!("i({name})"), "current"),
+            Self::VoltageRate => (format!("dvdt({name})"), "voltage/s"),
+            Self::CurrentRate => (format!("didt({name})"), "current/s"),
+            Self::Charge => (format!("q({name})"), "charge"),
+            Self::ExpressionState => (format!("state({name},0)"), "unknown"),
+            Self::VoltageState(index) => (format!("state({name},{index})"), "voltage"),
+            Self::CurrentState(index) => (format!("state({name},{index})"), "current"),
+            Self::InputCurrent => (format!("i({name}:input)"), "current"),
+            Self::BiasCurrent => (format!("i({name}:bias)"), "current"),
+        }
+    }
+}
+
 /// Which stored quantity a [`StorageElement`] integrates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
@@ -54,6 +206,113 @@ pub struct StorageElement {
     /// The instance `ic=` (volts for a capacitor, amperes for an inductor),
     /// if given.
     pub initial: Option<Real>,
+}
+
+/// How an initial dynamic coordinate is represented in adjacent history slots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InitialCoordinateHistory {
+    /// The signed physical charge/flux in the associated evolution equation.
+    EquationCharge {
+        /// Local state slot; its successor holds the time derivative.
+        slot: usize,
+        /// Conversion from signed equation charge to stored device quantity.
+        scale: Real,
+    },
+    /// The state coordinate itself is integrated by the device.
+    Coordinate {
+        /// Local state slot; its successor holds the time derivative.
+        slot: usize,
+    },
+}
+
+/// A prescribed internal state coordinate for UIC.
+///
+/// The coordinate and the equation that normally evolves it are distinct: e.g. an implicit
+/// differential inductor stores its current in branch 0 and evolves it
+/// through branch equation 1. Indices are device-local branch indices.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialCoordinate {
+    /// Fixed unknown.
+    pub coordinate: usize,
+    /// Differential equation removed in the instantaneous constraint solve.
+    pub equation: usize,
+    /// Value of the coordinate at the initial point.
+    pub value: Real,
+    /// Mapping to accepted history.
+    pub history: InitialCoordinateHistory,
+}
+
+/// A voltage-controlled storage coordinate at UIC. Scalar capacitors
+/// need a new free-current equation; implicit capacitors already have
+/// that current and specify the local evolution equation to replace.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialVoltageStorage {
+    /// Optional instance voltage, otherwise read the seeded terminal voltages.
+    pub voltage: Option<Real>,
+    /// Local history slot containing the signed integrated quantity.
+    pub slot: usize,
+    /// Storage coordinate per volt (not necessarily a physical capacitance).
+    pub scale: Real,
+    /// Existing evolution row, or None to append a free-current constraint.
+    pub equation: Option<usize>,
+}
+
+/// A device-local coordinate or a generated internal signal node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialStorageRow {
+    /// Device-local branch row.
+    Branch(usize),
+    /// Generated internal signal coordinate (not an arbitrary external node).
+    Signal(NodeId),
+}
+
+/// Initial signed storage expression constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialStoragePolicy {
+    /// Physical stored charge: its initial value is mandatory.
+    Physical,
+    /// Derivative input: the seeded value is an initial condition only
+    /// when independent of the circuit's mandatory constraints.
+    Derived,
+}
+
+/// Binding of a nonlinear stored expression for instantaneous initialization.
+/// The physical charge assembly supplies its value and Jacobian.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialExpressionStorage {
+    /// Local history slot containing the signed stored expression.
+    pub slot: usize,
+    /// Private storage coordinate and its two-term linear evolution row.
+    /// The only other coordinate in that row is the derivative output.
+    pub equation: InitialStorageRow,
+    /// Free current or derivative-output coordinate, whose own row holds
+    /// the constitutive storage law. A rank completion may select zero
+    /// only when the retained constraints do not determine it.
+    pub gauge: InitialStorageRow,
+    /// Optional initial terminal voltage used to evaluate physical charge.
+    pub voltage: Option<Real>,
+    /// Whether the seeded value is a mandatory or a derived constraint.
+    pub policy: InitialStoragePolicy,
+}
+
+/// An ideal voltage relation used by the initial-condition constraint graph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialVoltageRelation {
+    /// Positive and negative terminals.
+    pub terminals: [NodeId; 2],
+    /// How the differential voltage is determined.
+    pub law: InitialVoltageLaw,
+}
+
+/// Ideal voltage relation in the initial instantaneous system.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InitialVoltageLaw {
+    /// Voltage determined by the other equations of the circuit.
+    Controlled,
+    /// Fixed voltage, including a zero-voltage sensing branch.
+    Fixed(Real),
+    /// Voltage from the forcing vector at a device-local branch row.
+    Source(usize),
 }
 
 /// A device whose branch current another device senses, named as in the deck
@@ -134,6 +393,12 @@ pub enum AnalysisMode {
         /// Frequency in Hz.
         frequency: Real,
     },
+    /// Static physical equations at a transient time, without integration.
+    /// Used with separately assembled charge/flux in a memoryless DAE.
+    Instantaneous {
+        /// Absolute time in seconds.
+        time: Real,
+    },
     /// A step of a `.tran` analysis.
     Transient {
         /// Absolute time in seconds.
@@ -157,11 +422,17 @@ impl AnalysisMode {
         matches!(self, Self::Transient { .. })
     }
 
-    /// True for the DC analyses, where capacitors are open and inductors are
-    /// shorts.
+    /// True only for equilibrium bias loads, not unintegrated transient
+    /// physical residuals.
+    #[must_use = "bias constraints must be released during transient physical loads"]
+    pub const fn is_bias(self) -> bool {
+        matches!(self, Self::OperatingPoint | Self::DcSweep)
+    }
+
+    /// True for static loads, including the unintegrated physical DAE.
     #[must_use = "static loads omit time-dependent companion terms"]
     pub const fn is_dc(self) -> bool {
-        matches!(self, Self::OperatingPoint | Self::DcSweep)
+        self.is_bias() || matches!(self, Self::Instantaneous { .. })
     }
 }
 
@@ -270,6 +541,40 @@ impl MnaUnknowns {
             .ok_or_else(|| SpiceError::circuit(format!("unmapped MNA node {node}")))
     }
 
+    /// Seed a two-terminal voltage while retaining the negative terminal's
+    /// common-mode potential when both terminals are non-ground. This is
+    /// a guess or a local instance-IC evaluation, not a voltage source.
+    pub(crate) fn seed_terminal_voltage(
+        &self,
+        state: &mut Vector,
+        terminals: [NodeId; 2],
+        voltage: Real,
+    ) -> SpiceResult<()> {
+        let [positive, negative] = terminals;
+        let p = self.checked_node_row(positive)?;
+        let n = self.checked_node_row(negative)?;
+        if !voltage.is_finite() || state.len() != self.len() {
+            return Err(SpiceError::circuit("invalid initial voltage seed"));
+        }
+        if p == n {
+            if voltage != 0. {
+                return Err(SpiceError::circuit(
+                    "nonzero initial voltage across identical terminals",
+                ));
+            }
+        } else if let Some(p) = p {
+            let common = n.map_or(0., |n| state.as_slice()[n]);
+            let value = common + voltage;
+            if !value.is_finite() {
+                return Err(SpiceError::circuit("nonfinite initial voltage seed"));
+            }
+            state.set(p, value)?;
+        } else if let Some(n) = n {
+            state.set(n, -voltage)?;
+        }
+        Ok(())
+    }
+
     /// Reserves `count` rows after every node row, for branch currents.
     ///
     /// Returns the first reserved row, or `None` when `count` is zero.
@@ -317,8 +622,16 @@ pub struct ConvergenceContext<'a> {
     pub previous: &'a Vector,
     /// Branch rows of [`Device::controlling_sources`], in order.
     pub controls: &'a [usize],
+    /// This device's first allocated branch, if any.
+    pub branch: Option<usize>,
+    /// Time-integration formula of the load, absent in DC.
+    pub integration: Option<&'a Coefficients>,
     /// This device's slots of the last load's trial (C `CKTstate0`).
     pub states: &'a [Real],
+    /// Accepted state revision corresponding to the trial.
+    pub history: &'a crate::devices::StateHistory,
+    /// Range of this device's state in an accepted vector.
+    pub state_range: Range<usize>,
     /// The Newton phase of the last load (C's `MODEINITF` bits when
     /// `NIconvTest` runs, which `NIiter` does in `MODEINITFIX` as well as
     /// `MODEINITFLOAT`).
@@ -336,8 +649,18 @@ pub struct ConvergenceContext<'a> {
 }
 
 impl ConvergenceContext<'_> {
+    /// A device-local accepted state value, age one being the latest.
+    #[must_use]
+    pub fn accepted(&self, age: usize, slot: usize) -> Option<Real> {
+        self.history
+            .accepted(age)?
+            .get(self.state_range.clone())?
+            .get(slot)
+            .copied()
+    }
+
     /// The new iterate's value at a node, zero at ground.
-    #[must_use = "the node potential is needed to evaluate convergence at the current iterate"]
+    #[must_use = "the solved node potential is needed to evaluate the requested device quantity"]
     pub fn voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)
@@ -451,6 +774,8 @@ pub struct StampContext<'a> {
     pub frequency: Real,
     /// Which analysis is loading the matrix.
     pub mode: AnalysisMode,
+    /// Enclosing analysis for source-prepared passive bias constraints.
+    pub bias_analysis: Option<crate::primitives::AnalysisKind>,
     /// Branch-current rows allocated to this device, in order (empty if none).
     pub branches: Range<usize>,
     /// Branch rows of the devices named by [`Device::controlling_sources`], in
@@ -642,6 +967,13 @@ pub trait Device: fmt::Debug + std::any::Any {
     ) -> SpiceResult<Option<Real>> {
         Ok(None)
     }
+    /// Physical two-terminal current retained by a converged derivative
+    /// array. Returning a value avoids scalar evaluation at a branch event.
+    /// The default leaves the existing isolated observation load in use.
+    fn physical_terminal_current(&self, _states: &[Real], _branches: &[Real]) -> Option<Real> {
+        None
+    }
+
     /// Factor applied to this device's observed terminal currents: `-1` for
     /// devices whose C ask reports polarity-normalized currents for the
     /// p-type variant (`jfetask.c`), `1` (the default) otherwise.
@@ -655,21 +987,77 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Whether finalized topology must prepare per-candidate random streams.
+    /// False by default; deterministic sources add no candidate dispatch work.
+    fn has_stochastic_source(&self) -> bool {
+        false
+    }
+
+    /// Rebind only transient stochastic source identity for an independent
+    /// optimizer candidate, leaving terminal and state layout unchanged.
+    /// Other devices return None; this does not alter deterministic sources.
+    fn with_stochastic_candidate(&self, _identity: u64) -> Option<Box<dyn Device>> {
+        None
+    }
+
     /// The instance name, e.g. `r1`.
     fn name(&self) -> &str;
 
     /// The designator letter, lowercased.
     fn designator(&self) -> char;
 
-    /// The nodes this device is connected to, in terminal order.
+    /// The nodes this device is connected to, in numerical binding order.
     fn terminals(&self) -> &[NodeId];
 
-    /// How many extra current unknowns the device adds to the MNA system.
+    /// Public ports in source order, excluding setup-private
+    /// coordinates. Used for external current and power observations.
+    fn external_terminals(&self) -> &[NodeId] {
+        self.terminals()
+    }
+
+    /// Named internal node coordinates whose rows are constitutive equations,
+    /// not electrical KCL. They do not receive physical voltage shunts or
+    /// voltage tolerances; the owner checks their physical residuals.
+    fn constitutive_nodes(&self) -> &[NodeId] {
+        &[]
+    }
+
+    /// Install an occurrence-bound prepared passive startup policy before setup.
     ///
-    /// Non-zero for voltage sources and inductors, which contribute a branch
-    /// current row; zero for everything else.
+    /// # Errors
+    /// This device is not the matching physical storage family.
+    fn bind_passive_initialization(
+        &mut self,
+        _policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::circuit(
+            "prepared initialization requires a physical capacitor or inductor",
+        ))
+    }
+
+    /// True when bias equations need physical nodal continuation rather
+    /// than perturbing a numerical pivot diagonal.
+    fn has_passive_bias(&self) -> bool {
+        false
+    }
+
+    /// How many device-local coordinates the device adds to the MNA
+    /// system, including branch currents and auxiliary constitutive states.
     fn branch_currents(&self) -> usize {
         0
+    }
+
+    /// Observable meaning of a local coordinate. Ordinary branch-current
+    /// devices keep their reference representation; stateful native devices
+    /// identify their additional coordinates explicitly.
+    fn branch_quantity(&self, _branch: usize) -> BranchQuantity {
+        BranchQuantity::Current
+    }
+
+    /// Convergence classification of a device-local branch coordinate.
+    /// A constitutive coordinate must be checked by `convergence_test`.
+    fn branch_convergence(&self, _branch: usize) -> ConvergenceKind {
+        ConvergenceKind::Current
     }
 
     /// Devices whose branch current this device senses (F/H controlling
@@ -685,6 +1073,18 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// `CKTfndBranch` cannot find, including inductors.
     fn findable_branch(&self) -> Option<usize> {
         None
+    }
+
+    /// Physical branch for a resolved expression's current probe.
+    /// Unlike voltage-source-only controls, this can read a storage current.
+    fn expression_current_branch(&self) -> Option<usize> {
+        self.findable_branch()
+    }
+
+    /// Which current coordinate this device reads from a control target.
+    /// Traditional F/H/W cards retain their defined voltage-source semantics.
+    fn control_branch(&self, target: &dyn Device) -> Option<usize> {
+        target.findable_branch()
     }
 
     /// Binds the previous voltage-source value in C `VSRCload`'s reverse-deck
@@ -754,6 +1154,76 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
+    /// Identity of a homogeneous prepared artifact, if this device supports
+    /// tile evaluation. Only exact artifact identity may share a tile.
+    fn prepared_batch_key(&self) -> Option<crate::devices::prepared_model::batch::Key> {
+        None
+    }
+
+    /// Exact preparation inputs for detecting unchanged tile lanes.
+    fn prepared_recipe(&self) -> Option<crate::devices::prepared_model::batch::Recipe<'_>> {
+        None
+    }
+
+    /// Prepare a bounded homogeneous tile at a candidate-context boundary.
+    /// # Errors
+    /// Incompatible instances, invalid parameters or unsupported tile.
+    fn prepare_batch(
+        &self,
+        _instances: &[&dyn Device],
+        _unknowns: &MnaUnknowns,
+    ) -> SpiceResult<Box<dyn crate::devices::prepared_model::batch::Tile>> {
+        Err(SpiceError::circuit(
+            "device has no prepared batch implementation",
+        ))
+    }
+
+    /// Whether a prepared lane uses solver-owned trial linearization state.
+    fn needs_prepared_linearization(&self) -> bool {
+        false
+    }
+
+    /// Apply solver-owned trial linearization to one prepared lane before
+    /// constitutive evaluation. Exact loads retain the original coordinates.
+    /// # Errors
+    /// Invalid coordinate or history state.
+    fn linearize_prepared(
+        &self,
+        _states: &mut DeviceState<'_>,
+        _coordinates: &mut [Real],
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
+    /// Stamp a previously evaluated tile lane into a trial.
+    /// # Errors
+    /// Invalid numerical or history state.
+    fn stamp_prepared(
+        &self,
+        _context: &mut StampContext<'_>,
+        _point: &model_kernel_api::Point<'_>,
+        _coordinates: &[Real],
+    ) -> SpiceResult<()> {
+        Err(SpiceError::circuit("device has no prepared batch stamp"))
+    }
+
+    /// Assemble an already evaluated tile lane into the affine AC pencil.
+    /// # Errors
+    /// Missing charge equations or invalid row binding.
+    fn assemble_prepared(
+        &self,
+        _context: &mut crate::devices::linear::LinearContext<'_>,
+        _point: &model_kernel_api::Point<'_>,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::circuit("device has no prepared batch AC stamp"))
+    }
+
+    /// Whether the noise generator densities or injection weights depend
+    /// on the requested spectral frequency, independently of the AC pencil.
+    fn noise_depends_on_frequency(&self) -> bool {
+        false
+    }
+
     /// The device's accepted-waveform delay history behaviour (transmission
     /// lines), or `None` (the default). See [`crate::devices::delay`]: such a
     /// device reads its history while stamping
@@ -820,6 +1290,85 @@ pub trait Device: fmt::Debug + std::any::Any {
         &self,
         _context: &crate::devices::models::ModelContext,
     ) -> Option<SpiceResult<StorageElement>> {
+        None
+    }
+
+    /// Ideal voltage relations visible to initial-condition consistency
+    /// checking. A multiport device may publish more than one relation.
+    /// Only DC bias regards inductors as shorts; under UIC their stored
+    /// current is constrained instead.
+    fn initial_voltage_relations(&self, inductors_short: bool) -> Vec<InitialVoltageRelation> {
+        let law = match self.designator() {
+            'e' | 'h' => InitialVoltageLaw::Controlled,
+            'v' if self.branch_currents() == 1 => InitialVoltageLaw::Source(0),
+            'l' if inductors_short => InitialVoltageLaw::Fixed(0.),
+            _ => return Vec::new(),
+        };
+        let terminals = match (self.terminals(), self.rf_port()) {
+            ([_, negative, _], Some(port)) => [port.internal, *negative],
+            ([positive, negative, ..], None) => [*positive, *negative],
+            _ => return Vec::new(),
+        };
+        vec![InitialVoltageRelation { terminals, law }]
+    }
+
+    /// Explicit internal storage coordinates for UIC, independent of
+    /// the physical current/voltage storage representation of scalar RLC.
+    /// The device seeds its history from these coordinates during the
+    /// initial load; the analysis binds and checks the instantaneous system.
+    /// # Errors
+    /// Invalid effective storage inputs.
+    fn initial_coordinates(
+        &self,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Vec<InitialCoordinate>> {
+        Ok(self
+            .storage_element(context)
+            .transpose()?
+            .filter(|storage| storage.kind == StorageKind::Inductor)
+            .map(|storage| InitialCoordinate {
+                coordinate: 0,
+                equation: 0,
+                value: storage.initial.unwrap_or(0.),
+                history: InitialCoordinateHistory::EquationCharge {
+                    slot: 0,
+                    scale: -1.,
+                },
+            })
+            .into_iter()
+            .collect())
+    }
+
+    /// Initial differential-voltage storage and the corresponding equation
+    /// binding, independent of the physical charge scale.
+    /// # Errors
+    /// Invalid effective storage inputs or missing state slot.
+    fn initial_voltage_storage(
+        &self,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Option<InitialVoltageStorage>> {
+        let Some(storage) = self
+            .storage_element(context)
+            .transpose()?
+            .filter(|storage| storage.kind == StorageKind::Capacitor)
+        else {
+            return Ok(None);
+        };
+        let slot = self
+            .truncation_slot()
+            .ok_or_else(|| SpiceError::circuit("missing capacitor storage slot"))?;
+        Ok(Some(InitialVoltageStorage {
+            voltage: storage.initial,
+            slot,
+            scale: storage.value,
+            equation: None,
+        }))
+    }
+
+    /// Nonlinear storage expression constraints used during UIC. Devices
+    /// with explicit differential voltage/current or transfer coordinates
+    /// need not also declare an expression constraint.
+    fn initial_expression_storage(&self) -> Option<InitialExpressionStorage> {
         None
     }
 
@@ -901,6 +1450,45 @@ pub trait Device: fmt::Debug + std::any::Any {
         })
     }
 
+    /// Evaluate a nonlinear physical charge law separately from the
+    /// integration companion and small-signal AC conventions.
+    ///
+    /// # Errors
+    /// Unsupported device charge physics or a failed model evaluation.
+    fn assemble_nonlinear_charge(&self, _context: &mut ChargeContext<'_>) -> SpiceResult<()> {
+        Err(SpiceError::Unsupported {
+            feature: format!("nonlinear frequency-domain charge for {}", self.name()),
+            location: None,
+        })
+    }
+
+    /// Visit device-local charge/rate pairs and their electrical incidence.
+    /// The same declaration binds physical histories and reconstructs their
+    /// displacement currents in instantaneous terminal observations.
+    /// # Errors
+    /// Propagates an error from the visitor.
+    fn physical_charge_histories(
+        &self,
+        _visit: &mut dyn FnMut(PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
+    /// Assemble nonlinear physical residual/charge Taylor coefficients and
+    /// the corresponding state-Jacobian jets.
+    ///
+    /// # Errors
+    /// No analytic Taylor kernel for this device or invalid local physics.
+    fn assemble_nonlinear_taylor(
+        &self,
+        _context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::Unsupported {
+            feature: format!("physical Taylor equations for {}", self.name()),
+            location: None,
+        })
+    }
+
     /// Assemble the bias-linearized conductance and charge Jacobians for AC.
     /// Linear devices reuse their state-independent operators; nonlinear devices
     /// must explicitly implement this and must not provide a DC equivalent RHS.
@@ -958,6 +1546,13 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// checks succeeded and immediately before the histories are published.
     /// Never called for Newton trials or rejected steps.
     fn accept(&self, _context: &AcceptContext<'_>) {}
+
+    /// Opt in to exact transient event scheduling, using ordinary accepted
+    /// and tentative device state. No event queue is needed for devices
+    /// whose next event follows directly from their accepted state.
+    fn transient_events(&self) -> Option<&dyn DeviceTransientEvents> {
+        None
+    }
 
     /// An upper bound on the next transient step from this device's discrete
     /// state (C `DEVtrunc` of devices without charge storage, e.g.
@@ -1038,6 +1633,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Whether small-signal assembly requires the converged operating-point
+    /// trial state rather than the native reference's accepted history.
+    fn small_signal_uses_trial_state(&self) -> bool {
+        false
+    }
+
     /// The state slots C's `MODEINITSMSIG` load writes at the operating
     /// point that later analyses of the deck read back (C keeps one
     /// `CKTstate0` for the whole deck): `slots` is this device's window of
@@ -1077,6 +1678,67 @@ pub trait Device: fmt::Debug + std::any::Any {
             "src/spicelib/devices/<dev>/<dev>disto.c (DEVdisto)",
         ))
     }
+    /// Bind a numeric parameter to the device's immutable setter table.
+    fn bind_numeric_parameter(&self, name: &str) -> Option<crate::devices::sweep::ParameterKey> {
+        self.instance_parameter(name)
+            .map(crate::devices::sweep::ParameterKey::Native)
+    }
+
+    /// Name of a bound numeric setter for diagnostics and output labels.
+    fn numeric_parameter_name(&self, key: crate::devices::sweep::ParameterKey) -> Option<&str> {
+        match key {
+            crate::devices::sweep::ParameterKey::Native(name) => Some(name),
+            crate::devices::sweep::ParameterKey::Prepared(_) => None,
+        }
+    }
+
+    /// Dimensional transformation of a raw source setter. Effective device
+    /// replacements always consume physical values, never apply scale again.
+    fn parameter_geometry_scale(
+        &self,
+        _key: crate::devices::sweep::ParameterKey,
+    ) -> crate::devices::sweep::GeometryScale {
+        crate::devices::sweep::GeometryScale::Identity
+    }
+
+    /// Create an independent effective device with a previously bound setter.
+    /// # Errors
+    /// Foreign parameter or invalid physical input.
+    fn with_bound_parameter(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+        value: Real,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Box<dyn Device>> {
+        match key {
+            crate::devices::sweep::ParameterKey::Native(name) => {
+                self.with_instance_parameter(name, value, context)
+            }
+            crate::devices::sweep::ParameterKey::Prepared(_) => {
+                Err(SpiceError::circuit("foreign prepared parameter"))
+            }
+        }
+    }
+
+    /// Whether typed instance setters preserve the selected model declaration.
+    /// Model-backed devices opt in only when no setter can change model
+    /// selection (including binning). The candidate validator still checks
+    /// each replacement's physical validity, topology and state layout.
+    fn model_candidate_setters_are_stable(&self) -> bool {
+        false
+    }
+
+    /// Reprepare immutable context-dependent data at a context transition.
+    /// Ordinary native devices need no replacement.
+    /// # Errors
+    /// Invalid effective physical parameters.
+    fn reprepare_context(
+        &self,
+        _context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Option<Box<dyn Device>>> {
+        Ok(None)
+    }
+
     /// The canonical (lowercase, alias-folded) keyword of a settable real
     /// instance parameter that a `.dc @inst[param]` sweep may replace on this
     /// device (C `dctrcurv.c` `DCTfindInstParam`), or `None` (the default)
@@ -1128,6 +1790,52 @@ pub trait Device: fmt::Debug + std::any::Any {
             "",
         ))
     }
+}
+
+/// Converged trial data for a device-local, rollback-safe transient event.
+#[derive(Debug)]
+pub struct TransientEventContext<'a> {
+    /// Device-local state at the preceding accepted point.
+    pub accepted: &'a [Real],
+    /// Absolute candidate time.
+    pub time: Real,
+    /// The candidate solution.
+    pub solution: &'a Vector,
+    /// The circuit's ground-eliminated node numbering.
+    pub unknowns: &'a MnaUnknowns,
+}
+
+impl TransientEventContext<'_> {
+    /// Candidate node potential, zero at ground.
+    #[must_use]
+    pub fn voltage(&self, node: NodeId) -> Real {
+        self.unknowns
+            .node_row(node)
+            .and_then(|row| self.solution.get(row))
+            .unwrap_or(0.)
+    }
+}
+
+/// A device whose finite history directly determines future exact boundaries.
+/// Accepted state is read-only; probes cannot commit, queue or cancel events.
+pub trait DeviceTransientEvents {
+    /// The next boundary after the supplied accepted state, if any.
+    ///
+    /// # Errors
+    /// Invalid state or unrepresentable event time.
+    fn next_boundary(&self, accepted: &[Real]) -> SpiceResult<Option<Real>>;
+
+    /// Refine receiver state from the converged solution and optionally
+    /// request a retry at an interior crossing. Only candidate slots may
+    /// change; the Newton stamp must already satisfy its convergence test.
+    ///
+    /// # Errors
+    /// Invalid candidate physics, time or state.
+    fn refine_trial(
+        &self,
+        context: &TransientEventContext<'_>,
+        trial: &mut [Real],
+    ) -> SpiceResult<Option<Real>>;
 }
 
 /// What [`Device::timestep_limit`] sees for one converged trial step.

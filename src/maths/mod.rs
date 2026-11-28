@@ -21,6 +21,7 @@ pub use complex::{DynamicGroup, DynamicGroups};
 pub mod dense;
 pub mod dense_complex;
 pub mod equilibration;
+pub mod fft;
 pub mod integrator;
 pub mod linear;
 pub use linear::{
@@ -52,3 +53,47 @@ pub const C_REFERENCE_SPARSE: &str = "src/maths/sparse/ (SPARSE 1.3), src/maths/
 pub const C_REFERENCE_INTEGRATION: &str = "src/maths/ni/niinteg.c, src/maths/ni/nicomcof.c";
 
 pub mod polynomial;
+pub mod taylor;
+
+/// Nonnegative binary64 encodings preserve magnitude order. Keep the peak
+/// as an integer so hot stamp accumulation does not serialize FP additions
+/// with a floating-point max. The sentinel disables observation outside NI.
+#[derive(Debug, Clone, Copy)]
+struct StampPeak(u64);
+
+impl StampPeak {
+    const DISABLED: Self = Self(u64::MAX);
+    const EMPTY: Self = Self(0);
+
+    const fn enabled(self) -> bool {
+        self.0 != u64::MAX
+    }
+
+    #[inline]
+    const fn observe(&mut self, value: f64) {
+        let magnitude = value.to_bits() & i64::MAX.cast_unsigned();
+        if magnitude > self.0 {
+            self.0 = magnitude;
+        }
+    }
+
+    #[inline]
+    fn observe_batch<const N: usize>(&mut self, values: &[f64; N]) {
+        if self.enabled() {
+            // Include even ground entries omitted by the trace. Reduce a
+            // fixed-size batch in registers before touching the load peak.
+            let magnitude = values.iter().fold(0, |peak, value| {
+                peak.max(value.to_bits() & i64::MAX.cast_unsigned())
+            });
+            self.0 = self.0.max(magnitude);
+        }
+    }
+
+    fn value(self) -> f64 {
+        if self.enabled() {
+            f64::from_bits(self.0.min(f64::INFINITY.to_bits()))
+        } else {
+            0.
+        }
+    }
+}

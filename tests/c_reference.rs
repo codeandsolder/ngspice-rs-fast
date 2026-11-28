@@ -240,6 +240,7 @@ fn parsed_flags_and_ic_vectors_match_live_c_setter_order() {
                     }
                 }
                 ParameterKind::Waveform(_)
+                | ParameterKind::NumericVector(_)
                 | ParameterKind::Textual
                 | ParameterKind::Instance
                 | ParameterKind::Behavioural(_)
@@ -290,12 +291,12 @@ fn waveform_expectations(netlist: &Netlist) -> (BTreeMap<String, f64>, String) {
         let (function, fields): (f64, Vec<&str>) = match waveform {
             SourceWaveform::Pulse(p) => (
                 1.0,
-                std::iter::once(p.initial.text.as_str())
-                    .chain(std::iter::once(p.pulsed.text.as_str()))
+                std::iter::once(p.initial.source.text.as_str())
+                    .chain(std::iter::once(p.pulsed.source.text.as_str()))
                     .chain(
                         [&p.delay, &p.rise, &p.fall, &p.width, &p.period, &p.count]
                             .into_iter()
-                            .filter_map(|v| v.as_ref().map(|v| v.text.as_str())),
+                            .filter_map(|v| v.as_ref().map(|v| v.source.text.as_str())),
                     )
                     .collect(),
             ),
@@ -303,7 +304,7 @@ fn waveform_expectations(netlist: &Netlist) -> (BTreeMap<String, f64>, String) {
                 5.0,
                 points
                     .iter()
-                    .flat_map(|p| [p.time.text.as_str(), p.value.text.as_str()])
+                    .flat_map(|p| [p.time.source.text.as_str(), p.value.source.text.as_str()])
                     .collect(),
             ),
             SourceWaveform::Function(f) => (
@@ -313,7 +314,14 @@ fn waveform_expectations(netlist: &Netlist) -> (BTreeMap<String, f64>, String) {
                     SourceFunction::Sffm => 4.0,
                     SourceFunction::Am => 6.0,
                 },
-                f.values.iter().map(|v| v.text.as_str()).collect(),
+                f.values.iter().map(|v| v.source.text.as_str()).collect(),
+            ),
+            SourceWaveform::Stochastic { function, values } => (
+                match function {
+                    ngspice_rs::netlist::ast::StochasticFunction::Noise => 7.0,
+                    ngspice_rs::netlist::ast::StochasticFunction::Random => 8.0,
+                },
+                values.iter().map(|v| v.source.text.as_str()).collect(),
             ),
         };
         expected.insert(format!("@{}[function]", device.name), function);

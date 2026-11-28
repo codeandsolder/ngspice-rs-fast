@@ -349,15 +349,7 @@ impl StateHistory {
     /// to write one cannot have it committed.
     #[must_use = "the returned trial owns tentative state until the step is accepted"]
     pub fn trial(&self) -> TrialState {
-        TrialState {
-            topology: self.binding.as_ref().map(|binding| binding.topology),
-            revision: Arc::clone(&self.revision),
-            values: std::iter::repeat_n(Real::NAN, self.len).collect(),
-            mode: LoadMode::EXACT,
-            previous: None,
-            nonconvergent: false,
-            patches: State1Patches::default(),
-        }
+        self.trial_reusing(None)
     }
 
     /// A fresh trial for a Newton load in `phase`, seeing `previous` (the
@@ -374,18 +366,7 @@ impl StateHistory {
         phase: IterationPhase,
         previous: Option<&TrialState>,
     ) -> SpiceResult<TrialState> {
-        if let Some(previous) = previous {
-            self.check_trial(previous)?;
-        }
-        Ok(TrialState {
-            topology: self.binding.as_ref().map(|binding| binding.topology),
-            revision: Arc::clone(&self.revision),
-            values: std::iter::repeat_n(Real::NAN, self.len).collect(),
-            mode: LoadMode::newton(phase),
-            previous: previous.map(|previous| Arc::clone(&previous.values)),
-            nonconvergent: false,
-            patches: previous.map_or_default(|previous| previous.patches.clone()),
-        })
+        self.trial_in_reusing(phase, previous, None)
     }
 
     /// Reset a discarded Newton trial without borrowing or modifying any
@@ -406,8 +387,30 @@ impl StateHistory {
         if let Some(previous) = previous {
             self.check_trial(previous)?;
         }
+        Ok(self.recycle_trial(spare, LoadMode::newton(phase), previous))
+    }
+
+    /// Recycle an exact, independent evaluation trial without device limiting.
+    pub(crate) fn trial_reusing(&self, spare: Option<TrialState>) -> TrialState {
+        self.recycle_trial(spare, LoadMode::EXACT, None)
+    }
+
+    fn recycle_trial(
+        &self,
+        spare: Option<TrialState>,
+        mode: LoadMode,
+        previous: Option<&TrialState>,
+    ) -> TrialState {
         let Some(mut reused) = spare.filter(|spare| spare.values.len() == self.len) else {
-            return self.trial_in(phase, previous);
+            return TrialState {
+                topology: self.binding.as_ref().map(|binding| binding.topology),
+                revision: Arc::clone(&self.revision),
+                values: std::iter::repeat_n(Real::NAN, self.len).collect(),
+                mode,
+                previous: previous.map(|previous| Arc::clone(&previous.values)),
+                nonconvergent: false,
+                patches: previous.map_or_default(|previous| previous.patches.clone()),
+            };
         };
         // The previous accepted revision invalidates *read access* to this
         // trial's old data, but not reuse of uniquely owned raw storage.
@@ -420,12 +423,11 @@ impl StateHistory {
         }
         reused.topology = self.binding.as_ref().map(|binding| binding.topology);
         reused.revision = Arc::clone(&self.revision);
-        reused.mode = LoadMode::newton(phase);
+        reused.mode = mode;
         reused.previous = previous.map(|previous| Arc::clone(&previous.values));
         reused.nonconvergent = false;
-        reused.patches =
-            previous.map_or_else(State1Patches::default, |previous| previous.patches.clone());
-        Ok(reused)
+        reused.patches = previous.map_or_default(|previous| previous.patches.clone());
+        reused
     }
 
     /// Checks that `trial` could be committed.
@@ -500,6 +502,21 @@ impl StateHistory {
         Ok(())
     }
 
+    /// Re-anchor integration history at an accepted right-limit event.
+    /// No new physical point or device hook is published. Only the
+    /// pre-event integration stencil is discarded.
+    pub(crate) fn restart_integration(&mut self) -> SpiceResult<()> {
+        let latest = self
+            .accepted
+            .first()
+            .cloned()
+            .ok_or_else(|| state_error("cannot restart empty integration history"))?;
+        self.accepted.clear();
+        self.accepted.resize(ACCEPTED_DEPTH, latest);
+        self.revision = Arc::new(());
+        Ok(())
+    }
+
     /// Begin a new inner DC sweep from the state just accepted.
     pub(crate) fn retain_latest(&mut self) {
         self.accepted.truncate(1);
@@ -509,22 +526,41 @@ impl StateHistory {
         }
     }
 
-    /// Fill a constrained absolute UIC slot in the already loaded trial.
-    pub(crate) fn set_initial_slot(
+    /// Fill a verified absolute slot of a candidate point before acceptance.
+    pub(crate) fn set_candidate_slot(
         &self,
         trial: &mut TrialState,
         slot: usize,
         value: Real,
     ) -> SpiceResult<()> {
         self.check_trial(trial)?;
-        if !trial.initial_conditions() || self.depth() != 0 || !value.is_finite() {
-            return Err(state_error("invalid initial-state override"));
+        if !value.is_finite() {
+            return Err(state_error("invalid candidate-state override"));
         }
         let target = Arc::make_mut(&mut trial.values)
             .get_mut(slot)
             .ok_or_else(|| set_error(slot, value))?;
         *target = value;
         Ok(())
+    }
+
+    /// Edit only a verified device-local candidate window. Accepted history
+    /// remains immutable; a failed event probe discards this candidate.
+    pub(crate) fn edit_candidate<T>(
+        &self,
+        trial: &mut TrialState,
+        range: Range<usize>,
+        edit: impl FnOnce(&mut [Real]) -> SpiceResult<T>,
+    ) -> SpiceResult<T> {
+        self.check_trial(trial)?;
+        let slots = Arc::make_mut(&mut trial.values)
+            .get_mut(range)
+            .ok_or_else(|| state_error("invalid candidate event state range"))?;
+        let result = edit(slots)?;
+        if slots.iter().any(|value| !value.is_finite()) {
+            return Err(state_error("nonfinite candidate event state"));
+        }
+        Ok(result)
     }
 
     /// Forgets every accepted vector and delay sample, e.g. when a run
@@ -596,8 +632,7 @@ impl StateHistory {
         scratch.values.resize(range.len(), Real::NAN);
         scratch.values.fill(Real::NAN);
         scratch.nonconvergent = false;
-        scratch.patches =
-            previous.map_or_else(State1Patches::default, |trial| trial.patches.clone());
+        scratch.patches = previous.map_or_default(|trial| trial.patches.clone());
         let mut mode = LoadMode::newton(IterationPhase::Float);
         mode.set(LoadFlag::DeviceLimiting, false);
         let mut accepted = [&[][..]; ACCEPTED_DEPTH];

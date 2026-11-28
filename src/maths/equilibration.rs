@@ -775,7 +775,7 @@ impl EquilibratedDenseLu {
     }
 
     /// Immutable scaling metadata belonging to this factor snapshot.
-    #[must_use = "the scaling metadata belongs to this factor snapshot and must match its solves"]
+    #[must_use = "the scaling metadata belongs to this real factor snapshot and must match its solves"]
     pub const fn scaling(&self) -> &Equilibration {
         &self.scaling
     }

@@ -393,21 +393,24 @@ fn function_errors_are_explicit() {
     let e = scope_error(".func f(x) {x*k}\n.param k={f(1)}").to_string();
     assert!(e.contains("undefined parameter 'k'"), "{e}");
     // Excluded numparam built-ins without a .func are not yet ported.
-    let n = deck("r1 a 0 {agauss(1,2,3)}");
+    let n = deck("r1 a 0 {ternary_fcn(1,2,3)}");
     let e = literalize(&n).unwrap_err();
     assert!(e.is_not_yet_ported(), "{e}");
     assert!(e.to_string().contains("f.cir:2:9"), "{e}");
-    // Behavioural probe functions with no .func in scope: C rewrites such a
-    // device into a behavioural one, which is not ported.
-    for (body, at) in [
-        ("v1 1 0 dc 1\nr1 1 0 {1/i(v1)}", "f.cir:3:11"),
-        ("r1 1 0 {v(2)*2}", "f.cir:2:9"),
-        ("r1 1 0 {2*V(2)}", "f.cir:2:11"),
+    // Runtime probe functions are admitted as native passive laws.
+    for body in [
+        "v1 1 0 dc 1\nr1 1 0 {1/i(v1)}",
+        "r1 1 0 {v(2)*2}",
+        "r1 1 0 {2*V(2)}",
     ] {
-        let e = literalize(&deck(body)).unwrap_err();
-        assert!(e.is_not_yet_ported(), "{body}: {e}");
-        assert!(e.to_string().contains(at), "{body}: {e}");
-        assert!(e.to_string().contains("b_transformation_wanted"), "{e}");
+        let n = literalize(&deck(body)).unwrap();
+        assert!(
+            matches!(
+                n.netlist.devices.last().unwrap().parameters[0].kind,
+                ParameterKind::Behavioural(_)
+            ),
+            "{body}"
+        );
     }
     // ... but a .func named like one is an ordinary function.
     assert_eq!(probe(".func v(x) {x*3}", "v(2)"), 6.0);

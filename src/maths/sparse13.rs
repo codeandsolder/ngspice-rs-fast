@@ -317,6 +317,7 @@ trait RealGatherLane:
         + std::ops::BitOr<Output = Self::Valid>;
     fn broadcast(value: f64) -> Self;
     fn mask(value: bool) -> Self::Valid;
+    fn all(valid: Self::Valid) -> bool;
     fn zero(self) -> Self::Valid;
     fn normal(self) -> Self::Valid;
     fn finite(self) -> Self::Valid;
@@ -332,6 +333,9 @@ impl RealGatherLane for f64 {
     }
     fn mask(value: bool) -> bool {
         value
+    }
+    fn all(valid: bool) -> bool {
+        valid
     }
     fn zero(self) -> bool {
         self == 0.
@@ -360,6 +364,9 @@ impl RealGatherLane for f64x4 {
     }
     fn mask(value: bool) -> LaneMask {
         LaneMask::splat(value)
+    }
+    fn all(valid: LaneMask) -> bool {
+        valid.all()
     }
     fn zero(self) -> LaneMask {
         self.simd_eq(Self::splat(0.))
@@ -406,29 +413,81 @@ impl<V: RealGatherLane> RealGatherRow<V> {
         }
     }
 
-    fn subtract(&mut self, upper: f64, inverse: f64, solved: V) {
+    fn subtract<const TRACK_ERROR: bool>(&mut self, upper: f64, inverse: f64, solved: V) {
         if upper == 0. {
             return;
         }
         let coefficient = upper * inverse;
         let term = V::broadcast(coefficient) * solved;
-        self.valid =
-            self.valid & (solved.zero() | (V::mask(coefficient.is_normal()) & term.normal()));
-        let term = V::choose(solved.zero(), V::broadcast(0.), term);
-        self.value = V::choose(solved.zero(), self.value, self.value - term);
+        let zero = solved.zero();
+        self.valid = self.valid & (zero | (V::mask(coefficient.is_normal()) & term.normal()));
+        let term = V::choose(zero, V::broadcast(0.), term);
+        self.value = V::choose(zero, self.value, self.value - term);
         self.magnitude_sum = self.magnitude_sum + term.magnitude();
-        // Reciprocal, coefficient, term and accumulation rounding, with
-        // slack for the positive error-bound accumulation itself.
-        self.error = self.error + self.magnitude_sum * V::broadcast(4. * f64::EPSILON);
+        if TRACK_ERROR {
+            // Reciprocal, coefficient, term and accumulation rounding, with
+            // slack for the positive error-bound accumulation itself.
+            self.error = self.error + self.magnitude_sum * V::broadcast(4. * f64::EPSILON);
+        }
     }
 
-    fn finish(self) -> (V, V::Valid) {
+    fn accumulate<const TRACK_ERROR: bool>(
+        numerator: V,
+        inverse: f64,
+        terms: impl Iterator<Item = (f64, V)>,
+    ) -> Self {
+        let mut row = Self::new(numerator, inverse);
+        for (upper, solved) in terms {
+            row.subtract::<TRACK_ERROR>(upper, inverse, solved);
+        }
+        row
+    }
+
+    fn finish(self, error: V) -> (V, V::Valid) {
         let valid = self.valid
             & self.magnitude_sum.finite()
-            & self.error.finite()
+            & error.finite()
             & (self.value.normal() | self.value.zero())
-            & (self.magnitude_sum.zero() | self.value.magnitude().greater(self.error));
+            & (self.magnitude_sum.zero() | self.value.magnitude().greater(error));
         (self.value, valid)
+    }
+
+    fn precise(numerator: V, inverse: f64, terms: impl Iterator<Item = (f64, V)>) -> (V, V::Valid) {
+        let row = Self::accumulate::<true>(numerator, inverse, terms);
+        let error = row.error;
+        row.finish(error)
+    }
+
+    /// Sufficient certificate for the existing running error bound. The
+    /// rounded nonnegative magnitude prefixes never exceed the final sum S.
+    /// For a range-valid nonzero row S is normal. Each rounded old increment
+    /// is at most round(4*eps*S), even the initial 2*eps term. Rounding that
+    /// product upwards costs at most 1/8 relative error (including subnormal
+    /// products); summing at most 2^32 such terms adds less than 2^-20
+    /// relative error. The factor of two covers both and the final rounding
+    /// downwards, even at the minimum normal S. S=0 has exactly zero error.
+    ///
+    /// This bound is only a fast acceptance test, not a new fallback policy.
+    /// Replay the original running certificate if any lane is uncertain, so
+    /// normalized subtraction order, bits and raw-recovery decisions remain
+    /// unchanged. Short rows cannot amortize the additional certificate.
+    fn gather(
+        numerator: V,
+        inverse: f64,
+        terms: impl ExactSizeIterator<Item = (f64, V)> + Clone,
+    ) -> (V, V::Valid) {
+        if let Ok(count) = u32::try_from(terms.len())
+            && count > 1
+        {
+            let row = Self::accumulate::<false>(numerator, inverse, terms.clone());
+            let error =
+                row.magnitude_sum * V::broadcast(8. * f64::EPSILON * (f64::from(count) + 1.));
+            let candidate = row.finish(error);
+            if V::all(candidate.1) {
+                return candidate;
+            }
+        }
+        Self::precise(numerator, inverse, terms)
     }
 }
 
@@ -1051,12 +1110,11 @@ impl<I: PlanIndex> FactorRuns<I> {
             };
             for i in (1..=self.columns.runs.len()).rev() {
                 let inverse = inverses[i].real();
-                let mut row = RealGatherRow::new(x[i].real(), inverse);
-                for entry in axis.after_diagonal(i) {
+                let terms = axis.after_diagonal(i).iter().map(|entry| {
                     let (handle, col) = entry.indices();
-                    row.subtract(values[handle].real(), inverse, x[col].real());
-                }
-                let (value, valid) = row.finish();
+                    (values[handle].real(), x[col].real())
+                });
+                let (value, valid) = RealGatherRow::gather(x[i].real(), inverse, terms);
                 if !valid {
                     return false;
                 }
@@ -1103,12 +1161,11 @@ impl<I: PlanIndex> FactorRuns<I> {
             let mut valid = LaneMask::splat(true);
             for i in (1..=size).rev() {
                 let inverse = inverses[i].real();
-                let mut row = RealGatherRow::new(work.real[i], inverse);
-                for entry in gather.after_diagonal(i) {
+                let terms = gather.after_diagonal(i).iter().map(|entry| {
                     let (handle, col) = entry.indices();
-                    row.subtract(values[handle].real(), inverse, work.real[col]);
-                }
-                let (value, row_valid) = row.finish();
+                    (values[handle].real(), work.real[col])
+                });
+                let (value, row_valid) = RealGatherRow::gather(work.real[i], inverse, terms);
                 work.real[i] = value;
                 valid &= row_valid;
             }
@@ -5255,6 +5312,11 @@ mod tests {
         assert_eq!(m.untranslated().collect::<Vec<_>>(), [2]);
         m.mna_preorder();
         assert_eq!(m.order_and_factor(1e-3, 1e-13), Status::Okay);
+        // The raw SPARSE port retains this distinction; the public circuit
+        // factorization boundary rejects the unconstrained unknown.
+        let stats = m.storage();
+        assert_eq!((stats.external_order, stats.translated_order), (3, 2));
+        assert_eq!((stats.original_entries, stats.factor_entries), (4, 4));
         let x = m.solve(&[3.0, 7.5, 5.0]);
         assert_eq!(x[1], 7.5);
         assert!((2.0 * x[0] + x[2] - 3.0).abs() < 1e-15 && (x[0] + 4.0 * x[2] - 5.0).abs() < 1e-15);
@@ -5280,23 +5342,97 @@ mod tests {
     fn normalized_gather_guard_is_lane_local() {
         let numerators = [6., 3., -0., f64::MIN_POSITIVE];
         let solutions = [1., 1., 0., 0.];
-        let mut tile = RealGatherRow::new(f64x4::from_array(numerators), 0.5);
-        tile.subtract(3., 0.5, f64x4::from_array(solutions));
-        let (values, valid) = tile.finish();
+        let (values, valid) = RealGatherRow::gather(
+            f64x4::from_array(numerators),
+            0.5,
+            [(3., f64x4::from_array(solutions)), (0., f64x4::splat(1.))].into_iter(),
+        );
         assert_eq!(valid.to_array(), [true, false, true, false]);
         for i in 0..4 {
-            let mut row = RealGatherRow::new(numerators[i], 0.5);
-            row.subtract(3., 0.5, solutions[i]);
-            let (value, scalar_valid) = row.finish();
+            let (value, scalar_valid) = RealGatherRow::gather(
+                numerators[i],
+                0.5,
+                [(3., solutions[i]), (0., 1.)].into_iter(),
+            );
             assert_eq!(valid.test(i), scalar_valid);
             assert_eq!(values[i].to_bits(), value.to_bits());
         }
-        let mut row = RealGatherRow::new(1., 2.);
-        row.subtract(f64::MAX, 2., 0.5);
-        assert!(!row.finish().1);
-        let mut row = RealGatherRow::new(1., 0.5);
-        row.subtract(f64::MIN_POSITIVE, 0.5, 1.);
-        assert!(!row.finish().1);
+        assert!(!RealGatherRow::gather(1., 2., [(f64::MAX, 0.5), (0., 1.)].into_iter()).1);
+        assert!(!RealGatherRow::gather(1., 0.5, [(f64::MIN_POSITIVE, 1.), (0., 1.)].into_iter()).1);
+    }
+
+    #[test]
+    fn coarse_gather_certificate_preserves_precise_decisions() {
+        // A row that the coarse bound cannot certify but the old running
+        // certificate accepts must retain its normalized result, not fall
+        // back to raw scatter.
+        let terms = [(1., 1. - 32. * f64::EPSILON), (1., 0.)];
+        let old = RealGatherRow::precise(1., 1., terms.into_iter());
+        assert!(old.1);
+        let coarse = RealGatherRow::accumulate::<false>(1., 1., terms.into_iter());
+        let bound = coarse.magnitude_sum * (24. * f64::EPSILON);
+        assert!(!coarse.finish(bound).1);
+        assert_eq!(RealGatherRow::gather(1., 1., terms.into_iter()), old);
+
+        let mut seed = 0xc0a5_0a1e_f1ed_3b17_u64;
+        let mut random = |wide: bool| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            if wide {
+                // Include subnormal values and the full finite exponent
+                // range, including overflow/underflow in products.
+                let value = f64::from_bits(seed);
+                if value.is_finite() {
+                    value
+                } else {
+                    f64::from_bits(seed & !(1_u64 << 52))
+                }
+            } else {
+                f64::from(u32::try_from(seed >> 32).unwrap()) / 2_147_483_648. - 1.
+            }
+        };
+        for length in [0, 1, 2, 3, 8, 31, 128, 1024] {
+            for trial in 0..64 {
+                let wide = trial % 2 == 0;
+                let inverse = random(wide);
+                let numerator = std::array::from_fn(|_| random(wide));
+                let terms: Vec<_> = (0..length)
+                    .map(|index| {
+                        let upper = if index % 7 == 0 { 0. } else { random(wide) };
+                        let solved = std::array::from_fn(|lane| {
+                            if (index + lane) % 11 == 0 {
+                                -0.
+                            } else {
+                                random(wide)
+                            }
+                        });
+                        (upper, f64x4::from_array(solved))
+                    })
+                    .collect();
+                let tile = f64x4::from_array(numerator);
+                let (actual, valid) = RealGatherRow::gather(tile, inverse, terms.iter().copied());
+                let (expected, old_valid) =
+                    RealGatherRow::precise(tile, inverse, terms.iter().copied());
+                assert_eq!(valid, old_valid);
+                for lane in 0..RHS_BATCH_WIDTH {
+                    let scalar_terms = terms.iter().map(|(u, x)| (*u, x[lane]));
+                    let (scalar, scalar_valid) =
+                        RealGatherRow::gather(numerator[lane], inverse, scalar_terms.clone());
+                    let (old_scalar, old_scalar_valid) =
+                        RealGatherRow::precise(numerator[lane], inverse, scalar_terms);
+                    assert_eq!(scalar_valid, old_scalar_valid);
+                    assert_eq!(valid.test(lane), scalar_valid);
+                    for (a, b) in [
+                        (actual[lane], expected[lane]),
+                        (scalar, old_scalar),
+                        (actual[lane], scalar),
+                    ] {
+                        assert!(a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

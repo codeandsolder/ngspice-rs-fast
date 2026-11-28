@@ -16,7 +16,7 @@
 use ngspice_conformance::fixtures::DeckInputs;
 use ngspice_conformance::ngspice::Scratch;
 use ngspice_conformance::process::{ProcessLimits, run};
-use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig};
+use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
@@ -68,9 +68,7 @@ fn run_rust(deck: &str) -> Plot {
     let config = RunConfig::from_netlist(&netlist).unwrap();
     let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    request
-        .run(&mut circuit, &AnalysisContext::default())
-        .unwrap()
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 
 /// Compares `vectors` on `0, grid, 2 grid, ... , stop` plus `breakpoints`.
@@ -228,4 +226,23 @@ fn conformance_rc_transient_matches_c() {
         &[1e-9],
         &["v(in)", "v(out)", "i(v1)"],
     );
+}
+
+#[test]
+#[ignore = "requires NGSPICE_BIN; compares native diode soft recovery against live C"]
+fn diode_soft_recovery_matches_c() {
+    for method in ["trap", "gear"] {
+        for (vp, temp) in [(0., 27.), (0.01, 27.), (0.05, 27.), (0.05, 77.)] {
+            compare(
+                &format!("diode-recovery-{method}-{vp}-{temp}"),
+                &DeckInputs::same(&format!(
+                    "recovery\nv1 a 0 pulse(1 -1 20n 1n 1n 2u 5u)\nr1 a d 10\nd1 d 0 dm\n.model dm d(is=1e-14 tt=100n cjo=1p vp={vp} ttt1=0.003)\n.options method={method} temp={temp}\n.tran 100p 100n 0 100p\n.end\n"
+                )),
+                100e-12,
+                100e-9,
+                &[20e-9, 21e-9],
+                &["v(d)", "i(v1)"],
+            );
+        }
+    }
 }

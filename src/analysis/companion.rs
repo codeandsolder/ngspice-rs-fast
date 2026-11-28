@@ -90,6 +90,9 @@
 //! (see `docs/port/DC_CONTINUATION.md`). `xmu=` is the trapezoidal weighting of
 //! `nicomcof.c` (default 0.5).
 
+mod branch_events;
+
+use crate::devices::physical_dae::BranchTrace;
 use crate::devices::{
     AnalysisMode, BreakTable, Circuit, Forcing, LinearSystem, LoadRequest, SourceBreaks,
     SourceKind, TransientTiming, TrialState,
@@ -118,6 +121,14 @@ pub struct TransientStats {
     pub max_step: Real,
     /// Observed transient-attempt and LTRA preparation work.
     pub ltra: crate::devices::ltra::LtraWork,
+    /// Probes of opt-in device-local event sources at accepted states.
+    pub device_event_boundary_probes: usize,
+    /// Converged candidate probes of opt-in device event sources.
+    pub device_event_trial_probes: usize,
+    /// Rejected trials localized to a device crossing.
+    pub device_event_retries: usize,
+    /// Accepted landings on previously scheduled device boundaries.
+    pub device_event_landings: usize,
 }
 
 /// Convergence and truncation tolerances. `vntol` applies to node voltages and
@@ -139,6 +150,8 @@ pub struct TransientPlan {
     stop: Real,
     start: Real,
     max_step: Real,
+    minbreak: Real,
+    voltage_lte: Option<crate::analysis::plan::VoltageLte>,
     method: IntegrationMethod,
     max_order: u8,
     tolerances: Tolerances,
@@ -198,6 +211,8 @@ impl TransientPlan {
             stop: end_time,
             start: start_time,
             max_step,
+            minbreak: options.minbreak,
+            voltage_lte: options.voltage_lte,
             method: options.method,
             max_order: options.max_order,
             tolerances: Tolerances {
@@ -285,6 +300,16 @@ impl TransientPlan {
         self.over_duration(period)
     }
 
+    /// Resolved analog breakpoint merge distance (C `CKTminBreak`).
+    #[must_use = "the returned interval determines analog breakpoint coalescing"]
+    pub fn min_break(&self) -> Real {
+        if self.minbreak == 0. {
+            10. * self.min_step()
+        } else {
+            self.minbreak
+        }
+    }
+
     /// C `CKTdelmin`.
     fn min_step(&self) -> Real {
         1e-11 * self.max_step
@@ -298,11 +323,15 @@ fn failure(message: impl Into<String>) -> SpiceError {
     }
 }
 
+struct TrialPoint {
+    x: Vector,
+    state: TrialState,
+    guards: BranchTrace,
+    order_hint: usize,
+}
+
 enum Trial {
-    Converged {
-        x: Vector,
-        state: TrialState,
-    },
+    Converged(TrialPoint),
     /// The iteration limit was reached; `last` is the iterate of the final
     /// load (C's `CKTrhsOld`, the next trial's starting point).
     NotConverged {
@@ -366,6 +395,7 @@ struct NextStep {
     order: Order,
 }
 
+#[derive(Clone, Copy)]
 struct StepClock {
     time: Real,
     next: NextStep,
@@ -378,15 +408,19 @@ struct AcceptedCursor {
     boundary: Boundary,
 }
 
+#[derive(Clone, Copy)]
 struct ReadyStep {
     clock: StepClock,
     boundary: Boundary,
+    event_landing: Option<Real>,
+    probe_landing: Option<Real>,
 }
 
 struct AttemptedStep {
     clock: StepClock,
     boundary: Boundary,
     coefficients: Coefficients,
+    event_start: Option<Real>,
 }
 
 #[derive(PartialEq, Debug)]
@@ -456,7 +490,12 @@ impl AcceptedCursor {
             clock.save_delta = clock.next.delta;
             clock.next.delta = (breaks.first() - clock.time) / 2.0;
         }
-        Ok(ReadyStep { clock, boundary })
+        Ok(ReadyStep {
+            clock,
+            boundary,
+            event_landing: None,
+            probe_landing: None,
+        })
     }
 }
 
@@ -476,9 +515,33 @@ impl ReadyStep {
         }
     }
 
+    /// A digital or DAC-ramp boundary is not merged into the analog source
+    /// breakpoint table: distinct physical event times must not be lost to
+    /// its `CKTminBreak` coalescing policy.
+    fn limit_to_event(&mut self, at: Real) {
+        let distance = at - self.clock.time;
+        if distance > 0. && self.end_time() >= at {
+            if self.clock.next.delta > distance {
+                self.clock.save_delta = self.clock.next.delta;
+            }
+            self.clock.next.delta = distance;
+            self.boundary = Boundary::Forced;
+            self.event_landing = Some(at);
+            self.probe_landing = None;
+        }
+    }
+
+    fn end_time(&self) -> Real {
+        self.event_landing
+            .or(self.probe_landing)
+            .unwrap_or(self.clock.time + self.clock.next.delta)
+    }
+
     fn begin(self, steps: &StepHistory, settings: &TransientPlan) -> SpiceResult<AttemptedStep> {
+        let end = self.end_time();
         let mut clock = self.clock;
-        clock.time += clock.next.delta;
+        let event_start = self.event_landing.map(|_| clock.time);
+        clock.time = end;
         let coefficients = steps.trial(
             settings.method,
             clock.next.order.number(),
@@ -489,6 +552,7 @@ impl ReadyStep {
             clock,
             boundary: self.boundary,
             coefficients,
+            event_start,
         })
     }
 }
@@ -498,7 +562,7 @@ impl AttemptedStep {
         let mut clock = self.clock;
         // C adds then subtracts; restoring the previous accepted time would
         // change rounding. Only this retry cursor, never the history, moves.
-        clock.time -= clock.next.delta;
+        clock.time = self.event_start.unwrap_or(clock.time - clock.next.delta);
         if next.delta <= min_step {
             if clock.next.delta > min_step {
                 next.delta = min_step;
@@ -513,12 +577,17 @@ impl AttemptedStep {
         Ok(ReadyStep {
             clock,
             boundary: self.boundary.retry(),
+            event_landing: None,
+            probe_landing: None,
         })
     }
 
-    const fn accept(self, next: NextStep) -> AcceptedCursor {
+    const fn accept(self, mut next: NextStep) -> AcceptedCursor {
         let mut clock = self.clock;
         clock.phase = Phase::Continuing;
+        if self.event_start.is_some() {
+            next.order = Order::One;
+        }
         clock.next = next;
         AcceptedCursor {
             clock,
@@ -534,7 +603,7 @@ impl AttemptedStep {
         mut truncate: impl FnMut(&Coefficients) -> SpiceResult<Real>,
     ) -> SpiceResult<StepDecision> {
         let mut next = self.clock.next;
-        if self.clock.phase == Phase::First {
+        if self.clock.phase == Phase::First || steps.is_empty() {
             return Ok(StepDecision::Accept(next));
         }
         let delta = next.delta;
@@ -542,7 +611,10 @@ impl AttemptedStep {
         if next.delta > 0.9 * delta {
             // dctran.c never raises above order 2. Keep the probed timestep
             // even when the order-2 probe does not justify raising the order.
-            if next.order == Order::One && settings.max_order > 1 {
+            if next.order == Order::One
+                && settings.max_order > 1
+                && steps.available_order(settings.method) >= 2
+            {
                 let probe = steps.trial(settings.method, 2, delta, settings.xmu)?;
                 next.order = Order::Two;
                 next.delta = (2. * delta).min(truncate(&probe)?);
@@ -597,6 +669,27 @@ impl SampleGrid {
     }
 }
 
+#[derive(Clone, Copy)]
+struct OutputSelection<'a> {
+    sample_at: Option<Real>,
+    capture_boundary: bool,
+    selected: Option<&'a [usize]>,
+}
+
+struct CandidateOutput {
+    observed: Option<Vec<Complex>>,
+    periodic_boundary: Option<Box<PeriodicBoundary>>,
+}
+
+/// Converged point with all fallible observations and mixed-domain
+/// preparation complete, ready to publish after releasing trial borrows.
+struct AcceptedCandidate {
+    output: CandidateOutput,
+    mixed: Option<super::digital::MixedPoint>,
+    solution: Vector,
+    state: TrialState,
+}
+
 struct AcceptedPoint {
     cursor: AcceptedCursor,
     solution: Vector,
@@ -609,6 +702,98 @@ struct AcceptedPoint {
 enum Acceptance<'a> {
     Initial,
     Step(&'a AttemptedStep),
+}
+
+struct TruncationDevice {
+    rows: std::ops::Range<usize>,
+    slots: Vec<TruncationSlot>,
+}
+
+struct TruncationSlot {
+    base: usize,
+    explicit_derivative: bool,
+    derived: bool,
+}
+
+/// Accepted voltage history used only when newtrunc is requested. Rejected
+/// trials never enter this history. Breakpoint landings start a new predictor
+/// epoch; an algebraic jump must not force an arbitrarily small next step.
+struct VoltageHistory {
+    options: crate::analysis::plan::VoltageLte,
+    rows: Vec<usize>,
+    accepted: std::collections::VecDeque<Vector>,
+}
+
+impl VoltageHistory {
+    fn new(circuit: &Circuit, options: crate::analysis::plan::VoltageLte) -> Self {
+        let rows = circuit
+            .physical_voltage_nodes()
+            .filter_map(|node| circuit.unknowns().node_row(node.id))
+            .collect();
+        Self {
+            options,
+            rows,
+            accepted: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn accept(&mut self, solution: &Vector, acceptance: Acceptance<'_>) {
+        if matches!(acceptance, Acceptance::Step(attempt) if attempt.boundary == Boundary::Forced) {
+            self.accepted.clear();
+            return;
+        }
+        self.accepted.push_front(solution.clone());
+        self.accepted
+            .truncate(usize::from(IntegrationMethod::MAX_GEAR_ORDER) + 1);
+    }
+
+    fn limit(&self, coefficients: &Coefficients, solution: &Vector) -> SpiceResult<Real> {
+        let order = usize::from(coefficients.order());
+        if self.accepted.len() <= order {
+            return Ok(Real::INFINITY);
+        }
+        let dt = coefficients.dt();
+        let (multiplier, exponent) = match coefficients.method() {
+            IntegrationMethod::Trapezoidal => (2., 1. / Real::from(coefficients.order())),
+            IntegrationMethod::Gear { .. } => {
+                let mut ratio = 0.;
+                for age in 0..=order {
+                    ratio += coefficients
+                        .delta_old(age)
+                        .ok_or_else(|| failure("voltage predictor step history is too short"))?
+                        / dt;
+                }
+                (ratio, 1. / (Real::from(coefficients.order()) + 1.))
+            }
+        };
+        let mut bound = Real::INFINITY;
+        for &row in &self.rows {
+            let mut past = [0.; IntegrationMethod::MAX_GEAR_ORDER as usize + 1];
+            for (value, accepted) in past.iter_mut().zip(&self.accepted) {
+                *value = accepted.as_slice()[row];
+            }
+            let predicted = coefficients.predict(&past[..=order])?;
+            let corrected = solution.as_slice()[row];
+            let error = (corrected - predicted).abs();
+            if error > 0. {
+                let tolerance = self
+                    .options
+                    .relative
+                    .mul_add(corrected.abs().max(predicted.abs()), self.options.absolute);
+                // C CKTtrunc's predictor/corrector voltage bound. Evaluate
+                // the ratio before multiplying by dt; an unbounded proposal
+                // is harmless because the driver already caps growth.
+                let ratio = (tolerance / error) * self.options.factor * multiplier;
+                bound = bound.min(dt * ratio.powf(exponent));
+            }
+        }
+        Ok(bound)
+    }
+}
+
+struct EventDevice<'a> {
+    source: &'a dyn crate::devices::traits::DeviceTransientEvents,
+    rows: std::ops::Range<usize>,
 }
 
 struct Driver<'a> {
@@ -630,11 +815,18 @@ struct Driver<'a> {
     limited_rows: Option<Vec<bool>>,
     /// Each device's state rows and the absolute state index of every
     /// charge it hands `CKTterr` (`truncation_slots`), fixed for the run.
-    truncation: Vec<(std::ops::Range<usize>, Vec<usize>)>,
+    truncation: Vec<TruncationDevice>,
+    event_devices: Vec<EventDevice<'a>>,
+    voltage_history: Option<VoltageHistory>,
     stats: TransientStats,
     /// Reuse the ordinary Newton MNA/RHS/trial storage across timepoint
     /// acceptance and rejected smaller-step retries.
     workspace: crate::analysis::newton::CircuitNewtonWorkspace,
+    mixed: Option<&'a mut super::digital::MixedSignal>,
+    index_aware: bool,
+    derivative_order: usize,
+    physical_events: Option<std::iter::Peekable<crate::devices::SystemBreakpoints>>,
+    accepted_guards: BranchTrace,
 }
 
 /// Runs an ordinary `.tran` with the companion backend, returning the plot and
@@ -697,6 +889,61 @@ pub fn companion_transient_into(
         TransientRun::Ordinary,
         sink,
     )?;
+    circuit.record_final_transient_state(&result.history)?;
+    Ok(result.stats)
+}
+
+/// Run a typed mixed-signal transient using the ordinary companion solver.
+/// Digital model state is settled outside Newton iterations, and DAC output
+/// ramps are read-only during each analog attempt.
+///
+/// # Errors
+/// The ordinary transient errors, invalid mixed-signal bindings, unsupported
+/// UIC initialization, or an exceeded digital event/initialization budget.
+pub fn mixed_signal_transient(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    mixed: &mut super::digital::MixedSignal,
+) -> SpiceResult<(Plot, TransientStats)> {
+    let mut collector = super::results::PlotCollector::default();
+    let stats = mixed_signal_transient_into(circuit, request, context, mixed, &mut collector)?;
+    let plot = collector
+        .finish(1)?
+        .pop()
+        .ok_or_else(|| super::results::lifecycle_error("mixed transient returned no plot"))?;
+    Ok((plot, stats))
+}
+
+/// Streaming form of [`mixed_signal_transient`].
+///
+/// # Errors
+/// As [`mixed_signal_transient`], and any sink failure.
+pub fn mixed_signal_transient_into(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    mixed: &mut super::digital::MixedSignal,
+    sink: &mut dyn PointSink,
+) -> SpiceResult<TransientStats> {
+    let settings = *request
+        .transient()
+        .ok_or_else(|| unsupported("mixed signal requires a transient plan"))?;
+    if request.uic() {
+        return Err(unsupported("mixed-signal UIC initialization"));
+    }
+    mixed.activate(circuit)?;
+    let result = run_transient_inner(
+        circuit,
+        request,
+        context,
+        settings,
+        TransientRun::Ordinary,
+        sink,
+        Some(mixed),
+    );
+    mixed.deactivate();
+    let result = result?;
     circuit.record_final_transient_state(&result.history)?;
     Ok(result.stats)
 }
@@ -791,6 +1038,63 @@ pub(super) fn run_transient(
     purpose: TransientRun<'_>,
     sink: &mut dyn PointSink,
 ) -> SpiceResult<TransientEnd> {
+    run_transient_inner(circuit, request, context, settings, purpose, sink, None)
+}
+
+fn truncation_devices(circuit: &Circuit) -> SpiceResult<Vec<TruncationDevice>> {
+    circuit
+        .devices()
+        .iter()
+        .enumerate()
+        .map(|(index, device)| {
+            let rows = circuit
+                .state_rows(index)
+                .ok_or_else(|| failure("missing state range"))?;
+            let bases = device
+                .truncation_slots()
+                .into_iter()
+                .map(|slot| TruncationSlot {
+                    base: rows.start + slot,
+                    explicit_derivative: device
+                        .initial_expression_storage()
+                        .is_some_and(|storage| storage.slot == slot),
+                    derived: device.initial_expression_storage().is_some_and(|storage| {
+                        storage.slot == slot
+                            && storage.policy == crate::devices::InitialStoragePolicy::Derived
+                    }),
+                })
+                .collect();
+            Ok(TruncationDevice { rows, slots: bases })
+        })
+        .collect()
+}
+
+fn event_devices(circuit: &Circuit) -> SpiceResult<Vec<EventDevice<'_>>> {
+    circuit
+        .devices()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, device)| device.transient_events().map(|source| (index, source)))
+        .map(|(index, source)| {
+            Ok(EventDevice {
+                source,
+                rows: circuit
+                    .state_rows(index)
+                    .ok_or_else(|| failure("missing event device state range"))?,
+            })
+        })
+        .collect()
+}
+
+fn run_transient_inner(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    settings: TransientPlan,
+    purpose: TransientRun<'_>,
+    sink: &mut dyn PointSink,
+    mixed: Option<&mut super::digital::MixedSignal>,
+) -> SpiceResult<TransientEnd> {
     let bias = request.dc_settings().clone();
     let uic = request.uic() && !matches!(purpose, TransientRun::Shooting { .. });
     if uic && let Some(line) = circuit.devices().iter().find(|d| d.delay_line().is_some()) {
@@ -811,13 +1115,15 @@ pub(super) fn run_transient(
             reference,
         ));
     }
-    // Unknown/ground nodes in .ic/.nodeset fail before anything is assembled.
+    // Resolve row-indexed hints only after topology changes have been finalized.
+    circuit.finalize()?;
     let hints = initial::resolve(circuit, request)?;
     let model_context = context.model_context();
-    circuit.finalize()?;
     let nonlinear = circuit.devices().iter().any(|d| d.is_nonlinear());
     let mut system = if nonlinear {
-        circuit.small_signal_system(&model_context, &Vector::zeros(circuit.unknown_count()))?
+        circuit
+            .prepare_run()
+            .transient_forcing_system(&model_context)?
     } else {
         circuit.linear_system_with_context(&model_context)?
     };
@@ -849,22 +1155,17 @@ pub(super) fn run_transient(
     let circuit: &Circuit = circuit;
     let branch_row = crate::analysis::bias::branch_rows(circuit);
     let limited_rows = crate::analysis::bias::limited_rows(circuit);
-    let truncation = circuit
-        .devices()
-        .iter()
-        .enumerate()
-        .map(|(index, device)| {
-            let rows = circuit
-                .state_rows(index)
-                .ok_or_else(|| failure("missing state range"))?;
-            let bases = device
-                .truncation_slots()
-                .into_iter()
-                .map(|slot| rows.start + slot)
-                .collect();
-            Ok((rows, bases))
+    let truncation = truncation_devices(circuit)?;
+    let event_devices = event_devices(circuit)?;
+    // A timed receiver must not miss a whole pulse because the ordinary
+    // analog breakpoint table coalesced its two known source corners.
+    let physical_events = (!event_devices.is_empty())
+        .then(|| {
+            system
+                .breakpoints_in(0., settings.stop)
+                .map(Iterator::peekable)
         })
-        .collect::<SpiceResult<_>>()?;
+        .transpose()?;
     let driver = Driver {
         circuit,
         prepared: circuit.prepare_run(),
@@ -880,8 +1181,17 @@ pub(super) fn run_transient(
         branch_row,
         limited_rows,
         truncation,
+        event_devices,
+        voltage_history: settings
+            .voltage_lte
+            .map(|options| VoltageHistory::new(circuit, options)),
         stats: TransientStats::default(),
         workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
+        mixed,
+        index_aware: false,
+        derivative_order: 2,
+        physical_events,
+        accepted_guards: BranchTrace::default(),
     };
     driver.run(purpose, sink)
 }
@@ -892,6 +1202,15 @@ impl Driver<'_> {
         solution: &Vector,
         selected: Option<&[usize]>,
     ) -> SpiceResult<Vec<Complex>> {
+        if self.index_aware {
+            return self.observe_derivative_point(
+                solution,
+                None,
+                0.,
+                crate::devices::Limit::Right,
+                selected,
+            );
+        }
         let request = LoadRequest {
             mode: AnalysisMode::OperatingPoint,
             solution,
@@ -916,6 +1235,43 @@ impl Driver<'_> {
         )
     }
 
+    fn observe_derivative_point(
+        &self,
+        solution: &Vector,
+        state: Option<&TrialState>,
+        time: Real,
+        limit: crate::devices::Limit,
+        selected: Option<&[usize]>,
+    ) -> SpiceResult<Vec<Complex>> {
+        let forcing = Forcing {
+            limit,
+            timing: self.timing,
+        };
+        let request = LoadRequest {
+            mode: AnalysisMode::Instantaneous { time },
+            solution,
+            model_context: &self.model_context,
+            integration: None,
+            history: &self.history,
+            forcing: Some(forcing),
+        };
+        selected.map_or_else(
+            || {
+                self.prepared
+                    .observe_real(&request, &[], Some((time, forcing)), state)
+            },
+            |indices| {
+                self.prepared.observe_real_selected(
+                    &request,
+                    &[],
+                    Some((time, forcing)),
+                    state,
+                    indices,
+                )
+            },
+        )
+    }
+
     fn run(
         mut self,
         purpose: TransientRun<'_>,
@@ -923,8 +1279,7 @@ impl Driver<'_> {
     ) -> SpiceResult<TransientEnd> {
         let TransientPlan { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
-        let min_step = self.settings.min_step();
-        let mut breaks = BreakTable::new(stop, 10.0 * min_step)?;
+        let mut breaks = BreakTable::new(stop, self.settings.min_break())?;
         let mut sources = SourceBreaks::new(self.system);
         let (name, title) = match purpose {
             TransientRun::Ordinary | TransientRun::Seed => ("tran1", "Transient Analysis"),
@@ -983,7 +1338,8 @@ impl Driver<'_> {
                     &mut point,
                 )?;
             }
-            if almost_equal_ulps(accepted.cursor.clock.time, stop, 100) {
+            let exact_stop = self.physical_events.is_some() || sources.has_exact();
+            if (exact_stop && time >= stop) || (!exact_stop && almost_equal_ulps(time, stop, 100)) {
                 break;
             }
             let AcceptedPoint {
@@ -997,14 +1353,17 @@ impl Driver<'_> {
             if let Some(at) = next_sample {
                 ready.limit_to_sample(at);
             }
+            self.limit_source_step(&mut ready, &sources, time)?;
             accepted = self.advance(
                 ready,
                 solution,
-                next_sample,
-                capture_boundary,
-                selected
-                    .as_ref()
-                    .map(crate::analysis::results::SelectedOutput::observations),
+                OutputSelection {
+                    sample_at: next_sample,
+                    capture_boundary,
+                    selected: selected
+                        .as_ref()
+                        .map(crate::analysis::results::SelectedOutput::observations),
+                },
             )?;
         }
         sink.end()?;
@@ -1066,8 +1425,9 @@ impl Driver<'_> {
                 .history
                 .accepted(1)
                 .ok_or_else(|| failure("periodic charge history is empty"))?;
-            for (_, slots) in &self.truncation {
-                for &slot in slots {
+            for TruncationDevice { slots, .. } in &self.truncation {
+                for TruncationSlot { base: slot, .. } in slots {
+                    let slot = *slot;
                     scales[slot] = scales[slot].max(state[slot].abs());
                 }
             }
@@ -1138,24 +1498,244 @@ impl Driver<'_> {
         })
     }
 
+    fn limit_source_step(
+        &self,
+        ready: &mut ReadyStep,
+        sources: &SourceBreaks<'_>,
+        time: Real,
+    ) -> SpiceResult<()> {
+        self.limit_mixed_step(ready, time)?;
+        // The derivative solver's merged iterator already contains
+        // every native and prepared event. Do not schedule it twice.
+        if !self.index_aware
+            && let Some(at) = sources.next_exact(time, self.settings.stop)?
+        {
+            ready.limit_to_event(at);
+        }
+        Ok(())
+    }
+
+    fn limit_mixed_step(&self, ready: &mut ReadyStep, time: Real) -> SpiceResult<()> {
+        if let Some(mixed) = self.mixed.as_deref() {
+            if mixed.boundary() && time > 0. {
+                ready.clock.next.order = Order::One;
+                ready.clock.next.delta = ready.clock.next.delta.min(0.1 * ready.clock.save_delta);
+            }
+            if let Some(at) = mixed.next_ramp_boundary(time)? {
+                ready.limit_to_event(at);
+            }
+        }
+        Ok(())
+    }
+
+    fn mixed_retry(
+        &self,
+        attempt: &AttemptedStep,
+        solution: &Vector,
+    ) -> SpiceResult<Option<NextStep>> {
+        let Some(mixed) = self.mixed.as_deref() else {
+            return Ok(None);
+        };
+        let time = attempt.clock.time;
+        let min_step = self.settings.min_step();
+        if let Some(at) = mixed.first_crossing(self.circuit, solution, time)?
+            && time - at > min_step
+        {
+            let start = attempt
+                .event_start
+                .unwrap_or(time - attempt.clock.next.delta);
+            let delta = (at - start).max(min_step).max(start.next_up() - start);
+            if delta < attempt.clock.next.delta {
+                return Ok(Some(NextStep {
+                    delta,
+                    order: Order::One,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Cold-indexed event sources probe only accepted local state; no
+    /// per-device scan or additional event queue in the analog-only path.
+    fn next_device_boundary(&self, time: Real) -> SpiceResult<Option<Real>> {
+        if self.event_devices.is_empty() {
+            return Ok(None);
+        }
+        let history = self
+            .history
+            .accepted(1)
+            .ok_or_else(|| failure("missing accepted event state"))?;
+        let mut next = None::<Real>;
+        for event in &self.event_devices {
+            let slots = history
+                .get(event.rows.clone())
+                .ok_or_else(|| failure("invalid event state window"))?;
+            if let Some(at) = event.source.next_boundary(slots)? {
+                if !at.is_finite() || at <= time {
+                    return Err(failure("invalid device event boundary"));
+                }
+                next = Some(next.map_or(at, |prior| prior.min(at)));
+            }
+        }
+        Ok(next)
+    }
+
+    fn refine_device_events(
+        &self,
+        solution: &Vector,
+        state: &mut TrialState,
+        time: Real,
+    ) -> SpiceResult<Option<Real>> {
+        if self.event_devices.is_empty() {
+            return Ok(None);
+        }
+        let history = self
+            .history
+            .accepted(1)
+            .ok_or_else(|| failure("missing accepted event state"))?;
+        let mut next = None::<Real>;
+        for event in &self.event_devices {
+            let context = crate::devices::traits::TransientEventContext {
+                accepted: history
+                    .get(event.rows.clone())
+                    .ok_or_else(|| failure("invalid event state window"))?,
+                time,
+                solution,
+                unknowns: self.circuit.unknowns(),
+            };
+            if let Some(at) = self
+                .history
+                .edit_candidate(state, event.rows.clone(), |slots| {
+                    event.source.refine_trial(&context, slots)
+                })?
+            {
+                if !at.is_finite() || at > time {
+                    return Err(failure("invalid device crossing time"));
+                }
+                next = Some(next.map_or(at, |prior| prior.min(at)));
+            }
+        }
+        Ok(next)
+    }
+
+    fn device_retry(
+        &self,
+        attempt: &AttemptedStep,
+        solution: &Vector,
+        state: &mut TrialState,
+    ) -> SpiceResult<Option<NextStep>> {
+        let time = attempt.clock.time;
+        let min_step = self.settings.min_step();
+        if let Some(at) = self.refine_device_events(solution, state, time)?
+            && time - at > min_step
+        {
+            let start = attempt
+                .event_start
+                .unwrap_or(time - attempt.clock.next.delta);
+            let delta = (at - start).max(min_step).max(start.next_up() - start);
+            if delta < attempt.clock.next.delta {
+                return Ok(Some(NextStep {
+                    delta,
+                    order: Order::One,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn prepare_mixed_point(
+        &self,
+        solution: &Vector,
+        time: Real,
+        preview: Option<super::digital::EventPreview>,
+    ) -> SpiceResult<Option<super::digital::MixedPoint>> {
+        self.mixed
+            .as_deref()
+            .map(|mixed| mixed.prepare_point(self.circuit, solution, time, preview))
+            .transpose()
+    }
+
+    fn commit_mixed_point(&mut self, point: Option<super::digital::MixedPoint>) {
+        if let (Some(mixed), Some(point)) = (self.mixed.as_deref_mut(), point) {
+            mixed.commit_point(point);
+        }
+    }
+
+    fn preview_events(
+        &self,
+        ready: &mut ReadyStep,
+    ) -> SpiceResult<Option<super::digital::EventPreview>> {
+        let preview = self
+            .mixed
+            .as_deref()
+            .map(|mixed| mixed.preview(ready.end_time()))
+            .transpose()?
+            .flatten();
+        if let Some(time) = preview
+            .as_ref()
+            .and_then(super::digital::EventPreview::boundary)
+        {
+            ready.limit_to_event(time);
+        }
+        Ok(preview)
+    }
+
+    fn next_physical_event(&mut self, time: Real) -> Option<Real> {
+        let events = self.physical_events.as_mut()?;
+        while events.peek().is_some_and(|&event| event <= time) {
+            events.next();
+        }
+        events.peek().copied()
+    }
+
+    fn crosses_physical_event(&self, attempt: &AttemptedStep) -> bool {
+        self.index_aware && attempt.event_start.is_some() && attempt.clock.time < self.settings.stop
+    }
+
+    fn check_step_budget(&self, time: Real) -> SpiceResult<()> {
+        if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
+            return Err(failure(format!(
+                "work limit of {} accepted + rejected steps reached at t = {time:e}",
+                self.settings.max_steps
+            )));
+        }
+        Ok(())
+    }
+
     /// Advance through rejected trials. Only Newton's starting iterate moves
     /// between attempts; device and integration histories remain accepted-only.
     fn advance(
         &mut self,
+        ready: ReadyStep,
+        iterate: Vector,
+        output: OutputSelection<'_>,
+    ) -> SpiceResult<AcceptedPoint> {
+        if self.index_aware {
+            return self.advance_physical(ready, iterate, output);
+        }
+        self.advance_companion(ready, iterate, output)
+    }
+
+    fn advance_companion(
+        &mut self,
         mut ready: ReadyStep,
         mut iterate: Vector,
-        sample_at: Option<Real>,
-        capture_boundary: bool,
-        selected: Option<&[usize]>,
+        output: OutputSelection<'_>,
     ) -> SpiceResult<AcceptedPoint> {
         let min_step = self.settings.min_step();
+        let physical_event = self.next_physical_event(ready.clock.time);
+        let device_boundary = self.next_device_boundary(ready.clock.time)?;
+        self.stats.device_event_boundary_probes += self.event_devices.len();
         loop {
-            if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
-                return Err(failure(format!(
-                    "work limit of {} accepted + rejected steps reached at t = {:e}",
-                    self.settings.max_steps, ready.clock.time
-                )));
+            self.check_step_budget(ready.clock.time)?;
+            if let Some(event) = physical_event
+                .into_iter()
+                .chain(device_boundary)
+                .reduce(Real::min)
+            {
+                ready.limit_to_event(event);
             }
+            let preview = self.preview_events(&mut ready)?;
             let attempt = ready.begin(&self.steps, &self.settings)?;
             let mut prepared = self.prepared.transient_attempt(
                 &self.history,
@@ -1184,7 +1764,26 @@ impl Driver<'_> {
                     drop(prepared);
                     ready = attempt.retry(next, min_step)?;
                 }
-                Trial::Converged { x, state } => {
+                Trial::Converged(TrialPoint { x, mut state, .. }) => {
+                    if let Some(next) = self.mixed_retry(&attempt, &x)? {
+                        iterate = x;
+                        self.stats.rejected += 1;
+                        drop(prepared);
+                        ready = attempt.retry(next, min_step)?;
+                        ready.boundary = Boundary::Forced;
+                        continue;
+                    }
+                    self.stats.device_event_trial_probes += self.event_devices.len();
+                    if let Some(next) = self.device_retry(&attempt, &x, &mut state)? {
+                        iterate = x;
+                        self.stats.rejected += 1;
+                        self.stats.device_event_retries += 1;
+                        drop(prepared);
+                        ready = attempt.retry(next, min_step)?;
+                        ready.boundary = Boundary::Forced;
+                        ready.limit_to_event(ready.clock.time + ready.clock.next.delta);
+                        continue;
+                    }
                     let decision =
                         attempt.decision(&self.settings, &self.steps, |coefficients| {
                             self.truncation_limit(coefficients, &state, &x, attempt.clock.time)
@@ -1197,47 +1796,111 @@ impl Driver<'_> {
                             ready = attempt.retry(next, min_step)?;
                         }
                         StepDecision::Accept(next) => {
-                            let observed = if attempt.clock.time < self.settings.start
-                                || sample_at.is_some_and(|at| {
-                                    !almost_equal_ulps(attempt.clock.time, at, 100)
-                                }) {
-                                None
-                            } else {
-                                Some(match selected {
-                                    Some(indices) => {
-                                        prepared.observe_selected(&x, &state, Some(indices))?
-                                    }
-                                    None => prepared.observe(&x, &state)?,
-                                })
-                            };
-                            let periodic_boundary = (capture_boundary
-                                && almost_equal_ulps(attempt.clock.time, self.settings.stop, 100))
-                            .then(|| {
-                                Box::new(PeriodicBoundary::capture(
-                                    &self.history,
-                                    &attempt,
-                                    &state,
-                                    &x,
-                                    self.timing,
-                                ))
-                            });
-                            // Release the proposal's immutable history and exclusive scratch
-                            // before accepting, which changes the accepted history revision.
+                            let candidate = self.prepare_accepted_candidate(
+                                &attempt,
+                                &mut prepared,
+                                (x, state),
+                                &output,
+                                preview,
+                            )?;
+                            // Release immutable history before publication.
                             drop(prepared);
-                            let device_breaks =
-                                self.commit_point(Acceptance::Step(&attempt), &x, state)?;
-                            return Ok(AcceptedPoint {
-                                cursor: attempt.accept(next),
-                                solution: x,
-                                observed,
-                                device_breaks,
-                                periodic_boundary,
-                            });
+                            return self.commit_candidate(
+                                attempt,
+                                next,
+                                candidate,
+                                device_boundary,
+                            );
                         }
                     }
                 }
             }
         }
+    }
+
+    fn prepare_accepted_candidate(
+        &self,
+        attempt: &AttemptedStep,
+        prepared: &mut crate::devices::circuit::PreparedTransient<'_>,
+        (x, state): (Vector, TrialState),
+        output: &OutputSelection<'_>,
+        preview: Option<super::digital::EventPreview>,
+    ) -> SpiceResult<AcceptedCandidate> {
+        Ok(AcceptedCandidate {
+            mixed: self.prepare_mixed_point(&x, attempt.clock.time, preview)?,
+            output: self.candidate_output(attempt, &x, &state, output, || {
+                match output.selected {
+                    Some(indices) => prepared.observe_selected(&x, &state, Some(indices)),
+                    None => prepared.observe(&x, &state),
+                }
+            })?,
+            solution: x,
+            state,
+        })
+    }
+
+    fn commit_candidate(
+        &mut self,
+        attempt: AttemptedStep,
+        next: NextStep,
+        candidate: AcceptedCandidate,
+        device_boundary: Option<Real>,
+    ) -> SpiceResult<AcceptedPoint> {
+        let event = self.crosses_physical_event(&attempt);
+        let device_breaks = self.commit_point(
+            Acceptance::Step(&attempt),
+            &candidate.solution,
+            candidate.state,
+        )?;
+        self.commit_mixed_point(candidate.mixed);
+        self.stats.device_event_landings +=
+            usize::from(device_boundary == Some(attempt.clock.time));
+        if event {
+            self.history.restart_integration()?;
+            self.steps.clear();
+        }
+        Ok(AcceptedPoint {
+            cursor: attempt.accept(next),
+            solution: candidate.solution,
+            observed: candidate.output.observed,
+            device_breaks,
+            periodic_boundary: candidate.output.periodic_boundary,
+        })
+    }
+
+    fn candidate_output(
+        &self,
+        attempt: &AttemptedStep,
+        x: &Vector,
+        state: &TrialState,
+        output: &OutputSelection<'_>,
+        observe: impl FnOnce() -> SpiceResult<Vec<Complex>>,
+    ) -> SpiceResult<CandidateOutput> {
+        let time = attempt.clock.time;
+        let observed = if time < self.settings.start
+            || output
+                .sample_at
+                .is_some_and(|at| !almost_equal_ulps(time, at, 100))
+        {
+            None
+        } else {
+            Some(observe()?)
+        };
+        let periodic_boundary = (output.capture_boundary
+            && almost_equal_ulps(time, self.settings.stop, 100))
+        .then(|| {
+            Box::new(PeriodicBoundary::capture(
+                &self.history,
+                attempt,
+                state,
+                x,
+                self.timing,
+            ))
+        });
+        Ok(CandidateOutput {
+            observed,
+            periodic_boundary,
+        })
     }
 
     /// The sole acceptance boundary: commit device/delay history, then advance
@@ -1260,6 +1923,9 @@ impl Driver<'_> {
             trial,
             &delay,
         )?;
+        if let Some(history) = &mut self.voltage_history {
+            history.accept(solution, acceptance);
+        }
         match acceptance {
             Acceptance::Initial => {}
             Acceptance::Step(attempt) => {
@@ -1301,107 +1967,206 @@ impl Driver<'_> {
     /// Nothing is committed (no accept hook, no history) until every check has
     /// passed, so a failed initialization leaves no partial state.
     fn initialize(&mut self) -> SpiceResult<AcceptedPoint> {
-        let rhs = self.system.transient_rhs(0., crate::devices::Limit::Left)?;
-        let (x, trial) = if self.uic {
-            let start = initial::uic_start(self.circuit, &self.hints, &self.model_context)?;
-            // C's single MODETRANOP|MODEUIC|MODEINITJCT load: nonlinear
-            // devices evaluate at their instance initial conditions.
-            let trial = self.initial_state(&start.x, &start.charges, true)?;
-            let tolerances = &self.settings.tolerances;
-            initial::check_impulse_free(
-                self.circuit,
-                &self.system.a,
-                &self
-                    .system
-                    .transient_rhs(0., crate::devices::Limit::Right)?,
-                &start.x,
-                initial::Tolerances {
-                    reltol: tolerances.reltol,
-                    vntol: tolerances.vntol,
-                    abstol: tolerances.abstol,
-                },
-                &self.model_context,
-            )?;
-            (start.x, trial)
-        } else {
-            let tolerances = &self.settings.tolerances;
-            let constraints = initial::irredundant_constraints(
-                self.circuit,
-                &rhs,
-                &self.hints.initial,
-                VoltageTolerance {
-                    reltol: tolerances.reltol,
-                    vntol: tolerances.vntol,
-                },
-            )?;
-            // dctran.c calls CKTop (NIiter) for every circuit, linear or not.
-            let (x, solved) = {
-                // CKTic: the Newton guess holds the .nodeset, then the .ic
-                // values; cktload.c forces the .ic rows in every load of the
-                // MODETRANOP solve and the .nodeset rows in its MODEINITJCT/
-                // MODEINITFIX loads.
-                let mut seed = Vector::zeros(self.circuit.unknown_count());
-                for hint in self.hints.nodesets.iter().chain(&self.hints.initial) {
-                    seed.as_mut_slice()[hint.row] = hint.value;
+        // Solve the analog and event operating point to a common fixed point.
+        // The provisional digital state is rolled back if initialization
+        // fails; analog integration history is committed exactly once.
+        for _ in 0..self.bias.newton.max_iterations {
+            let (x, trial) = self.initial_candidate()?;
+            let mixed_point = self
+                .mixed
+                .as_deref()
+                .map(|mixed| mixed.prepare_point(self.circuit, &x, 0., None))
+                .transpose()?;
+            if let (Some(mixed), Some(point)) = (self.mixed.as_deref_mut(), mixed_point) {
+                let changed = mixed.initial_changed(&point)?;
+                mixed.commit_point(point);
+                if changed {
+                    continue;
                 }
-                // Every entry is forced, as cktload.c does;
-                // `irredundant_constraints` only rejects contradictions.
-                let nodes = crate::analysis::bias::NodeForcing {
-                    initial: self
-                        .hints
-                        .initial
-                        .iter()
-                        .map(|hint| (hint.row, hint.value))
-                        .collect(),
-                    nodesets: initial::forced_nodesets(&self.hints.nodesets),
-                };
-                let solution = crate::analysis::bias::solve_dc_forced_prepared(
-                    &self.prepared,
-                    &self.model_context,
-                    &self.bias,
-                    &[],
-                    Some(&seed),
-                    // MODETRANOP: the sources' time functions at 0-.
-                    Some(Forcing {
-                        limit: crate::devices::Limit::Left,
-                        timing: self.timing,
-                    }),
-                    &nodes,
-                )?
-                .solution;
-                (solution.values, Some(solution.trial))
+            }
+            let device_breaks = self.commit_point(Acceptance::Initial, &x, trial)?;
+            if let Some(mixed) = self.mixed.as_deref_mut() {
+                mixed.accept_initial();
+            }
+            return Ok(AcceptedPoint {
+                cursor: AcceptedCursor::initial(&self.settings),
+                solution: x,
+                observed: None,
+                device_breaks,
+                periodic_boundary: None,
+            });
+        }
+        Err(failure("mixed-signal operating point did not settle"))
+    }
+
+    fn initial_uic_candidate(&mut self) -> SpiceResult<(Vector, TrialState)> {
+        let start = initial::uic_start(self.circuit, &self.hints, &self.model_context)?;
+        // C's single MODETRANOP|MODEUIC|MODEINITJCT load: nonlinear
+        // devices evaluate at their instance initial conditions.
+        let mut trial = self.initial_state(&start.x, &start.charges, true)?;
+        if let Some(consistent) = self.derivative_initial(&start.x, &trial, true)? {
+            return Ok(consistent);
+        }
+        let mut right_rhs = self
+            .system
+            .transient_rhs(0., crate::devices::Limit::Right)?;
+        if let Some(mixed) = self.mixed.as_deref() {
+            mixed.initial_rhs(self.circuit, &mut right_rhs)?;
+        }
+        let consistent = initial::check_impulse_free(
+            &self.prepared,
+            &self.system.a,
+            &right_rhs,
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &start.x,
+                model_context: &self.model_context,
+                integration: None,
+                history: &self.history,
+                forcing: Some(Forcing {
+                    limit: crate::devices::Limit::Right,
+                    timing: self.timing,
+                }),
+            },
+            &trial,
+            self.physical_tolerances(),
+            &self.bias.newton,
+        )?;
+        // Keep the device-flagged UIC history, but start nonlinear
+        // Newton iteration at the solved algebraic point rather than
+        // guessing every unspecified node/branch at zero.
+        for (slot, value) in consistent.canonical {
+            self.history.set_candidate_slot(&mut trial, slot, value)?;
+        }
+        Ok((consistent.solution.unwrap_or(start.x), trial))
+    }
+
+    fn initial_candidate(&mut self) -> SpiceResult<(Vector, TrialState)> {
+        if self.uic {
+            return self.initial_uic_candidate();
+        }
+        let mut rhs = self.system.transient_startup_rhs()?;
+        if let Some(mixed) = self.mixed.as_deref() {
+            mixed.initial_rhs(self.circuit, &mut rhs)?;
+        }
+        let tolerances = &self.settings.tolerances;
+        let constraints = initial::irredundant_constraints(
+            self.circuit,
+            &rhs,
+            &self.hints.initial,
+            VoltageTolerance {
+                reltol: tolerances.reltol,
+                vntol: tolerances.vntol,
+            },
+        )?;
+        // dctran.c calls CKTop (NIiter) for every circuit, linear or not.
+        let solution = {
+            // CKTic: the Newton guess holds the .nodeset, then the .ic
+            // values; cktload.c forces the .ic rows in every load of the
+            // MODETRANOP solve and the .nodeset rows in its MODEINITJCT/
+            // MODEINITFIX loads.
+            let mut seed = Vector::zeros(self.circuit.unknown_count());
+            for hint in self.hints.nodesets.iter().chain(&self.hints.initial) {
+                seed.as_mut_slice()[hint.row] = hint.value;
+            }
+            // Every entry is forced, as cktload.c does;
+            // `irredundant_constraints` only rejects contradictions.
+            let nodes = crate::analysis::bias::NodeForcing {
+                initial: self
+                    .hints
+                    .initial
+                    .iter()
+                    .map(|hint| (hint.row, hint.value))
+                    .collect(),
+                nodesets: initial::forced_nodesets(&self.hints.nodesets),
             };
-            initial::check_implied(
-                &x,
-                &constraints,
-                VoltageTolerance {
-                    reltol: tolerances.reltol,
-                    vntol: tolerances.vntol,
-                },
-            )?;
-            // A nonlinear bias's converged trial is the DC-mode load at `x`
-            // (charges, zero derivatives) and also carries the operating
-            // point's discrete switch states, which a fresh reload in the
-            // initial phase would re-derive from the instance flags.
-            let trial = match solved {
-                Some(trial) => trial,
-                None => self.initial_state(&x, &[], false)?,
-            };
-            (x, trial)
+            crate::analysis::bias::solve_dc_forced_prepared(
+                &self.prepared,
+                &self.model_context,
+                &self.bias,
+                &[],
+                Some(&seed),
+                // MODETRANOP: native sources at 0-, prepared sources at 0+.
+                Some(Forcing {
+                    limit: crate::devices::Limit::Left,
+                    timing: self.timing,
+                }),
+                &nodes,
+            )?
+            .solution
         };
-        // C copies CKTstate0 into CKTstate1..3; the derivative is zero. The
-        // port fills every retained vector (ACCEPTED_DEPTH, sized for Gear
-        // order 6); dctran.c's orders 1-2 never read beyond CKTstate3.
-        // The t = 0 point also starts every transmission line's delay
-        // history (traload.c, MODEINITTRAN); it requests no breakpoints.
-        let device_breaks = self.commit_point(Acceptance::Initial, &x, trial)?;
-        Ok(AcceptedPoint {
-            cursor: AcceptedCursor::initial(&self.settings),
+        let x = solution.values;
+        initial::check_implied(
+            &x,
+            &constraints,
+            VoltageTolerance {
+                reltol: tolerances.reltol,
+                vntol: tolerances.vntol,
+            },
+        )?;
+        // A nonlinear bias's converged trial is the DC-mode load at `x`
+        // (charges, zero derivatives) and also carries the operating
+        // point's discrete switch states, which a fresh reload in the
+        // initial phase would re-derive from the instance flags.
+        let trial = solution.trial;
+        if let Some(consistent) = self.derivative_initial(&x, &trial, false)? {
+            return Ok(consistent);
+        }
+        Ok((x, trial))
+    }
+
+    fn derivative_initial(
+        &mut self,
+        x: &Vector,
+        trial: &TrialState,
+        uic: bool,
+    ) -> SpiceResult<Option<(Vector, TrialState)>> {
+        if self.mixed.is_some() || !initial::has_derived_storage(self.circuit) {
+            return Ok(None);
+        }
+        let request = LoadRequest {
+            mode: AnalysisMode::Instantaneous { time: 0. },
             solution: x,
-            observed: None,
-            device_breaks,
-            periodic_boundary: None,
-        })
+            model_context: &self.model_context,
+            integration: None,
+            history: &self.history,
+            forcing: Some(Forcing {
+                limit: crate::devices::Limit::Right,
+                timing: self.timing,
+            }),
+        };
+        let tolerance = &self.settings.tolerances;
+        let Some(consistent) = initial::consistent_derivative_start(
+            &self.prepared,
+            &request,
+            trial,
+            uic,
+            initial::Tolerances {
+                reltol: tolerance.reltol,
+                vntol: tolerance.vntol,
+                abstol: tolerance.abstol,
+                chgtol: tolerance.chgtol,
+            },
+            &self.bias.newton,
+        )?
+        else {
+            return Ok(None);
+        };
+        let TrialPoint {
+            x,
+            state: trial,
+            guards,
+            order_hint,
+        } = self.physical_candidate(&request, consistent)?;
+        self.accepted_guards = guards;
+        self.derivative_order = order_hint;
+        self.physical_events = Some(
+            self.system
+                .breakpoints_in(0., self.settings.stop)?
+                .peekable(),
+        );
+        self.index_aware = true;
+        Ok(Some((x, trial)))
     }
 
     /// The charge/flux state of the initial point: a DC-mode load at `x`
@@ -1432,7 +2197,7 @@ impl Driver<'_> {
             &mut trial,
         )?;
         for (slot, value) in overrides {
-            self.history.set_initial_slot(&mut trial, *slot, *value)?;
+            self.history.set_candidate_slot(&mut trial, *slot, *value)?;
         }
         Ok(trial)
     }
@@ -1443,6 +2208,112 @@ impl Driver<'_> {
     /// (`firsttime`) and `MODEINITPRED` after, for linear and nonlinear
     /// circuits alike. The trial is that of the last Newton load, one iterate
     /// behind the returned solution, as C's `CKTstate0`.
+    fn physical_candidate(
+        &self,
+        request: &LoadRequest<'_>,
+        consistent: initial::DerivativePoint,
+    ) -> SpiceResult<TrialPoint> {
+        let x = consistent.solution;
+        let trial = self.prepared.physical_candidate_state(
+            &LoadRequest {
+                solution: &x,
+                ..*request
+            },
+            &consistent.canonical,
+        )?;
+        Ok(TrialPoint {
+            x,
+            state: trial,
+            guards: consistent.guards,
+            order_hint: consistent.order_hint,
+        })
+    }
+
+    const fn physical_tolerances(&self) -> initial::Tolerances {
+        let t = &self.settings.tolerances;
+        initial::Tolerances {
+            reltol: t.reltol,
+            vntol: t.vntol,
+            abstol: t.abstol,
+            chgtol: t.chgtol,
+        }
+    }
+
+    fn derivative_event(
+        &self,
+        attempt: &AttemptedStep,
+        x: &Vector,
+        left: &TrialState,
+    ) -> SpiceResult<TrialPoint> {
+        let request = LoadRequest {
+            mode: AnalysisMode::Instantaneous {
+                time: attempt.clock.time,
+            },
+            solution: x,
+            model_context: &self.model_context,
+            integration: None,
+            history: &self.history,
+            forcing: Some(Forcing {
+                limit: crate::devices::Limit::Right,
+                timing: self.timing,
+            }),
+        };
+        let consistent = initial::consistent_derivative_event(
+            &self.prepared,
+            &request,
+            left,
+            self.physical_tolerances(),
+            self.settings.tran_max_iter,
+            self.derivative_order,
+        )?;
+        self.physical_candidate(&request, consistent)
+    }
+
+    fn derivative_trial(&self, attempt: &AttemptedStep, previous: &Vector) -> SpiceResult<Trial> {
+        let request = LoadRequest {
+            mode: AnalysisMode::Transient {
+                time: attempt.clock.time,
+                dt: attempt.coefficients.dt(),
+            },
+            solution: previous,
+            model_context: &self.model_context,
+            integration: Some(&attempt.coefficients),
+            history: &self.history,
+            forcing: Some(Forcing {
+                limit: if attempt.event_start.is_some() {
+                    crate::devices::Limit::Left
+                } else {
+                    crate::devices::Limit::Right
+                },
+                timing: self.timing,
+            }),
+        };
+        let outcome = initial::consistent_derivative_step(
+            &self.prepared,
+            &request,
+            self.physical_tolerances(),
+            self.settings.tran_max_iter,
+            self.derivative_order,
+        )?;
+        let consistent = match outcome {
+            initial::DerivativeTrial::Converged(point) => point,
+            initial::DerivativeTrial::NotConverged(last) => {
+                return Ok(Trial::NotConverged { last });
+            }
+        };
+        let point = self.physical_candidate(
+            &LoadRequest {
+                mode: AnalysisMode::Instantaneous {
+                    time: attempt.clock.time,
+                },
+                integration: None,
+                ..request
+            },
+            consistent,
+        )?;
+        Ok(Trial::Converged(point))
+    }
+
     fn solve_trial(
         &self,
         attempt: &AttemptedStep,
@@ -1457,6 +2328,7 @@ impl Driver<'_> {
             vntol: tolerance.vntol,
             abstol: tolerance.abstol,
             limiting: self.bias.newton.limiting,
+            diag_gmin: self.circuit.continuation_diagonal(),
             ..crate::analysis::newton::NewtonOptions::default()
         };
         // dctran.c: MODEINITTRAN (first step) or MODEINITPRED for the first
@@ -1478,10 +2350,12 @@ impl Driver<'_> {
         }
         .solve(previous, policy, None, |_, _, _| Ok(()));
         match solved {
-            Ok(solved) => Ok(Trial::Converged {
+            Ok(solved) => Ok(Trial::Converged(TrialPoint {
                 x: solved.values,
                 state: solved.trial,
-            }),
+                guards: BranchTrace::default(),
+                order_hint: 2,
+            })),
             Err(crate::analysis::newton::NewtonFailure {
                 last_iterate: Some(last),
                 ..
@@ -1495,13 +2369,13 @@ impl Driver<'_> {
     /// accepted steps; steps not taken yet read as the maximum step, as
     /// `dctran.c` initializes `CKTdeltaOld`) and the `CKTminBreak` that
     /// `TRAaccept` compares sample spacing with: the XSPICE build's
-    /// `10 CKTdelmin`, the same merge distance as the [`BreakTable`].
+    /// configured merge distance (default `10 CKTdelmin`), shared with the [`BreakTable`].
     fn delay_acceptance(&self, dt: Real, start: bool) -> crate::devices::DelayAcceptance {
         let accepted = self.steps.accepted();
         let older = |age: usize| accepted.get(age).copied().unwrap_or(self.settings.max_step);
         crate::devices::DelayAcceptance {
             steps: [dt, older(0), older(1)],
-            min_break: 10. * self.settings.min_step(),
+            min_break: self.settings.min_break(),
             start,
             reltol: self.settings.tolerances.reltol,
             abstol: self.settings.tolerances.abstol,
@@ -1528,8 +2402,15 @@ impl Driver<'_> {
         };
         let order = usize::from(coefficients.order());
         let mut limit = Real::INFINITY;
-        for (device, (rows, bases)) in self.circuit.devices().iter().zip(&self.truncation) {
-            for &base in bases {
+        for (device, TruncationDevice { rows, slots: bases }) in
+            self.circuit.devices().iter().zip(&self.truncation)
+        {
+            for &TruncationSlot {
+                base,
+                explicit_derivative,
+                ..
+            } in bases
+            {
                 let accepted = |age: usize, offset: usize| {
                     self.history
                         .accepted(age)
@@ -1537,18 +2418,29 @@ impl Driver<'_> {
                         .copied()
                         .ok_or_else(|| failure("accepted state history is too short"))
                 };
-                // The trial charge, then `order + 1` accepted ones.
                 let mut storage = [0.0; IntegrationMethod::MAX_GEAR_ORDER as usize + 2];
-                let charge = storage
-                    .get_mut(..order + 2)
-                    .ok_or_else(|| failure("integration order out of range"))?;
-                charge[0] = trial.values()[base];
-                for (age, value) in charge.iter_mut().enumerate().skip(1) {
-                    *value = accepted(age, 0)?;
-                }
-                let derivative = [trial.values()[base + 1], accepted(1, 1)?];
-                limit =
-                    limit.min(coefficients.truncation_timestep(charge, derivative, &tolerances)?);
+                let bound = if self.index_aware || explicit_derivative {
+                    let derivative = &mut storage[..=order];
+                    derivative[0] = trial.values()[base + 1];
+                    for (age, value) in derivative.iter_mut().enumerate().skip(1) {
+                        *value = accepted(age, 1)?;
+                    }
+                    coefficients.truncation_timestep_from_derivatives(
+                        [trial.values()[base], accepted(1, 0)?],
+                        derivative,
+                        &tolerances,
+                    )?
+                } else {
+                    // The trial charge, then order + 1 accepted ones.
+                    let charge = &mut storage[..order + 2];
+                    charge[0] = trial.values()[base];
+                    for (age, value) in charge.iter_mut().enumerate().skip(1) {
+                        *value = accepted(age, 0)?;
+                    }
+                    let derivative = [trial.values()[base + 1], accepted(1, 1)?];
+                    coefficients.truncation_timestep(charge, derivative, &tolerances)?
+                };
+                limit = limit.min(bound);
             }
             // Discrete-state bounds (`swtrunc.c`), from the same trial.
             if !rows.is_empty() {
@@ -1572,6 +2464,9 @@ impl Driver<'_> {
                     limit = limit.min(bound);
                 }
             }
+        }
+        if let Some(history) = &self.voltage_history {
+            limit = limit.min(history.limit(coefficients, solution)?);
         }
         if let Some(bound) = self.circuit.delay_timestep_limit(
             &self.history,
@@ -1616,6 +2511,8 @@ mod step_control_tests {
             stop: 10.,
             start: 0.,
             max_step: 1.,
+            minbreak: 0.,
+            voltage_lte: None,
             max_order: 2,
             method: IntegrationMethod::Trapezoidal,
             xmu: 0.5,
@@ -1643,6 +2540,8 @@ mod step_control_tests {
                 phase: Phase::Continuing,
             },
             boundary: Boundary::Forced,
+            event_landing: None,
+            probe_landing: None,
         }
     }
 

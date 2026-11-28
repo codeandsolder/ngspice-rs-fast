@@ -325,3 +325,79 @@ fn independent_complex_mesh_crossover() {
         }
     }
 }
+
+/// Retained-factor real RHS traversal over increasingly filled, nonsymmetric
+/// bands. Verify every batched answer against the scalar path before timing.
+#[test]
+#[ignore = "opt-in real sparse RHS traversal across fill patterns"]
+fn real_sparse_rhs_fill_crossover() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use ngspice_rs::maths::linear::SolveBatchWorkspace;
+    use ngspice_rs::maths::{SparseLu, SparseMatrix, Vector};
+
+    let size = 512_usize;
+    for (name, offsets) in [
+        ("tridiagonal", &[1_usize][..]),
+        ("two_band", &[1, 16][..]),
+        ("wide_band", &[1, 4, 16, 64][..]),
+    ] {
+        let mut matrix = SparseMatrix::new(size, size);
+        for row in 0..size {
+            matrix.add(row, row, 8.).unwrap();
+            for &offset in offsets {
+                if let Some(col) = row.checked_sub(offset) {
+                    matrix.add(row, col, -0.75).unwrap();
+                }
+                if row + offset < size {
+                    matrix.add(row, row + offset, -0.5).unwrap();
+                }
+            }
+        }
+        matrix.fold_duplicates();
+        let lu = SparseLu::new(&matrix, None).unwrap();
+        let rhs: Vec<_> = (0..size * 64)
+            .map(|i| f64::from(u32::try_from((i * 13 + 7) % 127).unwrap()) / 64. - 1.)
+            .collect();
+        let mut work = SolveBatchWorkspace::default();
+        let mut scalar_work = Vec::new();
+        let mut out = Vec::new();
+        println!(
+            "workload={name},factor_entries={}",
+            lu.factor_storage().factor_entries
+        );
+        for transposed in [false, true] {
+            for count in [1, 2, 4, 8, 16, 32, 64] {
+                let rhs = &rhs[..count * size];
+                lu.solve_batch_into(rhs, &mut work, &mut out, transposed)
+                    .unwrap();
+                for (input, output) in rhs.chunks_exact(size).zip(out.chunks_exact(size)) {
+                    let input = Vector::from(input.to_vec());
+                    let expected = if transposed {
+                        lu.solve_transposed_with_workspace(&input, &mut scalar_work)
+                    } else {
+                        lu.solve_with_workspace(&input, &mut scalar_work)
+                    }
+                    .unwrap();
+                    assert_eq!(output, expected.as_slice());
+                }
+                let mut times = [Duration::ZERO; 5];
+                for elapsed in &mut times {
+                    let start = Instant::now();
+                    for _ in 0..16 {
+                        lu.solve_batch_into(black_box(rhs), &mut work, &mut out, transposed)
+                            .unwrap();
+                        black_box(&out);
+                    }
+                    *elapsed = start.elapsed();
+                }
+                times.sort_unstable();
+                println!(
+                    "workload={name},transpose={transposed},rhs={count},batch_ns={}",
+                    times[2].as_nanos()
+                );
+            }
+        }
+    }
+}

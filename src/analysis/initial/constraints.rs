@@ -227,46 +227,49 @@ impl<'a> ConstraintGraph<'a> {
         rhs: &Vector,
         inductors_short: bool,
     ) -> SpiceResult<Self> {
+        use crate::devices::InitialVoltageLaw;
         let mut graph = Self::new(circuit.unknown_count())?;
         if rhs.as_slice().len() != circuit.unknown_count() {
             return Err(failure(
                 "constraint source vector does not match finalized circuit",
             ));
         }
-        for device in circuit.devices() {
-            if matches!(device.designator(), 'e' | 'h')
-                && let [positive, negative, ..] = device.terminals()
-            {
-                graph.add_controlled(
-                    VoltageVertex::bind(circuit, *positive)?,
-                    VoltageVertex::bind(circuit, *negative)?,
-                    Origin::Device(device.name()),
-                );
+        let mut fixed = Vec::new();
+        for (index, device) in circuit.devices().iter().enumerate() {
+            for relation in device.initial_voltage_relations(inductors_short) {
+                let [positive, negative] = relation.terminals;
+                let positive = VoltageVertex::bind(circuit, positive)?;
+                let negative = VoltageVertex::bind(circuit, negative)?;
+                let origin = Origin::Device(device.name());
+                match relation.law {
+                    InitialVoltageLaw::Controlled => {
+                        graph.add_controlled(positive, negative, origin);
+                    }
+                    InitialVoltageLaw::Fixed(value) => {
+                        fixed.push((positive, negative, value, origin));
+                    }
+                    InitialVoltageLaw::Source(branch) => {
+                        let rows = circuit
+                            .branch_rows(index)
+                            .ok_or_else(|| failure("missing initial source branch"))?;
+                        if branch >= rows.len() {
+                            return Err(failure("initial voltage source branch outside device"));
+                        }
+                        fixed.push((
+                            positive,
+                            negative,
+                            rhs.as_slice()[rows.start + branch],
+                            origin,
+                        ));
+                    }
+                }
             }
         }
-        // Independent ideal sources first, in original device order.
-        // Source loops are left for the numerical solver, as before.
-        for (index, device) in circuit.devices().iter().enumerate() {
-            let Some(rows) = circuit.branch_rows(index).filter(|rows| rows.len() == 1) else {
-                continue;
-            };
-            let value = match device.designator() {
-                'v' => rhs.as_slice()[rows.start],
-                'l' if inductors_short => 0.,
-                _ => continue,
-            };
-            // An RF port source is on the internal #res node.
-            let (positive, negative) = match (device.terminals(), device.rf_port()) {
-                ([_, negative, _], Some(port)) => (port.internal, *negative),
-                ([positive, negative], None) => (*positive, *negative),
-                _ => continue,
-            };
-            graph.join(
-                VoltageVertex::bind(circuit, positive)?,
-                VoltageVertex::bind(circuit, negative)?,
-                value,
-                Origin::Device(device.name()),
-            )?;
+        // Preserve the established order: controlled relations first, then
+        // independent relations in device order. Source loops remain for the
+        // numerical solver, as before.
+        for (positive, negative, value, origin) in fixed {
+            graph.join(positive, negative, value, origin)?;
         }
         Ok(graph)
     }

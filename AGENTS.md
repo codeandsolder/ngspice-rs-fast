@@ -73,13 +73,13 @@ numeric backend adapters or make lower-level modules depend on analysis/CLI code
 
 ## Implementation conventions
 
-- Rust edition 2024; respect the MSRV in `Cargo.toml` (currently 1.89).
-  Avoid APIs or syntax newer than that minimum.
+- Rust edition 2024; use the exact quarantined nightly in `rust-toolchain.toml`.
+  No separate stable or MSRV contract is maintained.
 - `unsafe_code` is forbidden. Do not add FFI, external native solver build
   requirements or solver crates casually: the linear algebra is a Rust port of
   ngspice's SPARSE 1.3 and the only dependencies are winnow and petgraph.
 - Use workspace dependencies and preserve `Cargo.lock`. Explain dependency or
-  feature changes, including their minimum-Rust and licensing consequences.
+  feature changes, including their compiler and licensing consequences.
 - Preserve `COPYING`, `AUTHORS` and `NOTICE`. Do not copy LGPL KLU algorithms
   into this BSD-licensed implementation; SPARSE 1.3 (Berkeley notice, kept in
   `src/maths/sparse13.rs` and `NOTICE`) is the solver to follow.
@@ -181,12 +181,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-For compiler/dependency changes, also validate minimum Rust:
-
-```sh
-cargo +1.89.0 test --workspace --locked
-cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings
-```
+Run the current shared rust-skills2 strict gate on the pinned nightly as
+well as these local checks. Keep managed sccache enabled; the routine CI jobs
+resolve the compiler from the same repository pin, and the shared gate checks
+new external registry versions against the 72-hour release-age quarantine.
 
 `cargo xtask ci` is the existing convenience command; explicit commands above
 also cover the lockfile and all-target lint requirements. For offline work,

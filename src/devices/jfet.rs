@@ -50,6 +50,7 @@
 
 pub(super) mod lifecycle;
 pub(super) mod linear;
+mod taylor;
 
 use self::lifecycle::{
     GateStamp, GateUpdate, Junctions, LoadPhase, Loaded, gate_charges, setup_gate_matrix,
@@ -1013,6 +1014,46 @@ impl Device for Jfet {
         }
         .finish(context, start, &loaded)
     }
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        use crate::devices::traits::PhysicalChargeHistory;
+        let [drain, gate, source] = self.inner;
+        let scale = self.model.pol * self.instance.m;
+        visit(PhysicalChargeHistory {
+            slot: slot::QGS,
+            nodes: [gate, source],
+            scale,
+        })?;
+        visit(PhysicalChargeHistory {
+            slot: slot::QGD,
+            nodes: [gate, drain],
+            scale,
+        })
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
+    fn assemble_nonlinear_charge(
+        &self,
+        context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        let op = self.operating(context.model)?;
+        let [vgs, vgd] = self.normalized(self.inner.map(|node| context.voltage(node)));
+        let [gs, gd] = self.evaluate(&op, vgs, vgd, context.model.gmin)?.gates;
+        let [drain, gate, source] = self.inner;
+        let m = self.instance.m;
+        let sign = self.model.pol * m;
+        context.branch([gate, source], sign * gs.charge, m * gs.capacitance)?;
+        context.branch([gate, drain], sign * gd.charge, m * gd.capacitance)
+    }
+
     /// `jfetacld.c` after C's `MODEINITSMSIG` load: the conductances and
     /// gate capacitances at the bias, every stamp scaled by `m` and grouped
     /// as C groups it.

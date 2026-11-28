@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 
 use crate::analysis::{AnalysisSupport, DRIVERS};
 use crate::devices::Registry;
-use crate::netlist::{Deck, RawCard, load_classified};
+use crate::netlist::parser::load_classified_with_admission;
+use crate::netlist::{Deck, RawCard, SourceLimits};
+
+mod preprocessing;
 use crate::primitives::{AnalysisKind as Kind, SpiceError, SpiceResult};
+pub use preprocessing::PreprocessArgs;
 
 /// Process exit codes. See the crate documentation.
 pub mod exit_code {
@@ -120,6 +124,8 @@ pub struct Args {
     pub auto_gnd: bool,
     /// Explicit rawfile encoding; otherwise deck/environment settings apply.
     pub format: Option<crate::analysis::RawFormat>,
+    /// Explicit source transformation, shared by every file-based command.
+    pub preprocess: PreprocessArgs,
 }
 
 impl Default for Args {
@@ -130,6 +136,7 @@ impl Default for Args {
             output: None,
             auto_gnd: true,
             format: None,
+            preprocess: PreprocessArgs::default(),
         }
     }
 }
@@ -159,6 +166,17 @@ impl Args {
                     args.command = Command::Version;
                     return Ok(args);
                 }
+                "--preprocess-command" => {
+                    let path = arguments
+                        .next()
+                        .ok_or("--preprocess-command needs an absolute executable path")?;
+                    args.preprocess.set_executable(PathBuf::from(path))?;
+                }
+                "--preprocess-arg" => args.preprocess.arguments.push(
+                    arguments
+                        .next()
+                        .ok_or("--preprocess-arg needs one literal argument")?,
+                ),
                 "--no-auto-gnd" => args.auto_gnd = false,
                 "--auto-gnd" => args.auto_gnd = true,
                 "--format" => {
@@ -210,28 +228,34 @@ impl Args {
             }
         }
 
-        if args.command.needs_netlist() && args.netlist.is_none() {
-            return Err(format!("'{}' needs a netlist file", args.command.name()));
+        args.validate()?;
+        Ok(args)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.command.needs_netlist() && self.netlist.is_none() {
+            return Err(format!("'{}' needs a netlist file", self.command.name()));
         }
-        if !args.command.needs_netlist() && args.netlist.is_some() {
+        if !self.command.needs_netlist() && self.netlist.is_some() {
             return Err(format!(
                 "'{}' does not take a netlist file",
-                args.command.name()
+                self.command.name()
             ));
         }
-        if args.command.needs_output() && args.output.is_none() {
+        if self.command.needs_output() && self.output.is_none() {
             return Err("'simulate' needs an output path: --output <path> <netlist>".to_owned());
         }
-        if !args.command.needs_output() && args.format.is_some() {
+        if !self.command.needs_output() && self.format.is_some() {
             return Err("--format is only supported by simulate".into());
         }
-        if !args.command.needs_output() && args.output.is_some() {
+        if !self.command.needs_output() && self.output.is_some() {
             return Err(format!(
                 "'{}' does not take --output (only 'simulate' writes a rawfile)",
-                args.command.name()
+                self.command.name()
             ));
         }
-        Ok(args)
+        self.preprocess.validate(self.command.needs_netlist())?;
+        Ok(())
     }
 
     /// Records `--output`, rejecting a repeated option.
@@ -268,6 +292,12 @@ OPTIONS:
     --output <path>  where 'simulate' writes the rawfile; also --output=<path>.
                      An existing destination is replaced only after a successful
                      run; a failed run leaves it untouched
+    --preprocess-command <absolute-path>
+                     optional executable for each original source, once per
+                     unique path; raw stdin, replacement UTF-8 stdout
+    --preprocess-arg <arg>
+                     literal argument before the canonical source pathname;
+                     repeat to provide multiple arguments
     --no-auto-gnd    treat 'gnd' as an ordinary node in the parser, like
                      ngspice's no_auto_gnd (the device node table still folds
                      'gnd'; see docs/port/CLI.md)
@@ -291,6 +321,15 @@ EXIT STATUS:
 ///
 /// Returns an unsupported-command error for missing required arguments.
 pub fn run(args: &Args) -> SpiceResult<()> {
+    if !matches!(args.command, Command::Help | Command::Version) {
+        args.preprocess
+            .validate(args.command.needs_netlist())
+            .map_err(|feature| SpiceError::Unsupported {
+                feature,
+                location: None,
+            })?;
+    }
+    let admission = args.preprocess.admission();
     match args.command {
         Command::Help => {
             println!("{}", usage());
@@ -306,23 +345,30 @@ pub fn run(args: &Args) -> SpiceResult<()> {
         }
         Command::Control => {
             let path = required_path(args, args.netlist.as_deref(), "netlist")?;
-            crate::cli::control::run_file(
+            crate::cli::control::run_file_with_admission(
                 path,
                 args.auto_gnd,
                 crate::cli::control::ScriptLimits::default(),
+                admission.as_ref(),
                 &mut std::io::stdout().lock(),
             )?;
         }
         Command::Simulate => {
             let deck = required_path(args, args.netlist.as_deref(), "netlist")?;
             let output = required_path(args, args.output.as_deref(), "--output")?;
-            let mut report =
-                crate::cli::simulate::run_with_format(deck, output, args.auto_gnd, args.format)?;
+            let mut report = crate::cli::simulate::run_with_admission(
+                deck,
+                output,
+                args.auto_gnd,
+                args.format,
+                admission.as_ref(),
+            )?;
             crate::cli::simulate::write_report(&mut report, &mut std::io::stdout().lock())?;
         }
         Command::Summary | Command::Cards | Command::Tokens => {
             let path = required_path(args, args.netlist.as_deref(), "netlist")?;
-            let (deck, cards) = load_classified(path)?;
+            let (deck, cards) =
+                load_classified_with_admission(path, SourceLimits::default(), admission.as_ref())?;
             let text = match args.command {
                 Command::Cards => cards_text(&deck, &cards),
                 Command::Tokens => tokens_text(&cards),
@@ -333,7 +379,9 @@ pub fn run(args: &Args) -> SpiceResult<()> {
         Command::Parse => {
             let path = required_path(args, args.netlist.as_deref(), "netlist")?;
             let parser = crate::netlist::Parser::with_auto_gnd(args.auto_gnd);
-            let netlist = parser.parse_file(path)?;
+            let netlist = parser
+                .parse_file_with_admission(path, SourceLimits::default(), admission.as_ref())?
+                .netlist;
             // Options are validated before reporting success: unknown or
             // unsupported settings are errors, never ignored.
             let config = crate::analysis::RunConfig::from_netlist(&netlist)?;
@@ -592,6 +640,7 @@ pub(crate) const fn kind_name(kind: Kind) -> &'static str {
         Kind::Fourier => "Fourier",
         Kind::SParameter => "S-parameter",
         Kind::PeriodicSteadyState => "periodic steady state",
+        Kind::HarmonicBalance => "harmonic balance",
     }
 }
 
@@ -744,7 +793,7 @@ r2 out 0 1k
         assert!(text.contains("by designator:    r(2) v(1)"), "{text}");
         assert!(text.contains("analyses: .tran"), "{text}");
         assert!(
-            text.contains("port:     12 ported and 11 bounded of 26 device designators"),
+            text.contains("port:     12 ported and 13 bounded of 26 device designators"),
             "{text}"
         );
     }
@@ -769,7 +818,7 @@ r2 out 0 1k
     fn the_device_list_distinguishes_ported_bounded_and_pending() {
         let text = devices_text(&Registry::with_builtins());
         assert!(
-            text.starts_with("26 device designator(s): 12 ported, 11 bounded, 3 pending"),
+            text.starts_with("26 device designator(s): 12 ported, 13 bounded, 1 pending"),
             "{text}"
         );
         let status = |letter: char| {
@@ -784,12 +833,12 @@ r2 out 0 1k
         for letter in ['r', 'c', 'l', 'v', 'i', 'e', 'f', 'g', 'h', 'b', 'k', 't'] {
             assert_eq!(status(letter), "ported", "{letter}");
         }
-        for letter in ['d', 'q', 'm', 's', 'w', 'x', 'j', 'u', 'o', 'y', 'z'] {
+        for letter in [
+            'd', 'q', 'm', 's', 'w', 'x', 'j', 'u', 'o', 'y', 'z', 'p', 'a',
+        ] {
             assert_eq!(status(letter), "bounded", "{letter}");
         }
-        for letter in ['n', 'p', 'a'] {
-            assert_eq!(status(letter), "pending", "{letter}");
-        }
+        assert_eq!(status('n'), "pending");
         assert!(
             [
                 "MOS1 (model level 0/1)",

@@ -98,6 +98,13 @@ fn invalid_values_are_errors() {
         ".options temp=-300",
         ".options temp=hot",
         ".options reltol=0",
+        ".options gshunt=-1",
+        ".options minbreak=-1n",
+        ".options minbreak=abc",
+        ".options lteabstol=0",
+        ".options ltereltol=-1",
+        ".options ltetrtol=abc",
+        ".options newtrunc=1",
         ".options reltol=-1e-3",
         ".options vntol=abc",
         ".options abstol=0",
@@ -128,13 +135,10 @@ fn unknown_unimplemented_and_conflicting_options_are_errors() {
         );
     }
     for options in [
-        ".options lteabstol=1e-6",
         // srcsteps/gminsteps/gminfactor/itl1 are implemented (tests/dc_continuation.rs);
         // itl2/itl4/itl6/gmin/xmu and the documented no-ops in tests/options_coverage.rs;
         // noopiter in tests/convergence.rs.
-        ".options gshunt=1e-12",
         ".options bypass=1",
-        ".options reltol=1m minbreak=1n",
     ] {
         assert!(
             config(options).unwrap_err().is_not_yet_ported(),
@@ -226,6 +230,55 @@ fn method_and_maxord_reach_the_companion_driver() {
         (3., c.transient().chgtol.unwrap())
     );
     assert!(config(".options trtol=0").is_err());
+}
+
+#[test]
+fn minbreak_is_real_valued_and_resolved_per_transient() {
+    let c = config(".param spacing=2n\n.options minbreak={spacing}").unwrap();
+    let input = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m"]);
+    let plan = c.plan(input.clone()).unwrap();
+    assert_eq!(
+        plan.transient().unwrap().min_break(),
+        c.transient().minbreak.unwrap()
+    );
+    let explicit =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "minbreak=5n"]);
+    assert_eq!(
+        c.plan(explicit.clone()).unwrap(),
+        explicit.resolve().unwrap()
+    );
+    let reset = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "minbreak=0"]);
+    assert_eq!(c.plan(reset).unwrap(), input.resolve().unwrap());
+    let invalid =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "minbreak=-1"]);
+    assert!(c.plan(invalid).is_err());
+}
+
+#[test]
+fn voltage_lte_request_overrides_deck_and_does_not_leak() {
+    let c = config(".options newtrunc lteabstol=1u ltereltol=0.01 ltetrtol=10").unwrap();
+    let request = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m"]);
+    let explicit = AnalysisInput::with_arguments(
+        AnalysisKind::Transient,
+        [
+            "1u",
+            "1m",
+            "newtrunc=1",
+            "lteabstol=1u",
+            "ltereltol=0.01",
+            "ltetrtol=10",
+        ],
+    );
+    assert_eq!(
+        c.plan(request.clone()).unwrap(),
+        explicit.resolve().unwrap()
+    );
+    let disabled =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "newtrunc=0"]);
+    assert_eq!(c.plan(disabled).unwrap(), request.resolve().unwrap());
+    let invalid =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "ltetrtol=0"]);
+    assert!(c.plan(invalid).is_err());
 }
 
 #[test]

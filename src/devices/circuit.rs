@@ -14,6 +14,9 @@
 //! [`Circuit::finalize`], which validates the graph and rebuilds the numbering
 //! in one go.
 
+pub(crate) mod bin_sweep;
+pub(crate) use bin_sweep::{BinnedDeck, GeometryEdit};
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -34,7 +37,10 @@ use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
 use crate::devices::state::{
     DeviceState, HistoryPublication, StateHistory, StateSnapshot, TrialState,
 };
-use crate::devices::sweep::{InstanceOverride, InstanceTarget, ResistorMetadata, ResistorOverride};
+use crate::devices::sweep::{
+    GeometryScale, InstanceOverride, InstanceTarget, ParameterKey, ResistorMetadata,
+    ResistorOverride,
+};
 use crate::devices::traits::{
     AcceptContext, AnalysisMode, Device, InductanceValue, MnaUnknowns, MutualTerm, StampContext,
     StampRhs,
@@ -156,6 +162,10 @@ pub struct Circuit {
     bindings: TopologyBindings,
     mutual_limits: MutualLimits,
     elaboration_limits: ElaborationLimits,
+    binned_deck: Option<Arc<BinnedDeck>>,
+    prepared_node_initializations:
+        BTreeMap<NodeId, crate::devices::passive_bias::NodeInitialization>,
+    prepared_initialization_analyses: Option<BTreeSet<(crate::primitives::AnalysisKind, bool)>>,
     pub(super) runtime: CircuitRuntime,
 }
 
@@ -168,9 +178,15 @@ struct TopologyBindings {
     names: DeviceNames,
     order: Vec<usize>,
     branch_rows: Vec<std::ops::Range<usize>>,
+    convergence_kinds: Vec<crate::devices::ConvergenceKind>,
+    private_storage_rows: Vec<(usize, usize)>,
+    regularization_nodes: Option<Vec<usize>>,
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
+    stochastic_sources: Vec<usize>,
+    prepared_devices: Vec<usize>,
+    native_mixed: Option<crate::analysis::digital::NativeTopology>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
 }
@@ -200,7 +216,9 @@ pub(super) struct CircuitRuntime {
     initial_revision: std::cell::RefCell<Arc<()>>,
     pattern: std::cell::RefCell<Option<Arc<crate::maths::Pattern>>>,
     carried_state: std::cell::RefCell<Option<StateSnapshot>>,
+    continuation_diagonal: std::cell::Cell<Real>,
     completed: Vec<crate::primitives::AnalysisKind>,
+    last_digital_stats: Option<crate::analysis::digital::Stats>,
     final_transient: std::cell::RefCell<Option<StateSnapshot>>,
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
@@ -213,7 +231,7 @@ pub(super) struct CircuitRuntime {
 ///
 /// It fits in `Copy` analysis requests; exhaustion is an explicit error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TopologyId(u64);
+pub(crate) struct TopologyId(std::num::NonZeroU64);
 
 impl TopologyId {
     fn allocate() -> SpiceResult<Self> {
@@ -225,7 +243,11 @@ impl TopologyId {
                 .checked_add(1)
                 .ok_or_else(|| SpiceError::circuit("topology identity space exhausted"))?;
             match NEXT.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return Ok(Self(id)),
+                Ok(_) => {
+                    return std::num::NonZeroU64::new(id)
+                        .map(Self)
+                        .ok_or_else(|| SpiceError::circuit("invalid zero topology identity"));
+                }
                 Err(observed) => id = observed,
             }
         }
@@ -340,6 +362,10 @@ impl<'a> PreparedTransient<'a> {
         self.run
     }
 
+    pub(crate) const fn coefficients(&self) -> &'a Coefficients {
+        self.coefficients
+    }
+
     pub(crate) const fn history(&self) -> &'a StateHistory {
         self.history
     }
@@ -391,6 +417,8 @@ pub(super) struct PreparedPoint {
     context: ModelContext,
     replacements: Vec<(usize, Box<dyn Device>)>,
     mutual: std::cell::OnceCell<PreparedMutualTerms>,
+    prepared_batches:
+        std::cell::OnceCell<std::cell::RefCell<crate::devices::prepared_model::batch::Plan>>,
 }
 
 fn effective_device<'a>(
@@ -409,6 +437,30 @@ fn effective_device<'a>(
 impl PreparedPoint {
     pub(super) fn device<'a>(&'a self, circuit: &'a Circuit, ordinal: usize) -> &'a dyn Device {
         effective_device(circuit, &self.replacements, ordinal)
+    }
+
+    fn batches(
+        &self,
+        circuit: &Circuit,
+    ) -> SpiceResult<std::cell::RefMut<'_, crate::devices::prepared_model::batch::Plan>> {
+        if self.prepared_batches.get().is_none() {
+            let plan = crate::devices::prepared_model::batch::Plan::new(
+                circuit.devices.len(),
+                &circuit.bindings.unknowns,
+                circuit
+                    .bindings
+                    .prepared_devices
+                    .iter()
+                    .copied()
+                    .map(|index| (index, self.device(circuit, index))),
+            )?;
+            let _ = self.prepared_batches.set(std::cell::RefCell::new(plan));
+        }
+        self.prepared_batches
+            .get()
+            .ok_or_else(|| SpiceError::circuit("missing prepared batch plan"))?
+            .try_borrow_mut()
+            .map_err(|_| SpiceError::circuit("prepared batch plan already active"))
     }
 
     pub(super) fn mutual(&self, circuit: &Circuit) -> SpiceResult<PreparedMutualTerms> {
@@ -443,11 +495,43 @@ impl<'a> PreparedRun<'a> {
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.contexts += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
-        let replacements = self.circuit.replacements(context)?;
+        let mut replacements = self.circuit.replacements(context)?;
+        for &index in &self.circuit.bindings.prepared_devices {
+            match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
+                Ok(slot) => {
+                    if let Some(device) = replacements[slot].1.reprepare_context(context)? {
+                        replacements[slot].1 = device;
+                    }
+                }
+                Err(slot) => {
+                    if let Some(device) = self.circuit.devices[index].reprepare_context(context)? {
+                        replacements.insert(slot, (index, device));
+                    }
+                }
+            }
+        }
+        let prepared_batches = std::cell::OnceCell::new();
+        {
+            let previous = self.point.borrow();
+            if let Some(plan) = previous
+                .as_ref()
+                .and_then(|point| point.prepared_batches.get())
+            {
+                let mut plan = plan
+                    .try_borrow_mut()
+                    .map_err(|_| SpiceError::circuit("prepared batch plan already active"))?;
+                plan.rebind(
+                    |index| effective_device(self.circuit, &replacements, index),
+                    &self.circuit.bindings.unknowns,
+                )?;
+                let _ = prepared_batches.set(std::cell::RefCell::new(std::mem::take(&mut *plan)));
+            }
+        }
         self.point.replace(Some(PreparedPoint {
             context: *context,
             replacements,
             mutual: std::cell::OnceCell::new(),
+            prepared_batches,
         }));
         std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
             .map_err(|_| SpiceError::circuit("missing prepared model context"))
@@ -574,6 +658,20 @@ impl<'a> PreparedRun<'a> {
             .record_small_signal_state_prepared(self, context, bias)
     }
 
+    /// Build independent physical small-signal state at a sampled orbit
+    /// point, without publishing any carried analysis state.
+    pub(crate) fn independent_small_signal_snapshot(
+        &self,
+        context: &ModelContext,
+        bias: &Vector,
+        values: &[Real],
+    ) -> SpiceResult<StateSnapshot> {
+        let mut state = values.to_vec();
+        self.circuit
+            .small_signal_slots(self, context, bias, &mut state)?;
+        self.circuit.bind_state(state)
+    }
+
     /// Assemble the small-signal system with this run's effective devices.
     /// # Errors
     /// As [`Circuit::small_signal_system_at`].
@@ -585,6 +683,248 @@ impl<'a> PreparedRun<'a> {
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
         self.circuit
             .bias_linearized_system(self, context, bias, state, 0, None)
+    }
+
+    /// Transient source timing and fixed linear equations, without
+    /// evaluating nonlinear devices at an artificial zero bias. The actual
+    /// nonlinear static and transient equations are loaded by Newton.
+    pub(crate) fn transient_forcing_system(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        self.circuit.assemble_linear_devices(self, context, true)
+    }
+
+    /// The constant linear operators and source bindings of a physical DAE.
+    /// Nonlinear devices are handled by the ordinary exact load and their
+    /// separate physical charge laws. Reject history-dependent equations
+    /// before any frequency-domain Newton iteration.
+    pub(crate) fn dae_linear_part(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        self.validate_physical_dae(context, false)?;
+        self.transient_forcing_system(context)
+    }
+
+    /// Prepare the memoryless physical DAE with independent forcing at the
+    /// requested time, rather than treating it as a DC or integrated load.
+    ///
+    /// # Errors
+    /// History-dependent or unsupported model, or invalid linear assembly.
+    pub fn prepare_physical_dae(
+        &self,
+        context: &ModelContext,
+        timing: crate::devices::TransientTiming,
+    ) -> SpiceResult<crate::devices::physical_dae::PhysicalDae<'_, 'a>> {
+        self.validate_physical_dae(context, true)?;
+        let linear = self.transient_forcing_system(context)?;
+        crate::devices::physical_dae::PhysicalDae::new(self, *context, timing, linear)
+    }
+
+    fn validate_physical_dae(
+        &self,
+        context: &ModelContext,
+        time_dependent: bool,
+    ) -> SpiceResult<()> {
+        let point = self.point(context)?;
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            if (!time_dependent && device.depends_on_time())
+                || device.depends_on_frequency()
+                || device.small_signal_depends_on_frequency()
+                || device.delay_line().is_some()
+                || device.has_discrete_state()
+            {
+                return Err(SpiceError::Unsupported {
+                    feature: format!("memoryless physical DAE for {}", device.name()),
+                    location: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Add exact nonlinear device charge and its derivative to a linear
+    /// charge assembly. The same effective recipes are used as in `load()`.
+    pub(crate) fn dae_nonlinear_charge(
+        &self,
+        context: &ModelContext,
+        state: &Vector,
+        time: Real,
+        charge: &mut Vector,
+        jacobian: &mut SparseMatrix,
+    ) -> SpiceResult<()> {
+        self.assemble_charge_for(
+            context,
+            state,
+            time,
+            charge,
+            jacobian,
+            self.circuit.load_order(),
+        )
+    }
+
+    pub(crate) fn physical_taylor_storage_bindings(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Vec<(usize, String)>> {
+        let point = self.point(context)?;
+        let mut bindings = Vec::new();
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            device.physical_charge_histories(&mut |history| {
+                let range = self
+                    .circuit
+                    .state_rows(index)
+                    .ok_or_else(|| SpiceError::circuit("missing physical Taylor history range"))?;
+                if history.slot.saturating_add(1) >= range.len() {
+                    return Err(SpiceError::circuit(
+                        "physical Taylor history pair outside device",
+                    ));
+                }
+                bindings.push((range.start + history.slot, device.name().to_owned()));
+                Ok(())
+            })?;
+        }
+        bindings.sort_unstable_by_key(|binding| binding.0);
+        if bindings
+            .windows(2)
+            .any(|pair| pair[0].0.saturating_add(1) >= pair[1].0)
+        {
+            return Err(SpiceError::circuit(
+                "overlapping physical Taylor history pairs",
+            ));
+        }
+        Ok(bindings)
+    }
+
+    pub(crate) fn dae_nonlinear_taylor(
+        &self,
+        model: &ModelContext,
+        state: &[Vector],
+        time: &crate::maths::taylor::Jet,
+        output: &mut crate::devices::physical_dae::PhysicalDaeTaylor,
+    ) -> SpiceResult<()> {
+        let point = self.point(model)?;
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            if device.is_nonlinear() {
+                device
+                    .assemble_nonlinear_taylor(&mut crate::devices::physical_dae::TaylorContext {
+                        device: index,
+                        state_rows: self
+                            .circuit
+                            .state_rows(index)
+                            .ok_or_else(|| SpiceError::circuit("missing Taylor state range"))?,
+                        model,
+                        unknowns: &self.circuit.bindings.unknowns,
+                        branch: self.circuit.bindings.branch_rows[index].clone().next(),
+                        controls: self.circuit.controls(index)?,
+                        state,
+                        time,
+                        output,
+                    })
+                    .map_err(|error| match error {
+                        SpiceError::Circuit { message } => SpiceError::circuit(format!(
+                            "{}: physical Taylor evaluation at t = {:e}: {message}",
+                            device.name(),
+                            time.value()
+                        )),
+                        other => other,
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Populate a physical trial from its solved one-sided state. Devices
+    /// whose history is already fully specified must not be evaluated again
+    /// at the scalar boundary (which may select an isolated, undefined branch).
+    pub(crate) fn physical_candidate_state(
+        &self,
+        request: &LoadRequest<'_>,
+        canonical: &[(usize, Real)],
+    ) -> SpiceResult<TrialState> {
+        let mut trial = request.history.trial();
+        let mut covered = vec![false; trial.values().len()];
+        for &(slot, value) in canonical {
+            let flag = covered
+                .get_mut(slot)
+                .ok_or_else(|| SpiceError::circuit("invalid physical history slot"))?;
+            *flag = true;
+            request
+                .history
+                .set_candidate_slot(&mut trial, slot, value)?;
+        }
+        let point = self.point(request.model_context)?;
+        let mutual = point.mutual(self.circuit)?;
+        let n = request.solution.len();
+        let mut matrix = SparseMatrix::new(n, n);
+        let mut rhs = Vector::zeros(n);
+        for index in self.circuit.load_order() {
+            let mut rows = self
+                .circuit
+                .state_rows(index)
+                .ok_or_else(|| SpiceError::circuit("missing physical state range"))?;
+            if rows.all(|slot| covered[slot]) {
+                continue;
+            }
+            matrix.clear();
+            rhs.clear();
+            self.circuit.stamp_isolated(
+                index,
+                point.device(self.circuit, index),
+                request,
+                &mut matrix,
+                StampRhs::dense(&mut rhs),
+                request.history.device_of(&mut trial, index)?,
+                &mutual,
+                None,
+            )?;
+        }
+        // Partial device loads may have overwritten canonical coordinates.
+        for &(slot, value) in canonical {
+            request
+                .history
+                .set_candidate_slot(&mut trial, slot, value)?;
+        }
+        trial.snapshot()?;
+        Ok(trial)
+    }
+
+    /// Assemble only selected physical charge equations for a constrained
+    /// instantaneous load. Uses the same prepared model and physical kernel
+    /// as the frequency-domain DAE; does not evaluate unrelated devices.
+    pub(crate) fn assemble_charge_for(
+        &self,
+        context: &ModelContext,
+        state: &Vector,
+        time: Real,
+        charge: &mut Vector,
+        jacobian: &mut SparseMatrix,
+        indices: impl Iterator<Item = usize>,
+    ) -> SpiceResult<()> {
+        let point = self.point(context)?;
+        let mut input = crate::devices::traits::ChargeContext {
+            model: context,
+            unknowns: &self.circuit.bindings.unknowns,
+            branch: None,
+            controls: &[],
+            state,
+            time,
+            charge,
+            jacobian,
+        };
+        for index in indices {
+            let device = point.device(self.circuit, index);
+            if device.is_nonlinear() {
+                input.branch = self.circuit.bindings.branch_rows[index].clone().next();
+                input.controls = self.circuit.controls(index)?;
+                device.assemble_nonlinear_charge(&mut input)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -832,6 +1172,8 @@ pub struct ConvergenceRequest<'a> {
     pub model_context: &'a ModelContext,
     /// Transient time, zero otherwise.
     pub time: Real,
+    /// Companion formula for the current transient step.
+    pub integration: Option<&'a Coefficients>,
     /// C `CKTreltol`.
     pub reltol: Real,
     /// C `CKTabstol`.
@@ -931,10 +1273,13 @@ fn ordered_control_targets(
     let mut unique = BTreeMap::new();
     for (order, target) in targets.into_iter().enumerate() {
         let value = match target {
-            CandidateNumericOverride::Resistor(value) => {
-                InstanceTarget::new(value.topology(), value.device(), "resistance")
-                    .at(value.supplied())?
-            }
+            CandidateNumericOverride::Resistor(value) => InstanceTarget::new(
+                value.topology(),
+                value.device(),
+                ParameterKey::Native("resistance"),
+                GeometryScale::Identity,
+            )
+            .at(value.supplied())?,
             CandidateNumericOverride::Instance(value) => value,
         };
         unique.insert((value.device(), value.parameter()), (order, value));
@@ -1124,10 +1469,145 @@ impl Circuit {
     }
 
     fn invalidate_topology(&mut self) {
+        self.binned_deck = None;
         if self.bindings.identity.is_some() {
             self.bindings = TopologyBindings::default();
             self.runtime = CircuitRuntime::default();
         }
+    }
+
+    fn apply_prepared_waveforms(
+        &mut self,
+        waveforms: Vec<(String, crate::devices::prepared_waveform::PreparedForcing)>,
+    ) -> SpiceResult<()> {
+        if waveforms.is_empty() {
+            return Ok(());
+        }
+        let mut prepared = BTreeMap::new();
+        for (name, forcing) in waveforms {
+            if prepared.insert(name, forcing).is_some() {
+                return Err(SpiceError::circuit("duplicate expanded prepared waveform"));
+            }
+        }
+        for device in &mut self.devices {
+            if let Some(forcing) = prepared.remove(device.name()) {
+                let source = (&mut *device.device as &mut dyn std::any::Any)
+                    .downcast_mut::<crate::devices::IndependentSource>()
+                    .ok_or_else(|| {
+                        SpiceError::circuit(
+                            "prepared waveform identity is not an independent source",
+                        )
+                    })?;
+                source.bind_prepared(forcing)?;
+            }
+        }
+        if !prepared.is_empty() {
+            return Err(SpiceError::circuit("unbound expanded prepared waveform"));
+        }
+        Ok(())
+    }
+
+    fn apply_prepared_initializations(
+        &mut self,
+        bound: crate::netlist::prepared_initialization::BoundInitializations,
+    ) -> SpiceResult<()> {
+        self.prepared_initialization_analyses = bound.analyses;
+        if !bound.devices.is_empty() {
+            let names = self.validate_topology()?;
+            for (name, policy) in bound.devices {
+                let index = names.get(&name).ok_or_else(|| {
+                    SpiceError::circuit(format!("unknown prepared passive occurrence {name}"))
+                })?;
+                self.devices[index]
+                    .device
+                    .bind_passive_initialization(policy)?;
+            }
+            self.invalidate_topology();
+        }
+        for (name, policy) in bound.nodes {
+            self.bind_node_initialization(&name, policy)?;
+        }
+        Ok(())
+    }
+
+    /// Bind a fully resolved source-prepared passive occurrence before
+    /// any analysis or observation plan is constructed. Ordinary decks do
+    /// not install these equations.
+    ///
+    /// # Errors
+    /// Unknown device or incompatible physical storage family.
+    pub fn bind_passive_initialization(
+        &mut self,
+        name: &str,
+        policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        let index = self
+            .devices
+            .iter()
+            .position(|device| device.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                SpiceError::circuit(format!("unknown prepared passive occurrence {name}"))
+            })?;
+        self.devices[index]
+            .device
+            .bind_passive_initialization(policy)?;
+        self.invalidate_topology();
+        Ok(())
+    }
+
+    /// Bind a source-prepared voltage hint to its resolved node. The first
+    /// declaration targeting the same physical node wins.
+    ///
+    /// # Errors
+    /// An unknown node or ground.
+    pub fn bind_node_initialization(
+        &mut self,
+        name: &str,
+        policy: crate::devices::passive_bias::NodeInitialization,
+    ) -> SpiceResult<()> {
+        let node = self
+            .nodes
+            .get(name)
+            .filter(|node| *node != NodeId::GROUND)
+            .ok_or_else(|| SpiceError::circuit(format!("invalid prepared node hint {name}")))?;
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.prepared_node_initializations.entry(node)
+        {
+            entry.insert(policy);
+            self.invalidate_topology();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_prepared_analysis(
+        &self,
+        kind: crate::primitives::AnalysisKind,
+        uic: bool,
+    ) -> SpiceResult<()> {
+        if self
+            .prepared_initialization_analyses
+            .as_ref()
+            .is_some_and(|analyses| !analyses.contains(&(kind, uic)))
+        {
+            return Err(SpiceError::circuit(format!(
+                "prepared initialization was not bound for {} (uic={uic}); elaborate the requested analysis first",
+                kind.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_prepared_bias(&self) -> bool {
+        !self.prepared_node_initializations.is_empty()
+            || self.devices.iter().any(|device| device.has_passive_bias())
+    }
+
+    pub(crate) fn prepared_node_hints(
+        &self,
+    ) -> impl Iterator<Item = (NodeId, &crate::devices::passive_bias::NodeInitialization)> {
+        self.prepared_node_initializations
+            .iter()
+            .map(|(&node, policy)| (node, policy))
     }
 
     /// Number of device instances.
@@ -1220,7 +1700,9 @@ impl Circuit {
             // CKTfndBranch for each controlling source, in order.
             for control in self.devices[index].controlling_sources() {
                 if let Some(target) = names.get(&control.name)
-                    && self.devices[target].findable_branch().is_some()
+                    && self.devices[index]
+                        .control_branch(self.devices[target].as_ref())
+                        .is_some()
                 {
                     allocate_branch(&mut self.bindings.unknowns, target)?;
                 }
@@ -1229,6 +1711,22 @@ impl Circuit {
                 self.bindings.unknowns.assign_deferred(node);
             }
             allocate_branch(&mut self.bindings.unknowns, index)?;
+        }
+        self.bindings.convergence_kinds =
+            vec![crate::devices::ConvergenceKind::Voltage; self.bindings.unknowns.len()];
+        for (device, rows) in self.devices.iter().zip(&self.bindings.branch_rows) {
+            for node in device.constitutive_nodes() {
+                let row = self
+                    .bindings
+                    .unknowns
+                    .node_row(*node)
+                    .ok_or_else(|| SpiceError::circuit("unbound constitutive node"))?;
+                self.bindings.convergence_kinds[row] =
+                    crate::devices::ConvergenceKind::Constitutive;
+            }
+            for (local, row) in rows.clone().enumerate() {
+                self.bindings.convergence_kinds[row] = device.branch_convergence(local);
+            }
         }
         let mut state_rows = Vec::with_capacity(self.devices.len());
         self.bindings.state_len = 0;
@@ -1248,14 +1746,156 @@ impl Circuit {
             .iter()
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect::<SpiceResult<_>>()?;
+        self.bindings.private_storage_rows = self.bind_private_storage()?;
+        self.bindings.regularization_nodes = self.bind_regularization_nodes();
         self.bindings.mutual = self.resolve_mutual(names)?;
         Ok(())
+    }
+
+    /// Mixed-unit constitutive systems require a physical nodal regularization.
+    ///
+    /// Unlike the legacy SPARSE internal diagonal, a conductance in an
+    /// original electrical KCL row cannot perturb a charge, flux or
+    /// derivative equation, regardless of numerical pivot permutations.
+    fn bind_regularization_nodes(&self) -> Option<Vec<usize>> {
+        use crate::devices::BranchQuantity;
+        let mixed = self
+            .devices
+            .iter()
+            .zip(&self.bindings.branch_rows)
+            .any(|(device, rows)| {
+                !device.constitutive_nodes().is_empty()
+                    || device.has_passive_bias()
+                    || (0..rows.len())
+                        .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
+            });
+        mixed.then(|| {
+            self.physical_voltage_nodes()
+                .filter_map(|node| self.bindings.unknowns.node_row(node.id))
+                .collect()
+        })
+    }
+
+    /// Bind each private expression storage coordinate and its derivative
+    /// output. The linear evolution equation belongs to the private
+    /// coordinate's own row; other devices cannot address that coordinate.
+    fn bind_private_storage(&self) -> SpiceResult<Vec<(usize, usize)>> {
+        use crate::devices::InitialStorageRow;
+        let controlled: std::collections::BTreeSet<_> = self
+            .bindings
+            .control_rows
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let mut bindings = Vec::new();
+        for (index, device) in self.devices.iter().enumerate() {
+            let Some(storage) = device.initial_expression_storage() else {
+                continue;
+            };
+            let rows = &self.bindings.branch_rows[index];
+            let bind = |local| match local {
+                InitialStorageRow::Branch(index) => rows.clone().nth(index),
+                InitialStorageRow::Signal(node) => self.bindings.unknowns.node_row(node),
+            };
+            let (Some(coordinate), Some(derivative)) =
+                (bind(storage.equation), bind(storage.gauge))
+            else {
+                return Err(SpiceError::circuit("invalid private storage coordinate"));
+            };
+            if !matches!(storage.equation, InitialStorageRow::Branch(_))
+                || coordinate == derivative
+                || controlled.contains(&coordinate)
+            {
+                return Err(SpiceError::circuit(
+                    "expression storage coordinate is not private",
+                ));
+            }
+            bindings.push((coordinate, derivative));
+        }
+        Ok(bindings)
     }
 
     /// Preflight every K card in linear input work before expanding any
     /// pairs, then resolve its names in original card order.
     fn resolve_mutual(&self, names: &DeviceNames) -> SpiceResult<MutualBinding> {
         let limits = self.mutual_limits;
+        let (total_pairs, card_count) = self.preflight_mutual(limits)?;
+        if card_count == 0 {
+            return Ok(MutualBinding::default());
+        }
+
+        // Every card passed aggregate resource preflight. Only resolved
+        // references, not pairs, are materialized until group bounds pass.
+        let mut cards = Vec::new();
+        for (coupling, device) in self.devices.iter().enumerate() {
+            let Some(description) = device.mutual_coupling() else {
+                continue;
+            };
+            let site = CouplingSite::of(device.as_ref());
+            if cards.is_empty() {
+                cards = site.reserve(card_count)?;
+            }
+            let mut inductors = site.reserve(description.inductors.len())?;
+            let mut seen = BTreeSet::new();
+            for reference in description.inductors {
+                let failure = |message: String| match &reference.location {
+                    Some(location) => SpiceError::parse(location.clone(), message),
+                    None => SpiceError::circuit(message),
+                };
+                let Some(index) = names.get(&reference.name) else {
+                    return Err(failure(format!(
+                        "{}: coupling to non-existent inductor {}",
+                        device.name(),
+                        reference.name
+                    )));
+                };
+                let target = &self.devices[index];
+                if target.designator() == 'l'
+                    && target.inductance(&ModelContext::default()).is_none()
+                {
+                    return Err(failure(format!(
+                        "{}: {} has no constant coupling inductance; K with expression-controlled inductors requires an explicit coupled flux law",
+                        device.name(),
+                        target.name()
+                    )));
+                }
+                if target.inductance(&ModelContext::default()).is_none()
+                    || self.bindings.branch_rows[index].len() != 1
+                {
+                    return Err(failure(format!(
+                        "{}: {} is not an inductor (a K card couples inductors only)",
+                        device.name(),
+                        target.name()
+                    )));
+                }
+                if !seen.insert(index) {
+                    return Err(failure(format!(
+                        "{}: couples inductor {} to itself",
+                        device.name(),
+                        target.name()
+                    )));
+                }
+                inductors.push(index);
+            }
+            let pairs = pair_count(inductors.len())
+                .ok_or_else(|| site.resource("mutual pair count overflows"))?;
+            cards.push(ResolvedCard {
+                coupling,
+                inductors,
+                pairs,
+            });
+        }
+        MutualBinding::from_cards(
+            cards,
+            total_pairs,
+            &self.bindings.branch_rows,
+            &self.devices,
+            limits,
+        )
+    }
+
+    fn preflight_mutual(&self, limits: MutualLimits) -> SpiceResult<(usize, usize)> {
         let mut total_pairs = 0_usize;
         let mut references = 0_usize;
         let mut card_count = 0_usize;
@@ -1295,69 +1935,7 @@ impl Circuit {
                 )));
             }
         }
-        if card_count == 0 {
-            return Ok(MutualBinding::default());
-        }
-
-        // Every card passed aggregate resource preflight. Only resolved
-        // references, not pairs, are materialized until group bounds pass.
-        let mut cards = Vec::new();
-        for (coupling, device) in self.devices.iter().enumerate() {
-            let Some(description) = device.mutual_coupling() else {
-                continue;
-            };
-            let site = CouplingSite::of(device.as_ref());
-            if cards.is_empty() {
-                cards = site.reserve(card_count)?;
-            }
-            let mut inductors = site.reserve(description.inductors.len())?;
-            let mut seen = BTreeSet::new();
-            for reference in description.inductors {
-                let failure = |message: String| match &reference.location {
-                    Some(location) => SpiceError::parse(location.clone(), message),
-                    None => SpiceError::circuit(message),
-                };
-                let Some(index) = names.get(&reference.name) else {
-                    return Err(failure(format!(
-                        "{}: coupling to non-existent inductor {}",
-                        device.name(),
-                        reference.name
-                    )));
-                };
-                let target = &self.devices[index];
-                if target.inductance(&ModelContext::default()).is_none()
-                    || self.bindings.branch_rows[index].len() != 1
-                {
-                    return Err(failure(format!(
-                        "{}: {} is not an inductor (a K card couples inductors only)",
-                        device.name(),
-                        target.name()
-                    )));
-                }
-                if !seen.insert(index) {
-                    return Err(failure(format!(
-                        "{}: couples inductor {} to itself",
-                        device.name(),
-                        target.name()
-                    )));
-                }
-                inductors.push(index);
-            }
-            let pairs = pair_count(inductors.len())
-                .ok_or_else(|| site.resource("mutual pair count overflows"))?;
-            cards.push(ResolvedCard {
-                coupling,
-                inductors,
-                pairs,
-            });
-        }
-        MutualBinding::from_cards(
-            cards,
-            total_pairs,
-            &self.bindings.branch_rows,
-            &self.devices,
-            limits,
-        )
+        Ok((total_pairs, card_count))
     }
 
     /// The mutual-inductance terms of every device's branch equation under
@@ -1558,8 +2136,9 @@ impl Circuit {
     /// Branch rows of the devices `device` senses (C `CKTfndBranch`, called
     /// from `CCCSsetup`/`CCVSsetup`): looked up by instance name after every
     /// device is known, so a controlling source may follow its user in the
-    /// deck. Only devices with a [`Device::findable_branch`] qualify: C finds
-    /// V, E, H (and B) branches, but not inductor currents.
+    /// deck. The consumer selects the physical branch through
+    /// [`Device::control_branch`]; expression probes can also use native
+    /// storage currents.
     fn resolve_controls(
         &self,
         device: &dyn Device,
@@ -1581,11 +2160,9 @@ impl Circuit {
                     )));
                 };
                 let target = &self.devices[index];
-                let Some(branch) = target.findable_branch() else {
+                let Some(branch) = device.control_branch(target.as_ref()) else {
                     return Err(failure(format!(
-                        "{}: controlling source {} has no findable branch current (only \
-                         independent voltage sources and E/H sources can be sensed, as by \
-                         CKTfndBranch)",
+                        "{}: controlling source {} has no findable branch current for this control",
                         device.name(),
                         target.name()
                     )));
@@ -1642,6 +2219,31 @@ impl Circuit {
         result
     }
 
+    pub(crate) fn prepare_native_mixed(
+        &mut self,
+    ) -> SpiceResult<Option<crate::analysis::digital::MixedSignal>> {
+        self.finalize()?;
+        self.runtime.last_digital_stats = None;
+        self.bindings
+            .native_mixed
+            .as_ref()
+            .map(crate::analysis::digital::NativeTopology::start)
+            .transpose()
+    }
+
+    /// Accepted event work from the most recent successful native mixed analysis.
+    #[must_use]
+    pub const fn last_digital_stats(&self) -> Option<crate::analysis::digital::Stats> {
+        self.runtime.last_digital_stats
+    }
+
+    pub(crate) const fn record_digital_stats(
+        &mut self,
+        stats: Option<crate::analysis::digital::Stats>,
+    ) {
+        self.runtime.last_digital_stats = stats;
+    }
+
     fn prepare_topology(&mut self) -> SpiceResult<()> {
         // Validate graph before any predecessor binding or numbering mutation.
         self.elaboration_limits
@@ -1665,6 +2267,23 @@ impl Circuit {
         }
         self.check_port_numbering()?;
         self.allocate_matrix(order)?;
+        self.bindings.stochastic_sources = self
+            .devices
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, device)| device.has_stochastic_source().then_some(ordinal))
+            .collect();
+        self.bindings.prepared_devices = self
+            .bindings
+            .order
+            .iter()
+            .copied()
+            .filter(|&index| self.devices[index].prepared_batch_key().is_some())
+            .collect();
+        self.bindings.native_mixed = crate::devices::code_model::source::mixed_topology(
+            &self.devices,
+            self.elaboration_limits,
+        )?;
         self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
@@ -1733,7 +2352,15 @@ impl Circuit {
     /// same elements is kept, so its pivot order survives re-finalization
     /// (C sets a circuit up once).
     fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
-        let elements = self.ordered_elements(&order, 0)?;
+        let mut elements = self.ordered_elements(&order, 0)?;
+        elements.extend(
+            self.prepared_node_initializations
+                .keys()
+                .filter_map(|&node| self.bindings.unknowns.node_row(node).map(|row| (row, row))),
+        );
+        if let Some(rows) = &self.bindings.regularization_nodes {
+            elements.extend(rows.iter().map(|&row| (row, row)));
+        }
         self.bindings.order = order;
         let n = self.unknown_count();
         let mut slot = self.runtime.pattern.borrow_mut();
@@ -1849,7 +2476,11 @@ impl Circuit {
                 solution: request.solution,
                 previous: request.previous,
                 controls: self.controls(index)?,
+                branch: self.bindings.branch_rows[index].clone().next(),
+                integration: request.integration,
                 states: &request.trial.values()[self.bindings.state_rows[index].clone()],
+                history: request.history,
+                state_range: self.bindings.state_rows[index].clone(),
                 phase: request.trial.phase(),
                 model_context: request.model_context,
                 time: request.time,
@@ -2017,10 +2648,97 @@ impl Circuit {
         Ok(())
     }
 
+    /// Append an already budgeted device graph without synthesizing a netlist.
+    /// Node ownership is assigned once, to the first device in the graph.
+    pub(super) fn add_prepared_devices(
+        &mut self,
+        size: ElaborationSize,
+        build: impl FnOnce(&mut crate::primitives::NodeAppend<'_>) -> SpiceResult<Vec<Box<dyn Device>>>,
+    ) -> SpiceResult<()> {
+        let existing = self.elaboration_size()?;
+        self.elaboration_limits
+            .check(existing.checked_add(size, None)?, None)?;
+        let mut seen: BTreeSet<_> = self
+            .devices
+            .iter()
+            .map(|d| d.name().to_lowercase())
+            .collect();
+        let devices = &mut self.devices;
+        let staged = self.nodes.transaction(|nodes| {
+            let mark = nodes.len();
+            let generated = build(nodes)?;
+            let mut staged = Vec::new();
+            reserve(&mut staged, generated.len(), None)?;
+            for device in generated {
+                if !seen.insert(device.name().to_lowercase()) {
+                    return Err(SpiceError::circuit(format!(
+                        "duplicate instance name '{}'",
+                        device.name()
+                    )));
+                }
+                if device
+                    .terminals()
+                    .iter()
+                    .any(|&id| nodes.node(id).is_none())
+                {
+                    return Err(SpiceError::circuit(
+                        "prepared device refers to an unknown node",
+                    ));
+                }
+                staged.push(ElaboratedDevice {
+                    device,
+                    origin: DeviceOrigin::default(),
+                });
+            }
+            let actual = ElaborationSize::new(
+                staged.len(),
+                nodes.len() - mark,
+                Self::declared_state_slots(&staged, None)?,
+            );
+            if actual != size {
+                return Err(SpiceError::circuit(
+                    "prepared graph differs from its elaboration budget",
+                ));
+            }
+            if let Some(first) = staged.first_mut() {
+                first.origin.internal_nodes = nodes.nodes()[mark..]
+                    .iter()
+                    .filter(|node| node.kind == NodeKind::Internal)
+                    .map(|node| node.id)
+                    .collect();
+            }
+            reserve(devices, staged.len(), None)?;
+            Ok(staged)
+        })?;
+        self.invalidate_topology();
+        self.devices.extend(staged);
+        Ok(())
+    }
+
     /// Branch rows by device ordinal, after finalization.
     pub fn branch_rows(&self, index: usize) -> Option<std::ops::Range<usize>> {
         self.bindings.identity.as_ref()?;
         self.bindings.branch_rows.get(index).cloned()
+    }
+
+    pub(crate) fn convergence_kinds(&self) -> &[crate::devices::ConvergenceKind] {
+        &self.bindings.convergence_kinds
+    }
+
+    pub(crate) const fn continuation_diagonal(&self) -> Real {
+        self.runtime.continuation_diagonal.get()
+    }
+
+    pub(crate) fn set_continuation_diagonal(&self, value: Real) {
+        self.runtime.continuation_diagonal.set(value);
+    }
+
+    pub(crate) fn regularization_nodes(&self) -> Option<&[usize]> {
+        self.bindings.regularization_nodes.as_deref()
+    }
+
+    pub(crate) fn private_storage_rows(&self) -> &[(usize, usize)] {
+        &self.bindings.private_storage_rows
     }
 
     /// The name of every unknown by matrix row, as ngspice names them
@@ -2078,6 +2796,15 @@ impl Circuit {
     /// # Errors
     /// The circuit has no validated topology.
     pub fn state_history(&self) -> SpiceResult<StateHistory> {
+        self.make_state_history(true)
+    }
+
+    /// A physical trial history without analysis-to-analysis carry state.
+    pub(crate) fn independent_state_history(&self) -> SpiceResult<StateHistory> {
+        self.make_state_history(false)
+    }
+
+    fn make_state_history(&self, carry: bool) -> SpiceResult<StateHistory> {
         Ok(StateHistory::bound(
             self.topology_id()?,
             Arc::clone(&self.bindings.state_rows),
@@ -2087,7 +2814,7 @@ impl Circuit {
                 .carried_state
                 .borrow()
                 .as_ref()
-                .filter(|snapshot| self.snapshot_matches(snapshot))
+                .filter(|snapshot| carry && self.snapshot_matches(snapshot))
                 .map(|snapshot| Arc::clone(&snapshot.values)),
             self.devices
                 .iter()
@@ -2151,6 +2878,20 @@ impl Circuit {
                 || vec![0.; self.bindings.state_len],
                 |snapshot| snapshot.values.to_vec(),
             );
+        self.small_signal_slots(run, context, bias, &mut state)?;
+        let snapshot = self.bind_state(state)?;
+        *self.runtime.carried_state.borrow_mut() = Some(snapshot);
+        self.runtime.initial_revision.replace(Arc::new(()));
+        Ok(())
+    }
+
+    fn small_signal_slots(
+        &self,
+        run: &PreparedRun<'_>,
+        context: &ModelContext,
+        bias: &Vector,
+        state: &mut [Real],
+    ) -> SpiceResult<()> {
         let operating = crate::devices::distortion::DistortionContext::new(
             context,
             &self.bindings.unknowns,
@@ -2165,10 +2906,32 @@ impl Circuit {
                     .small_signal_state(&operating, slots)?;
             }
         }
-        let snapshot = self.bind_state(state)?;
-        *self.runtime.carried_state.borrow_mut() = Some(snapshot);
-        self.runtime.initial_revision.replace(Arc::new(()));
         Ok(())
+    }
+
+    /// Mix the accepted reference state with converged trial slots of devices
+    /// whose explicit constitutive law uses the solved bias instead.
+    pub(crate) fn bias_small_signal_snapshot(
+        &self,
+        trial: &TrialState,
+    ) -> SpiceResult<StateSnapshot> {
+        let history = self.state_history()?;
+        let mut values = history
+            .accepted(1)
+            .map_or_else(|| vec![0.; history.len()], <[Real]>::to_vec);
+        for (index, device) in self.devices.iter().enumerate() {
+            if device.small_signal_uses_trial_state() {
+                let range = self.bindings.state_rows[index].clone();
+                let source = trial
+                    .slice(range.clone())
+                    .ok_or_else(|| SpiceError::circuit("missing solved device state"))?;
+                values
+                    .get_mut(range)
+                    .ok_or_else(|| SpiceError::circuit("invalid small-signal device state"))?
+                    .copy_from_slice(source);
+            }
+        }
+        self.bind_state(values)
     }
 
     /// Keeps the final accepted transient load's device state for later
@@ -2309,7 +3072,7 @@ impl Circuit {
         &self,
         name: &str,
         keyword: &str,
-    ) -> SpiceResult<(usize, &'static str)> {
+    ) -> SpiceResult<(usize, ParameterKey)> {
         let Some(index) = self.device_index(name) else {
             return Err(SpiceError::Unsupported {
                 feature: format!("DC sweep parameter target: no instance named {name}"),
@@ -2317,7 +3080,7 @@ impl Circuit {
             });
         };
         let device = &self.devices[index];
-        if let Some(parameter) = device.instance_parameter(keyword) {
+        if let Some(parameter) = device.bind_numeric_parameter(keyword) {
             return Ok((index, parameter));
         }
         if crate::devices::sweep::c_instance_parameter_known(device.designator(), keyword) {
@@ -2353,10 +3116,12 @@ impl Circuit {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<InstanceOverride> {
-        let target = self.bind_instance_override(name, keyword, value)?;
-        self.devices[target.device()].with_instance_parameter(
+        let target = self
+            .bind_instance_target(name, keyword)?
+            .at_source(value, context.geometry_scale)?;
+        self.devices[target.device()].with_bound_parameter(
             target.parameter(),
-            value,
+            target.value(),
             context,
         )?;
         Ok(target)
@@ -2371,7 +3136,12 @@ impl Circuit {
         let (index, parameter) = self.instance_parameter(name, keyword)?;
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.bindings += 1);
-        Ok(InstanceTarget::new(self.topology_id()?, index, parameter))
+        Ok(InstanceTarget::new(
+            self.topology_id()?,
+            index,
+            parameter,
+            self.devices[index].parameter_geometry_scale(parameter),
+        ))
     }
 
     /// Bind a resistor's supplied (not effective) resistance via its metadata.
@@ -2387,17 +3157,9 @@ impl Circuit {
         Ok(InstanceTarget::new(
             self.topology_id()?,
             index,
-            "resistance",
+            ParameterKey::Native("resistance"),
+            GeometryScale::Identity,
         ))
-    }
-
-    pub(crate) fn bind_instance_override(
-        &self,
-        name: &str,
-        keyword: &str,
-        value: Real,
-    ) -> SpiceResult<InstanceOverride> {
-        self.bind_instance_target(name, keyword)?.at(value)
     }
 
     /// A DC value override of the independent V or I source `name`, as
@@ -2428,7 +3190,12 @@ impl Circuit {
             .ok_or_else(|| SpiceError::circuit("invalid or unknown DC source override"))?;
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.bindings += 1);
-        Ok(InstanceTarget::new(self.topology_id()?, index, "dc"))
+        Ok(InstanceTarget::new(
+            self.topology_id()?,
+            index,
+            ParameterKey::Native("dc"),
+            GeometryScale::Identity,
+        ))
     }
 
     pub(crate) fn bind_source_override(
@@ -2517,6 +3284,7 @@ impl Circuit {
             reltol: request.model_context.reltol,
             frequency: request.model_context.frequency,
             mode: request.mode,
+            bias_analysis: request.model_context.bias_analysis,
             branches: self.bindings.branch_rows[index].clone(),
             controls: self.controls(index)?,
             mutual: mutual.get(index).map_or(&[], Vec::as_slice),
@@ -2587,10 +3355,24 @@ impl Circuit {
     /// are untouched; callers stamp the replacement instead of the original for
     /// that ordinal. Several instance overrides of one device are applied in
     /// slot order to the same replacement.
+    /// Rebind stochastic source streams to the caller's candidate identity.
+    /// The replacement preserves terminals, branch rows and device state
+    /// layout so finalized topology and symbolic matrices remain valid.
+    pub(crate) fn reseed_stochastic_sources(&mut self, identity: u64) {
+        for &ordinal in &self.bindings.stochastic_sources {
+            if let Some(source) = self.devices.get_mut(ordinal)
+                && let Some(replacement) = source.device.with_stochastic_candidate(identity)
+            {
+                source.device = replacement;
+            }
+        }
+    }
+
     /// Clear analysis-scoped accepted/trial state when an optimizer session
     /// changes its candidate. Preserve finalized bindings, sparse pattern and
     /// prepared names; only independent simulation state is invalidated.
     pub(crate) fn clear_candidate_analysis_state(&mut self) {
+        self.runtime.continuation_diagonal.set(0.);
         self.runtime.completed.clear();
         self.runtime.carried_state.get_mut().take();
         self.runtime.final_transient.get_mut().take();
@@ -2737,7 +3519,7 @@ impl Circuit {
                 if value.topology() != topology {
                     return Err(SpiceError::circuit("foreign or stale instance override"));
                 }
-                original.with_instance_parameter(value.parameter(), value.value(), context)?
+                original.with_bound_parameter(value.parameter(), value.value(), context)?
             }
         };
         #[cfg(test)]
@@ -2824,7 +3606,7 @@ impl Circuit {
                     preparation_metrics::record(|counts| counts.setters += 1);
                     if let Some(index) = device_slots.get(&ordinal).copied() {
                         let previous = replacements[index].1.as_ref();
-                        replacements[index].1 = previous.with_instance_parameter(
+                        replacements[index].1 = previous.with_bound_parameter(
                             value.parameter(),
                             value.value(),
                             context,
@@ -2833,7 +3615,7 @@ impl Circuit {
                         device_slots.insert(ordinal, replacements.len());
                         replacements.push((
                             ordinal,
-                            original.with_instance_parameter(
+                            original.with_bound_parameter(
                                 value.parameter(),
                                 value.value(),
                                 context,
@@ -2855,9 +3637,21 @@ impl Circuit {
                 || original.c_device_type() != replacement.c_device_type()
                 || original.designator() != replacement.designator()
                 || original.terminals() != replacement.terminals()
+                || original.constitutive_nodes() != replacement.constitutive_nodes()
                 || original.branch_currents() != replacement.branch_currents()
+                || (0..original.branch_currents()).any(|row| {
+                    original.branch_convergence(row) != replacement.branch_convergence(row)
+                        || original.branch_quantity(row) != replacement.branch_quantity(row)
+                })
                 || original.state_count() != replacement.state_count()
                 || original.findable_branch() != replacement.findable_branch()
+                || original.expression_current_branch() != replacement.expression_current_branch()
+                || original
+                    .initial_expression_storage()
+                    .map(|s| (s.equation, s.gauge, s.policy))
+                    != replacement
+                        .initial_expression_storage()
+                        .map(|s| (s.equation, s.gauge, s.policy))
                 || !original
                     .controlling_sources()
                     .iter()
@@ -2961,6 +3755,18 @@ impl Circuit {
             .fixed_stamps
             .replace(unlent.unwrap_or_else(|| matrix.return_fixed()));
         stamped?;
+        if request.mode.is_bias()
+            && let Some(analysis) = request.model_context.bias_analysis
+        {
+            for (&node, policy) in &self.prepared_node_initializations {
+                let row = self
+                    .bindings
+                    .unknowns
+                    .checked_node_row(node)?
+                    .ok_or_else(|| SpiceError::circuit("prepared node bias has no physical row"))?;
+                policy.stamp(analysis, row, matrix, rhs)?;
+            }
+        }
         self.learn_pattern(matrix)?;
         matrix.record_trace()?;
         Ok(())
@@ -2982,8 +3788,16 @@ impl Circuit {
         voltage_source_value: &mut Real,
         mut ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
+        let mut batches = point.batches(self)?;
+        batches.begin();
         for (position, index) in self.load_order().enumerate() {
             let device = point.device(self, index);
+            let output = batches.point(index, request.solution, |ordinal, coordinates| {
+                let mut states = request.history.device_of(trial, ordinal)?;
+                point
+                    .device(self, ordinal)
+                    .linearize_prepared(&mut states, coordinates)
+            })?;
             let states = request.history.device_of(trial, index)?.with_ltra(
                 ltra.as_deref_mut(),
                 request.history,
@@ -3002,6 +3816,7 @@ impl Circuit {
                 reltol: request.model_context.reltol,
                 frequency: request.model_context.frequency,
                 mode: request.mode,
+                bias_analysis: request.model_context.bias_analysis,
                 branches: self.bindings.branch_rows[index].clone(),
                 controls: self.controls(index)?,
                 mutual: mutual.get(index).map_or(&[], Vec::as_slice),
@@ -3011,7 +3826,11 @@ impl Circuit {
                 source_factor: request.model_context.source_factor,
                 voltage_source_value: &mut *voltage_source_value,
             };
-            device.stamp(&mut context)?;
+            if let Some(output) = output {
+                device.stamp_prepared(&mut context, &output.point, output.coordinates)?;
+            } else {
+                device.stamp(&mut context)?;
+            }
         }
         Ok(())
     }
@@ -3044,6 +3863,8 @@ impl Circuit {
                 && a.order == b.order
                 && a.branch_rows == b.branch_rows
                 && a.control_rows == b.control_rows
+                && a.private_storage_rows == b.private_storage_rows
+                && a.regularization_nodes == b.regularization_nodes
                 && a.state_rows == b.state_rows
                 && self.nodes.nodes() == previous.nodes.nodes()
                 && self.devices.len() == previous.devices.len()
@@ -3058,7 +3879,11 @@ impl Circuit {
                             && left.c_device_type() == right.c_device_type()
                             && left.designator() == right.designator()
                             && left.terminals() == right.terminals()
+                            && left.constitutive_nodes() == right.constitutive_nodes()
                             && left.findable_branch() == right.findable_branch()
+                            && left.expression_current_branch() == right.expression_current_branch()
+                            && (0..left.branch_currents())
+                                .all(|row| left.branch_quantity(row) == right.branch_quantity(row))
                             && left.rf_port().map(|port| (port.number, port.internal))
                                 == right.rf_port().map(|port| (port.number, port.internal))
                             && left.mutual_coupling().map(|coupling| coupling.inductors)
@@ -3076,6 +3901,7 @@ impl Circuit {
     /// this circuit has allocated (the rule `finalize` applies on
     /// re-finalization); otherwise this circuit keeps its own.
     pub fn inherit_from(&mut self, previous: &Self) {
+        self.runtime.continuation_diagonal.set(0.);
         self.runtime.fixed_stamps.get_mut().forget();
         self.runtime.completed.clear();
         self.runtime.final_transient.get_mut().take();
@@ -3087,6 +3913,9 @@ impl Circuit {
         if !self.compatible_topology(previous) {
             return;
         }
+        self.runtime
+            .continuation_diagonal
+            .set(previous.continuation_diagonal());
         self.runtime
             .completed
             .clone_from(&previous.runtime.completed);
@@ -3438,6 +4267,15 @@ impl Circuit {
         context.validate(&MODEL_CONTEXT_LOCATION)?;
         self.finalize()?;
         let run = self.prepare_run();
+        self.assemble_linear_devices(&run, context, false)
+    }
+
+    fn assemble_linear_devices(
+        &self,
+        run: &PreparedRun<'_>,
+        context: &ModelContext,
+        skip_nonlinear: bool,
+    ) -> SpiceResult<crate::devices::linear::LinearSystem> {
         let point = run.point(context)?;
         let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
@@ -3455,6 +4293,9 @@ impl Circuit {
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
             let device = point.device(self, index);
+            if skip_nonlinear && device.is_nonlinear() {
+                continue;
+            }
             let range = &self.bindings.branch_rows[index];
             device.assemble_linear(&mut crate::devices::linear::LinearContext {
                 model_context: context,
@@ -3660,6 +4501,8 @@ impl Circuit {
         })?;
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
+        let mut batches = point.batches(self)?;
+        batches.begin();
         for index in self.load_order() {
             let device = point.device(self, index);
             let range = &self.bindings.branch_rows[index];
@@ -3687,7 +4530,9 @@ impl Circuit {
                 linear.system.a.triplets().len(),
                 linear.system.e.triplets().len(),
             );
-            if pole_zero_setups > 0 {
+            if let Some(output) = batches.point(index, bias, |_, _| Ok(()))? {
+                device.assemble_prepared(&mut linear, &output.point)?;
+            } else if pole_zero_setups > 0 {
                 device.assemble_pole_zero(&mut linear, bias)?;
             } else {
                 device.assemble_small_signal(&mut linear, bias)?;
@@ -3747,12 +4592,33 @@ impl Circuit {
         models: &crate::devices::models::ModelResolver<'_>,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<()> {
+        self.add_prepared_instances(instances, models, context, &BTreeMap::new())
+    }
+
+    fn add_prepared_instances(
+        &mut self,
+        instances: &[crate::netlist::ast::DeviceInstance],
+        models: &crate::devices::models::ModelResolver<'_>,
+        context: &ModelContext,
+        resistors: &crate::devices::pwl_resistor::BoundResistors,
+    ) -> SpiceResult<()> {
         let existing = self.elaboration_size()?;
         let limits = self.elaboration_limits;
+        let instances = crate::devices::behavioural::dynamic::expand(
+            instances,
+            &self.nodes,
+            models,
+            self.devices.iter().map(|device| device.name()),
+            limits.devices.saturating_sub(existing.devices),
+            resistors,
+        )?;
+        let aliases = instances.probe_aliases;
+        let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
-        let plan =
+        let mut plan =
             PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
+        plan.resistors = (!resistors.is_empty()).then_some(resistors);
         let seen: BTreeSet<String> = self
             .devices
             .iter()
@@ -3762,6 +4628,12 @@ impl Circuit {
         let staged = self.nodes.transaction(|nodes| {
             let staged =
                 Self::elaborate_batch(plan, models, context, nodes, existing, limits, seen)?;
+            for alias in &aliases {
+                let id = nodes.get(alias).ok_or_else(|| {
+                    SpiceError::circuit(format!("missing generated probe alias {alias}"))
+                })?;
+                nodes.set_kind(id, NodeKind::ProbeAlias)?;
+            }
             // The node transaction commits only after the final device and
             // provenance vector can hold the entire staged suffix.
             devices.try_reserve(staged.len()).map_err(|error| {
@@ -3847,9 +4719,15 @@ impl Circuit {
                     )?;
                 }
                 None => {
-                    let device = crate::devices::factory::instantiate_with_models(
-                        instance, nodes, models, context,
-                    )?;
+                    let device = if let Some(resistor) =
+                        plan.resistors.and_then(|laws| laws.get(&instance.name))
+                    {
+                        resistor.bind(instance, nodes)?
+                    } else {
+                        crate::devices::factory::instantiate_with_models(
+                            instance, nodes, models, context,
+                        )?
+                    };
                     Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
                 }
                 Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Native(native))) => {
@@ -4077,13 +4955,30 @@ impl Circuit {
         elaboration_limits: ElaborationLimits,
         scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
     ) -> SpiceResult<Self> {
+        Self::from_prepared_netlist_with_limits(
+            netlist,
+            context,
+            mutual_limits,
+            elaboration_limits,
+            scope,
+            crate::devices::subckt::PreparedDeclarations::default(),
+        )
+    }
+
+    /// Elaborate a prepared electrical artifact with its explicit waveform
+    /// declarations. An optional immutable root scope binds a parameter
+    /// candidate; every subcircuit occurrence resolves its own coefficients.
+    /// # Errors
+    /// Invalid deck, identity, waveform, parameter scope, or resource limits.
+    pub fn from_prepared_netlist_with_limits(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+        elaboration_limits: ElaborationLimits,
+        scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
+        declarations: crate::devices::subckt::PreparedDeclarations<'_>,
+    ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
-        if !netlist.includes.is_empty() {
-            return Err(SpiceError::Unsupported {
-                feature: "includes in linear elaboration".into(),
-                location: None,
-            });
-        }
         // The nonlinear E/G/F/H forms become B sources and generated XSPICE
         // instances first, as inpcom.c rewrites them before numparam and
         // subcircuit expansion (#79).
@@ -4103,16 +4998,22 @@ impl Circuit {
         // `X` instances are expanded into a fresh device/model list before any
         // device is built, so a deck that fails to elaborate never leaves a
         // partial circuit behind (#18).
-        let expanded = crate::devices::subckt::expand_subcircuits(
+        let expanded = crate::devices::subckt::expand_prepared(
             netlist,
             &elaborated.scope,
             crate::devices::subckt::SubcircuitLimits {
                 max_devices: elaboration_limits.devices,
                 ..Default::default()
             },
+            declarations,
         )?;
-        let models = crate::devices::models::ModelResolver::new(&expanded.models)?;
+        let models = crate::devices::models::ModelResolver::new(&expanded.models)?
+            .with_bin_options(crate::devices::binning::BinOptions {
+                scale: context.geometry_scale,
+                ..Default::default()
+            });
         let mut circuit = Self {
+            nodes: NodeTable::with_auto_gnd(netlist.auto_gnd),
             mutual_limits,
             elaboration_limits,
             ..Self::default()
@@ -4122,8 +5023,33 @@ impl Circuit {
         setup.noise_analysis = netlist
             .analyses
             .iter()
-            .any(|card| card.kind == crate::primitives::AnalysisKind::Noise);
-        circuit.add_instances(&expanded.devices, &models, &setup)?;
+            .any(|card| card.kind == crate::primitives::AnalysisKind::Noise)
+            || expanded
+                .prepared_initialization
+                .analyses
+                .as_ref()
+                .is_some_and(|analyses| {
+                    analyses.contains(&(crate::primitives::AnalysisKind::Noise, false))
+                });
+        circuit.add_prepared_instances(
+            &expanded.devices,
+            &models,
+            &setup,
+            &expanded.prepared_resistors,
+        )?;
+        let binned_deck = BinnedDeck::capture(
+            &expanded.devices,
+            &expanded.models,
+            &models,
+            setup.noise_analysis,
+            &expanded.prepared_initialization,
+            &expanded.prepared_waveforms,
+            &expanded.prepared_resistors,
+        )
+        .map(Arc::new);
+        circuit.apply_prepared_waveforms(expanded.prepared_waveforms)?;
+        circuit.apply_prepared_initializations(expanded.prepared_initialization)?;
+        circuit.add_topology_shunts(setup.shunts)?;
         let referenced: BTreeSet<_> = expanded
             .devices
             .iter()
@@ -4133,11 +5059,10 @@ impl Circuit {
             .flat_map(|name| models.declarations_for(name))
             .map(|card| card.name.to_ascii_lowercase())
             .collect();
-        if let Some(model) = netlist
-            .models
-            .iter()
-            .find(|model| !referenced.contains(&model.name.to_ascii_lowercase()))
-        {
+        if let Some(model) = netlist.models.iter().find(|model| {
+            let name = model.name.to_ascii_lowercase();
+            !referenced.contains(&name) && !expanded.statistical_model_origins.contains(&name)
+        }) {
             // First-declaration duplicate policy remains explicit; unused
             // declarations cannot silently discard unsupported physics. A root
             // model shadowed only inside a subcircuit body is unused by this
@@ -4150,7 +5075,122 @@ impl Circuit {
         circuit.finalize()?;
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
+        circuit.binned_deck = binned_deck;
         Ok(circuit)
+    }
+
+    pub(crate) fn binned_deck(&self) -> Option<&BinnedDeck> {
+        self.binned_deck.as_deref()
+    }
+
+    /// Electrical voltage nodes, excluding probe aliases and solver-owned signals.
+    ///
+    /// A generated differentiator signal is a matrix coordinate, but its
+    /// row contains a constitutive equation rather than a physical KCL.
+    /// Its values also need not have voltage units.
+    pub(crate) fn physical_voltage_nodes(&self) -> impl Iterator<Item = &crate::primitives::Node> {
+        use crate::devices::InitialStorageRow;
+        let signals: BTreeSet<_> = self
+            .devices
+            .iter()
+            .filter_map(|device| device.initial_expression_storage())
+            .filter_map(|storage| match storage.gauge {
+                InitialStorageRow::Signal(node) => Some(node),
+                InitialStorageRow::Branch(_) => None,
+            })
+            .collect();
+        let constitutive: BTreeSet<_> = self
+            .devices
+            .iter()
+            .flat_map(|device| device.constitutive_nodes().iter().copied())
+            .collect();
+        self.nodes.nodes().iter().filter(move |node| {
+            matches!(node.kind, NodeKind::Terminal | NodeKind::Internal)
+                && !signals.contains(&node.id)
+                && !constitutive.contains(&node.id)
+        })
+    }
+
+    /// C `INPpas4` adds capacitors to parsed voltage nodes before device
+    /// setup; `CKTsetup`'s rshunt adds noiseless conductance to all voltage
+    /// nodes after setup. Branch-current, automatic probe aliases and private storage coordinates
+    /// are never physical shunt targets. Materialize real device equations
+    /// so all analysis paths see the same topology and charge states.
+    fn add_topology_shunts(
+        &mut self,
+        shunts: crate::devices::models::TopologyShunts,
+    ) -> SpiceResult<()> {
+        use crate::devices::{Capacitor, Resistor, ResistorNoise};
+        if shunts == crate::devices::models::TopologyShunts::default() {
+            return Ok(());
+        }
+        let mut names: BTreeSet<_> = self
+            .devices
+            .iter()
+            .map(|device| device.name().to_ascii_lowercase())
+            .collect();
+        let nodes: Vec<_> = self.physical_voltage_nodes().collect();
+        let resistors = if shunts.resistance.is_some() {
+            nodes.len()
+        } else {
+            0
+        };
+        let capacitors = if shunts.capacitance > 0. {
+            nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::Terminal)
+                .count()
+        } else {
+            0
+        };
+        let size = ElaborationSize::new(resistors, 0, 0).checked_add(
+            ElaborationSize::new(
+                capacitors,
+                0,
+                capacitors
+                    .checked_mul(crate::devices::rlc::REACTIVE_STATE_COUNT)
+                    .ok_or_else(|| resource_error(None, "shunt charge state count overflows"))?,
+            ),
+            None,
+        )?;
+        self.elaboration_limits
+            .check(self.elaboration_size()?.checked_add(size, None)?, None)?;
+        let mut devices: Vec<Box<dyn Device>> = Vec::new();
+        reserve(&mut devices, size.devices, None)?;
+        let mut unique = |base: String| {
+            let mut name = base.clone();
+            let mut suffix = 0_usize;
+            while !names.insert(name.to_ascii_lowercase()) {
+                suffix += 1;
+                name = format!("{base}_{suffix}");
+            }
+            name
+        };
+        for node in nodes {
+            let terminals = [node.id, NodeId::GROUND];
+            if let Some(resistance) = shunts.resistance {
+                devices.push(Box::new(
+                    Resistor::new(
+                        unique(format!("r__rshunt_{}", node.id.index())),
+                        terminals,
+                        resistance,
+                    )?
+                    .with_noise(ResistorNoise {
+                        noisy: false,
+                        ..Default::default()
+                    }),
+                ));
+            }
+            if shunts.capacitance > 0. && node.kind == NodeKind::Terminal {
+                devices.push(Box::new(Capacitor::new(
+                    unique(format!("capac{}shunt", node.id.index())),
+                    terminals,
+                    shunts.capacitance,
+                    None,
+                )?));
+            }
+        }
+        self.add_prepared_devices(size, |_| Ok(devices))
     }
 
     /// Looks up a device by instance name, case-insensitively.

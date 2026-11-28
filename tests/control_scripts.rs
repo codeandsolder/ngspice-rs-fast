@@ -254,9 +254,8 @@ fn control_work_retention_and_output_budgets_are_independent() {
 }
 
 use ngspice_rs::Complex;
-use ngspice_rs::analysis::control::vectors::{
-    SpectrumWindow, TimeGrid, TransformBudget, fft, linearize,
-};
+use ngspice_rs::analysis::control::vectors::{TimeGrid, TransformBudget, fft, linearize};
+use ngspice_rs::analysis::spectrum::{SpectrumLength, SpectrumSettings, SpectrumWindow};
 use ngspice_rs::analysis::{Plot, PlotFlags, Variable};
 
 fn waveform(times: impl IntoIterator<Item = f64>, signal: impl Fn(f64) -> f64) -> Plot {
@@ -306,7 +305,10 @@ fn linearize_resamples_nonuniform_accepted_points() {
         fft(
             &plot,
             &[],
-            SpectrumWindow::Rectangular,
+            SpectrumSettings {
+                window: SpectrumWindow::Rectangular,
+                ..SpectrumSettings::default()
+            },
             &mut transform_budget()
         )
         .is_err()
@@ -340,7 +342,10 @@ fn spectrum_matches_analytic_sinusoid_dc_and_nyquist() {
     let spectrum = fft(
         &plot,
         &[],
-        SpectrumWindow::Rectangular,
+        SpectrumSettings {
+            window: SpectrumWindow::Rectangular,
+            ..SpectrumSettings::default()
+        },
         &mut transform_budget(),
     )
     .unwrap();
@@ -359,14 +364,28 @@ fn zero_padding_preserves_actual_sample_count_normalization() {
     let spectrum = fft(
         &plot,
         &[],
-        SpectrumWindow::Rectangular,
+        SpectrumSettings {
+            window: SpectrumWindow::Rectangular,
+            length: SpectrumLength::Padded,
+            ..SpectrumSettings::default()
+        },
         &mut transform_budget(),
     )
     .unwrap();
     assert_eq!(spectrum.point_count(), 17);
     assert!((spectrum.value("v(out)", 0).unwrap().re - 2.5).abs() < 1e-13);
     assert!((spectrum.value("frequency", 1).unwrap().re - 1. / 32.).abs() < 1e-15);
-    let hann = fft(&plot, &[], SpectrumWindow::Hann, &mut transform_budget()).unwrap();
+    let hann = fft(
+        &plot,
+        &[],
+        SpectrumSettings {
+            window: SpectrumWindow::Hann,
+            length: SpectrumLength::Padded,
+            ..SpectrumSettings::default()
+        },
+        &mut transform_budget(),
+    )
+    .unwrap();
     assert!((hann.value("v(out)", 0).unwrap().re - 2.5).abs() < 1e-13);
 }
 
@@ -682,4 +701,208 @@ fn control_only_deck_executes_numeric_loops() {
         output,
         "index is 0\nindex is 1\nindex is 2\nindex is 3\nindex is 4\n"
     );
+}
+
+#[test]
+fn control_spectrum_explicit_mode_and_length() {
+    let deck = ScriptDeck::new(
+        "spectrum-modes",
+        "\ntran 1m 8m\nlinearize v(out) np=7\nset specwindow=none\nfft mode=power length=exact v(out)\nsetplot tran2\nfft mode=psd length=padded v(out)\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    let power = &report.plots[2].plot;
+    let density = &report.plots[3].plot;
+    assert_eq!(power.point_count(), 4);
+    assert_eq!(density.point_count(), 5);
+    assert_eq!(power.flags(), PlotFlags::Real);
+    assert_eq!(density.flags(), PlotFlags::Real);
+    let power_sum = power
+        .column("v(out)")
+        .unwrap()
+        .iter()
+        .map(|v| v.re)
+        .sum::<f64>();
+    let density_sum = density
+        .column("v(out)")
+        .unwrap()
+        .iter()
+        .map(|v| v.re)
+        .sum::<f64>();
+    let df = density.value("frequency", 1).unwrap().re;
+    assert!((power_sum - 2.25).abs() < 1e-12);
+    assert!((density_sum * df - power_sum).abs() < 1e-12);
+}
+
+#[test]
+fn complex_linearization_preserves_both_components() {
+    let mut plot = Plot::new(
+        "tran",
+        "Transient Analysis",
+        PlotFlags::Complex,
+        vec![
+            Variable::new("time", "time"),
+            Variable::complex("v(out)", "voltage"),
+        ],
+    );
+    for time in [0., 0.1, 0.3, 0.6, 1.] {
+        plot.push_point(&[Complex::real(time), Complex::new(2. * time + 3., 1. - time)])
+            .unwrap();
+    }
+    let uniform = linearize(
+        &plot,
+        TimeGrid {
+            start: 0.,
+            stop: 1.,
+            step: 0.125,
+        },
+        None,
+        &[],
+        &mut transform_budget(),
+    )
+    .unwrap();
+    assert_eq!(uniform.flags(), PlotFlags::Complex);
+    for row in uniform.rows() {
+        assert!((row[1].re - (2. * row[0].re + 3.)).abs() < 1e-14);
+        assert!((row[1].im - (1. - row[0].re)).abs() < 1e-14);
+    }
+    let spectrum = fft(
+        &uniform,
+        &[],
+        SpectrumSettings {
+            window: SpectrumWindow::Rectangular,
+            ..SpectrumSettings::default()
+        },
+        &mut transform_budget(),
+    )
+    .unwrap();
+    assert_eq!(spectrum.point_count(), 9);
+    assert!((spectrum.value("v(out)", 0).unwrap() - Complex::new(4., 0.5)).magnitude() < 1e-12);
+    assert!(spectrum.value("frequency", 8).unwrap().re < 0.);
+}
+
+#[test]
+fn control_transient_breakpoint_spacing_matches_deck_and_is_request_local() {
+    let deck = ScriptDeck::from_text(
+        "minbreak",
+        "breakpoint options\nv1 in 0 PWL(0 0 1m 0 1.001m 0.001 2m 1)\n\
+        r1 in out 1k\nc1 out 0 1u\n.options minbreak=2u\n.tran 10u 3m\n\
+        .control\nrun\ntran 10u 3m minbreak=0\ntran 10u 3m minbreak=2u\n\
+        tran 10u 3m\noption minbreak=0\nrun\ntran 10u 3m minbreak=2u\ntran 10u 3m\nreset\nrun\nquit\n.endc\n.end\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.plots.len(), 8);
+    let plots = report.plots.iter().map(|p| &p.plot).collect::<Vec<_>>();
+    let axis = |plot: &ngspice_rs::analysis::Plot| {
+        (0..plot.point_count())
+            .map(|point| plot.value("time", point).unwrap().re.to_bits())
+            .collect::<Vec<_>>()
+    };
+    let reference = axis(plots[0]);
+    assert_ne!(reference, axis(plots[1]));
+    assert_eq!(reference, axis(plots[2]));
+    assert_eq!(reference, axis(plots[3]));
+    assert_eq!(axis(plots[1]), axis(plots[4]));
+    assert_eq!(reference, axis(plots[5]));
+    assert_eq!(axis(plots[1]), axis(plots[6]));
+    assert_eq!(reference, axis(plots[7]));
+}
+
+#[test]
+fn option_commands_take_effect_in_execution_order_and_reset_restores_deck() {
+    let deck = ScriptDeck::from_text(
+        "ordered-options",
+        "* ordered options\n.param bias=-10\nv1 a 0 {bias}\nd1 a 0 dm\n.model dm d is=1e-30\n.options gmin=1e-12\n.op\n.control\nop\noption gmin=3e-14\nrun\nlet next_gmin=5e-14\noptions gmin={next_gmin} reltol=1e-6\nop\nalterparam bias=-20\nreset\nop\nquit\n.endc\n.end\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.plots.len(), 4);
+    for (plot, expected) in report.plots.iter().zip([1e-11, 3e-13, 5e-13, 2e-11]) {
+        let actual = plot.plot.value("i(v1)", 0).unwrap().re;
+        assert!(
+            (actual - expected).abs() <= 1e-8 * expected,
+            "{actual:e} != {expected:e}"
+        );
+    }
+}
+
+#[test]
+fn runtime_shunts_rebuild_atomically_without_losing_instance_edits() {
+    let deck = ScriptDeck::from_text(
+        "runtime-shunt",
+        "* shunt option\n.param resistance=1k\nv1 a 0 1\nr1 a out {resistance}\n.control\nalter r1=2k\nop\noption rshunt=1k\nop\noption rshunt=2k\nop\nreset\nop\nquit\n.endc\n.end\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.plots.len(), 4);
+    for (plot, expected) in report.plots.iter().zip([1., 1. / 3., 0.5, 1.]) {
+        let actual = plot.plot.value("v(out)", 0).unwrap().re;
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{actual:e} != {expected:e}"
+        );
+    }
+}
+
+#[test]
+fn option_card_failure_preserves_previous_session_snapshot() {
+    let plan = divider();
+    let mut session = ControlSession::new(&plan, EvalLimits::default()).unwrap();
+    let option = |text: &str| {
+        Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("option.cir"),
+                &format!("* option\n.options {text}\n.end\n"),
+            ))
+            .unwrap()
+            .options
+            .remove(0)
+    };
+    session
+        .apply_options(&option("gmin=3e-14 rshunt=10k"))
+        .unwrap();
+    let before = session.config().clone();
+    assert!(
+        session
+            .apply_options(&option("gmin=5e-14 reltol=-1"))
+            .is_err()
+    );
+    assert_eq!(session.config(), &before);
+    assert!(session.apply_options(&option("rshunt=0")).is_err());
+    assert_eq!(session.config(), &before);
+    let plots = session
+        .run(AnalysisInput::new(AnalysisKind::OperatingPoint), 1, 100)
+        .unwrap();
+    assert!((plots[0].value("v(out)", 0).unwrap().re - 3. / 2.1).abs() < 1e-12);
+}
+
+#[test]
+fn scaled_instance_sweeps_and_alters_preserve_resolved_geometry() {
+    let deck = ScriptDeck::from_text(
+        "scaled-mos",
+        "* scaled MOS1\n.options scale=1u\nvd d 0 1\nvg g 0 1\nm1 d g 0 0 n w=1 l=1 ad=2 pd=4\n.model n nmos level=1 vto=0.5 kp=1m\n.control\nop\ndc @m1[w] 1 3 1\nop\ndc @m1[ad] 0 2 1\nop\nalter @m1[w]=2\nop\noption scale=2u\nop\ndc @m1[w] 1 2 1\nop\nalter @m1[w]=2\nop\noption rshunt=1G\nop\nreset\nop\nquit\n.endc\n.end\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    let expected = [
+        vec![-125e-6],
+        vec![-125e-6, -250e-6, -375e-6],
+        vec![-125e-6],
+        vec![-125e-6; 3],
+        vec![-125e-6],
+        vec![-250e-6],
+        vec![-250e-6],
+        vec![-250e-6, -500e-6],
+        vec![-250e-6],
+        vec![-500e-6],
+        vec![-500e-6 - 1e-9],
+        vec![-125e-6],
+    ];
+    assert_eq!(report.plots.len(), expected.len());
+    for (plot, expected) in report.plots.iter().zip(expected) {
+        assert_eq!(plot.plot.point_count(), expected.len());
+        for (row, expected) in expected.into_iter().enumerate() {
+            let actual = plot.plot.value("i(vd)", row).unwrap().re;
+            assert!(
+                (actual - expected).abs() < 2e-10,
+                "{actual:e} != {expected:e}"
+            );
+        }
+    }
 }

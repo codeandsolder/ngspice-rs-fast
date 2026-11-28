@@ -8,7 +8,7 @@ use crate::devices::{
     SffmSpec, SineSpec, Waveform,
 };
 use crate::netlist::ast::{
-    DeviceInstance, FunctionWaveform, ParameterKind, PositionedValue, SourceFunction,
+    DeviceInstance, FunctionWaveform, NumericVectorEntry, ParameterKind, SourceFunction,
     SourceWaveform, WaveformKind,
 };
 use crate::netlist::source::{Deck, LogicalLine};
@@ -70,6 +70,9 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Diode => {
             crate::devices::nonlinear::Diode::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::SimetrixDiodeLevel1 => {
+            crate::devices::simetrix_diode::instantiate(instance, nodes, &model, context)
+        }
         ModelBackend::Bjt => {
             crate::devices::bjt::Bjt::instantiate(instance, nodes, &model, context)
         }
@@ -108,9 +111,20 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Hfet2 => {
             crate::devices::hfet::hfet2::Hfet2::instantiate(instance, nodes, &model, context)
         }
-        ModelBackend::Switch | ModelBackend::CurrentSwitch => {
+        ModelBackend::Switch | ModelBackend::LtspiceSwitch | ModelBackend::CurrentSwitch => {
             crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::RationalTransfer
+        | ModelBackend::LogicEvent
+        | ModelBackend::LogicVoltage
+        | ModelBackend::TimedSwitch => {
+            let schema =
+                crate::devices::code_model::source::SourceModel::from_base(&model.card().base)
+                    .ok_or_else(|| SpiceError::circuit("missing registered code-model schema"))?;
+            crate::devices::code_model::source::instantiate(schema, instance, nodes, &model)
+        }
+        ModelBackend::Cpl => crate::devices::cpl::CoupledLine::instantiate(instance, nodes, &model)
+            .map(|line| Box::new(line) as Box<dyn Device>),
         ModelBackend::Txl => Err(SpiceError::circuit(format!(
             "TXL {} is prepared by Circuit::add_instances",
             instance.name
@@ -131,6 +145,10 @@ pub(super) fn instantiate(
     nodes: &mut NodeAppend<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
     if matches!(instance.designator, 'e'..='h') {
+        if matches!(instance.parameters.first(), Some(parameter) if matches!(parameter.kind, ParameterKind::Behavioural(_)) && matches!(parameter.name.as_str(),"v"|"i"))
+        {
+            return crate::devices::behavioural::instantiate(instance, nodes);
+        }
         return crate::devices::controlled::instantiate(instance, nodes);
     }
     if instance.designator == 'k' {
@@ -141,6 +159,17 @@ pub(super) fn instantiate(
     }
     // `a` instances only come from the front end's TABLE/POLY lowering
     // (crate::netlist::behavioural); user XSPICE cards are not parsed.
+    if matches!(instance.designator, 'r' | 'c' | 'l')
+        && instance
+            .parameters
+            .iter()
+            .any(|parameter| matches!(parameter.kind, ParameterKind::Behavioural(_)))
+    {
+        return crate::devices::behavioural::rlc::instantiate(instance, nodes);
+    }
+    if crate::devices::behavioural::dynamic::is_generated(instance) {
+        return crate::devices::behavioural::rlc::instantiate(instance, nodes);
+    }
     if matches!(instance.designator, 'b' | 'a') {
         return crate::devices::behavioural::instantiate(instance, nodes);
     }
@@ -587,12 +616,16 @@ impl PortSetters {
 }
 
 /// Numeric text of a waveform field. `what` names the field in diagnostics.
-fn field(value: &PositionedValue, what: &str) -> SpiceResult<f64> {
-    parse_spice_number(&value.text)
+fn field(value: &NumericVectorEntry, what: &str) -> SpiceResult<f64> {
+    value
+        .expression
+        .is_none()
+        .then(|| parse_spice_number(&value.source.text))
+        .flatten()
         .filter(|v| v.is_finite())
         .ok_or_else(|| SpiceError::Unsupported {
-            feature: format!("non-finite or nonliteral {what}={}", value.text),
-            location: Some(value.location.clone()),
+            feature: format!("non-finite or nonliteral {what}={}", value.source.text),
+            location: Some(value.source.location.clone()),
         })
 }
 
@@ -635,8 +668,53 @@ fn source_waveform(
     }
     match source {
         SourceWaveform::Function(f) => function_waveform(f, setter),
+        SourceWaveform::Stochastic { function, values } => {
+            use crate::devices::stochastic::{
+                RandomKind, StochasticSpec, StochasticWaveform, TransientNoise, TransientRandom,
+            };
+            let maximum = function.fields().len();
+            if !(2..=maximum).contains(&values.len()) {
+                return Err(SpiceError::parse(
+                    setter.clone(),
+                    format!("{} requires 2 to {maximum} fields", function.keyword()),
+                ));
+            }
+            let values = values
+                .iter()
+                .zip(function.fields())
+                .map(|(v, field_name)| field(v, field_name))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            let get = |index: usize, default: f64| values.get(index).copied().unwrap_or(default);
+            let spec = match function {
+                crate::netlist::ast::StochasticFunction::Noise => {
+                    StochasticSpec::Noise(TransientNoise {
+                        white_rms: values[0],
+                        step: values[1],
+                        alpha: get(2, 0.),
+                        // VSRCparam/ISRCparam ignore supplied NAMP when
+                        // NALPHA is zero; keep the AST text but resolve the
+                        // physical law to an inactive colored generator.
+                        flicker_drive_rms: if get(2, 0.) > 0. { get(3, 0.) } else { 0. },
+                        rts_amplitude: get(4, 0.),
+                        capture_mean: get(5, 0.),
+                        emission_mean: get(6, 0.),
+                    })
+                }
+                crate::netlist::ast::StochasticFunction::Random => {
+                    StochasticSpec::Random(TransientRandom {
+                        kind: RandomKind::from_scalar(values[0])?,
+                        step: values[1],
+                        delay: get(2, 0.),
+                        scale: get(3, 1.),
+                        offset: get(4, 0.),
+                    })
+                }
+            };
+            Ok(Waveform::Stochastic(StochasticWaveform::new(spec)?))
+        }
         SourceWaveform::Pulse(p) => {
-            let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
+            let optional =
+                |v: &Option<NumericVectorEntry>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {
                 initial: field(&p.initial, "pulse v1")?,
                 pulsed: field(&p.pulsed, "pulse v2")?,
@@ -665,7 +743,7 @@ fn source_waveform(
                     location: Some(
                         points
                             .first()
-                            .map_or_else(|| setter.clone(), |p| p.time.location.clone()),
+                            .map_or_else(|| setter.clone(), |p| p.time.source.location.clone()),
                     ),
                 })
         }
@@ -685,7 +763,7 @@ fn function_waveform(f: &FunctionWaveform, setter: &SourceLoc) -> SpiceResult<Wa
             location: Some(
                 f.values
                     .get(most)
-                    .map_or_else(|| setter.clone(), |extra| extra.location.clone()),
+                    .map_or_else(|| setter.clone(), |extra| extra.source.location.clone()),
             ),
         });
     }
@@ -741,10 +819,10 @@ fn function_waveform(f: &FunctionWaveform, setter: &SourceLoc) -> SpiceResult<Wa
     Ok(waveform)
 }
 
-fn waveform_error(at: &PositionedValue, error: &SpiceError) -> SpiceError {
+fn waveform_error(at: &NumericVectorEntry, error: &SpiceError) -> SpiceError {
     SpiceError::Unsupported {
         feature: error.to_string(),
-        location: Some(at.location.clone()),
+        location: Some(at.source.location.clone()),
     }
 }
 

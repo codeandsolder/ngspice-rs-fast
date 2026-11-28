@@ -63,12 +63,19 @@ fn model_defaults_match_all_c_numeric_fields() {
 fn explicit_bsim3_setters_match_c_fields_for_both_level_aliases() {
     let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
     assert!(binary.is_absolute());
-    for level in [8, 49] {
+    // INPevaluate's platform pow can round the spelling 1e23 one ulp
+    // above the strict binary64 setter threshold. Exercise converted and
+    // unconverted fields away from that discontinuity; the exact threshold
+    // and its adjacent binary64 values are covered by the setter unit test.
+    for (level, lngate) in [8, 49]
+        .into_iter()
+        .flat_map(|level| [(level, "1.1e23"), (level, "1e-10")])
+    {
         let text = format!(
             "BSIM3 explicit setters\nvd d 0 0.1\nvg g 0 1\n\
              m1 d g 0 0 nn l=1u ad=2p nqsmod=0.6 geo=0 delvto=0.1 mulu0=0.8\n\
              .model nn nmos level={level} version=3.3.0 tnom=50 nch=1e21 \
-             ngate=1e24 lnch=1e21 lngate=1e23 vth0=0.3 vtho=0.4 \
+             ngate=1e24 lnch=1e21 lngate={lngate} vth0=0.3 vtho=0.4 \
              w=2u w=3u m=7\n.end\n"
         );
         let netlist = Parser::new()
@@ -129,7 +136,7 @@ fn explicit_bsim3_setters_match_c_fields_for_both_level_aliases() {
             let actual = actual[&name];
             assert!(
                 actual.is_finite() && (actual - expected).abs() <= 1e-12 * expected.abs() + 1e-24,
-                "level {level}, {name}: Rust input {expected:e}, C {actual:e}"
+                "level {level}, lngate={lngate}, {name}: Rust input {expected:e}, C {actual:e}"
             );
         }
     }

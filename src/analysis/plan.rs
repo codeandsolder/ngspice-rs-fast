@@ -73,6 +73,7 @@ struct SolverOverrides {
     source: Option<usize>,
     gmin_steps: Option<usize>,
     gmin_factor: Option<Real>,
+    gshunt: Option<Real>,
     skip: Option<bool>,
     schedule: Schedule,
     limiting: Option<StepLimiting>,
@@ -115,6 +116,7 @@ impl SolverOverrides {
         };
         continuation.stage_max_iterations = stage.map(IterationLimit::new).transpose()?;
         continuation.skip_direct = self.skip.unwrap_or(dc.noopiter);
+        continuation.gshunt = self.gshunt.or(dc.gshunt).unwrap_or(0.);
         Ok(DcSettings {
             newton,
             continuation,
@@ -128,9 +130,36 @@ struct TransientOverrides {
     max_order: Option<u8>,
     chgtol: Option<Real>,
     trtol: Option<Real>,
+    minbreak: Option<Real>,
+    voltage_lte: crate::analysis::config::VoltageLteOptions,
     max_steps: Option<usize>,
     tran_max_iter: Option<usize>,
     xmu: Option<Real>,
+}
+
+/// Resolved voltage predictor tolerances, independent of charge tolerances.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct VoltageLte {
+    pub relative: Real,
+    pub absolute: Real,
+    pub factor: Real,
+}
+
+impl VoltageLte {
+    fn resolve(
+        local: crate::analysis::config::VoltageLteOptions,
+        deck: crate::analysis::config::VoltageLteOptions,
+    ) -> Option<Self> {
+        local
+            .enabled
+            .or(deck.enabled)
+            .unwrap_or(false)
+            .then(|| Self {
+                relative: local.relative.or(deck.relative).unwrap_or(1e-3),
+                absolute: local.absolute.or(deck.absolute).unwrap_or(1e-6),
+                factor: local.factor.or(deck.factor).unwrap_or(500.),
+            })
+    }
 }
 
 /// The transient-only part of a resolved plan, independent of time bounds.
@@ -140,6 +169,8 @@ pub(super) struct TransientOptions {
     pub max_order: u8,
     pub chgtol: Real,
     pub trtol: Real,
+    pub minbreak: Real,
+    pub voltage_lte: Option<VoltageLte>,
     pub max_steps: usize,
     pub tran_max_iter: usize,
     pub xmu: Real,
@@ -160,6 +191,8 @@ impl TransientOverrides {
             max_order,
             chgtol: self.chgtol.or(deck.chgtol).unwrap_or(1e-14),
             trtol: self.trtol.or(deck.trtol).unwrap_or(7.),
+            minbreak: self.minbreak.or(deck.minbreak).unwrap_or(0.),
+            voltage_lte: VoltageLte::resolve(self.voltage_lte, deck.voltage_lte),
             max_steps: self.max_steps.unwrap_or(DEFAULT_MAX_STEPS),
             tran_max_iter: self.tran_max_iter.or(deck.itl4).unwrap_or(100),
             xmu: self.xmu.or(deck.xmu).unwrap_or(DEFAULT_XMU),
@@ -171,8 +204,14 @@ impl TransientOverrides {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum SpecificOptions {
     Ordinary,
-    Dc { point_iterations: Option<usize> },
+    Dc {
+        point_iterations: Option<usize>,
+    },
     Transient(TransientOptions),
+    HarmonicBalance {
+        oversampling: u16,
+        iterations: usize,
+    },
 }
 
 /// One resolution of literal arguments and the deck's typed defaults.
@@ -190,6 +229,8 @@ struct Overrides {
     solver: SolverOverrides,
     tran: TransientOverrides,
     point_iterations: Option<usize>,
+    hb_oversampling: Option<u16>,
+    hb_iterations: Option<usize>,
 }
 
 fn real(text: &str, key: &str) -> SpiceResult<Real> {
@@ -219,6 +260,23 @@ pub(super) fn count(text: &str, key: &str, minimum: usize, maximum: usize) -> Sp
 
 impl Overrides {
     fn set(&mut self, kind: AnalysisKind, key: &str, text: &str) -> SpiceResult<()> {
+        if kind == AnalysisKind::HarmonicBalance {
+            match key {
+                "oversample" => {
+                    self.hb_oversampling = Some(
+                        u16::try_from(count(text, key, 2, 16)?)
+                            .map_err(|_| unsupported("HB oversampling overflow"))?,
+                    );
+                    return Ok(());
+                }
+                "hbiter" => {
+                    self.hb_iterations = Some(count(text, key, 1, 100)?);
+                    return Ok(());
+                }
+                "abstol" | "vntol" => {}
+                _ => return Err(unsupported(format!("HB option {key}"))),
+            }
+        }
         let solver = &mut self.solver;
         match key {
             "rtol" => solver.reltol = Some(positive(text, key)?),
@@ -230,6 +288,13 @@ impl Overrides {
             "srcsteps" => solver.source = Some(count(text, key, 0, MAX_SOURCE_STEPS)?),
             "gminsteps" => solver.gmin_steps = Some(count(text, key, 0, MAX_GMIN_STAGES)?),
             "gminfactor" => solver.gmin_factor = Some(real(text, key)?),
+            "gshunt" => {
+                let value = real(text, key)?;
+                if value < 0. {
+                    return Err(unsupported("option gshunt must be nonnegative"));
+                }
+                solver.gshunt = Some(value);
+            }
             "noopiter" => solver.skip = Some(count(text, key, 0, 1)? == 1),
             "continuation" => {
                 solver.schedule = match text.to_ascii_lowercase().as_str() {
@@ -301,6 +366,17 @@ impl TransientOverrides {
             }
             "chgtol" => self.chgtol = Some(positive(text, key)?),
             "trtol" => self.trtol = Some(positive(text, key)?),
+            "newtrunc" => self.voltage_lte.enabled = Some(count(text, key, 0, 1)? == 1),
+            "ltereltol" => self.voltage_lte.relative = Some(positive(text, key)?),
+            "lteabstol" => self.voltage_lte.absolute = Some(positive(text, key)?),
+            "ltetrtol" => self.voltage_lte.factor = Some(positive(text, key)?),
+            "minbreak" => {
+                let value = real(text, key)?;
+                if value < 0. {
+                    return Err(unsupported("option minbreak must be nonnegative"));
+                }
+                self.minbreak = Some(value);
+            }
             "maxsteps" => {
                 self.max_steps = Some(
                     text.parse::<usize>()
@@ -356,6 +432,12 @@ pub(super) fn resolve_options(
         AnalysisKind::DcSweep => SpecificOptions::Dc {
             point_iterations: overrides.point_iterations.or_else(|| config.dc().itl2),
         },
+        AnalysisKind::HarmonicBalance => SpecificOptions::HarmonicBalance {
+            oversampling: overrides.hb_oversampling.unwrap_or(3),
+            iterations: overrides
+                .hb_iterations
+                .unwrap_or_else(|| super::harmonic_balance::BalanceLimits::default().iterations),
+        },
         _ => SpecificOptions::Ordinary,
     };
     Ok(ResolvedOptions {
@@ -386,6 +468,7 @@ pub(super) enum PlanKind {
         settings: super::pss::PssPlan,
         uic: bool,
     },
+    HarmonicBalance(super::harmonic_balance::HarmonicBalancePlan),
     PoleZero {
         card: crate::analysis::pz::Card,
         retain_bias: bool,
@@ -485,6 +568,26 @@ fn resolve_time_domain(
     }
 }
 
+fn resolve_harmonic_balance(
+    positional: &[String],
+    specific: SpecificOptions,
+) -> SpiceResult<PlanKind> {
+    let SpecificOptions::HarmonicBalance {
+        oversampling,
+        iterations,
+    } = specific
+    else {
+        return Err(unsupported("missing harmonic balance settings"));
+    };
+    Ok(PlanKind::HarmonicBalance(
+        super::harmonic_balance::HarmonicBalancePlan::resolve(
+            positional,
+            oversampling,
+            iterations,
+        )?,
+    ))
+}
+
 impl AnalysisPlan {
     pub(super) fn resolve(
         input: AnalysisInput,
@@ -530,6 +633,7 @@ impl AnalysisPlan {
             AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState => {
                 resolve_time_domain(kind, &positional, specific, &dc.newton, input.uic)?
             }
+            AnalysisKind::HarmonicBalance => resolve_harmonic_balance(&positional, specific)?,
             AnalysisKind::PoleZero => PlanKind::PoleZero {
                 card: pz::parse(&positional)?,
                 retain_bias,
@@ -590,6 +694,7 @@ impl AnalysisPlan {
         match &self.analysis {
             PlanKind::Dc { axes, .. } => axes.point_count(),
             PlanKind::PeriodicSteadyState { settings, .. } => settings.grid_points(),
+            PlanKind::HarmonicBalance(settings) => settings.grid_points(),
             PlanKind::Ac { frequencies, .. }
             | PlanKind::SParameter { frequencies, .. }
             | PlanKind::Noise { frequencies, .. }
@@ -610,6 +715,7 @@ impl AnalysisPlan {
             PlanKind::Ac { .. } => AnalysisKind::Ac,
             PlanKind::Transient { .. } => AnalysisKind::Transient,
             PlanKind::PeriodicSteadyState { .. } => AnalysisKind::PeriodicSteadyState,
+            PlanKind::HarmonicBalance(_) => AnalysisKind::HarmonicBalance,
             PlanKind::PoleZero { .. } => AnalysisKind::PoleZero,
             PlanKind::TransferFunction(_) => AnalysisKind::TransferFunction,
             PlanKind::SParameter { .. } => AnalysisKind::SParameter,
@@ -766,8 +872,16 @@ impl AnalysisPlan {
         circuit: &mut crate::devices::Circuit,
         context: &crate::analysis::AnalysisContext,
     ) -> SpiceResult<(crate::analysis::Plot, crate::analysis::Plot)> {
+        if circuit.prepare_native_mixed()?.is_some() {
+            return Err(unsupported("native mixed-signal sensitivity"));
+        }
         let PlanKind::Sensitivity { card, frequencies } = &self.analysis else {
             return Err(unsupported("sensitivity resolution requires a .sens plan"));
+        };
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: circuit.has_prepared_bias().then(|| self.kind()),
+            ..*context
         };
         let (plot, resolution) =
             super::sens::run(circuit, self, context, card, frequencies.as_ref(), true)?;
@@ -783,6 +897,26 @@ impl AnalysisPlan {
         sink: &mut dyn crate::analysis::PointSink,
     ) -> SpiceResult<()> {
         use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
+            ..*context
+        };
+        if let Some(mut mixed) = circuit.prepare_native_mixed()? {
+            let result = match &self.analysis {
+                PlanKind::OperatingPoint => linear::mixed_op(circuit, self, context, &mut mixed)
+                    .and_then(|plot| sink.complete(plot)),
+                PlanKind::Transient { .. } => super::companion::mixed_signal_transient_into(
+                    circuit, self, context, &mut mixed, sink,
+                )
+                .map(drop),
+                _ => Err(unsupported(
+                    "native mixed-signal analysis requires OP or transient",
+                )),
+            };
+            circuit.record_digital_stats(result.as_ref().ok().map(|()| mixed.engine().stats()));
+            return result;
+        }
         // Large sweeps emit rows directly. Drivers whose numerical method
         // still requires a materialized output transfer ownership instead.
         let plots = match &self.analysis {
@@ -800,6 +934,9 @@ impl AnalysisPlan {
             }
             PlanKind::PeriodicSteadyState { settings, .. } => {
                 return super::pss::run(circuit, self, context, settings, None, sink).map(drop);
+            }
+            PlanKind::HarmonicBalance(settings) => {
+                return settings.run(circuit, context, &self.dc.newton, sink);
             }
             PlanKind::PoleZero { card, .. } => pz::run(circuit, self, context, card, retain_bias)?,
             PlanKind::TransferFunction(card) => vec![tf::run(circuit, self, context, card)?],
@@ -838,8 +975,16 @@ impl AnalysisPlan {
         warm: Option<&super::PeriodicOrbit>,
         sink: &mut dyn crate::analysis::PointSink,
     ) -> SpiceResult<super::PeriodicOrbit> {
+        if circuit.prepare_native_mixed()?.is_some() {
+            return Err(unsupported("native mixed-signal periodic analysis"));
+        }
         let PlanKind::PeriodicSteadyState { settings, .. } = &self.analysis else {
             return Err(unsupported("periodic orbit requires a .pss plan"));
+        };
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
+            ..*context
         };
         super::pss::run(circuit, self, context, settings, warm, sink)
     }
@@ -970,6 +1115,7 @@ mod boundary_tests {
             (AnalysisKind::Distortion, "dec 2 1k 10k"),
             (AnalysisKind::Sensitivity, "v ( out )"),
             (AnalysisKind::PeriodicSteadyState, "1k 1m out"),
+            (AnalysisKind::HarmonicBalance, "1k 3"),
         ];
         assert_eq!(inputs.map(|(kind, _)| kind), DRIVERS);
         for (kind, arguments) in inputs {

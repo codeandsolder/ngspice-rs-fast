@@ -39,6 +39,7 @@ use crate::maths::Vector;
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 
 pub(crate) mod layout;
+pub mod transient;
 
 /// A differential transfer bound to the finalized topology. Only ground
 /// maps to no row.
@@ -86,11 +87,30 @@ pub enum NoiseFamily {
     Resistor,
     /// `sw`, the S switch (`swnoise.c`).
     VoltageSwitch,
+    /// Prepared native compact-model kernels.
+    Prepared,
+}
+
+/// A generalized source injects into native MNA equation coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoiseCoordinate {
+    /// Current injection into a node's KCL equation.
+    Node(NodeId),
+    /// Injection into a device-local branch equation (e.g. series voltage
+    /// noise of an implicit nonlinear resistance).
+    Branch(usize),
 }
 
 /// The physical law of one noise generator, evaluated at the bias point.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NoiseKind {
+    /// A physical PSD and its coherent generalized equation injections.
+    Generalized {
+        /// Spectral density of the independent generator.
+        density: Real,
+        /// Coordinate weights in native node and device-local branch identity.
+        injections: std::sync::Arc<[(NoiseCoordinate, Complex)]>,
+    },
     /// Thermal noise of a conductance: `4 k T g` (C `THERMNOISE`).
     Thermal {
         /// Conductance in siemens.
@@ -218,6 +238,7 @@ impl NoiseKind {
             // C: `noizDens = gain; noizDens *= <numerator> / <denominator>`.
             Self::Flicker { numerator, law } => gain * law.apply(numerator, frequency),
             Self::Gain { factor } => gain * factor,
+            Self::Generalized { density, .. } => gain * density,
             Self::CorrelatedThermal { .. } => {
                 return Err(SpiceError::circuit(
                     "coherent thermal noise requires two complex transfers",
@@ -247,6 +268,7 @@ impl NoiseKind {
             } => 4. * BOLTZMANN * temperature * conductance,
             Self::Shot { current } => 2. * CHARGE * current.abs(),
             Self::Flicker { .. } | Self::Gain { .. } => return Ok(None),
+            Self::Generalized { density, .. } => density,
             // Do not substitute the ordinary NevalSrc2 expression: the RF
             // branch builds complex port amplitudes and the C implementation
             // even uses param1 for both amplitude scales.
@@ -269,6 +291,15 @@ impl NoiseKind {
             Self::Shot { current } => current.is_finite(),
             Self::Flicker { numerator, law } => numerator.is_finite() && law.validate(),
             Self::Gain { factor } => factor.is_finite(),
+            Self::Generalized {
+                density,
+                ref injections,
+            } => {
+                density.is_finite()
+                    && density >= 0.
+                    && !injections.is_empty()
+                    && injections.iter().all(|(_, weight)| weight.is_finite())
+            }
             Self::CorrelatedThermal {
                 conductance,
                 second_conductance,
@@ -291,10 +322,10 @@ impl NoiseKind {
 /// One noise generator: a current source between `nodes` (C's `node1`,
 /// `node2` of `NevalSrc`), named by `suffix` after the instance name
 /// (`onoise_<instance><suffix>`, e.g. `_thermal`, `_rb`, `_1overf`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NoiseSource {
     /// C's generator name suffix, including the leading underscore.
-    pub suffix: &'static str,
+    pub suffix: std::borrow::Cow<'static, str>,
     /// The first node pair, in reference order (sign matters for coherent noise).
     pub nodes: [NodeId; 2],
     /// The generator's law at the bias point.
@@ -320,7 +351,11 @@ fn finite_density(density: Real) -> SpiceResult<Real> {
     }
 }
 
-/// Squared magnitude of the transfer gain.
+/// Squared transfer gain in the reference noise evaluator's operation order.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "C noise transfer uses separately rounded squares"
+)]
 pub(crate) const fn squared_gain(transfer: Complex) -> Real {
     transfer.im.mul_add(transfer.im, transfer.re * transfer.re)
 }
@@ -347,11 +382,29 @@ fn correlated_gain(
 }
 
 impl NoiseSource {
+    /// Construct a generalized source without reducing coherent injections
+    /// to an artificial terminal pair.
+    #[must_use = "the returned generator retains the supplied coherent injections and spectral density"]
+    pub fn generalized(
+        name: &str,
+        density: Real,
+        injections: Vec<(NoiseCoordinate, Complex)>,
+    ) -> Self {
+        Self {
+            suffix: std::borrow::Cow::Owned(format!("_{name}")),
+            nodes: [NodeId::GROUND; 2],
+            kind: NoiseKind::Generalized {
+                density,
+                injections: injections.into(),
+            },
+        }
+    }
+
     /// A generator.
     #[must_use = "the returned generator carries the specified physical terminals and noise law"]
     pub const fn new(suffix: &'static str, nodes: [NodeId; 2], kind: NoiseKind) -> Self {
         Self {
-            suffix,
+            suffix: std::borrow::Cow::Borrowed(suffix),
             nodes,
             kind,
         }

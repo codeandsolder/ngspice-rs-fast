@@ -6,14 +6,16 @@
 
 use super::{
     Binary, Environment, EvaluationView, Node, Operator, PwlTable, Tree, Unary, XspicePwl, divide,
-    power, power_h, pwr, unary_value,
+    power_h, unary_value,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::{collections::HashMap, sync::Arc};
 
 mod derivative;
+mod taylor;
 #[cfg(test)]
 use super::Evaluation;
+pub(in crate::devices::behavioural) use taylor::TaylorEvaluation;
 
 const MAX_INSTRUCTIONS: usize = 262_144;
 /// Index of an instruction and its corresponding scratch value.
@@ -326,8 +328,7 @@ impl Evaluator<'_, '_> {
                 let a = read(lhs);
                 let b = read(rhs);
                 let value = match function {
-                    Binary::Pow => power(a, b),
-                    Binary::Pwr => pwr(a, b),
+                    Binary::Power(law, part) => law.evaluate(*part, a, b),
                     Binary::Min => {
                         if a > b {
                             b
@@ -392,15 +393,11 @@ fn describe(node: &Instruction) -> String {
                 Operator::Power => "^",
             }
         ),
-        Instruction::Binary(function, _, _) => format!(
-            "{}()",
-            match function {
-                Binary::Pow => "pow",
-                Binary::Pwr => "pwr",
-                Binary::Min => "min",
-                Binary::Max => "max",
-            }
-        ),
+        Instruction::Binary(Binary::Power(law, part), _, _) => {
+            format!("{}{}()", law.name(), part.suffix())
+        }
+        Instruction::Binary(Binary::Min, _, _) => "min()".into(),
+        Instruction::Binary(Binary::Max, _, _) => "max()".into(),
         Instruction::Ternary(..) => "'?:'".into(),
         Instruction::Pwl(..) => "pwl()".into(),
         Instruction::PwlDerivative(..) => "pwl_derivative()".into(),

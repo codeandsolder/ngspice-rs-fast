@@ -15,11 +15,11 @@
 //!    | `g1 ... table ... [m=k]` | the same with gain `k` (node names with `[`, `]`, `%` replaced by `_`) |
 //!    | `e1 n+ n- nc+ nc- table=(...)` | `e1 n+ n- e1_int1 0 1` and `ae1` from `v(nc+,nc-)` (domain 0.001) |
 //!    | one TABLE pair `(x0, y0)` | `v<name> <name>_int1 0 y0` instead of the B/A pair |
-//!    | `e1 n+ n- poly(n) ...` (also F/G/H and the implicit `POLY(1)`) | the XSPICE `spice2poly` instance `a$poly$e1` |
+//!    | `e1 n+ n- poly(n) ...` (also F/G/H and the implicit `POLY(1)`) | native polynomial behavioural law retaining the original instance identity |
 //!
-//!    The generated XSPICE instances (`ae1`, `a$poly$e1`) are designator-`a`
-//!    devices carrying a behavioural `v=`/`i=` expression; they are internal
-//!    to this port (user `a` cards remain unported). The rewrite runs before
+//!    Generated TABLE instances (`ae1`) are designator-`a` devices carrying
+//!    a behavioural voltage expression; POLY retains the source instance's
+//!    identity and uses the same compiled expression kernel. The rewrite runs before
 //!    subcircuit expansion, as in C, so generated names and nodes are renamed
 //!    like any other (`x1.e1_int1`, `b.x1.be1`).
 //!
@@ -39,6 +39,7 @@ use crate::netlist::bexpr::{
     STATISTICAL_FUNCTIONS, TableTransfer, is_builtin_function, round_like_c_literal,
 };
 use crate::netlist::elaborate::format_literal;
+use crate::netlist::eval::statistics::PreparedSite;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
 use crate::netlist::expr::{
     BinaryOp, Expr, ExprKind, MAX_TREE_DEPTH, MAX_TREE_NODES, SourceSpan, TreeBudget, UnaryOp,
@@ -65,9 +66,9 @@ pub const LTSPICE_TABLE_DOMAIN: Real = 0.001;
 /// A malformed nonlinear form (no expression, an odd TABLE point list, a
 /// POLY without its controls), positioned at the card.
 pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
-    let plan = edits::ScopeEdits::build(ScopeView::from(netlist), &mut 0)?;
+    edits::validate(ScopeView::from(netlist))?;
     let mut out = netlist.clone();
-    plan.apply(&mut out)?;
+    edits::lower(&mut out)?;
     Ok(out)
 }
 
@@ -98,6 +99,7 @@ fn instance(
     location: &SourceLoc,
 ) -> DeviceInstance {
     DeviceInstance {
+        code_ports: Vec::new(),
         name,
         designator,
         nodes,
@@ -439,8 +441,8 @@ fn lower_poly(device: &DeviceInstance, form: &PolyForm<'_>) -> SpiceResult<Devic
     }];
     parameters.extend_from_slice(form.setters);
     Ok(instance(
-        format!("a$poly${}", device.name),
-        'a',
+        device.name.clone(),
+        device.designator,
         device.nodes[..2].to_vec(),
         parameters,
         location,
@@ -465,11 +467,27 @@ pub fn resolve_expression(
     scope: &ParamScope,
     budget: &mut EvalBudget,
 ) -> SpiceResult<BehaviouralExpression> {
+    resolve_expression_at(expression, scope, budget, None)
+}
+
+pub(crate) fn resolve_expression_at(
+    expression: &BehaviouralExpression,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+    site: Option<PreparedSite>,
+) -> SpiceResult<BehaviouralExpression> {
     let mut resolver = Resolver {
         scope,
         functions: scope.functions().cloned(),
         budget,
+        sampler: scope.sampler(&expression.span.start, site),
+        prepared_frames: site
+            .into_iter()
+            .map(|site| (expression.span.clone(), site.expression))
+            .collect(),
+        exact: false,
         verbatim: expression.verbatim,
+        syntax_only: false,
         nodes: 0,
         expansion_budget: TreeBudget::new(MAX_TREE_NODES),
     };
@@ -482,11 +500,192 @@ pub fn resolve_expression(
     })
 }
 
+/// Use the same lexical classification for actual elaboration and for
+/// inspecting a candidate's compiled constitutive dependencies.
+pub(crate) fn classify_device_passives(
+    device: &mut DeviceInstance,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<()> {
+    for parameter in &mut device.parameters {
+        if matches!(
+            (device.designator, parameter.name.as_str()),
+            ('r', "resistance") | ('c', "capacitance" | "charge") | ('l', "inductance")
+        ) {
+            classify_passive(parameter, scope, budget)?;
+        }
+    }
+    Ok(())
+}
+
+/// Expand the exact macro language of a runtime law without substituting
+/// numerical parameters. Discarded macro arguments are not dependencies;
+/// names captured inside the body, including nested calls, are.
+fn expand_symbolic(
+    expression: &BehaviouralExpression,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<BExpr> {
+    let mut resolver = Resolver {
+        scope,
+        functions: scope.functions().cloned(),
+        budget,
+        sampler: scope.sampler(&expression.span.start, None),
+        prepared_frames: Vec::new(),
+        exact: false,
+        verbatim: expression.verbatim,
+        syntax_only: true,
+        nodes: 0,
+        expansion_budget: TreeBudget::new(MAX_TREE_NODES),
+    };
+    resolver.resolve(&expression.root, 1)
+}
+
+/// Inspect the top-level laws *after* the same controlled-source lowering
+/// and passive classification used by the circuit factory. This work is
+/// performed once per parameter plan, never in a Newton iteration.
+pub(crate) fn candidate_laws(
+    netlist: &Netlist,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<Vec<BExpr>> {
+    let mut lowered = lower_nonlinear_sources(netlist)?;
+    let mut roots = Vec::new();
+    for device in &mut lowered.devices {
+        classify_device_passives(device, scope, budget)?;
+        for parameter in &device.parameters {
+            if let ParameterKind::Behavioural(expression) = &parameter.kind {
+                roots.push(expand_symbolic(expression, scope, budget)?);
+            }
+        }
+    }
+    Ok(roots)
+}
+
+/// Classify a passive's primary expression after lexical macro expansion.
+/// Numeric-only expressions remain in the numparam evaluator; runtime laws
+/// use the behavioural evaluator. No static function is numerically evaluated
+/// or rounded by the classification pass.
+pub(crate) fn classify_passive(
+    parameter: &mut ParameterAssignment,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<()> {
+    if parameter.name == "charge" {
+        return Ok(());
+    }
+    let functions = scope.functions().map(Arc::as_ref);
+    let numeric;
+    let expression = match &parameter.kind {
+        ParameterKind::Expression(value) => {
+            // A simple arithmetic parameter value cannot hide a runtime law.
+            let potentially_runtime = value.root.preorder().any(|node| match &node.kind {
+                ExprKind::Identifier(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
+                ExprKind::UserCall { .. } => true,
+                ExprKind::Call { function, .. } => {
+                    functions.is_some_and(|scope| scope.get(function.name()).is_some())
+                }
+                _ => false,
+            });
+            if !potentially_runtime {
+                return Ok(());
+            }
+            numeric = BehaviouralExpression {
+                text: value.spelling(),
+                span: value.span.clone(),
+                verbatim: false,
+                root: from_numparam(
+                    &value.root,
+                    &[],
+                    &[],
+                    1,
+                    &mut TreeBudget::new(MAX_TREE_NODES),
+                    functions,
+                )?,
+            };
+            &numeric
+        }
+        ParameterKind::Behavioural(expression) => expression,
+        _ => return Ok(()),
+    };
+    let root = expand_symbolic(expression, scope, budget)?;
+    let mut runtime = false;
+    root.visit(&mut |expr| {
+        runtime |= match &expr.kind {
+            BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
+            BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
+            BExprKind::Call { name, .. } => name == "ddt",
+            _ => false,
+        };
+    });
+    if runtime {
+        // The symbolic expansion classifies the law, but retain the original
+        // call tree for realization: otherwise macro invocation identities
+        // are lost before statistical calls can be bound.
+        parameter.kind = ParameterKind::Behavioural(Box::new(expression.clone()));
+    } else if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
+        // A locally shadowed probe call or an erased macro argument may
+        // make the syntactically behavioural candidate an ordinary scalar.
+        // Preserve the original numeric evaluation and its site metadata.
+        let text = &expression.text;
+        let inner = text.get(1..text.len().saturating_sub(1)).ok_or_else(|| {
+            parse_error(
+                &expression.span,
+                "missing passive expression delimiters".into(),
+            )
+        })?;
+        let mut value = crate::netlist::parse_parameter_expression(
+            inner,
+            &expression
+                .span
+                .start
+                .at_column(expression.span.start.column + 1),
+        )?;
+        value.braced = true;
+        value.quoted = text.starts_with('\'');
+        parameter.kind = ParameterKind::Expression(Box::new(value));
+    }
+    Ok(())
+}
+
+/// Static argument arithmetic follows the same compiled expression semantics
+/// as the surrounding behavioural law, but cannot read any circuit quantity.
+fn statistical_argument(expr: &BExpr) -> SpiceResult<Real> {
+    let mut dynamic = false;
+    expr.visit(&mut |node| {
+        dynamic |= matches!(
+            &node.kind,
+            BExprKind::Voltage { .. } | BExprKind::Current(_)
+        ) || matches!(&node.kind, BExprKind::Name(name) if !matches!(name.as_str(),"pi"|"e"))
+            || matches!(&node.kind, BExprKind::Call { name,.. } if name == "ddt");
+    });
+    if dynamic {
+        return Err(parse_error(
+            &expr.span,
+            "statistical function requires static arguments, not a circuit-dependent value".into(),
+        ));
+    }
+    let program = crate::devices::behavioural::program::Program::compile(expr)?;
+    Ok(program
+        .evaluate(&crate::devices::behavioural::program::Environment {
+            values: &[],
+            time: 0.,
+            temperature: 0.,
+            gmin: 0.,
+            frequency: 0.,
+        })?
+        .value)
+}
+
 struct Resolver<'a> {
     scope: &'a ParamScope,
     functions: Option<Arc<FunctionScope>>,
     budget: &'a mut EvalBudget,
+    sampler: crate::netlist::eval::statistics::Sampler<'a>,
+    prepared_frames: Vec<(SourceSpan, model_statistics::Identity)>,
+    exact: bool,
     verbatim: bool,
+    syntax_only: bool,
     nodes: usize,
     expansion_budget: TreeBudget,
 }
@@ -496,6 +695,40 @@ fn parse_error(span: &SourceSpan, message: String) -> SpiceError {
 }
 
 impl Resolver<'_> {
+    // Macro arguments retain their original source spans when textually
+    // substituted. Resolve their prepared identity in the caller frame, not
+    // the callee frame: repeated formal reads must not resample the argument.
+    fn prepared_frame(&self, span: &SourceSpan) -> Option<(model_statistics::Identity, u64)> {
+        self.prepared_frames
+            .iter()
+            .rev()
+            .find_map(|(parent, identity)| {
+                let start = (span.start.line, span.start.column);
+                let end = (span.end.line, span.end.column);
+                let parent_start = (parent.start.line, parent.start.column);
+                let parent_end = (parent.end.line, parent.end.column);
+                if span.start.path() != parent.start.path()
+                    || start < parent_start
+                    || end > parent_end
+                {
+                    return None;
+                }
+                span.relative_to(parent)
+                    .map(|range| (*identity, range.start as u64))
+            })
+    }
+
+    fn numeric_value(&self, value: Real) -> BExprKind {
+        if self.exact {
+            BExprKind::Number {
+                value,
+                spelling: format_literal(value),
+            }
+        } else {
+            spliced(value)
+        }
+    }
+
     fn resolve(&mut self, expr: &BExpr, depth: usize) -> SpiceResult<BExpr> {
         self.nodes += 1;
         if self.nodes > MAX_TREE_NODES || depth > MAX_TREE_DEPTH {
@@ -510,7 +743,7 @@ impl Resolver<'_> {
         let boxed = |this: &mut Self, expr: &BExpr| this.resolve(expr, depth + 1).map(Box::new);
         let kind = match &expr.kind {
             BExprKind::Number { value, spelling } => BExprKind::Number {
-                value: if self.verbatim {
+                value: if self.verbatim || self.syntax_only || self.exact {
                     *value
                 } else {
                     round_like_c_literal(*value)
@@ -518,7 +751,31 @@ impl Resolver<'_> {
                 spelling: spelling.clone(),
             },
             BExprKind::Name(name) => return self.name(expr, name),
-            BExprKind::Voltage { .. } | BExprKind::Current(_) => expr.kind.clone(),
+            BExprKind::Voltage { positive, negative } => {
+                if self
+                    .functions
+                    .as_deref()
+                    .is_some_and(|scope| scope.get("v").is_some())
+                {
+                    return self.shadowed_probe(
+                        expr,
+                        "v",
+                        std::iter::once(positive.as_str()).chain(negative.as_deref()),
+                        depth,
+                    );
+                }
+                expr.kind.clone()
+            }
+            BExprKind::Current(name) => {
+                if self
+                    .functions
+                    .as_deref()
+                    .is_some_and(|scope| scope.get("i").is_some())
+                {
+                    return self.shadowed_probe(expr, "i", std::iter::once(name.as_str()), depth);
+                }
+                expr.kind.clone()
+            }
             BExprKind::Unary { op, operand } => BExprKind::Unary {
                 op: *op,
                 operand: boxed(self, operand)?,
@@ -541,7 +798,16 @@ impl Resolver<'_> {
             BExprKind::Call { name, arguments } => {
                 return self.call(expr, name, arguments, depth);
             }
-            BExprKind::Value(value) => spliced(self.scope.evaluate(value, self.budget)?),
+            BExprKind::Value(value) if !self.syntax_only => {
+                let identity = self
+                    .prepared_frame(&expr.span)
+                    .map(|(identity, _)| identity);
+                let evaluated =
+                    self.scope
+                        .evaluate_sampled(value, self.budget, &self.sampler, identity)?;
+                self.numeric_value(evaluated)
+            }
+            BExprKind::Value(_) => expr.kind.clone(),
             BExprKind::Table(table) => {
                 let input = self.resolve(&table.input, depth + 1)?;
                 let mut points = Vec::with_capacity(table.points.len());
@@ -562,7 +828,7 @@ impl Resolver<'_> {
     }
 
     fn name(&self, expr: &BExpr, name: &str) -> SpiceResult<BExpr> {
-        if SPECIAL_NAMES.contains(&name) {
+        if self.syntax_only || SPECIAL_NAMES.contains(&name) {
             return Ok(expr.clone());
         }
         if self.verbatim {
@@ -581,7 +847,58 @@ impl Resolver<'_> {
             )
         })?;
         Ok(BExpr {
-            kind: spliced(value),
+            kind: self.numeric_value(value),
+            span: expr.span.clone(),
+        })
+    }
+
+    fn shadowed_probe<'a>(
+        &mut self,
+        expr: &BExpr,
+        name: &str,
+        operands: impl Iterator<Item = &'a str>,
+        depth: usize,
+    ) -> SpiceResult<BExpr> {
+        let arguments = operands
+            .map(|operand| {
+                crate::netlist::Parser::new()
+                    .parse_behavioural_expression(operand, &expr.span.start, false)
+                    .map(|expression| expression.root)
+            })
+            .collect::<SpiceResult<Vec<_>>>()?;
+        self.call(expr, name, &arguments, depth)
+    }
+
+    fn prepared_call(
+        &mut self,
+        expr: &BExpr,
+        name: &str,
+        arguments: &[BExpr],
+        depth: usize,
+    ) -> SpiceResult<BExpr> {
+        let identity = self
+            .prepared_frame(&expr.span)
+            .map(|(identity, _)| identity);
+        if identity.is_none() && self.sampler.prepared_site().is_some() {
+            return Err(parse_error(
+                &expr.span,
+                "prepared statistical call has no static expression identity".into(),
+            ));
+        }
+        let previous = std::mem::replace(&mut self.exact, true);
+        let values = arguments
+            .iter()
+            .map(|argument| {
+                let resolved = self.resolve(argument, depth + 1)?;
+                statistical_argument(&resolved)
+            })
+            .collect::<SpiceResult<Vec<_>>>();
+        self.exact = previous;
+        let value = self
+            .sampler
+            .sample_prepared(name, &values?, identity, &expr.span.start)?;
+        Ok(BExpr {
+            kind: self.numeric_value(value),
             span: expr.span.clone(),
         })
     }
@@ -593,6 +910,9 @@ impl Resolver<'_> {
         arguments: &[BExpr],
         depth: usize,
     ) -> SpiceResult<BExpr> {
+        if !self.syntax_only && name.starts_with(model_statistics::PREPARED_PREFIX) {
+            return self.prepared_call(expr, name, arguments, depth);
+        }
         let functions = self.functions.clone();
         let definition = functions
             .as_deref()
@@ -618,28 +938,41 @@ impl Resolver<'_> {
                 arguments,
                 depth + 1,
                 &mut self.expansion_budget,
+                functions.as_deref(),
             )?;
-            let expanded = self.resolve(&body, depth + 1)?;
+            let frame = self.prepared_frame(&expr.span).map(|(identity, offset)| {
+                (
+                    definition.body.span.clone(),
+                    identity
+                        .child(b"macro")
+                        .child(definition.name.as_bytes())
+                        .child(&offset.to_le_bytes()),
+                )
+            });
+            let pushed = frame.is_some();
+            self.prepared_frames.extend(frame);
+            let expanded = self.resolve(&body, depth + 1);
+            if pushed {
+                self.prepared_frames.pop();
+            }
             return Ok(BExpr {
-                kind: BExprKind::Group(Box::new(expanded)),
+                kind: BExprKind::Group(Box::new(expanded?)),
                 span: expr.span.clone(),
             });
         }
-        if STATISTICAL_FUNCTIONS.contains(&name) {
-            // inp.c's eval_agauss() replaces each call on a B line by one
-            // value drawn before parsing (inpcom.c applies the same set to
-            // .param lines in inp_fix_agauss_in_param()).
-            return Err(SpiceError::not_yet_ported(
-                format!(
-                    "{}: {name}() in a behavioural expression (a random value drawn \
-                     once before the expression is parsed)",
-                    expr.span.start
-                ),
-                "src/frontend/inp.c (eval_agauss); src/frontend/inpcom.c \
-                 (inp_fix_agauss_in_param)",
-            ));
+        if !self.syntax_only && STATISTICAL_FUNCTIONS.contains(&name) {
+            let mut values = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                let resolved = self.resolve(argument, depth + 1)?;
+                values.push(statistical_argument(&resolved)?);
+            }
+            let value = self.sampler.sample(name, &values, &expr.span.start)?;
+            return Ok(BExpr {
+                kind: spliced(value),
+                span: expr.span.clone(),
+            });
         }
-        if !is_builtin_function(name) {
+        if !self.syntax_only && !is_builtin_function(name) {
             return Err(SpiceError::parse(
                 expr.span.start.clone(),
                 format!(
@@ -671,10 +1004,12 @@ fn from_numparam(
     arguments: &[BExpr],
     depth: usize,
     budget: &mut TreeBudget,
+    functions: Option<&FunctionScope>,
 ) -> SpiceResult<BExpr> {
     budget.charge(depth, 1, &expr.span.start)?;
-    let mut convert =
-        |expr: &Expr| from_numparam(expr, formals, arguments, depth + 1, budget).map(Box::new);
+    let mut convert = |expr: &Expr| {
+        from_numparam(expr, formals, arguments, depth + 1, budget, functions).map(Box::new)
+    };
     let kind = match &expr.kind {
         ExprKind::Number { value, spelling } => BExprKind::Number {
             value: *value,
@@ -716,7 +1051,9 @@ fn from_numparam(
             name: function.name().to_owned(),
             arguments: operands
                 .iter()
-                .map(|operand| from_numparam(operand, formals, arguments, depth + 1, budget))
+                .map(|operand| {
+                    from_numparam(operand, formals, arguments, depth + 1, budget, functions)
+                })
                 .collect::<SpiceResult<_>>()?,
         },
         ExprKind::Group(inner) => BExprKind::Group(convert(inner)?),
@@ -724,7 +1061,9 @@ fn from_numparam(
             name,
             arguments: operands,
         } => {
-            if let Some(kind) = circuit_quantity(name, operands) {
+            if functions.is_none_or(|scope| scope.get(name).is_none())
+                && let Some(kind) = circuit_quantity(name, operands)
+            {
                 kind
             } else {
                 BExprKind::Call {
@@ -732,7 +1071,7 @@ fn from_numparam(
                     arguments: operands
                         .iter()
                         .map(|operand| {
-                            from_numparam(operand, formals, arguments, depth + 1, budget)
+                            from_numparam(operand, formals, arguments, depth + 1, budget, functions)
                         })
                         .collect::<SpiceResult<_>>()?,
                 }

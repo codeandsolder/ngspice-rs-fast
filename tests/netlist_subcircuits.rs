@@ -16,7 +16,7 @@ fn parse(body: &str) -> Result<Netlist, SpiceError> {
 fn ordered_cards_are_scope_local_and_nested_definitions_are_retained() {
     let n = parse("X0 A GND OUTER K=2 K={base*2}\n.subckt OUTER A B params: K=1K K=base\n.model dm d\nX1 a b INNER params: T='K + 1'\n.subckt INNER 1 0\nD1 1 0 dm\n.ends inner\nr1 a b 1k\n.ends OUTER\n.op\n.end\nignored {\n").unwrap();
     assert_eq!(n.devices.len(), 1);
-    assert_eq!(n.devices[0].nodes, ["a", "0"]);
+    assert_eq!(n.devices[0].nodes, ["a", "gnd"]);
     assert_eq!(n.devices[0].parameters[1].value, "{base*2}");
     assert!(matches!(
         n.devices[0].parameters[1].kind,
@@ -126,10 +126,8 @@ fn ground_alias_and_byte_positions_survive_structural_grammar() {
     for auto in [true, false] {
         let n = Parser::with_auto_gnd(auto).parse_deck(&deck).unwrap();
         assert_eq!(n.subcircuits[0].name, "gnd");
-        assert_eq!(
-            n.subcircuits[0].terminals[0],
-            if auto { "0" } else { "gnd" }
-        );
+        assert_eq!(n.subcircuits[0].terminals[0], "gnd");
+        assert_eq!(n.auto_gnd, auto);
         assert_eq!(n.devices[0].model.as_deref(), Some("gnd"));
         assert_eq!(n.devices[0].parameters[0].location.column, 19);
         assert_eq!(n.subcircuits[0].parameters[0].location.column, 30);

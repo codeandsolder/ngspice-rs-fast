@@ -27,9 +27,10 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue,
-    ParameterAssignment, ParameterKind, Subcircuit,
+    NumericVectorEntry, ParameterAssignment, ParameterKind, Subcircuit,
 };
-use crate::netlist::eval::{EvalBudget, EvalLimits, FunctionScope, ParamScope};
+use crate::netlist::eval::statistics::PreparedSite;
+use crate::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
 
 /// Which site was literalized (indexes into the *input* netlist).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,24 @@ pub enum SiteKind {
         model: usize,
         /// Parameter index.
         parameter: usize,
+    },
+    /// One entry of a device numeric vector.
+    DeviceVectorEntry {
+        /// Device index.
+        device: usize,
+        /// Parameter index.
+        parameter: usize,
+        /// Vector entry index.
+        entry: usize,
+    },
+    /// One entry of a model numeric vector.
+    ModelVectorEntry {
+        /// Model index.
+        model: usize,
+        /// Parameter index.
+        parameter: usize,
+        /// Vector entry index.
+        entry: usize,
     },
     /// `Netlist::analyses[analysis].arguments[argument]`.
     AnalysisArgument {
@@ -80,6 +99,8 @@ pub struct ResolvedSite {
     pub original: String,
     /// Location of the expression text.
     pub location: SourceLoc,
+    /// The actual numeric expression after lexical passive classification.
+    pub expression: crate::netlist::expr::ParameterExpression,
     /// The evaluated finite value before numparam formatting.
     pub value: Real,
     /// The literal inserted into the card by numparam.
@@ -87,16 +108,18 @@ pub struct ResolvedSite {
     /// Correctly rounded read-back of the formatted literal, which may
     /// differ from the original evaluation because of decimal formatting.
     pub read_back: Real,
+    pub(crate) statistical: Option<PreparedSite>,
 }
 
 impl ResolvedSite {
     fn record(
         kind: SiteKind,
         original: String,
-        location: SourceLoc,
+        expression: &crate::netlist::expr::ParameterExpression,
         value: Real,
         formatted: &str,
     ) -> SpiceResult<Self> {
+        let location = expression.span.start.clone();
         let read_back = crate::primitives::parse_spice_number(formatted).ok_or_else(|| {
             SpiceError::parse(
                 location.clone(),
@@ -107,9 +130,11 @@ impl ResolvedSite {
             kind,
             original,
             location,
+            expression: expression.clone(),
             value,
             formatted: formatted.to_owned(),
             read_back,
+            statistical: None,
         })
     }
 }
@@ -189,7 +214,7 @@ pub fn format_literal(value: Real) -> String {
 /// Any parameter or site evaluation failure (undefined, cyclic, domain,
 /// non-finite, over budget), with source locations.
 pub fn literalize(netlist: &Netlist) -> SpiceResult<ElaboratedNetlist> {
-    let mut budget = EvalBudget::new(EvalLimits::default());
+    let mut budget = EvalBudget::for_netlist(netlist)?;
     let functions = FunctionScope::for_netlist(netlist, &budget)?;
     let scope = Arc::new(ParamScope::resolve_scoped(
         None,
@@ -243,6 +268,31 @@ pub fn literalize_with(
     })
 }
 
+#[derive(Clone, Copy)]
+enum ParameterOwner {
+    Device(usize),
+    Model(usize),
+}
+
+impl ParameterOwner {
+    const fn site(self, parameter: usize, entry: Option<usize>) -> SiteKind {
+        match (self, entry) {
+            (Self::Device(device), None) => SiteKind::DeviceParameter { device, parameter },
+            (Self::Model(model), None) => SiteKind::ModelParameter { model, parameter },
+            (Self::Device(device), Some(entry)) => SiteKind::DeviceVectorEntry {
+                device,
+                parameter,
+                entry,
+            },
+            (Self::Model(model), Some(entry)) => SiteKind::ModelVectorEntry {
+                model,
+                parameter,
+                entry,
+            },
+        }
+    }
+}
+
 fn literalize_device_models(
     devices: &mut [DeviceInstance],
     models: &mut [ModelCard],
@@ -251,30 +301,96 @@ fn literalize_device_models(
     mut sites: Option<&mut Vec<ResolvedSite>>,
 ) -> SpiceResult<()> {
     for (di, device) in devices.iter_mut().enumerate() {
+        crate::netlist::behavioural::classify_device_passives(device, scope, budget)?;
+        let device_site = device
+            .parameters
+            .iter()
+            .any(|parameter| match &parameter.kind {
+                ParameterKind::Expression(expr) => scope.uses_prepared_statistics(&expr.root),
+                ParameterKind::NumericVector(entries) => entries.iter().any(|entry| {
+                    entry
+                        .expression
+                        .as_ref()
+                        .is_some_and(|expr| scope.uses_prepared_statistics(&expr.root))
+                }),
+                ParameterKind::Behavioural(_) | ParameterKind::Waveform(_) => true,
+                _ => false,
+            })
+            .then(|| scope.statistical_site(b"device", &device.name))
+            .flatten();
         literalize_parameters(
             &mut device.parameters,
             scope,
             budget,
             sites.as_deref_mut(),
-            |p| SiteKind::DeviceParameter {
-                device: di,
-                parameter: p,
-            },
+            (ParameterOwner::Device(di), device_site),
         )?;
     }
     for (mi, model) in models.iter_mut().enumerate() {
+        // These fields require the physical device occurrence as well as
+        // the scope owning the model declaration. Bind at model selection.
+        if model_uses_statistics(model, scope) {
+            continue;
+        }
         literalize_parameters(
             &mut model.parameters,
             scope,
             budget,
             sites.as_deref_mut(),
-            |p| SiteKind::ModelParameter {
-                model: mi,
-                parameter: p,
-            },
+            (ParameterOwner::Model(mi), None),
         )?;
     }
     Ok(())
+}
+
+/// Scalar/vector expressions whose model declaration requires occurrence binding.
+pub(crate) fn model_expressions(
+    model: &ModelCard,
+) -> impl Iterator<Item = &crate::netlist::expr::ParameterExpression> {
+    model.parameters.iter().flat_map(|parameter| {
+        let (scalar, vector) = match &parameter.kind {
+            ParameterKind::Expression(expression) => (Some(expression.as_ref()), None),
+            ParameterKind::NumericVector(entries) => (None, Some(entries.as_slice())),
+            _ => (None, None),
+        };
+        scalar.into_iter().chain(
+            vector
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.expression.as_deref()),
+        )
+    })
+}
+
+pub(crate) fn model_uses_statistics(model: &ModelCard, scope: &ParamScope) -> bool {
+    model_expressions(model).any(|expression| scope.uses_prepared_statistics(&expression.root))
+}
+
+pub(crate) fn realize_model(
+    card: &ModelCard,
+    scope: &ParamScope,
+    occurrence: PreparedSite,
+    budget: &mut EvalBudget,
+) -> SpiceResult<ModelCard> {
+    let mut bound = card.clone();
+    let mut site = scope
+        .statistical_site(b"model", &card.name)
+        .ok_or_else(|| {
+            SpiceError::parse(
+                card.location.clone(),
+                "statistical model declaration has no lexical owner",
+            )
+        })?;
+    site.lot = Some(site.occurrence);
+    site.occurrence = occurrence.occurrence;
+    literalize_parameters(
+        &mut bound.parameters,
+        scope,
+        budget,
+        None,
+        (ParameterOwner::Model(0), Some(site)),
+    )?;
+    Ok(bound)
 }
 
 /// Instance-scoped semantic values, without copying lexical declarations or
@@ -369,7 +485,7 @@ fn literalize_hints(
                     } else {
                         expression.text.clone()
                     },
-                    expression.span.start.clone(),
+                    expression,
                     value,
                     &text,
                 )?;
@@ -393,14 +509,52 @@ fn literalize_parameters(
     scope: &ParamScope,
     budget: &mut EvalBudget,
     mut sites: Option<&mut Vec<ResolvedSite>>,
-    kind: impl Fn(usize) -> SiteKind,
+    (owner, statistical): (ParameterOwner, Option<PreparedSite>),
 ) -> SpiceResult<()> {
+    let mut ordinals = std::collections::HashMap::<String, u64>::new();
     for (index, parameter) in parameters.iter_mut().enumerate() {
+        let site = statistical.map(|site| {
+            let name = parameter.name.to_ascii_lowercase();
+            let ordinal = ordinals.entry(name.clone()).or_default();
+            let field = site.field(name.as_bytes()).field(&ordinal.to_le_bytes());
+            *ordinal += 1;
+            field
+        });
+        let vector = match &mut parameter.kind {
+            ParameterKind::NumericVector(entries) => Some((entries.iter_mut().collect(), false)),
+            ParameterKind::Waveform(waveform) => Some((waveform.coefficients_mut(), true)),
+            _ => None,
+        };
+        if let Some((mut entries, waveform)) = vector {
+            let mut changed = false;
+            for (entry_index, entry) in entries.iter_mut().enumerate() {
+                changed |= literalize_vector_entry(
+                    entry,
+                    scope,
+                    budget,
+                    sites.as_deref_mut(),
+                    (
+                        owner.site(index, Some(entry_index)),
+                        site.map(|site| site.field(&(entry_index as u64).to_le_bytes())),
+                    ),
+                    &parameter.name,
+                )?;
+            }
+            if changed || !waveform {
+                let text = entries
+                    .iter()
+                    .map(|entry| entry.source.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                parameter.value = if waveform { format!("({text})") } else { text };
+            }
+            continue;
+        }
         if let ParameterKind::Behavioural(expression) = &parameter.kind {
             // Behavioural expressions stay symbolic: only their `.param`
             // names, `.func` calls and numparam values are resolved here.
-            let resolved = crate::netlist::behavioural::resolve_expression(
-                expression, scope, budget,
+            let resolved = crate::netlist::behavioural::resolve_expression_at(
+                expression, scope, budget, site,
             )
             .map_err(|error| match error {
                 SpiceError::Parse { location, message } => SpiceError::parse(
@@ -419,7 +573,7 @@ fn literalize_parameters(
             continue;
         };
         let value = scope
-            .evaluate(expression, budget)
+            .evaluate_at(expression, site, budget)
             .map_err(|error| match error {
                 SpiceError::Parse { location, message } => SpiceError::parse(
                     location,
@@ -432,18 +586,54 @@ fn literalize_parameters(
             })?;
         let text = format_literal(value);
         if let Some(sites) = sites.as_deref_mut() {
-            sites.push(ResolvedSite::record(
-                kind(index),
+            let mut record = ResolvedSite::record(
+                owner.site(index, None),
                 parameter.value.clone(),
-                expression.span.start.clone(),
+                expression,
                 value,
                 &text,
-            )?);
+            )?;
+            record.statistical = site;
+            sites.push(record);
         }
         parameter.value = text;
         parameter.kind = ParameterKind::Scalar;
     }
     Ok(())
+}
+
+fn literalize_vector_entry(
+    entry: &mut NumericVectorEntry,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+    sites: Option<&mut Vec<ResolvedSite>>,
+    (kind, site): (SiteKind, Option<PreparedSite>),
+    name: &str,
+) -> SpiceResult<bool> {
+    let Some(expression) = entry.expression.take() else {
+        return Ok(false);
+    };
+    let value = scope
+        .evaluate_at(&expression, site, budget)
+        .map_err(|error| match error {
+            SpiceError::Parse { location, message } => SpiceError::parse(
+                location,
+                format!(
+                    "{message} while resolving {name} vector coefficient at {}",
+                    entry.source.location
+                ),
+            ),
+            other => other,
+        })?;
+    let text = format_literal(value);
+    if let Some(sites) = sites {
+        let mut record =
+            ResolvedSite::record(kind, entry.source.text.clone(), &expression, value, &text)?;
+        record.statistical = site;
+        sites.push(record);
+    }
+    entry.source.text = text;
+    Ok(true)
 }
 
 /// Replace the braced arguments of one analysis card with their values.
@@ -515,7 +705,7 @@ fn literalize_analysis_into(
                     argument: e.index,
                 },
                 argument.clone(),
-                e.expression.span.start.clone(),
+                &e.expression,
                 value,
                 &formatted,
             )?);

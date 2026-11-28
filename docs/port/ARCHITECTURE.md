@@ -90,8 +90,10 @@ circuit pattern, `.options pivtol`/`pivrel` at every reorder, a reorder after a
 zero pivot on refactor. Its status is the policy: `spSINGULAR`/`spZERO_DIAG`
 fail, naming the unknown as `NIiter`'s warning does (`singular matrix:  check
 node v1#branch`, from `Circuit::unknown_names`); `spSMALL_PIVOT` is accepted
-(ngspice's `OK`) with a solver warning; a circuit unknown with no matrix
-element keeps its right-hand side, as C's untranslated row does. There is no
+(ngspice's `OK`) with a solver warning. Circuit unknowns with no allocated
+matrix entries now fail with named structural singularity diagnostics (#202)
+instead of interpreting RHS current as voltage. No node-degree pruning is
+performed; sensed and observable passive leaves retain their equations. There is no
 rank probe, condition estimate or residual check, because C has none; the
 faer-era rank diagnostics of #47 are superseded
 ([SPARSE_RANK_DIAGNOSTICS.md](SPARSE_RANK_DIAGNOSTICS.md)). Non-finite inputs,

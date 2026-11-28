@@ -41,6 +41,7 @@ fn input_for(kind: AnalysisKind) -> AnalysisInput {
         AnalysisKind::TransferFunction => "v ( out ) v1",
         AnalysisKind::Transient => "1u 10u",
         AnalysisKind::PeriodicSteadyState => "1k 1m out",
+        AnalysisKind::HarmonicBalance => "1k 3",
         AnalysisKind::Fourier => unreachable!("not a driver"),
     };
     AnalysisInput::with_arguments(kind, text.split_whitespace())
@@ -75,6 +76,340 @@ fn close(a: f64, b: f64, rel: f64, abs: f64) {
 }
 
 // ---- options with an effect -------------------------------------------------
+
+#[test]
+fn physical_shunts_match_independent_nodal_equations() {
+    let circuit = "v1 in 0 dc 1 ac 1\nr1 in out 1k";
+    let plot = simulate(&format!("{circuit}\n.options rshunt=1k\n.op")).unwrap();
+    close(plot.value("v(out)", 0).unwrap().re, 0.5, 1e-12, 0.);
+    close(plot.value("i(v1)", 0).unwrap().re, -1.5e-3, 1e-12, 0.);
+    // An extreme finite resistance must retain its real reciprocal.
+    let large = simulate(&format!("{circuit}\n.options rshunt=1e15\n.op")).unwrap();
+    close(large.value("i(v1)", 0).unwrap().re, -2e-15, 0., 5e-19);
+    let frequency = 1000.;
+    let omega_c = std::f64::consts::TAU * frequency * 1e-6;
+    let denominator = 1. + (omega_c * 1000.).powi(2);
+    let ac = simulate(&format!("{circuit}\n.options cshunt=1u\n.ac lin 1 1k 1k")).unwrap();
+    let output = ac.value("v(out)", 0).unwrap();
+    close(output.re, denominator.recip(), 1e-12, 0.);
+    close(output.im, -omega_c * 1000. / denominator, 1e-12, 0.);
+    let current = ac.value("i(v1)", 0).unwrap();
+    close(current.re, (output.re - 1.) / 1000., 1e-12, 0.);
+    close(current.im, output.im / 1000. - omega_c, 1e-12, 0.);
+    let unshunted = simulate(&format!("{circuit}\n.op")).unwrap();
+    close(unshunted.value("v(out)", 0).unwrap().re, 1., 1e-12, 0.);
+}
+
+#[test]
+fn topology_shunts_agree_with_explicit_reactive_storage() {
+    let circuit = "v1 in 0 pulse(0 1 1u 1u 1u 1m 2m)\nr1 in out 1k";
+    let analysis = ".tran 1u 50u";
+    for method in ["trap", "gear"] {
+        let generated = simulate(&format!(
+            "{circuit}\n.options rshunt=1k cshunt=1n method={method}\n{analysis}"
+        ))
+        .unwrap();
+        let explicit = simulate(&format!(
+            "{circuit}\nrsi in 0 1k\nrso out 0 1k\ncsi in 0 1n\ncso out 0 1n\n.options method={method}\n{analysis}"
+        )).unwrap();
+        assert_eq!(generated.point_count(), explicit.point_count());
+        for point in 0..generated.point_count() {
+            for variable in ["time", "v(out)", "i(v1)"] {
+                close(
+                    generated.value(variable, point).unwrap().re,
+                    explicit.value(variable, point).unwrap().re,
+                    1e-8,
+                    1e-12,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn generated_shunts_preserve_nonlinear_charge_lte_and_physical_decay() {
+    // The combined charge is Q = 1 uF * (1.5 V + V^2), and the two
+    // 1 kOhm resistors give G = 2 mS. Thus, integrating dQ/dt = -G V:
+    // 1.5 ln(V) + 2 V = 1.5 ln(2) + 4 - t/(500 us).
+    let circuit = "r1 out 0 1k\nc1 out 0 q={1u*(v(out)+v(out)^2)} ic=2\n.ic v(out)=2";
+    let primitive = |v: f64| 1.5 * v.ln() + 2. * v;
+    for method in ["trap", "gear"] {
+        for truncation in ["", "newtrunc ltereltol=1e-5 lteabstol=1n ltetrtol=1"] {
+            let settings = format!(
+                ".options method={method} reltol=1e-6 vntol=1n {truncation}\n.tran 5u 2m 0 5u uic"
+            );
+            let generated = simulate(&format!(
+                "{circuit}\n.options rshunt=1k cshunt=0.5u\n{settings}"
+            ))
+            .unwrap();
+            let explicit = simulate(&format!(
+                "{circuit}\nrsh out 0 1k\ncsh out 0 0.5u\n{settings}"
+            ))
+            .unwrap();
+            for plot in [&generated, &explicit] {
+                for point in 0..plot.point_count() {
+                    let t = plot.value("time", point).unwrap().re;
+                    let v = plot.value("v(out)", point).unwrap().re;
+                    assert!(v > 0.);
+                    close(primitive(v), primitive(2.) - t / 5e-4, 0., 5e-4);
+                    let q = plot.value("q(c1)", point).unwrap().re;
+                    close(q, 1e-6 * (v + v * v), 1e-6, 1e-14);
+                }
+            }
+            close(
+                generated
+                    .value("v(out)", generated.point_count() - 1)
+                    .unwrap()
+                    .re,
+                explicit
+                    .value("v(out)", explicit.point_count() - 1)
+                    .unwrap()
+                    .re,
+                1e-5,
+                1e-8,
+            );
+        }
+    }
+}
+
+#[test]
+fn topology_shunts_validate_and_preserve_branch_coordinates() {
+    for invalid in [
+        ".options rshunt=0",
+        ".options rshunt=-1",
+        ".options rshunt=1e-320",
+        ".options cshunt=-1",
+        ".options cshunt=abc",
+    ] {
+        assert!(config(invalid).is_err(), "{invalid}");
+    }
+    let n = deck(
+        "v1 a 0 1\nr1 a b 1k\nd1 b 0 dm\n.model dm d(is=1e-14 rs=10)\n.options rshunt=1e15 cshunt=1p",
+    );
+    let c = RunConfig::from_netlist(&n).unwrap();
+    let circuit = c.circuit(&n).unwrap();
+    let nodes = circuit.nodes().nodes();
+    let terminals = nodes
+        .iter()
+        .filter(|node| node.kind == ngspice_rs::primitives::NodeKind::Terminal)
+        .count();
+    let internal = nodes
+        .iter()
+        .filter(|node| node.kind == ngspice_rs::primitives::NodeKind::Internal)
+        .count();
+    assert!(internal > 0);
+    let resistors = circuit
+        .devices()
+        .iter()
+        .filter(|d| d.name().starts_with("r__rshunt_"))
+        .count();
+    let capacitors = circuit
+        .devices()
+        .iter()
+        .filter(|d| d.name().starts_with("capac") && d.name().ends_with("shunt"))
+        .count();
+    assert_eq!(resistors, terminals + internal);
+    assert_eq!(capacitors, terminals);
+}
+
+#[test]
+fn gshunt_is_continuation_regularization_not_a_physical_resistor() {
+    let circuit = "v1 in 0 dc 1 ac 1\nr1 in out 1k";
+    let direct = simulate(&format!("{circuit}\n.options gshunt=1m\n.op")).unwrap();
+    close(direct.value("v(out)", 0).unwrap().re, 1., 1e-12, 0.);
+    close(direct.value("i(v1)", 0).unwrap().re, 0., 0., 1e-15);
+    // ngspice 47, cktop.c + SPARSE LoadGmin: after MNA preorder the
+    // diagonal contains the source incidence entries as well as the
+    // output voltage diagonal. The regularized equations are
+    // (1+g)*Vin=1 and (G+g)*Vout=G*Vin.
+    for steps in [1, 2] {
+        let forced = simulate(&format!(
+            "{circuit}\n.options gshunt=1m noopiter gminsteps={steps}\n.op"
+        ))
+        .unwrap();
+        let vin = 1. / 1.001;
+        let vout = vin / 2.;
+        close(forced.value("v(out)", 0).unwrap().re, vout, 1e-9, 0.);
+        close(
+            forced.value("i(v1)", 0).unwrap().re,
+            (vout - vin) * 1e-3 / 1.001,
+            1e-9,
+            0.,
+        );
+    }
+    let source_only = simulate(&format!(
+        "{circuit}\n.options gshunt=1m noopiter gminsteps=0 srcsteps=1\n.op"
+    ))
+    .unwrap();
+    close(source_only.value("v(out)", 0).unwrap().re, 1., 1e-12, 0.);
+}
+
+#[test]
+fn persistent_gshunt_preserves_the_entire_charge_constitutive_block() {
+    // The first branch coordinate is a current, but its equation is
+    // Q=f(V). A diagonal perturbation of that equation changes a physical
+    // charge and causes the derivative consistency check to reject steps.
+    for law in ["1u*v(out)", "1u*(v(out)+v(out)^2)"] {
+        for method in ["trap", "gear"] {
+            for steps in [1, 2] {
+                let plot = simulate(&format!(
+                    "v1 in 0 sin(1 0.1 1k)\nr1 in out 1k\nc1 out 0 q={{{law}}}\n.options gshunt=1u noopiter gminsteps={steps} method={method} reltol=1e-6 vntol=1n\n.tran 5u 50u 0 5u"
+                ))
+                .unwrap();
+                assert!(plot.point_count() >= 10);
+                close(
+                    plot.value("time", plot.point_count() - 1).unwrap().re,
+                    50e-6,
+                    1e-12,
+                    0.,
+                );
+                for point in 0..plot.point_count() {
+                    let v = plot.value("v(out)", point).unwrap().re;
+                    let expected = if law.contains("^2") {
+                        1e-6 * (v + v * v)
+                    } else {
+                        1e-6 * v
+                    };
+                    close(
+                        plot.value("q(c1)", point).unwrap().re,
+                        expected,
+                        1e-6,
+                        1e-14,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_unit_regularization_keeps_differentiator_laws_and_source_voltage() {
+    for method in ["trap", "gear"] {
+        for source in ["dc 2.1", "sin(2 0.1 1k 0 0 90)"] {
+            let plot = simulate(&format!(
+                "v1 in 0 {source}\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k\n.options gshunt=1u noopiter gminsteps=1 method={method} reltol=1e-6 vntol=1n\n.tran 5u 50u 0 5u"
+            )).unwrap();
+            for point in 0..plot.point_count() {
+                let t = plot.value("time", point).unwrap().re;
+                let v = plot.value("v(in)", point).unwrap().re;
+                let expected = if source.starts_with("dc") {
+                    2.1
+                } else {
+                    2. + 0.1 * (std::f64::consts::TAU * 1000. * t).cos()
+                };
+                close(v, expected, 1e-10, 1e-10);
+                close(
+                    plot.value("i(v1)", point).unwrap().re,
+                    -1e-6 * v,
+                    1e-6,
+                    1e-12,
+                );
+                close(
+                    plot.value("state(b__dynamic_0,0)", point).unwrap().re,
+                    v * v,
+                    1e-6,
+                    1e-12,
+                );
+            }
+            let last = plot.point_count() - 1;
+            close(plot.value("time", last).unwrap().re, 50e-6, 1e-12, 0.);
+        }
+    }
+}
+
+#[test]
+fn physical_shunts_never_load_solver_owned_derivative_signals() {
+    // A smooth zero-initial-charge excitation supports the strict tolerance
+    // test with capacitive loads. Nonzero initial charge on a differentiator
+    // driving a capacitor is a separate higher-index consistency problem.
+    let circuit = "v1 in 0 sin(0 0.1 1k)\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k";
+    for method in ["trap", "gear"] {
+        let analysis =
+            format!(".options method={method} reltol=1e-6 vntol=1n newtrunc\n.tran 5u 50u 0 5u");
+        let generated = simulate(&format!(
+            "{circuit}\n.options rshunt=1k cshunt=1n\n{analysis}"
+        ))
+        .unwrap();
+        let explicit = simulate(&format!(
+            "{circuit}\nrsh1 in 0 1k\nrsh2 y 0 1k\ncsh1 in 0 1n\ncsh2 y 0 1n\n{analysis}"
+        ))
+        .unwrap();
+        assert_eq!(generated.point_count(), explicit.point_count());
+        for point in 0..generated.point_count() {
+            for variable in ["time", "v(in)", "v(y)", "i(v1)", "state(b__dynamic_0,0)"] {
+                close(
+                    generated.value(variable, point).unwrap().re,
+                    explicit.value(variable, point).unwrap().re,
+                    1e-8,
+                    1e-12,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn automatic_current_probes_do_not_duplicate_physical_shunts() {
+    // A user-specified node with a generated-looking name is still physical.
+    let circuit = "v1 in 0 dc 1 ac 1\nr1 in out 1k\nr2 out 0 1k\nv2 __sense_0 0 1";
+    let measured = format!("{circuit}\nb1 measured 0 v=i(r2)");
+    let op = simulate(&format!("{measured}\n.options rshunt=1k\n.op")).unwrap();
+    close(op.value("v(out)", 0).unwrap().re, 1. / 3., 1e-12, 0.);
+    close(op.value("v(measured)", 0).unwrap().re, 1e-3 / 3., 1e-12, 0.);
+    close(op.value("i(v2)", 0).unwrap().re, -1e-3, 1e-12, 0.);
+    for analysis in [".ac lin 1 1k 1k", ".tran 1u 20u"] {
+        let direct = simulate(&format!(
+            "{circuit}\n.options rshunt=1k cshunt=1n\n{analysis}"
+        ))
+        .unwrap();
+        let observed = simulate(&format!(
+            "{measured}\n.options rshunt=1k cshunt=1n\n{analysis}"
+        ))
+        .unwrap();
+        assert_eq!(direct.point_count(), observed.point_count());
+        for point in 0..direct.point_count() {
+            for variable in ["v(out)", "i(v1)", "i(v2)"] {
+                let a = direct.value(variable, point).unwrap();
+                let b = observed.value(variable, point).unwrap();
+                close(a.re, b.re, 1e-10, 1e-12);
+                close(a.im, b.im, 1e-10, 1e-12);
+            }
+            let out = observed.value("v(out)", point).unwrap();
+            let sense = observed.value("v(measured)", point).unwrap();
+            close(sense.re, 1e-3 * out.re, 1e-10, 1e-12);
+            close(sense.im, 1e-3 * out.im, 1e-10, 1e-12);
+        }
+    }
+}
+
+#[test]
+fn voltage_lte_controls_add_a_predictor_bound_without_removing_charge_control() {
+    let circuit = "v1 in 0 sin(0 1 1k)\nr1 in out 1k\nc1 out 0 1u";
+    let analysis = ".tran 20u 2m 0 20u";
+    let base = simulate(&format!("{circuit}\n{analysis}")).unwrap();
+    let inactive = simulate(&format!(
+        "{circuit}\n.options ltereltol=1e-6 lteabstol=1e-8 ltetrtol=1\n{analysis}"
+    ))
+    .unwrap();
+    assert_eq!(base.point_count(), inactive.point_count());
+    for method in ["trap", "gear"] {
+        let tight = simulate(&format!(
+            "{circuit}\n.options method={method} newtrunc ltereltol=1e-6 lteabstol=1e-8 ltetrtol=1\n{analysis}"
+        )).unwrap();
+        let ordinary =
+            simulate(&format!("{circuit}\n.options method={method}\n{analysis}")).unwrap();
+        assert!(tight.point_count() > ordinary.point_count(), "{method}");
+        // Analytic zero-initial-state driven RC solution.
+        let omega_tau = std::f64::consts::TAU;
+        let divisor = 1. + omega_tau.powi(2);
+        for index in 0..tight.point_count() {
+            let time = tight.value("time", index).unwrap().re;
+            let (sin, cos) = (omega_tau * 1000. * time).sin_cos();
+            let expected = (sin - omega_tau * cos + omega_tau * (-1000. * time).exp()) / divisor;
+            close(tight.value("v(out)", index).unwrap().re, expected, 0., 2e-5);
+        }
+    }
+}
 
 #[test]
 fn gmin_is_the_junction_gmin_of_every_analysis() {
@@ -637,6 +972,7 @@ fn every_analysis_with_an_operating_point_gets_the_deck_tolerances() {
         AnalysisKind::TransferFunction,
         AnalysisKind::SParameter,
         AnalysisKind::PeriodicSteadyState,
+        AnalysisKind::HarmonicBalance,
     ] {
         let request = c.plan(input_for(kind)).unwrap();
         let newton = &request.dc_settings().newton;
@@ -836,6 +1172,16 @@ fn pivot_thresholds_reach_every_circuit_factorization() {
 
 #[test]
 fn unknown_and_unported_options_still_fail() {
+    assert!(config(".options seed=5").is_ok());
+    assert!(config(".options rndseed=5").is_ok());
+    for invalid in [
+        ".options seed=0",
+        ".options seed=1.5",
+        ".options seed=random",
+        ".options seed={x}",
+    ] {
+        assert!(config(invalid).is_err(), "{invalid}");
+    }
     for unknown in [".options bogus=1", ".options postt", ".options itl7=1"] {
         assert!(
             matches!(config(unknown), Err(SpiceError::Parse { .. })),
@@ -843,13 +1189,9 @@ fn unknown_and_unported_options_still_fail() {
         );
     }
     for pending in [
-        ".options gshunt=1e-12",
-        ".options cshunt=1p",
-        ".options minbreak=1n",
         ".options numdgt=8",
         ".options savecurrents",
-        ".options scale=1u",
-        ".options seed=5",
+        ".options scalm=1u",
         ".options klu",
     ] {
         assert!(
@@ -903,7 +1245,7 @@ fn option_expression_failures_are_explicit() {
         Err(SpiceError::Parse { message, .. }) if message.contains("unknown option")
     ));
     assert!(
-        config(".options gshunt={nope}")
+        config(".options oldlimit={nope}")
             .unwrap_err()
             .is_not_yet_ported()
     );
@@ -933,5 +1275,28 @@ fn removed_diffsol_backend_is_rejected_whatever_the_deck_options() {
                 && error.to_string().contains("backend=diffsol"),
             "{options}: {error}"
         );
+    }
+}
+
+#[test]
+fn recovery_coordinates_are_not_electrical_shunt_targets() {
+    for scale in [1., 1e6, 1e9] {
+        let circuit = format!(
+            "v1 a 0 dc 0.7 ac 1\nd1 a 0 dm\n.model dm d(is=1e-14 tt=100n vp=.05 qpscale={scale})"
+        );
+        for analysis in [".op", ".ac dec 2 10k 100meg"] {
+            let generated = simulate(&format!(
+                "{circuit}\n.options rshunt=1k cshunt=1p\n{analysis}"
+            ))
+            .unwrap();
+            let explicit =
+                simulate(&format!("{circuit}\nrsh a 0 1k\ncsh a 0 1p\n{analysis}")).unwrap();
+            for point in 0..generated.point_count() {
+                let actual = generated.value("i(v1)", point).unwrap();
+                let expected = explicit.value("i(v1)", point).unwrap();
+                close(actual.re, expected.re, 1e-9, 1e-14);
+                close(actual.im, expected.im, 1e-9, 1e-14);
+            }
+        }
     }
 }

@@ -199,6 +199,8 @@ pub fn solve_counted_limited<T>(
         limited_rows,
         options,
         Phases {
+            coordinate_kinds: None,
+            private_storage: &[],
             first: IterationPhase::Junction,
             previous: None,
             nonconvergent: |_: &T| false,
@@ -274,6 +276,8 @@ pub fn solve_phased(
     solve_phased_into(
         initial,
         branch_rows,
+        None,
+        &[],
         limited_rows,
         options,
         policy,
@@ -297,6 +301,8 @@ pub fn solve_phased(
 fn solve_phased_into(
     initial: &Vector,
     branch_rows: &[bool],
+    coordinate_kinds: Option<&[crate::devices::ConvergenceKind]>,
+    private_storage: &[(usize, usize)],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
     policy: PhasePolicy,
@@ -321,6 +327,8 @@ fn solve_phased_into(
         limited_rows,
         options,
         Phases {
+            coordinate_kinds,
+            private_storage,
             first,
             previous: continued,
             nonconvergent: TrialState::is_nonconvergent,
@@ -384,30 +392,49 @@ impl CircuitNewton<'_, '_> {
     ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
         // Both stamping and convergence read the same attempt-bound model
         // and accepted history, with no second caller-supplied identity.
-        let (prepared, context, history, forcing, time, uic, mut attempt) = match &mut self.load {
-            CircuitLoad::Bias {
-                prepared,
-                context,
-                history,
-                forcing,
-            } => (*prepared, *context, *history, *forcing, 0., None, None),
-            CircuitLoad::Transient { attempt, uic } => (
-                attempt.run(),
-                attempt.context(),
-                attempt.history(),
-                None,
-                attempt.time(),
-                Some(*uic),
-                Some(&mut **attempt),
-            ),
-        };
-        let options = self.options;
+        let (prepared, context, history, forcing, time, integration, uic, mut attempt) =
+            match &mut self.load {
+                CircuitLoad::Bias {
+                    prepared,
+                    context,
+                    history,
+                    forcing,
+                } => (
+                    *prepared, *context, *history, *forcing, 0., None, None, None,
+                ),
+                CircuitLoad::Transient { attempt, uic } => (
+                    attempt.run(),
+                    attempt.context(),
+                    attempt.history(),
+                    None,
+                    attempt.time(),
+                    Some(attempt.coefficients()),
+                    Some(*uic),
+                    Some(&mut **attempt),
+                ),
+            };
         let circuit = prepared.circuit();
+        let nodal_regularization = circuit.regularization_nodes();
+        let gmin = self.options.diag_gmin;
+        let options = NewtonOptions {
+            diag_gmin: if nodal_regularization.is_some() && gmin.is_finite() && gmin >= 0. {
+                0.
+            } else {
+                gmin
+            },
+            ..*self.options
+        };
         solve_phased_into(
             initial,
             self.branch_rows,
+            Some(circuit.convergence_kinds()),
+            if integration.is_some() {
+                circuit.private_storage_rows()
+            } else {
+                &[]
+            },
             self.limited_rows,
-            options,
+            &options,
             policy,
             continued,
             &mut self.workspace.load,
@@ -443,6 +470,7 @@ impl CircuitNewton<'_, '_> {
                         &mut trial,
                     )?;
                 }
+                stamp_nodal_regularization(matrix, nodal_regularization, gmin)?;
                 after_load(phase, matrix, rhs)?;
                 Ok(trial)
             },
@@ -454,6 +482,7 @@ impl CircuitNewton<'_, '_> {
                     history,
                     model_context: context,
                     time,
+                    integration,
                     reltol: options.reltol,
                     abstol: options.abstol,
                     vntol: options.vntol,
@@ -461,6 +490,22 @@ impl CircuitNewton<'_, '_> {
             },
         )
     }
+}
+
+/// Stamp the requested conductance only on original electrical KCL rows.
+fn stamp_nodal_regularization(
+    matrix: &mut SparseMatrix,
+    rows: Option<&[usize]>,
+    conductance: Real,
+) -> SpiceResult<()> {
+    if let Some(rows) = rows
+        && conductance > 0.
+    {
+        for &row in rows {
+            matrix.add(row, row, conductance)?;
+        }
+    }
+    Ok(())
 }
 
 /// One ordinary Newton driver's disposable load slots. The matrix/RHS stay
@@ -471,6 +516,7 @@ struct LoadStorage<T> {
     matrix: Option<SparseMatrix>,
     rhs: Option<Vector>,
     spare_trial: Option<T>,
+    correction: Correction,
 }
 
 impl<T> Default for LoadStorage<T> {
@@ -479,6 +525,7 @@ impl<T> Default for LoadStorage<T> {
             matrix: None,
             rhs: None,
             spare_trial: None,
+            correction: Correction::Absolute,
         }
     }
 }
@@ -487,6 +534,21 @@ impl<T> LoadStorage<T> {
     fn loaded(&mut self, matrix: SparseMatrix, rhs: Vector) {
         self.matrix = Some(matrix);
         self.rhs = Some(rhs);
+    }
+
+    /// Check the assembled system and fold duplicates before factorization.
+    fn checked_system(&mut self, n: usize) -> SpiceResult<(&mut SparseMatrix, &mut Vector)> {
+        let matrix = self
+            .matrix
+            .as_mut()
+            .ok_or_else(|| failure("Newton load returned no matrix"))?;
+        let rhs = self
+            .rhs
+            .as_mut()
+            .ok_or_else(|| failure("Newton load returned no RHS"))?;
+        check(matrix, rhs, n)?;
+        matrix.fold_duplicates();
+        Ok((matrix, rhs))
     }
 }
 
@@ -532,11 +594,15 @@ impl LoadStorage<TrialState> {
             .ok_or_else(|| failure("missing Newton RHS"))?;
         matrix.clear();
         rhs.clear();
+        matrix.record_original(self.correction.capturing());
+        rhs.record_original(self.correction.capturing());
         Ok((matrix, rhs))
     }
 }
 
-struct Phases<T, F> {
+struct Phases<'a, T, F> {
+    coordinate_kinds: Option<&'a [crate::devices::ConvergenceKind]>,
+    private_storage: &'a [(usize, usize)],
     first: IterationPhase,
     previous: Option<T>,
     nonconvergent: F,
@@ -550,7 +616,7 @@ struct Phases<T, F> {
     nodesets: bool,
 }
 
-impl<T, F> Phases<T, F> {
+impl<T, F> Phases<'_, T, F> {
     /// C's MODEINITF transition after a nonconverged/initializing load.
     /// `MODEINITFLOAT` leaves the mode unchanged; its convergence decision
     /// and special nodeset `ipass` still belong to the main iteration loop.
@@ -600,7 +666,7 @@ fn iterate<T, F: Fn(&T) -> bool>(
     branch_rows: &[bool],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
-    phases: Phases<T, F>,
+    phases: Phases<'_, T, F>,
     storage: &mut LoadStorage<T>,
     load: impl FnMut(&Vector, IterationPhase, Option<&T>, &mut LoadStorage<T>) -> SpiceResult<T>,
     device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
@@ -624,6 +690,29 @@ fn iterate<T, F: Fn(&T) -> bool>(
         iterations: progress.iterations,
         last_iterate: progress.last_iterate,
     })
+}
+
+/// Validate dimensions and numerical options before any disposable load.
+fn validate_iteration_input(
+    initial: &Vector,
+    branch_rows: &[bool],
+    limited_rows: Option<&[bool]>,
+    coordinate_kinds: Option<&[crate::devices::ConvergenceKind]>,
+    options: &NewtonOptions,
+) -> SpiceResult<()> {
+    options.validate()?;
+    let n = initial.len();
+    if n == 0
+        || n != branch_rows.len()
+        || limited_rows.is_some_and(|rows| rows.len() != n)
+        || coordinate_kinds.is_some_and(|rows| rows.len() != n)
+        || !initial.is_finite()
+    {
+        return Err(failure(
+            "Newton requires a nonempty square system, finite solution and matching row kinds",
+        ));
+    }
+    Ok(())
 }
 
 /// C `NIiter` (`niiter.c`, the SPARSE path) over disposable loads.
@@ -653,50 +742,51 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     branch_rows: &[bool],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
-    phases: Phases<T, F>,
+    phases: Phases<'_, T, F>,
     storage: &mut LoadStorage<T>,
     mut load: impl FnMut(&Vector, IterationPhase, Option<&T>, &mut LoadStorage<T>) -> SpiceResult<T>,
     mut device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
     release_previous: impl Fn(&mut T),
     progress: &mut Progress,
 ) -> SpiceResult<NewtonSolution<T>> {
-    options.validate()?;
+    validate_iteration_input(
+        initial,
+        branch_rows,
+        limited_rows,
+        phases.coordinate_kinds,
+        options,
+    )?;
     let n = initial.len();
-    if n == 0
-        || n != branch_rows.len()
-        || limited_rows.is_some_and(|rows| rows.len() != n)
-        || !initial.is_finite()
-    {
-        return Err(failure(
-            "Newton requires a nonempty square system, finite solution and matching row kinds",
-        ));
-    }
     let mut guess = initial.clone();
     let mut phase = phases.first;
     let mut previous = phases.previous;
     let mut ordering = None;
     let mut reorder = phases.initial_transient;
     let mut ipass = false;
+    // Each solve begins with ordinary absolute NI iteration. Only an
+    // otherwise converged, potentially cancellation-dominated circuit load
+    // switches to original-stamp correction coordinates.
+    storage.correction = Correction::Absolute;
     loop {
         // NIiter increments before checking the CKTload return code.
         progress.iterations += 1;
         let iterno = progress.iterations;
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
-        let matrix = storage
-            .matrix
-            .as_mut()
-            .ok_or_else(|| failure("Newton load returned no matrix"))?;
-        let rhs = storage
-            .rhs
-            .as_ref()
-            .ok_or_else(|| failure("Newton load returned no RHS"))?;
         let flagged = (phases.nonconvergent)(&trial);
-        check(matrix, rhs, n)?;
-        matrix.fold_duplicates();
+        let correction = storage.correction;
+        let (matrix, rhs) = storage.checked_system(n)?;
         if phase == IterationPhase::Junction {
             reorder = true;
         }
-        let mut next = match linearised_solve(matrix, rhs, &mut ordering, reorder, options)? {
+        let mut next = match linearised_solve(
+            matrix,
+            rhs,
+            &guess,
+            &mut ordering,
+            reorder,
+            options,
+            correction.capturing(),
+        )? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
                 next
@@ -719,21 +809,22 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                 options.voltage_step,
             );
         }
+        reconstruct_storage(matrix, rhs, &mut next, phases.private_storage)?;
         if !next.is_finite() {
             return Err(failure("nonfinite Newton iterate"));
         }
-        if iterno > options.max_iterations {
-            progress.last_iterate = Some(guess);
-            return Err(failure(format!(
-                "Newton iteration limit ({}) reached",
-                options.max_iterations
-            )));
-        }
+        check_iteration_budget(progress, &guess, options)?;
         let mut noncon = if flagged || iterno == 1 {
             true
         } else {
-            !converged(&next, &guess, branch_rows, options) || device_test(&next, &guess, &trial)?
+            !converged(&next, &guess, branch_rows, phases.coordinate_kinds, options)
+                || device_test(&next, &guess, &trial)?
         };
+        (storage.correction, noncon) = correction.after_solve(noncon, phase, &guess, &next, || {
+            phases.coordinate_kinds.is_some()
+                && options.diag_gmin == 0.
+                && correction_risk(matrix, rhs, &next, options)
+        });
         if phase == IterationPhase::Float {
             if phases.nodesets {
                 noncon |= ipass;
@@ -772,6 +863,65 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         guess = next;
     }
 }
+/// A corrective load must be followed by a state-owning reload if the
+/// first correction changes the solution. Subsequent loads use the same
+/// convergence test as the absolute-coordinate solver.
+#[derive(Clone, Copy)]
+enum Correction {
+    Absolute,
+    First,
+    Subsequent,
+}
+
+impl Correction {
+    const fn capturing(self) -> bool {
+        !matches!(self, Self::Absolute)
+    }
+
+    fn after_solve(
+        self,
+        noncon: bool,
+        phase: IterationPhase,
+        guess: &Vector,
+        next: &Vector,
+        risk: impl FnOnce() -> bool,
+    ) -> (Self, bool) {
+        match self {
+            Self::Absolute if !noncon && phase != IterationPhase::Junction && risk() => {
+                // Fix must still advance to Float. A converged Float pass
+                // must reload rather than accept the absolute solution.
+                (Self::First, phase == IterationPhase::Float)
+            }
+            Self::First => (Self::Subsequent, noncon || next != guess),
+            _ => (self, noncon),
+        }
+    }
+}
+
+/// A conservative roundoff envelope (eight binary64 epsilons) on the
+/// scale of the largest original stamped product or RHS term. This is
+/// only a trigger for a physical correction, never a singularity test.
+/// No row traversal, exact sums or factorization are required here.
+fn correction_risk(
+    matrix: &SparseMatrix,
+    rhs: &Vector,
+    values: &Vector,
+    options: &NewtonOptions,
+) -> bool {
+    let roundoff = 8. * Real::EPSILON;
+    let source = roundoff * rhs.peak_stamp();
+    if source >= options.abstol {
+        return true;
+    }
+    let coefficient = roundoff * matrix.peak_stamp();
+    // The solution has already passed the finite check. Integer magnitude
+    // reduction avoids a serial floating-point max and NaN handling.
+    let largest = values.as_slice().iter().fold(0_u64, |peak, value| {
+        peak.max(value.to_bits() & i64::MAX.cast_unsigned())
+    });
+    coefficient * Real::from_bits(largest) >= options.abstol
+}
+
 /// [`StepLimiting::Global`]: scale the step so no watched nodal voltage moves
 /// by more than `limit` (all non-branch rows when `limited_rows` is `None`).
 fn damp(
@@ -797,16 +947,76 @@ fn damp(
         }
     }
 }
-/// One `NIiter` factor-and-solve on the raw matrix ([`crate::maths::solve_ni`]):
-/// there is no row equilibration or conditioning guard; ngspice has neither.
-fn linearised_solve(
+fn check_iteration_budget(
+    progress: &mut Progress,
+    guess: &Vector,
+    options: &NewtonOptions,
+) -> SpiceResult<()> {
+    if progress.iterations > options.max_iterations {
+        progress.last_iterate = Some(guess.clone());
+        return Err(failure(format!(
+            "Newton iteration limit ({}) reached",
+            options.max_iterations
+        )));
+    }
+    Ok(())
+}
+
+/// The explicit storage formulation has a private coordinate with a
+/// two-term linear evolution equation. Reconstruct that coordinate from
+/// the solved physical derivative, not from cancellation in the nonlinear
+/// constitutive row. This is a local back-substitution in the same system;
+/// neither the electrical solution nor its KCL rows are changed. The
+/// ordinary nonlinear convergence check still verifies the storage law.
+fn reconstruct_storage(
     matrix: &SparseMatrix,
     rhs: &Vector,
+    next: &mut Vector,
+    coordinates: &[(usize, usize)],
+) -> SpiceResult<()> {
+    for &(coordinate, derivative) in coordinates {
+        let pivot = matrix.get(coordinate, coordinate);
+        if pivot == 0. {
+            return Err(failure("missing private storage evolution pivot"));
+        }
+        let coefficient = matrix.get(coordinate, derivative);
+        let value =
+            (-coefficient).mul_add(next.as_slice()[derivative], rhs.as_slice()[coordinate]) / pivot;
+        next.set(coordinate, value)?;
+    }
+    Ok(())
+}
+
+/// One `NIiter` solve, in absolute or correction coordinates. Both use
+/// the same assembled Jacobian, pivot policy and reusable factor frame.
+/// The exact residual is only evaluated for a captured physical load.
+fn linearised_solve(
+    matrix: &mut SparseMatrix,
+    rhs: &mut Vector,
+    guess: &Vector,
     ordering: &mut Option<crate::maths::SparseSymbolic>,
     reorder: bool,
     options: &NewtonOptions,
+    capturing: bool,
 ) -> SpiceResult<crate::maths::NiStep> {
-    crate::maths::solve_ni(matrix, rhs, ordering, reorder, options.diag_gmin)
+    let correction = if capturing {
+        Some(matrix.original_correction(rhs, guess)?)
+    } else {
+        None
+    };
+    let mut step = crate::maths::solve_ni(
+        matrix,
+        correction.as_ref().unwrap_or(rhs),
+        ordering,
+        reorder,
+        options.diag_gmin,
+    )?;
+    if capturing && let crate::maths::NiStep::Solved(delta) = &mut step {
+        for (new, old) in delta.as_mut_slice().iter_mut().zip(guess.as_slice()) {
+            *new += old;
+        }
+    }
+    Ok(step)
 }
 
 fn check(matrix: &SparseMatrix, rhs: &Vector, n: usize) -> SpiceResult<()> {
@@ -815,21 +1025,38 @@ fn check(matrix: &SparseMatrix, rhs: &Vector, n: usize) -> SpiceResult<()> {
     }
     Ok(())
 }
-fn converged(new: &Vector, old: &Vector, branch: &[bool], options: &NewtonOptions) -> bool {
+fn converged(
+    new: &Vector,
+    old: &Vector,
+    branch: &[bool],
+    kinds: Option<&[crate::devices::ConvergenceKind]>,
+    options: &NewtonOptions,
+) -> bool {
+    use crate::devices::ConvergenceKind;
     new.as_slice()
         .iter()
         .zip(old.as_slice())
         .zip(branch)
-        .all(|((new, old), branch)| {
-            let relative_tolerance = options.reltol * new.abs().max(old.abs());
-            let absolute_tolerance = if *branch {
-                options.abstol
-            } else {
-                options.vntol
+        .enumerate()
+        .all(|(row, ((new, old), branch))| {
+            let kind = kinds.map_or(
+                if *branch {
+                    ConvergenceKind::Current
+                } else {
+                    ConvergenceKind::Voltage
+                },
+                |kinds| kinds[row],
+            );
+            let absolute = match kind {
+                ConvergenceKind::Current => options.abstol,
+                ConvergenceKind::Voltage => options.vntol,
+                ConvergenceKind::Constitutive => return true,
             };
-            (new - old).abs() <= relative_tolerance + absolute_tolerance
+            let relative = options.reltol * new.abs().max(old.abs());
+            (new - old).abs() <= relative + absolute
         })
 }
+
 fn failure(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
         context: "Newton".into(),

@@ -332,8 +332,7 @@ pub enum ContinuationSchedule {
 ///
 /// Order: direct Newton (not part of this policy), then gmin stepping, then
 /// source stepping, as [`Self::schedule`] defines them. Each strategy ends in
-/// a solve with **full sources, zero artificial nodal gmin and the configured
-/// junction gmin**; only that solve may be returned. Temporary stages never
+/// a solve with **full sources and the configured continuation diagonal (zero by default)**; only that solve may be returned. Temporary stages never
 /// touch device history, accept hooks or stored source values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContinuationPolicy {
@@ -355,6 +354,8 @@ pub struct ContinuationPolicy {
     /// Skip the direct Newton attempt and start with continuation (C
     /// `CKTnoOpIter`, deck `.options noopiter`).
     pub skip_direct: bool,
+    /// C `CKTgshunt`: persistent diagonal value after a nodal gmin fallback.
+    pub gshunt: Real,
 }
 
 /// The ngspice schedule with C's defaults (`gminsteps=1`, `srcsteps=1`,
@@ -402,6 +403,7 @@ impl ContinuationPolicy {
             max_total_iterations: None,
             stage_max_iterations: None,
             skip_direct: false,
+            gshunt: 0.,
         }
     }
 
@@ -424,6 +426,15 @@ impl ContinuationPolicy {
             adapt_iterations.unwrap_or(NGSPICE_ADAPT_ITERATIONS),
         )
         .map(Self::ngspice)
+    }
+
+    /// Seed for C's fixed gmin ladder and zero-source recovery.
+    pub(crate) fn gmin_seed(&self, junction: Real) -> Real {
+        if self.gshunt > 0. {
+            self.gshunt
+        } else {
+            junction
+        }
     }
 
     /// Geometric gmin schedule `start / factor^k`, `k = 0..steps`. `steps == 0`
@@ -532,6 +543,9 @@ impl DcSettings {
     /// # Errors
     /// Invalid Newton options.
     pub fn validate(&self) -> SpiceResult<()> {
+        if !self.continuation.gshunt.is_finite() || self.continuation.gshunt < 0. {
+            return Err(invalid("gshunt must be finite and nonnegative"));
+        }
         self.newton.validate()
     }
 }
@@ -682,7 +696,7 @@ impl DcReport {
 /// A successful DC solve and how it was reached.
 #[derive(Debug)]
 pub struct DcSolution {
-    /// The solution of the original (full-source, zero-artificial-gmin) system.
+    /// Full-source solution with the configured continuation diagonal.
     pub solution: NewtonSolution<TrialState>,
     /// Attempts and stages that produced it.
     pub report: DcReport,
@@ -822,11 +836,14 @@ impl NodeForcing {
             // diagonal for an `.ic`: the same value).
             let currents = a.zero_row(row, |col| branch.get(col).copied().unwrap_or(false));
             a.set(row, row, if currents { 1e10 } else { 1. })?;
-            b.as_mut_slice()[row] = if currents {
-                1e10 * value * scale
-            } else {
-                value * scale
-            };
+            b.set(
+                row,
+                if currents {
+                    1e10 * value * scale
+                } else {
+                    value * scale
+                },
+            )?;
         }
         Ok(())
     }
@@ -920,9 +937,9 @@ pub fn solve_dc(
 /// Direct Newton runs first. Only a [`SpiceError::Numerical`] failure starts
 /// continuation (gmin stepping, then source stepping, as enabled and within the
 /// total iteration budget); any other error is returned at once, unretried.
-/// Every success is a solve with **zero artificial nodal gmin and full source
-/// values**, so continuation never changes the requested physical solution. The
-/// device's own junction gmin is separate and always present.
+/// Every success has full sources and zero temporary continuation conductance,
+/// unless the deck explicitly requests a persistent gshunt diagonal. Junction
+/// gmin is a separate device parameter.
 ///
 /// # Errors
 /// [`DcFailure`] carrying the error and report: invalid settings/inputs,
@@ -1090,7 +1107,7 @@ enum Halt {
 struct Point {
     /// Source multiplier (C `CKTsrcFact`).
     scale: Real,
-    /// Artificial nodal gmin on non-branch rows (C `CKTdiagGmin`).
+    /// SPARSE internal-diagonal conductance (C `CKTdiagGmin`).
     gmin: Real,
     /// Replacement junction gmin of every device (C `CKTgmin` in `new_gmin`).
     junction: Option<Real>,
@@ -1123,6 +1140,8 @@ struct Engine<'a> {
     newton: NewtonOptions,
     /// Per-stage limit of the gmin/source-stepping strategies.
     stage_limit: usize,
+    gshunt: Real,
+    persistent_gmin: Real,
     remaining: usize,
     /// One numeric and disposable-state buffer across every continuation
     /// attempt; an accepted history revision still invalidates spare state.
@@ -1156,7 +1175,7 @@ impl GminKind {
 }
 
 /// A solve identifies both its equation modifications and its iteration policy.
-/// The original-equation closing stages cannot accidentally retain a gmin.
+/// Closing stages replace temporary regularization with the configured continuation diagonal.
 #[derive(Clone, Copy)]
 enum Stage {
     Direct,
@@ -1280,7 +1299,7 @@ impl ContinuationPolicy {
                     }
                     Stepping::Fixed(steps) => plan.push(Plan::FixedGmin {
                         start: seed,
-                        ladder: stepping.spice3_ladder(gmin, steps)?,
+                        ladder: stepping.spice3_ladder(self.gmin_seed(gmin), steps)?,
                     }),
                 }
                 plan.push(match stepping.source {
@@ -1358,6 +1377,38 @@ impl Engine<'_> {
         })
     }
 
+    /// Apply the continuation-diagonal state and junction floor to the stage.
+    fn resolve_stage_point(&mut self, stage: Stage) -> Point {
+        let Point {
+            scale,
+            mut gmin,
+            mut junction,
+        } = stage.point();
+        // CKTdiagGmin is solver state, not a physical nodal resistor. It
+        // starts at zero, survives nodal continuation, and remains in real
+        // NIiter loads until the task changes it.
+        match stage {
+            Stage::Gmin(GminKind::Nodal, _) => {}
+            Stage::CloseGmin(GminKind::Nodal) => {
+                self.persistent_gmin = self.gshunt;
+                gmin = self.persistent_gmin;
+            }
+            Stage::CloseGmin(GminKind::Junction) => {
+                gmin = self.persistent_gmin;
+                if self.gshunt > self.context.gmin {
+                    junction = Some(self.gshunt);
+                }
+            }
+            Stage::Source { .. } if gmin > 0. => {}
+            _ => gmin = self.persistent_gmin,
+        }
+        Point {
+            scale,
+            gmin,
+            junction,
+        }
+    }
+
     /// One disposable Newton solve of the typed stage; charges the budget.
     /// `continued` is the preceding stage's converged trial, if any.
     fn stage(
@@ -1371,7 +1422,7 @@ impl Engine<'_> {
             scale,
             gmin,
             junction,
-        } = stage.point();
+        } = self.resolve_stage_point(stage);
         let strategy = stage.strategy();
         let describe = || {
             junction.map_or_else(
@@ -1525,8 +1576,8 @@ impl Engine<'_> {
         adapt: IterationLimit,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
         let junction = matches!(kind, GminKind::Junction);
-        // gtarget = MAX(CKTgmin, CKTgshunt); gshunt is not ported (0).
-        let target = self.context.gmin;
+        // C gtarget = MAX(CKTgmin, CKTgshunt).
+        let target = self.context.gmin.max(self.gshunt);
         let slow_floor = if junction {
             TRUE_GMIN_SLOW_FACTOR
         } else {
@@ -1595,7 +1646,12 @@ impl Engine<'_> {
             Ok(solved) => solved,
             Err(Halt::Retry(_)) => {
                 // diagGmin = (gshunt <= 0 ? gmin : gshunt) * 10^10, then / 10.
-                let mut gmin = self.context.gmin;
+                let mut gmin = if self.gshunt > 0. {
+                    self.gshunt
+                } else {
+                    self.context.gmin
+                };
+                self.persistent_gmin = self.gshunt;
                 for _ in 0..GILLESPIE_GMIN_DECADES {
                     gmin *= 10.;
                 }
@@ -1703,6 +1759,16 @@ impl Engine<'_> {
             } => self.dynamic_gmin(report, *kind, *factor, *adapt),
             Plan::Gillespie(adapt) => self.gillespie(report, *adapt),
         };
+        if matches!(
+            plan,
+            Plan::FixedGmin { .. }
+                | Plan::Dynamic {
+                    kind: GminKind::Nodal,
+                    ..
+                }
+        ) {
+            self.persistent_gmin = self.gshunt;
+        }
         let (outcome, detail) = match &result {
             Ok(_) => (AttemptOutcome::Converged, String::new()),
             Err(_) if matches!(plan, Plan::Disabled(_)) => {
@@ -1797,10 +1863,16 @@ fn run(
         nodes,
         newton: *options,
         stage_limit,
+        gshunt: policy.gshunt,
+        persistent_gmin: circuit.continuation_diagonal(),
         remaining: budget,
         workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
     };
-    engine.execute_plan(report, &plan)
+    let result = engine.execute_plan(report, &plan);
+    if result.is_ok() {
+        circuit.set_continuation_diagonal(engine.persistent_gmin);
+    }
+    result
 }
 
 /// Appended to an exhausted continuation's error: ngspice's `CKTop` would

@@ -42,7 +42,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::devices::{Circuit, ModelContext, StorageKind};
+use crate::devices::{
+    Circuit, InitialCoordinateHistory, InitialStoragePolicy, InitialStorageRow, IterationPhase,
+    LoadRequest, ModelContext, PreparedRun,
+};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -83,8 +86,35 @@ pub(super) struct Hints {
 /// A node that is not part of the circuit (C: warning "IC on non-existent node
 /// ... ignored") or that is ground.
 pub(super) fn resolve(circuit: &Circuit, request: &AnalysisPlan) -> SpiceResult<Hints> {
+    let mut initial = bind(circuit, request.initial_conditions(), ".ic")?;
+    if request.uic() {
+        // Prepared source node hints are not native .ic forcing rows.
+        // They participate only in differential UIC initialization.
+        let mut by_row: BTreeMap<_, _> = initial.into_iter().map(|hint| (hint.row, hint)).collect();
+        for (node, policy) in circuit.prepared_node_hints() {
+            let row = circuit
+                .unknowns()
+                .checked_node_row(node)?
+                .ok_or_else(|| failure("prepared node hint has no physical row"))?;
+            let (value, location) = policy.hint();
+            let name = circuit
+                .nodes()
+                .node(node)
+                .ok_or_else(|| failure("prepared node hint has no node identity"))?;
+            by_row.insert(
+                row,
+                RowHint {
+                    row,
+                    node: name.name.clone(),
+                    value,
+                    location: location.clone(),
+                },
+            );
+        }
+        initial = by_row.into_values().collect();
+    }
     Ok(Hints {
-        initial: bind(circuit, request.initial_conditions(), ".ic")?,
+        initial,
         nodesets: bind(circuit, request.nodesets(), ".nodeset")?,
     })
 }
@@ -258,9 +288,9 @@ pub(super) fn forced_nodesets(nodesets: &[RowHint]) -> Vec<(usize, Real)> {
 #[derive(Debug)]
 pub(super) struct UicStart {
     /// Node rows from `.nodeset` then `.ic` (zero elsewhere); inductor branch
-    /// rows hold their initial current.
+    /// rows hold their initial current or another prescribed storage coordinate.
     pub x: Vector,
-    /// `(absolute state slot, charge)` for capacitors with an instance `ic=`.
+    /// `(absolute state slot, signed storage coordinate)` for voltage storage.
     pub charges: Vec<(usize, Real)>,
 }
 
@@ -278,33 +308,14 @@ pub(super) fn uic_start(
         x.as_mut_slice()[hint.row] = hint.value;
     }
     let mut charges = Vec::new();
-    for (index, device) in circuit.devices().iter().enumerate() {
-        let (Some(element), Some(slot)) =
-            (device.storage_element(context), device.truncation_slot())
-        else {
-            continue;
-        };
-        let element = element?;
-        match element.kind {
-            StorageKind::Capacitor => {
-                if let Some(voltage) = element.initial {
-                    let base = circuit
-                        .state_rows(index)
-                        .ok_or_else(|| failure("missing state range"))?
-                        .start;
-                    charges.push((base + slot, element.value * voltage));
-                }
-            }
-            StorageKind::Inductor => {
-                let row = circuit
-                    .branch_rows(index)
-                    .filter(|rows| rows.len() == 1)
-                    .ok_or_else(|| {
-                        failure(format!("inductor {} has no branch row", device.name()))
-                    })?
-                    .start;
-                x.as_mut_slice()[row] = element.initial.unwrap_or(0.);
-            }
+    for (index, _) in circuit.devices().iter().enumerate() {
+        for (row, coordinate) in bound_initial_coordinates(circuit, index, context)? {
+            x.as_mut_slice()[row.0] = coordinate.value;
+        }
+    }
+    for index in 0..circuit.device_count() {
+        if let Some(voltage) = bound_initial_voltage(circuit, index, &x, context)? {
+            charges.push((voltage.slot, voltage.scale * voltage.voltage));
         }
     }
     Ok(UicStart { x, charges })
@@ -316,17 +327,113 @@ pub(super) struct Tolerances {
     pub reltol: Real,
     pub vntol: Real,
     pub abstol: Real,
+    pub chgtol: Real,
+}
+
+/// Bind both sides of the local coordinate/evolution-equation relation.
+fn bound_initial_coordinates(
+    circuit: &Circuit,
+    index: usize,
+    context: &ModelContext,
+) -> SpiceResult<Vec<(AbsoluteRow, FixedCoordinate)>> {
+    let device = &circuit.devices()[index];
+    let coordinates = device.initial_coordinates(context)?;
+    if coordinates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = circuit
+        .branch_rows(index)
+        .ok_or_else(|| failure("missing initial coordinate rows"))?;
+    let mut bound = Vec::with_capacity(coordinates.len());
+    for coordinate in coordinates {
+        if coordinate.coordinate >= rows.len()
+            || coordinate.equation >= rows.len()
+            || !coordinate.value.is_finite()
+        {
+            return Err(failure(format!(
+                "{}: invalid initial coordinate binding",
+                device.name()
+            )));
+        }
+        bound.push((
+            AbsoluteRow(rows.start + coordinate.coordinate),
+            FixedCoordinate {
+                name: device.name().to_owned(),
+                value: coordinate.value,
+                equation: AbsoluteRow(rows.start + coordinate.equation),
+                history: coordinate.history,
+                device: index,
+            },
+        ));
+    }
+    Ok(bound)
+}
+
+fn bound_initial_voltage(
+    circuit: &Circuit,
+    index: usize,
+    initial: &Vector,
+    context: &ModelContext,
+) -> SpiceResult<Option<CapacitorInitial>> {
+    let device = &circuit.devices()[index];
+    let Some(storage) = device.initial_voltage_storage(context)? else {
+        return Ok(None);
+    };
+    let [positive, negative, ..] = device.terminals() else {
+        return Err(failure("voltage storage needs two terminals"));
+    };
+    let positive = VoltageVertex::bind(circuit, *positive)?;
+    let negative = VoltageVertex::bind(circuit, *negative)?;
+    let at = |vertex| match vertex {
+        VoltageVertex::Ground => 0.,
+        VoltageVertex::Node(AbsoluteRow(row)) => initial.as_slice()[row],
+    };
+    let voltage = storage
+        .voltage
+        .unwrap_or_else(|| at(positive) - at(negative));
+    let states = circuit
+        .state_rows(index)
+        .ok_or_else(|| failure("missing voltage storage range"))?;
+    if storage.slot >= states.len() || !storage.scale.is_finite() || !voltage.is_finite() {
+        return Err(failure("invalid initial voltage storage binding"));
+    }
+    let equation = storage
+        .equation
+        .map(|equation| {
+            let rows = circuit
+                .branch_rows(index)
+                .ok_or_else(|| failure("missing voltage evolution row"))?;
+            if equation >= rows.len() {
+                return Err(failure("voltage evolution row outside device"));
+            }
+            Ok(AbsoluteRow(rows.start + equation))
+        })
+        .transpose()?;
+    Ok(Some(CapacitorInitial {
+        slot: states.start + storage.slot,
+        scale: storage.scale,
+        name: device.name().to_owned(),
+        positive,
+        negative,
+        voltage,
+        equation,
+    }))
 }
 
 /// Storage constraints for the instantaneous circuit, in device order.
 struct ImpulseStorage {
-    fixed_currents: BTreeMap<AbsoluteRow, FixedCurrent>,
+    fixed_coordinates: BTreeMap<AbsoluteRow, FixedCoordinate>,
     capacitors: Vec<CapacitorInitial>,
+    charges: BTreeMap<AbsoluteRow, ChargeInitial>,
+    local_charges: Vec<LocalChargeInitial>,
 }
 
-struct FixedCurrent {
+struct FixedCoordinate {
     name: String,
     value: Real,
+    equation: AbsoluteRow,
+    history: InitialCoordinateHistory,
+    device: usize,
 }
 
 struct CapacitorInitial {
@@ -334,72 +441,130 @@ struct CapacitorInitial {
     positive: VoltageVertex,
     negative: VoltageVertex,
     voltage: Real,
+    equation: Option<AbsoluteRow>,
+    slot: usize,
+    scale: Real,
+}
+
+struct LocalChargeInitial {
+    name: String,
+    slot: usize,
+    target: Real,
+    optional: bool,
+}
+
+struct ChargeInitial {
+    name: String,
+    device: usize,
+    slot: usize,
+    gauge: AbsoluteRow,
+    target: Real,
+    voltage: Option<Real>,
+    policy: InitialStoragePolicy,
 }
 
 impl ImpulseStorage {
-    fn collect(circuit: &Circuit, initial: &Vector, context: &ModelContext) -> SpiceResult<Self> {
+    fn collect(
+        circuit: &Circuit,
+        initial: &Vector,
+        context: &ModelContext,
+        values: &[Real],
+    ) -> SpiceResult<Self> {
         if initial.len() != circuit.unknown_count() {
             return Err(failure("initial vector does not match finalized circuit"));
         }
         let mut storage = Self {
-            fixed_currents: BTreeMap::new(),
+            fixed_coordinates: BTreeMap::new(),
             capacitors: Vec::new(),
+            charges: BTreeMap::new(),
+            local_charges: Vec::new(),
         };
-        for (index, device) in circuit.devices().iter().enumerate() {
-            let Some(element) = device.storage_element(context).transpose()? else {
-                continue;
-            };
-            let [positive, negative] = device.terminals() else {
-                continue;
-            };
-            match element.kind {
-                StorageKind::Inductor => {
-                    let row = circuit
-                        .branch_rows(index)
-                        .filter(|rows| rows.len() == 1)
-                        .ok_or_else(|| {
-                            failure(format!("inductor {} has no branch row", device.name()))
-                        })?
-                        .start;
-                    let value = *initial
-                        .as_slice()
-                        .get(row)
-                        .ok_or_else(|| failure("inductor branch row outside finalized circuit"))?;
-                    storage.fixed_currents.insert(
-                        AbsoluteRow(row),
-                        FixedCurrent {
-                            name: device.name().to_owned(),
-                            value,
-                        },
-                    );
+        for index in 0..circuit.device_count() {
+            for (row, coordinate) in bound_initial_coordinates(circuit, index, context)? {
+                if storage.fixed_coordinates.insert(row, coordinate).is_some() {
+                    return Err(failure("duplicate fixed initial coordinate"));
                 }
-                StorageKind::Capacitor => {
-                    let positive = VoltageVertex::bind(circuit, *positive)?;
-                    let negative = VoltageVertex::bind(circuit, *negative)?;
-                    let at = |vertex| match vertex {
-                        VoltageVertex::Ground => 0.,
-                        VoltageVertex::Node(AbsoluteRow(row)) => initial.as_slice()[row],
-                    };
-                    let voltage = element
-                        .initial
-                        .unwrap_or_else(|| at(positive) - at(negative));
-                    storage.capacitors.push(CapacitorInitial {
-                        name: device.name().to_owned(),
-                        positive,
-                        negative,
-                        voltage,
-                    });
-                }
+            }
+            if let Some(voltage) = bound_initial_voltage(circuit, index, initial, context)? {
+                storage.capacitors.push(voltage);
+            }
+            if let Some((row, item)) = bound_expression_storage(circuit, index, values)?
+                && storage.charges.insert(row, item).is_some()
+            {
+                return Err(failure("duplicate initial expression equation"));
             }
         }
         Ok(storage)
     }
 }
 
+/// Bind local storage coordinates to the finalized MNA layout. Signal
+/// rows are exclusively declared by generated differentiator devices.
+fn bound_expression_storage(
+    circuit: &Circuit,
+    index: usize,
+    values: &[Real],
+) -> SpiceResult<Option<(AbsoluteRow, ChargeInitial)>> {
+    let device = &circuit.devices()[index];
+    let Some(storage) = device.initial_expression_storage() else {
+        return Ok(None);
+    };
+    let rows = circuit
+        .branch_rows(index)
+        .ok_or_else(|| failure("missing initial expression branch binding"))?;
+    let mut states = circuit
+        .state_rows(index)
+        .ok_or_else(|| failure("missing initial expression state binding"))?;
+    let bind = |row| {
+        match row {
+            InitialStorageRow::Branch(local) => rows.clone().nth(local),
+            InitialStorageRow::Signal(node) => {
+                if storage.policy == InitialStoragePolicy::Derived
+                    && device.terminals().first() == Some(&node)
+                {
+                    circuit.unknowns().node_row(node)
+                } else {
+                    None
+                }
+            }
+        }
+        .map(AbsoluteRow)
+        .ok_or_else(|| failure(format!("{}: invalid initial expression row", device.name())))
+    };
+    let slot = states.nth(storage.slot).ok_or_else(|| {
+        failure(format!(
+            "{}: invalid initial expression slot",
+            device.name()
+        ))
+    })?;
+    let target = values[slot];
+    if !target.is_finite() {
+        return Err(failure(format!(
+            "{}: nonfinite initial stored expression",
+            device.name()
+        )));
+    }
+    Ok(Some((
+        bind(storage.equation)?,
+        ChargeInitial {
+            name: device.name().to_owned(),
+            device: index,
+            slot,
+            gauge: bind(storage.gauge)?,
+            target,
+            voltage: storage.voltage,
+            policy: storage.policy,
+        },
+    )))
+}
+
 /// Independent capacitor voltage relations and relations implied by E/H outputs.
 struct CapacitorRelations<'a> {
     kept: Vec<&'a CapacitorInitial>,
     implied: Vec<ImpliedCapacitor<'a>>,
+    // Known redundant voltage relations; snap their accepted storage
+    // to the actual constrained voltage, within the user's IC tolerance.
+    canonical: Vec<(usize, Real)>,
 }
 
 struct ImpliedCapacitor<'a> {
@@ -418,6 +583,7 @@ impl<'a> CapacitorRelations<'a> {
         let mut relations = Self {
             kept: Vec::new(),
             implied: Vec::new(),
+            canonical: Vec::new(),
         };
         for capacitor in capacitors {
             let CapacitorInitial {
@@ -425,6 +591,7 @@ impl<'a> CapacitorRelations<'a> {
                 positive,
                 negative,
                 voltage,
+                ..
             } = capacitor;
             if graph.controlled_implies(*positive, *negative) {
                 relations.implied.push(ImpliedCapacitor {
@@ -435,7 +602,11 @@ impl<'a> CapacitorRelations<'a> {
             }
             match graph.join(*positive, *negative, *voltage, Origin::Device(name))? {
                 Join::Tree => relations.kept.push(capacitor),
-                Join::Cycle { expected } if tolerance.agree(expected, *voltage) => {}
+                Join::Cycle { expected } if tolerance.agree(expected, *voltage) => {
+                    relations
+                        .canonical
+                        .push((capacitor.slot, capacitor.scale * expected));
+                }
                 Join::Cycle { expected } => {
                     return Err(failure(format!(
                         "uic initial conditions are inconsistent with the circuit at t = 0+: \
@@ -451,7 +622,7 @@ impl<'a> CapacitorRelations<'a> {
     }
 
     fn check_implied(
-        &self,
+        &mut self,
         solution: &InstantaneousSolution,
         tolerance: VoltageTolerance,
     ) -> SpiceResult<()> {
@@ -465,6 +636,7 @@ impl<'a> CapacitorRelations<'a> {
                 positive,
                 negative,
                 voltage,
+                ..
             } = capacitor;
             let (Some(vp), Some(vq)) =
                 (solution.potential(*positive), solution.potential(*negative))
@@ -484,9 +656,235 @@ impl<'a> CapacitorRelations<'a> {
                      or add series impedance"
                 )));
             }
+            self.canonical
+                .push((capacitor.slot, capacitor.scale * expected));
         }
         Ok(())
     }
+}
+
+/// Replaces only the selected charge evolution rows with their actual
+/// signed physical storage constraint; no extra integration timepoint or
+/// artificial capacitor is introduced.
+struct ChargeConstraints {
+    value: Vector,
+    jacobian: SparseMatrix,
+}
+
+impl ChargeConstraints {
+    fn new(size: usize) -> Self {
+        Self {
+            value: Vector::zeros(size),
+            jacobian: SparseMatrix::new(size, size),
+        }
+    }
+
+    fn load(
+        &mut self,
+        prepared: &PreparedRun<'_>,
+        request: &LoadRequest<'_>,
+        storage: &ImpulseStorage,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+    ) -> SpiceResult<()> {
+        self.value.clear();
+        self.jacobian.clear();
+        prepared.assemble_charge_for(
+            request.model_context,
+            request.solution,
+            0.,
+            &mut self.value,
+            &mut self.jacobian,
+            storage.charges.values().map(|charge| charge.device),
+        )?;
+        for (&AbsoluteRow(row), charge) in &storage.charges {
+            matrix.zero_row(row, |_| false);
+            rhs.set(row, charge.target - self.value.as_slice()[row])?;
+        }
+        // The replacement RHS is J_Q*x - Q(x) + Q0. Preserve the
+        // physical signed quantity separately for the acceptance residual.
+        for term in self.jacobian.triplets() {
+            if !storage.charges.contains_key(&AbsoluteRow(term.row)) {
+                return Err(failure(
+                    "initial charge kernel wrote an undeclared equation",
+                ));
+            }
+            matrix.add(term.row, term.col, term.value)?;
+            let value = term.value.mul_add(
+                request.solution.as_slice()[term.col],
+                rhs.as_slice()[term.row],
+            );
+            rhs.set(term.row, value)?;
+        }
+        Ok(())
+    }
+
+    fn residual(
+        &self,
+        storage: &ImpulseStorage,
+        solution: &InstantaneousSolution,
+        tolerance: Tolerances,
+    ) -> (Real, bool) {
+        let mut ratio: Real = 0.;
+        let mut roundoff = true;
+        for (&AbsoluteRow(row), charge) in &storage.charges {
+            let actual = self.value.as_slice()[row];
+            if !actual.is_finite() {
+                return (Real::INFINITY, false);
+            }
+            if charge.policy == InitialStoragePolicy::Derived
+                && !solution.retained_derived(AbsoluteRow(row))
+            {
+                continue;
+            }
+            let absolute = match charge.policy {
+                InitialStoragePolicy::Physical => tolerance.chgtol,
+                InitialStoragePolicy::Derived => tolerance.vntol,
+            };
+            let scale = actual.abs().max(charge.target.abs());
+            let residual = (actual - charge.target).abs();
+            ratio = ratio.max(residual / tolerance.reltol.mul_add(scale, absolute));
+            roundoff &= residual <= 4. * Real::EPSILON * scale;
+        }
+        (ratio, roundoff)
+    }
+
+    fn canonical(&self, storage: &ImpulseStorage) -> Vec<(usize, Real)> {
+        storage
+            .charges
+            .iter()
+            .map(|(&AbsoluteRow(row), charge)| (charge.slot, self.value.as_slice()[row]))
+            .collect()
+    }
+}
+
+struct NonlinearInitial {
+    solution: InstantaneousSolution,
+    canonical: Vec<(usize, Real)>,
+}
+
+/// Disposable exact static Newton loads for the reduced instantaneous
+/// circuit. The initial history remains untouched; the ordinary UIC
+/// device-flagged load still owns semiconductor initial charge semantics.
+fn solve_nonlinear_instantaneous(
+    prepared: &PreparedRun<'_>,
+    request: &LoadRequest<'_>,
+    storage: &ImpulseStorage,
+    kept: &[&CapacitorInitial],
+    tolerances: Tolerances,
+    options: &crate::analysis::newton::NewtonOptions,
+) -> SpiceResult<Option<NonlinearInitial>> {
+    let circuit = prepared.circuit();
+    let mut x = request.solution.clone();
+    // Explicit instance voltage is only a Newton seed here. Its physical
+    // effect is the signed charge value fixed by the original UIC load.
+    for charge in storage.charges.values() {
+        if let Some(voltage) = charge.voltage {
+            let [positive, negative, ..] = circuit.devices()[charge.device].terminals() else {
+                return Err(failure("initial charge requires two terminals"));
+            };
+            circuit
+                .unknowns()
+                .seed_terminal_voltage(&mut x, [*positive, *negative], voltage)?;
+        }
+    }
+    let mut charge_constraints =
+        (!storage.charges.is_empty()).then(|| ChargeConstraints::new(x.len()));
+    let mut matrix = circuit.new_matrix()?;
+    let mut rhs = Vector::zeros(x.len());
+    let limited = crate::analysis::bias::limited_rows(circuit).unwrap_or_else(|| {
+        crate::analysis::bias::branch_rows(circuit)
+            .into_iter()
+            .map(|branch| !branch)
+            .collect()
+    });
+    let mut previous = None;
+    let mut best: Option<(Real, NonlinearInitial)> = None;
+    let mut trial = None;
+    for _ in 0..options.max_iterations {
+        matrix.clear();
+        rhs.clear();
+        let mut next_trial = request
+            .history
+            .trial_in(
+                if trial.is_some() {
+                    IterationPhase::Float
+                } else {
+                    IterationPhase::Junction
+                },
+                trial.as_ref(),
+            )?
+            .with_device_limiting(false);
+        let point = LoadRequest {
+            solution: &x,
+            ..*request
+        };
+        prepared.load(&point, &mut matrix, &mut rhs, &mut next_trial)?;
+        let nonconvergent = next_trial.is_nonconvergent();
+        trial = Some(next_trial);
+        if let Some(constraints) = &mut charge_constraints {
+            constraints.load(prepared, &point, storage, &mut matrix, &mut rhs)?;
+        }
+        let system = InstantaneousSystem::assemble(circuit, &matrix, &rhs, storage, kept)?;
+        if let Some(solution) = previous.take()
+            && !nonconvergent
+        {
+            let (mut ratio, mut roundoff) = system.residual_ratio(&solution, &x, tolerances);
+            if let Some(constraints) = &charge_constraints {
+                let (physical, exact) = constraints.residual(storage, &solution, tolerances);
+                ratio = ratio.max(physical);
+                roundoff &= exact;
+            }
+            if ratio <= 1. {
+                let solution = NonlinearInitial {
+                    solution,
+                    canonical: charge_constraints
+                        .as_ref()
+                        .map_or_else(Vec::new, |constraints| constraints.canonical(storage)),
+                };
+                // Refine a consistent algebraic point to rounding accuracy
+                // when possible. Otherwise retain the best verified iterate
+                // once the residual stops improving. A tiny voltage error
+                // can become a large artificial derivative on the first step.
+                if roundoff {
+                    return Ok(Some(solution));
+                }
+                if best.as_ref().is_some_and(|(score, _)| ratio >= *score) {
+                    return Ok(best.map(|(_, solution)| solution));
+                }
+                best = Some((ratio, solution));
+            }
+        }
+        let Some(solution) = system.solve(circuit, storage, tolerances)? else {
+            if charge_constraints.is_some() {
+                return Err(failure(
+                    "uic initial charge constraints leave no instantaneous solution",
+                ));
+            }
+            return Ok(None);
+        };
+        let scale = solution.step_scale(&x, options.voltage_step, &limited);
+        x = solution.update(&x, scale);
+        previous = (scale >= 1.).then_some(solution);
+    }
+    best.map(|(_, solution)| Some(solution)).ok_or_else(|| {
+        let names = storage
+            .charges
+            .values()
+            .map(|charge| charge.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        failure(format!(
+            "uic nonlinear instantaneous constraints did not converge (charge storage: {names})"
+        ))
+    })
+}
+
+/// Consistent algebraic guess plus canonical storage values for redundant
+/// initial voltage constraints.
+pub(super) struct CheckedInitial {
+    pub solution: Option<Vector>,
+    pub canonical: Vec<(usize, Real)>,
 }
 
 /// Checks that the `uic` state can start without an impulse at `t = 0+`.
@@ -496,8 +894,12 @@ impl<'a> CapacitorRelations<'a> {
 /// just produces a huge first-step current. Here the instantaneous (`h -> 0`)
 /// problem is formed exactly: every capacitor becomes a voltage constraint with
 /// a free current, every inductor a fixed current (its voltage is free), every
-/// other element and the sources at their `t = 0` right limit (`rhs`) stay as
-/// they are. A state is impulse-free exactly when that system has a solution.
+/// other linear element and the sources at their `t = 0` right limit (`rhs`)
+/// stay as they are. Native differential devices replace their evolution
+/// equations, preserving their constitutive rows. Fixed internal transfer
+/// coordinates eliminate their own differential equations. For nonlinear
+/// devices the reduced system is reloaded at each Newton iterate and
+/// checked against the true residual before accepting consistency.
 ///
 /// Redundant-but-consistent relations (a capacitor whose `ic` equals the
 /// voltage that ideal sources already force, an inductor in series with a
@@ -508,27 +910,70 @@ impl<'a> CapacitorRelations<'a> {
 /// # Errors
 /// An inconsistent (impulsive) or ill-posed initial state.
 pub(super) fn check_impulse_free(
-    circuit: &Circuit,
+    prepared: &PreparedRun<'_>,
     a: &SparseMatrix,
     rhs: &Vector,
-    x: &Vector,
+    request: &LoadRequest<'_>,
+    initial_trial: &crate::devices::TrialState,
     tolerances: Tolerances,
-    context: &ModelContext,
-) -> SpiceResult<()> {
-    let storage = ImpulseStorage::collect(circuit, x, context)?;
-    if storage.capacitors.is_empty() && storage.fixed_currents.is_empty() {
-        return Ok(());
+    options: &crate::analysis::newton::NewtonOptions,
+) -> SpiceResult<CheckedInitial> {
+    let circuit = prepared.circuit();
+    let storage = ImpulseStorage::collect(
+        circuit,
+        request.solution,
+        request.model_context,
+        initial_trial.values(),
+    )?;
+    if storage.capacitors.is_empty()
+        && storage.fixed_coordinates.is_empty()
+        && storage.charges.is_empty()
+    {
+        return Ok(CheckedInitial {
+            solution: None,
+            canonical: Vec::new(),
+        });
     }
     let voltage_tolerance = VoltageTolerance {
         reltol: tolerances.reltol,
         vntol: tolerances.vntol,
     };
-    let relations =
+    let mut relations =
         CapacitorRelations::classify(circuit, rhs, &storage.capacitors, voltage_tolerance)?;
-    let system = InstantaneousSystem::assemble(circuit, a, rhs, &storage, &relations.kept)?;
-    match system.solve(circuit, &storage, tolerances)? {
-        Some(solution) => relations.check_implied(&solution, voltage_tolerance),
-        None if relations.implied.is_empty() => Ok(()),
+    let nonlinear = circuit.devices().iter().any(|device| device.is_nonlinear());
+    let solution = if nonlinear {
+        solve_nonlinear_instantaneous(
+            prepared,
+            request,
+            &storage,
+            &relations.kept,
+            tolerances,
+            options,
+        )?
+    } else {
+        InstantaneousSystem::assemble(circuit, a, rhs, &storage, &relations.kept)?
+            .solve(circuit, &storage, tolerances)?
+            .map(|solution| NonlinearInitial {
+                solution,
+                canonical: Vec::new(),
+            })
+    };
+    match solution {
+        Some(NonlinearInitial {
+            solution,
+            canonical,
+        }) => {
+            relations.check_implied(&solution, voltage_tolerance)?;
+            relations.canonical.extend(canonical);
+            Ok(CheckedInitial {
+                solution: nonlinear.then(|| solution.update(request.solution, 1.)),
+                canonical: relations.canonical,
+            })
+        }
+        None if relations.implied.is_empty() => Ok(CheckedInitial {
+            solution: None,
+            canonical: relations.canonical,
+        }),
         None => Err(failure(format!(
             "uic initial conditions cannot be shown consistent: capacitors across the \
              output of controlled sources {} are left without an instantaneous system",
@@ -540,4 +985,305 @@ pub(super) fn check_impulse_free(
                 .join("; ")
         ))),
     }
+}
+
+/// Whether this circuit has explicitly derived, rather than physical,
+/// initial storage. Ordinary RLC and charge-law circuits keep their established
+/// operating-point and UIC initialization path.
+pub(super) fn has_derived_storage(circuit: &Circuit) -> bool {
+    circuit.devices().iter().any(|device| {
+        device
+            .initial_expression_storage()
+            .is_some_and(|storage| storage.policy == InitialStoragePolicy::Derived)
+    })
+}
+
+impl ImpulseStorage {
+    fn retain_operating_point(&mut self, state: &Vector) {
+        for (&AbsoluteRow(row), coordinate) in &mut self.fixed_coordinates {
+            coordinate.value = state.as_slice()[row];
+        }
+        for capacitor in &mut self.capacitors {
+            capacitor.voltage =
+                potential(state, capacitor.positive) - potential(state, capacitor.negative);
+        }
+    }
+
+    fn bind_local_charges(
+        &mut self,
+        dae: &crate::devices::physical_dae::PhysicalDae<'_, '_>,
+        values: &[Real],
+        optional: bool,
+    ) -> SpiceResult<()> {
+        self.local_charges = dae
+            .storage_bindings()
+            .iter()
+            .map(|(slot, name)| {
+                let target = *values
+                    .get(*slot)
+                    .ok_or_else(|| failure("missing physical device charge history"))?;
+                if !target.is_finite() {
+                    return Err(failure(format!(
+                        "{name}: nonfinite physical device charge history"
+                    )));
+                }
+                Ok(LocalChargeInitial {
+                    name: name.clone(),
+                    slot: *slot,
+                    target,
+                    optional,
+                })
+            })
+            .collect::<SpiceResult<_>>()?;
+        Ok(())
+    }
+
+    fn consistent_history(
+        &self,
+        circuit: &Circuit,
+        right: &system::RightLimit,
+        continuity: Option<Real>,
+        tolerances: Tolerances,
+    ) -> SpiceResult<Vec<(usize, Real)>> {
+        let mut slots = right.candidate_states.clone();
+        slots.extend_from_slice(&right.local_history);
+        for (&AbsoluteRow(row), charge) in &self.charges {
+            let actual = right.charge.as_slice()[row];
+            if let Some(time) = continuity
+                && charge.policy == InitialStoragePolicy::Derived
+            {
+                let tolerance = VoltageTolerance {
+                    reltol: tolerances.reltol,
+                    vntol: tolerances.vntol,
+                };
+                if !tolerance.agree(actual, charge.target) {
+                    return Err(failure(format!(
+                        "{}: the derivative input jumps from {} to {} at t = {time}; a classical derivative does not exist across this prehistory discontinuity or source event",
+                        charge.name, -charge.target, -actual
+                    )));
+                }
+            }
+            slots.extend([
+                (charge.slot, actual),
+                (charge.slot + 1, right.charge_rate.as_slice()[row]),
+            ]);
+        }
+        for capacitor in &self.capacitors {
+            let voltage = potential(&right.state, capacitor.positive)
+                - potential(&right.state, capacitor.negative);
+            let slope = potential(&right.rate, capacitor.positive)
+                - potential(&right.rate, capacitor.negative);
+            slots.extend([
+                (capacitor.slot, capacitor.scale * voltage),
+                (capacitor.slot + 1, capacitor.scale * slope),
+            ]);
+        }
+        for (&AbsoluteRow(row), coordinate) in &self.fixed_coordinates {
+            let states = circuit
+                .state_rows(coordinate.device)
+                .ok_or_else(|| failure("missing initial coordinate history"))?;
+            let (slot, value, rate) = match coordinate.history {
+                InitialCoordinateHistory::EquationCharge { slot, scale } => {
+                    let AbsoluteRow(equation) = coordinate.equation;
+                    (
+                        slot,
+                        scale * right.charge.as_slice()[equation],
+                        scale * right.charge_rate.as_slice()[equation],
+                    )
+                }
+                InitialCoordinateHistory::Coordinate { slot } => (
+                    slot,
+                    right.state.as_slice()[row],
+                    right.rate.as_slice()[row],
+                ),
+            };
+            if slot.saturating_add(1) >= states.len() {
+                return Err(failure("invalid initial coordinate history binding"));
+            }
+            slots.extend([
+                (states.start + slot, value),
+                (states.start + slot + 1, rate),
+            ]);
+        }
+        Ok(slots)
+    }
+}
+
+fn potential(state: &Vector, vertex: VoltageVertex) -> Real {
+    match vertex {
+        VoltageVertex::Ground => 0.,
+        VoltageVertex::Node(AbsoluteRow(row)) => state.as_slice()[row],
+    }
+}
+
+/// A completely determined physical derivative point. The order hint is
+/// disposable computational metadata, not an accepted integration state.
+pub(super) struct DerivativePoint {
+    pub solution: Vector,
+    pub canonical: Vec<(usize, Real)>,
+    pub order_hint: usize,
+    pub guards: crate::devices::physical_dae::BranchTrace,
+}
+
+/// Calculate the right-limit state and all declared initial storage rates.
+/// The caller publishes a fresh exact device trial only after this succeeds.
+pub(super) fn consistent_derivative_start(
+    prepared: &PreparedRun<'_>,
+    request: &LoadRequest<'_>,
+    trial: &crate::devices::TrialState,
+    uic: bool,
+    tolerances: Tolerances,
+    options: &crate::analysis::newton::NewtonOptions,
+) -> SpiceResult<Option<DerivativePoint>> {
+    let circuit = prepared.circuit();
+    if !has_derived_storage(circuit) {
+        return Ok(None);
+    }
+    let forcing = request
+        .forcing
+        .ok_or_else(|| failure("missing derivative initialization timing"))?;
+    let mut storage = ImpulseStorage::collect(
+        circuit,
+        request.solution,
+        request.model_context,
+        trial.values(),
+    )?;
+    if !uic {
+        storage.retain_operating_point(request.solution);
+    }
+    let result = (|| {
+        let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+        // Like C's junction UIC load, unspecified device charge is a seed.
+        // Prescribed sources may determine it instead; after initialization
+        // the actual accepted charge is retained at events.
+        storage.bind_local_charges(&dae, trial.values(), uic)?;
+        let solve = |seed: &Vector| {
+            system::solve_right_limit(
+                &dae,
+                seed,
+                &storage,
+                forcing.timing.step(),
+                tolerances,
+                options.max_iterations,
+            )
+        };
+        let right = match solve(request.solution) {
+            // A zero UIC guess can lie outside a regular Taylor domain
+            // even when the physical right limit is smooth (for example,
+            // sqrt of a positive voltage fixed by an ideal source).
+            // Use the existing reduced algebraic solve only for a new
+            // Newton seed. Its history and derivative gauges are discarded;
+            // the original storage and full array still decide acceptance.
+            Err(original @ SpiceError::Circuit { .. }) if uic => {
+                let mut linear = prepared.transient_forcing_system(request.model_context)?;
+                linear.bind_transient_timing(&forcing.timing)?;
+                let rhs = linear.transient_rhs(0., crate::devices::Limit::Right)?;
+                let Ok(CheckedInitial {
+                    solution: Some(seed),
+                    ..
+                }) = check_impulse_free(
+                    prepared, &linear.a, &rhs, request, trial, tolerances, options,
+                )
+                else {
+                    return Err(original);
+                };
+                solve(&seed)?
+            }
+            other => other?,
+        };
+        let canonical =
+            storage.consistent_history(circuit, &right, (!uic).then_some(0.), tolerances)?;
+        Ok(DerivativePoint {
+            solution: right.state,
+            order_hint: right.order_hint,
+            guards: right.guards,
+            canonical,
+        })
+    })();
+    match result {
+        // Existing ordinary transient loads remain available for device
+        // families that have not yet acquired a high-order physical kernel.
+        Err(SpiceError::Unsupported { .. }) => Ok(None),
+        other => other.map(Some),
+    }
+}
+
+pub(super) enum DerivativeTrial {
+    Converged(DerivativePoint),
+    NotConverged(Vector),
+}
+
+/// Solve the physical derivative array with independent numerical storage
+/// constraints; dependent companion equations are intentionally projected out.
+pub(super) fn consistent_derivative_step(
+    prepared: &PreparedRun<'_>,
+    request: &LoadRequest<'_>,
+    tolerances: Tolerances,
+    iterations: usize,
+    order_hint: usize,
+) -> SpiceResult<DerivativeTrial> {
+    let circuit = prepared.circuit();
+    let forcing = request
+        .forcing
+        .ok_or_else(|| failure("missing derivative step forcing"))?;
+    let values = request
+        .history
+        .accepted(1)
+        .ok_or_else(|| failure("missing derivative step history"))?;
+    let mut storage =
+        ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
+    let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+    storage.bind_local_charges(&dae, values, false)?;
+    let right = match system::solve_step(
+        &dae, circuit, request, &storage, tolerances, iterations, order_hint,
+    )? {
+        system::SolveOutcome::Converged(right) => *right,
+        system::SolveOutcome::NotConverged { last, .. } => {
+            return Ok(DerivativeTrial::NotConverged(last));
+        }
+    };
+    let canonical = storage.consistent_history(circuit, &right, None, tolerances)?;
+    Ok(DerivativeTrial::Converged(DerivativePoint {
+        solution: right.state,
+        order_hint: right.order_hint,
+        guards: right.guards,
+        canonical,
+    }))
+}
+
+/// Cross an event without changing physical or derivative-input storage.
+/// The left point is a disposable, already validated integration candidate.
+pub(super) fn consistent_derivative_event(
+    prepared: &PreparedRun<'_>,
+    request: &LoadRequest<'_>,
+    left: &crate::devices::TrialState,
+    tolerances: Tolerances,
+    iterations: usize,
+    order_hint: usize,
+) -> SpiceResult<DerivativePoint> {
+    let circuit = prepared.circuit();
+    let forcing = request
+        .forcing
+        .ok_or_else(|| failure("missing derivative event timing"))?;
+    let crate::devices::AnalysisMode::Instantaneous { time } = request.mode else {
+        return Err(failure("invalid derivative event mode"));
+    };
+    let mut storage = ImpulseStorage::collect(
+        circuit,
+        request.solution,
+        request.model_context,
+        left.values(),
+    )?;
+    storage.retain_operating_point(request.solution);
+    let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+    storage.bind_local_charges(&dae, left.values(), false)?;
+    let right = system::solve_event(&dae, request, &storage, tolerances, iterations, order_hint)
+        .map_err(|error| failure(format!("source event at t = {time:e}: {error}")))?;
+    let canonical = storage.consistent_history(circuit, &right, Some(time), tolerances)?;
+    Ok(DerivativePoint {
+        solution: right.state,
+        order_hint: right.order_hint,
+        guards: right.guards,
+        canonical,
+    })
 }

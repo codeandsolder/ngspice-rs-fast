@@ -251,11 +251,11 @@ complete root sets and multiplicities, and the live C cases that converge.
   sources) has no SPARSE row; as in C, circuit solves leave the right-hand
   side in its solution entry, with a warning. Standalone factorizations
   (`SparseLu::new`, `DenseLu`) reject such a system instead.
-- There is **no** condition estimate, rank probe, residual check or
-  equilibration on circuit solves, because ngspice has none: each would
-  reject or alter circuits C simulates. Non-finite coefficients, duplicate
-  summation overflow, non-finite right-hand sides and non-finite solutions
-  are still errors, and dimensions are validated before the solver runs.
+- Circuit solves do not use condition estimates, rank probes, equilibration,
+  or a backward-error rejection gate. Ordinary Newton convergence can invoke
+  original-stamp correction coordinates (#244, below). Non-finite coefficients,
+  duplicate summation overflow, non-finite right-hand sides and non-finite
+  solutions are still errors, and dimensions are validated before the solver runs.
 - `.options pivtol` / `pivrel` (`CKTpivotAbsTol`/`CKTpivotRelTol`, defaults
   `1e-13` / `1e-3`) reach every reorder through `AnalysisContext::pivot`.
   Values C's `spOrderAndFactor` would silently replace (`pivtol < 0`,
@@ -263,7 +263,47 @@ complete root sets and multiplicities, and the live C cases that converge.
 
 `tests/solver_robustness.rs` checks degenerate decks (ideal-source loops,
 floating nodes, current-source cutsets, near-singular, badly scaled, zero
-R/C/L) against C's answer or C's class of error.
+R/C/L) against C's class of error and independent electrical identities where
+C's answer loses accuracy.
+
+## Selective original-stamp Newton correction (#244)
+
+The absolute-coordinate MNA solve can lose a small conductance or current
+contribution during assembly, or lose a branch current through subtraction
+of nearly equal large terms. A small iterate difference does not detect this:
+both Rust and C reported a supply current near 0.9765625 mA for a 1 V source,
+a RESMIN-clamped 1 pΩ series resistor and a 1 kΩ load, rather than the analytic
+current of approximately 1 mA.
+
+The ordinary load tracks the peak magnitudes of individual matrix and RHS
+stamps. At nominal convergence, a roundoff envelope of eight binary64 epsilons
+multiplied by the maximum stamped coefficient times maximum solution magnitude
+(or peak RHS contribution, whichever is larger) selects a corrective reload
+if the envelope reaches the absolute current tolerance. This is a conservative
+heuristic, not a condition bound or a residual acceptance criterion. No
+original-stamp ledger or exact product sums are required on the ordinary path.
+
+The reload retains individual contributions (including repeated entries,
+row replacement and RHS overwrites) before binary64 assembly. It evaluates
+`b - A*x` with exact binary64-product accumulation, rounds each row once, and
+solves for the update with the ordinary assembled Jacobian and existing pivot
+order. The corrected iterate is reloaded before acceptance so the device trial
+owns its actual state. This path uses the same convergence tolerances and
+iteration budget; it does not change singular classification or RESMIN warnings.
+Legacy nonzero internal pivot-diagonal gmin stages keep their ordinary solve;
+final zero-diagonal-gmin stages are eligible. Physical nodal regularization
+stamps participate normally.
+
+The correction reconstructs the exact residual of the *emitted* binary64
+stamps; it cannot undo rounding already performed within a device's stamp
+calculation or recover a voltage difference smaller than the spacing of its
+two stored absolute node voltages. In the latter case source branch currents
+and downstream load currents can agree to near machine precision while a local
+resistor current reconstructed from those voltages remains quantized. This is
+not a blanket forward-error guarantee for arbitrary ill-conditioned systems.
+The robustness tests cover resistance ratios, common modes, explicit and
+model RESMIN clamps, controlled branch constraints, and cancellation within
+matrix/RHS entries, including an independent local-voltage resolution bound.
 
 ## Opt-in original-operator residual telemetry (#104)
 
@@ -295,7 +335,7 @@ backward error is *reported*, not rejected as singular.
 
 The diagnostic is opt-in, with `O(nnz)` integer traversal indices
 and `O(n)` reported errors, no deep copy of the numeric operator
-and no per-RHS reindexing. Ordinary LU/C parity are unchanged.
+and no per-RHS reindexing. This opt-in interface is separate from the circuit Newton correction path.
 
 The optional `EquilibratedSparseLu::solve_refined` now uses the
 same exact original-unit quality and once-rounded correction RHSs. It takes
@@ -374,7 +414,15 @@ singular systems).
   roundoff bound rejects unresolved cancellation, and normalization or
   product range failures also reject that route. Rejected RHS values
   are replayed using raw scatter from the original RHS, independently
-  for each SIMD lane. The guard is not a global conditioning certificate.
+  for each SIMD lane. For longer real rows, a sufficient row-level
+  certificate bounds the original running error by eight machine epsilons
+  times the number of row terms plus one times the rounded magnitude sum.
+  The bound exploits monotone nonnegative magnitude prefixes and includes
+  slack for rounded subnormal products and the positive sum itself. Short
+  rows retain the original running guard. If the sufficient certificate
+  cannot accept every lane, the original guard is replayed in the same
+  subtraction order; no RHS changes its raw-recovery decision. The guard
+  is not a global conditioning certificate.
   See [BSIM_NUMERICAL_DIAGNOSIS.md](BSIM_NUMERICAL_DIAGNOSIS.md) for
   the independent C replay motivating the change.
   Exact product accumulation distinguishes

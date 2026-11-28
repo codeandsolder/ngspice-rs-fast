@@ -400,3 +400,20 @@ fn parameter_fit_gradient_benchmark() {
         start.elapsed().as_nanos()
     );
 }
+
+#[test]
+fn compiled_law_dependency_does_not_report_a_false_zero_gradient() {
+    let plan = CircuitParameterPlan::new(
+        deck(".param gain=1000 unused=4\n.func law(x) {gain*(1+v(in))}\nv1 in 0 2\nr1 in out {law(1)}\nr2 out 0 1k"),
+        &["gain", "unused"],
+    ).unwrap();
+    let candidate = plan.session().unwrap();
+    let result = evaluate(
+        &candidate,
+        &requests(AnalysisKind::OperatingPoint, None),
+        EvalLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(result[0].status, DerivativeStatus::Unsupported(_)));
+    assert_eq!(result[1].status, DerivativeStatus::Defined(Complex::ZERO));
+}

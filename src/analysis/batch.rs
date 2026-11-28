@@ -111,7 +111,8 @@ pub const fn job_order(kind: AnalysisKind) -> usize {
         // which have no card here).
         AnalysisKind::PeriodicSteadyState => 10,
         AnalysisKind::SParameter => 11,
-        AnalysisKind::Fourier => 12,
+        AnalysisKind::HarmonicBalance => 12,
+        AnalysisKind::Fourier => 13,
     }
 }
 
@@ -133,6 +134,7 @@ pub const fn plot_abbreviation(kind: AnalysisKind) -> &'static str {
         // typesdef.c maps the "SP Analysis" plot name to "sp".
         AnalysisKind::SParameter => "sp",
         AnalysisKind::PeriodicSteadyState => "pss",
+        AnalysisKind::HarmonicBalance => "hb",
     }
 }
 
@@ -1066,6 +1068,7 @@ mod tests {
                 AnalysisKind::Sensitivity,
                 AnalysisKind::PeriodicSteadyState,
                 AnalysisKind::SParameter,
+                AnalysisKind::HarmonicBalance,
                 AnalysisKind::Fourier,
             ]
         );

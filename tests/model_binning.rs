@@ -302,7 +302,7 @@ fn resolver_exposes_candidates_and_selection() {
         .find(|d| d.designator == 'm')
         .unwrap();
     assert_eq!(resolver.select_bin(mos).unwrap().unwrap().name, "nch.2");
-    // `.options scale` is not yet a deck setting; the API takes it explicitly.
+    // The resolver API and deck option must select the same scaled bin.
     let scaled = ModelResolver::new(&netlist.models)
         .unwrap()
         .with_bin_options(BinOptions {
@@ -310,6 +310,13 @@ fn resolver_exposes_candidates_and_selection() {
             wnflag: false,
         });
     assert_eq!(scaled.select_bin(mos).unwrap().unwrap().name, "nch.1");
+    let scaled_deck = parse(&format!(
+        "{BINS}m1 d g 0 0 nch l=2u w=2u\n.options scale=0.35\n"
+    ));
+    let config = RunConfig::from_netlist(&scaled_deck).unwrap();
+    let circuit = config.circuit(&scaled_deck).unwrap();
+    assert_eq!(circuit.device("m1").unwrap().model_name(), Some("nch.1"));
+
     // An exact-name or non-MOS reference is not a binning lookup.
     let vd = netlist.devices.iter().find(|d| d.name == "vd").unwrap();
     assert!(resolver.select_bin(vd).unwrap().is_none());
@@ -514,4 +521,110 @@ m2 a b 0 0 nch w=1u l=1u
             format!("{}.2", instance.model.as_deref().unwrap())
         );
     }
+}
+
+fn sweep_deck(length: f64, width: f64, scale: f64, temperature: f64) -> Netlist {
+    parse(&format!(
+        "m1 d g 0 0 nch l={length:.17e} w={width:.17e} m=2 nrd=2 nrs=3\n\
+         .model nch.1 nmos level=8 lmin=0.5u lmax=1.1u wmin=0.5u wmax=5u vth0=0.3\n\
+         .model nch.2 nmos level=8 lmin=1u lmax=3u wmin=0.5u wmax=5u vth0=0.5 rsh=10\n\
+         .options scale={scale} temp={temperature} reltol=1e-10 vntol=1e-12\n"
+    ))
+}
+
+fn operating(netlist: &Netlist) -> ngspice_rs::analysis::Plot {
+    let config = RunConfig::from_netlist(netlist).unwrap();
+    let mut circuit = config.circuit(netlist).unwrap();
+    config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap()
+}
+
+#[test]
+fn geometry_sweep_rebinds_overlapping_bins_and_structural_nodes() {
+    use ngspice_rs::analysis::AnalysisInput;
+    use ngspice_rs::primitives::AnalysisKind;
+    let scale = 0.5;
+    let width = 4e-6;
+    let netlist = sweep_deck(1.5e-6, width, scale, 27.);
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let context = config.context();
+    let op = config.plan_for(&netlist.analyses[0]).unwrap();
+    let before = op.run(&mut circuit, &context).unwrap();
+    let plan = AnalysisInput::with_arguments(
+        AnalysisKind::DcSweep,
+        "@M1[L] 1.5u 5u 0.5u temp 27 67 40 rtol=1e-10 vntol=1e-12".split_whitespace(),
+    )
+    .resolve()
+    .unwrap();
+    let plot = plan.run(&mut circuit, &context).unwrap();
+    assert_eq!(plot.point_count(), 16);
+    // ngspice 47, independent .op deck for each written geometry and
+    // temperature (not the upstream sweep, which retains the initial bin).
+    let reference = [
+        -1.943_144_339_543_338e-5,
+        -3.307_775_240_504_74e-6,
+        -3.413_497_936_075_038e-6,
+        -3.375_858_672_369_225e-6,
+        -3.262_494_419_578_599e-6,
+        -3.115_833_245_859_179e-6,
+        -2.959_168_509_439_336e-6,
+        -2.804_334_553_851_984e-6,
+        -1.694_539_439_993_244e-5,
+        -3.054_924_100_714_951e-6,
+        -3.106_272_316_172_332e-6,
+        -3.044_485_047_329_348e-6,
+        -2.925_138_229_664_67e-6,
+        -2.782_490_373_373_636e-6,
+        -2.634_984_731_075_818e-6,
+        -2.491_724_822_986_652e-6,
+    ];
+    for (row, &want) in reference.iter().enumerate() {
+        let current = plot.value("i(vd)", row).unwrap().re;
+        assert!(
+            (current - want).abs() <= 1e-12 + 1e-3 * want.abs(),
+            "independent ngspice row {row}: {current:e} vs {want:e}"
+        );
+        let drain = plot.value("v(m1#drain)", row).unwrap().re;
+        let source = plot.value("v(m1#source)", row).unwrap().re;
+        if row % 8 == 0 {
+            assert!(drain.is_nan() && source.is_nan());
+        } else {
+            assert!(drain.is_finite() && source.is_finite());
+        }
+    }
+    for row in 0..plot.point_count() {
+        let length = plot.value("v(param-sweep)", row).unwrap().re;
+        let temperature = if row < 8 { 27. } else { 67. };
+        let expected = operating(&sweep_deck(length, width, scale, temperature));
+        let current = plot.value("i(vd)", row).unwrap().re;
+        let want = expected.value("i(vd)", 0).unwrap().re;
+        assert!(
+            (current - want).abs() <= 1e-10 + 1e-6 * want.abs(),
+            "row {row}: {current:e} vs {want:e}"
+        );
+        for variable in expected.variables() {
+            let actual = plot.value(&variable.name, row).unwrap();
+            let want = expected.value(&variable.name, 0).unwrap();
+            assert!(
+                (actual.re - want.re).abs() <= 1e-9 + 1e-6 * want.re.abs(),
+                "row {row}: {}: {actual:?} vs {want:?}",
+                variable.name
+            );
+        }
+    }
+    let after = op.run(&mut circuit, &context).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(circuit.device("m1").unwrap().model_name(), Some("nch.1"));
+    let absent = AnalysisInput::with_arguments(
+        AnalysisKind::DcSweep,
+        "@m1[l] 1.5u 8u 0.5u".split_whitespace(),
+    )
+    .resolve()
+    .unwrap();
+    assert!(absent.run(&mut circuit, &context).is_err());
+    assert_eq!(before, op.run(&mut circuit, &context).unwrap());
 }

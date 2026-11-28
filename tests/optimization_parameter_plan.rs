@@ -31,6 +31,7 @@ fn nested_candidate_vectors_match_independent_scalar_resolution() {
         .add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: Some(Arc::clone(&functions)),
                 bindings: &[],
                 cards: &root.params,
@@ -44,6 +45,7 @@ fn nested_candidate_vectors_match_independent_scalar_resolution() {
         .add_scope(
             ParameterScopeSpec {
                 parent: Some(top),
+                instance: Some("xchild"),
                 functions: Some(Arc::clone(&functions)),
                 bindings: &[],
                 cards: &child.params,
@@ -57,6 +59,7 @@ fn nested_candidate_vectors_match_independent_scalar_resolution() {
         .add_scope(
             ParameterScopeSpec {
                 parent: Some(sub),
+                instance: Some("xchild"),
                 functions: Some(Arc::clone(&functions)),
                 bindings: &[],
                 cards: &grandchild.params,
@@ -132,6 +135,7 @@ fn exact_dirty_propagation_and_tunable_cut_points() {
         .add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: None,
                 bindings: &[],
                 cards: &netlist.params,
@@ -167,6 +171,7 @@ fn failed_updates_are_atomic_and_preserve_sign_of_zero() {
         .add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: None,
                 bindings: &[],
                 cards: &netlist.params,
@@ -218,6 +223,7 @@ fn instance_precedence_and_invalid_plan_compilation() {
     let mut plan = ParameterPlan::new();
     let spec = |tunables| ParameterScopeSpec {
         parent: None,
+        instance: None,
         functions: None,
         bindings: &bindings,
         cards: &netlist.params,
@@ -237,6 +243,7 @@ fn instance_precedence_and_invalid_plan_compilation() {
         .add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: None,
                 bindings: &[],
                 cards: &cycle.params,
@@ -260,6 +267,7 @@ fn sibling_scopes_and_concurrent_sessions_are_independent() {
         .add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: None,
                 bindings: &[],
                 cards: &root.params,
@@ -271,6 +279,7 @@ fn sibling_scopes_and_concurrent_sessions_are_independent() {
         .unwrap();
     let child_spec = |tunables| ParameterScopeSpec {
         parent: Some(top),
+        instance: Some("xchild"),
         functions: None,
         bindings: &[],
         cards: &child.params,

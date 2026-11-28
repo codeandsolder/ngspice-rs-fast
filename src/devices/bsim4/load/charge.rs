@@ -7,10 +7,9 @@
     clippy::similar_names,
     reason = "C equation names preserve the reference distinctions"
 )]
-#![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
 #![expect(
     clippy::suboptimal_flops,
-    reason = "preserve non-fused C floating-point arithmetic"
+    reason = "Remaining translated product-rule sums and companion stamps have no demonstrated cancellation defect; preserve shared charge identities and avoid indiscriminate software FMA. See BSIM_CHANNEL_NUMERICS.md."
 )]
 #![expect(
     unused_assignments,
@@ -43,7 +42,8 @@
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
     DELTA_1, DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model,
-    SizeParam, exp, fabs, log, mode, sqrt, state,
+    SizeParam, depletion_charge, exp, fabs, log, mode, positive_half_sum, smooth_drain,
+    smooth_positive, sqrt, state,
 };
 use super::{
     bias::LoadBias,
@@ -112,7 +112,6 @@ pub(super) fn intrinsic(
     let mut dVfbeff_dVg: f64;
     let mut dVfbeff_dVb: f64;
     let mut V3: f64;
-    let mut V4: f64;
     let mut qgate: f64 = 0.0;
     let mut qbulk: f64 = 0.0;
     let mut qdrn: f64 = 0.0;
@@ -271,12 +270,11 @@ pub(super) fn intrinsic(
             here.cbdb = 0.0;
             here.cbsb = -here.cgsb;
         } else if Vgst <= 0.0 {
-            T1 = 0.5 * pParam.k1ox;
-            T2 = sqrt(T1 * T1 + Arg1);
-            qgate = CoxWL * pParam.k1ox * (T2 - T1);
+            let (charge, slope) = depletion_charge(pParam.k1ox, Arg1);
+            qgate = CoxWL * charge;
             qbulk = -qgate;
             qdrn = 0.0;
-            T0 = CoxWL * T1 / T2;
+            T0 = CoxWL * slope;
             here.cggb = T0 * dVgs_eff_dVg;
             here.cgdb = 0.0;
             here.cgsb = T0 * (dVbseffCV_dVb - dVgs_eff_dVg);
@@ -482,14 +480,14 @@ pub(super) fn intrinsic(
                 dVgsteff_dVd = -dVth_dVd;
                 dVgsteff_dVb = -dVth_dVb;
             } else if VgstNVt < -EXP_THRESHOLD {
-                Vgsteff = T0 * log(1.0 + MIN_EXP);
+                Vgsteff = T0 * MIN_EXP.ln_1p();
                 dVgsteff_dVg = 0.0;
                 dVgsteff_dVd = Vgsteff / noff;
                 dVgsteff_dVb = dVgsteff_dVd * dnoff_dVb;
                 dVgsteff_dVd *= dnoff_dVd;
             } else {
                 ExpVgst = exp(VgstNVt);
-                Vgsteff = T0 * log(1.0 + ExpVgst);
+                Vgsteff = T0 * ExpVgst.ln_1p();
                 dVgsteff_dVg = ExpVgst / (1.0 + ExpVgst);
                 dVgsteff_dVd = -dVgsteff_dVg * (dVth_dVd + (Vgst - voffcv) / noff * dnoff_dVd)
                     + Vgsteff / noff * dnoff_dVd;
@@ -507,14 +505,14 @@ pub(super) fn intrinsic(
                 dT10_dVd = -dVth_dVd * pParam.mstarcv;
                 dT10_dVb = -dVth_dVb * pParam.mstarcv;
             } else if T2 < -EXP_THRESHOLD {
-                T10 = Vtm * log(1.0 + MIN_EXP);
+                T10 = Vtm * MIN_EXP.ln_1p();
                 dT10_dVg = 0.0;
                 dT10_dVd = T10 * dn_dVd;
                 dT10_dVb = T10 * dn_dVb;
                 T10 *= n;
             } else {
                 ExpVgst = exp(T2);
-                T3 = Vtm * log(1.0 + ExpVgst);
+                T3 = Vtm * ExpVgst.ln_1p();
                 T10 = n * T3;
                 dT10_dVg = pParam.mstarcv * ExpVgst / (1.0 + ExpVgst);
                 dT10_dVb = T3 * dn_dVb - dT10_dVg * (dVth_dVb + Vgst * dn_dVb / n);
@@ -547,73 +545,36 @@ pub(super) fn intrinsic(
                 dT9_dVg *= dVgs_eff_dVg;
             }
             Vgsteff = T10 / T9;
-            T11 = T9 * T9;
-            dVgsteff_dVg = (T9 * dT10_dVg - T10 * dT9_dVg) / T11;
-            dVgsteff_dVd = (T9 * dT10_dVd - T10 * dT9_dVd) / T11;
-            dVgsteff_dVb = (T9 * dT10_dVb - T10 * dT9_dVb) / T11;
+            dVgsteff_dVg = (-Vgsteff).mul_add(dT9_dVg, dT10_dVg) / T9;
+            dVgsteff_dVd = (-Vgsteff).mul_add(dT9_dVd, dT10_dVd) / T9;
+            dVgsteff_dVb = (-Vgsteff).mul_add(dT9_dVb, dT10_dVb) / T9;
         }
         if model.capMod == 1 {
             Vfb = here.vfbzb;
             V3 = Vfb - Vgs_eff + VbseffCV - DELTA_3;
-            if Vfb <= 0.0 {
-                T0 = sqrt(V3 * V3 - 4.0 * DELTA_3 * Vfb);
-            } else {
-                T0 = sqrt(V3 * V3 + 4.0 * DELTA_3 * Vfb);
-            }
-            T1 = 0.5 * (1.0 + V3 / T0);
-            Vfbeff = Vfb - 0.5 * (V3 + T0);
+            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * Vfb.abs());
+            T1 = flatband_slope;
+            Vfbeff = Vfb - flatband_shift;
             dVfbeff_dVg = T1 * dVgs_eff_dVg;
             dVfbeff_dVb = -T1 * dVbseffCV_dVb;
-            Qac0 = CoxWL * (Vfbeff - Vfb);
+            Qac0 = -CoxWL * flatband_shift;
             dQac0_dVg = CoxWL * dVfbeff_dVg;
             dQac0_dVb = CoxWL * dVfbeff_dVb;
-            T0 = 0.5 * pParam.k1ox;
             T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
-            if pParam.k1ox == 0.0 {
-                T1 = 0.0;
-                T2 = 0.0;
-            } else if T3 < 0.0 {
-                T1 = T0 + T3 / pParam.k1ox;
-                T2 = CoxWL;
-            } else {
-                T1 = sqrt(T0 * T0 + T3);
-                T2 = CoxWL * T0 / T1;
-            }
-            Qsub0 = CoxWL * pParam.k1ox * (T1 - T0);
+            let (charge, slope) = depletion_charge(pParam.k1ox, T3);
+            Qsub0 = CoxWL * charge;
+            T2 = CoxWL * slope;
             dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg);
             dQsub0_dVd = -T2 * dVgsteff_dVd;
             dQsub0_dVb = -T2 * (dVfbeff_dVb + dVbseffCV_dVb + dVgsteff_dVb);
             AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
             VdsatCV = Vgsteff / AbulkCV;
-            T0 = VdsatCV - Vds - DELTA_4;
-            dT0_dVg = 1.0 / AbulkCV;
-            dT0_dVb = -VdsatCV * dAbulkCV_dVb / AbulkCV;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_4 * VdsatCV);
-            dT1_dVg = (T0 + DELTA_4 + DELTA_4) / T1;
-            dT1_dVd = -T0 / T1;
-            dT1_dVb = dT1_dVg * dT0_dVb;
-            dT1_dVg *= dT0_dVg;
-            if T0 >= 0.0 {
-                VdseffCV = VdsatCV - 0.5 * (T0 + T1);
-                dVdseffCV_dVg = 0.5 * (dT0_dVg - dT1_dVg);
-                dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
-                dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
-            } else {
-                let twice_delta = DELTA_4 + DELTA_4;
-                T3 = twice_delta / (T1 - T0);
-                T4 = 1.0 - T3;
-                T5 = VdsatCV * T3 / (T1 - T0);
-                VdseffCV = VdsatCV * T4;
-                dVdseffCV_dVg = dT0_dVg * T4 + T5 * (dT1_dVg - dT0_dVg);
-                dVdseffCV_dVd = T5 * (dT1_dVd + 1.0);
-                dVdseffCV_dVb = dT0_dVb * (T4 - T5) + T5 * dT1_dVb;
-            }
-            if Vds == 0.0 {
-                VdseffCV = 0.0;
-                dVdseffCV_dVg = 0.0;
-                dVdseffCV_dVb = 0.0;
-            }
+            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4);
+            VdseffCV = smoothing.effective;
+            dVdseffCV_dVg = smoothing.saturation_partial * (1.0 / AbulkCV);
+            dVdseffCV_dVd = smoothing.drain_partial;
+            dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
             T0 = AbulkCV * VdseffCV;
             T1 = 12.0 * (Vgsteff - 0.5 * T0 + 1.0e-20);
             T2 = VdseffCV / T1;
@@ -690,13 +651,9 @@ pub(super) fn intrinsic(
             here.cbdb = Cbd;
         } else if model.capMod == 2 {
             V3 = here.vfbzb - Vgs_eff + VbseffCV - DELTA_3;
-            if here.vfbzb <= 0.0 {
-                T0 = sqrt(V3 * V3 - 4.0 * DELTA_3 * here.vfbzb);
-            } else {
-                T0 = sqrt(V3 * V3 + 4.0 * DELTA_3 * here.vfbzb);
-            }
-            T1 = 0.5 * (1.0 + V3 / T0);
-            Vfbeff = here.vfbzb - 0.5 * (V3 + T0);
+            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * here.vfbzb.abs());
+            T1 = flatband_slope;
+            Vfbeff = here.vfbzb - flatband_shift;
             dVfbeff_dVg = T1 * dVgs_eff_dVg;
             dVfbeff_dVb = -T1 * dVbseffCV_dVb;
             Cox = here.coxp;
@@ -720,10 +677,9 @@ pub(super) fn intrinsic(
                 dTcen_dVg = dTcen_dVb;
             }
             LINK = 1.0e-3 * here.toxp;
-            V3 = pParam.ldeb - Tcen - LINK;
-            V4 = sqrt(V3 * V3 + 4.0 * LINK * pParam.ldeb);
-            Tcen = pParam.ldeb - 0.5 * (V3 + V4);
-            T1 = 0.5 * (1.0 + V3 / V4);
+            let centroid = smooth_drain(pParam.ldeb, Tcen, LINK);
+            Tcen = centroid.effective;
+            T1 = centroid.drain_partial;
             dTcen_dVg *= T1;
             dTcen_dVb *= T1;
             Ccen = epssub / Tcen;
@@ -734,23 +690,14 @@ pub(super) fn intrinsic(
             dCoxeff_dVb = dCoxeff_dVg * dTcen_dVb;
             dCoxeff_dVg *= dTcen_dVg;
             CoxWLcen = CoxWL * Coxeff / model.coxe;
-            Qac0 = CoxWLcen * (Vfbeff - here.vfbzb);
+            Qac0 = -CoxWLcen * flatband_shift;
             QovCox = Qac0 / Coxeff;
             dQac0_dVg = CoxWLcen * dVfbeff_dVg + QovCox * dCoxeff_dVg;
             dQac0_dVb = CoxWLcen * dVfbeff_dVb + QovCox * dCoxeff_dVb;
-            T0 = 0.5 * pParam.k1ox;
             T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
-            if pParam.k1ox == 0.0 {
-                T1 = 0.0;
-                T2 = 0.0;
-            } else if T3 < 0.0 {
-                T1 = T0 + T3 / pParam.k1ox;
-                T2 = CoxWLcen;
-            } else {
-                T1 = sqrt(T0 * T0 + T3);
-                T2 = CoxWLcen * T0 / T1;
-            }
-            Qsub0 = CoxWLcen * pParam.k1ox * (T1 - T0);
+            let (charge, slope) = depletion_charge(pParam.k1ox, T3);
+            Qsub0 = CoxWLcen * charge;
+            T2 = CoxWLcen * slope;
             QovCox = Qsub0 / Coxeff;
             dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg) + QovCox * dCoxeff_dVg;
             dQsub0_dVd = -T2 * dVgsteff_dVd;
@@ -763,13 +710,13 @@ pub(super) fn intrinsic(
                 T0 = pParam.k1ox * pParam.sqrtPhi;
             }
             T1 = 2.0 * T0 + Vgsteff;
-            DeltaPhi = Vtm * log(1.0 + T1 * Vgsteff / Denomi);
+            DeltaPhi = Vtm * (T1 * Vgsteff / Denomi).ln_1p();
             dDeltaPhi_dVg = 2.0 * Vtm * (T1 - T0) / (Denomi + T1 * Vgsteff);
             T0 = Vgsteff - DeltaPhi - 0.001;
             dT0_dVg = 1.0 - dDeltaPhi_dVg;
             T1 = sqrt(T0 * T0 + Vgsteff * 0.004);
-            VgDP = 0.5 * (T0 + T1);
-            dVgDP_dVg = 0.5 * (dT0_dVg + (T0 * dT0_dVg + 0.002) / T1);
+            VgDP = positive_half_sum(T0, T1, 0.001 * Vgsteff);
+            dVgDP_dVg = dT0_dVg.mul_add(VgDP, 0.001) / T1;
             Tox += Tox;
             T0 = (Vgsteff + here.vtfbphi2) / Tox;
             tmp = exp(model.bdos * 0.7 * log(T0));
@@ -792,34 +739,11 @@ pub(super) fn intrinsic(
             AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
             VdsatCV = VgDP / AbulkCV;
-            T0 = VdsatCV - Vds - DELTA_4;
-            dT0_dVg = dVgDP_dVg / AbulkCV;
-            dT0_dVb = -VdsatCV * dAbulkCV_dVb / AbulkCV;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_4 * VdsatCV);
-            dT1_dVg = (T0 + DELTA_4 + DELTA_4) / T1;
-            dT1_dVd = -T0 / T1;
-            dT1_dVb = dT1_dVg * dT0_dVb;
-            dT1_dVg *= dT0_dVg;
-            if T0 >= 0.0 {
-                VdseffCV = VdsatCV - 0.5 * (T0 + T1);
-                dVdseffCV_dVg = 0.5 * (dT0_dVg - dT1_dVg);
-                dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
-                dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
-            } else {
-                let twice_delta = DELTA_4 + DELTA_4;
-                T3 = twice_delta / (T1 - T0);
-                T4 = 1.0 - T3;
-                T5 = VdsatCV * T3 / (T1 - T0);
-                VdseffCV = VdsatCV * T4;
-                dVdseffCV_dVg = dT0_dVg * T4 + T5 * (dT1_dVg - dT0_dVg);
-                dVdseffCV_dVd = T5 * (dT1_dVd + 1.0);
-                dVdseffCV_dVb = dT0_dVb * (T4 - T5) + T5 * dT1_dVb;
-            }
-            if Vds == 0.0 {
-                VdseffCV = 0.0;
-                dVdseffCV_dVg = 0.0;
-                dVdseffCV_dVb = 0.0;
-            }
+            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4);
+            VdseffCV = smoothing.effective;
+            dVdseffCV_dVg = smoothing.saturation_partial * (dVgDP_dVg / AbulkCV);
+            dVdseffCV_dVd = smoothing.drain_partial;
+            dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
             T0 = AbulkCV * VdseffCV;
             T1 = VgDP;
             T2 = 12.0 * (T1 - 0.5 * T0 + 1.0e-20);
@@ -1286,13 +1210,13 @@ pub(super) fn companion(
                     dxpart = qdrn / qcheq;
                     Cdd = here.cddb;
                     Csd = -(here.cgdb + here.cddb + here.cbdb);
-                    ddxpart_dVd = (Cdd - dxpart * (Cdd + Csd)) / qcheq;
+                    ddxpart_dVd = dxpart.mul_add(-(Cdd + Csd), Cdd) / qcheq;
                     Cdg = here.cdgb;
                     Csg = -(here.cggb + here.cdgb + here.cbgb);
-                    ddxpart_dVg = (Cdg - dxpart * (Cdg + Csg)) / qcheq;
+                    ddxpart_dVg = dxpart.mul_add(-(Cdg + Csg), Cdg) / qcheq;
                     Cds = here.cdsb;
                     Css = -(here.cgsb + here.cdsb + here.cbsb);
-                    ddxpart_dVs = (Cds - dxpart * (Cds + Css)) / qcheq;
+                    ddxpart_dVs = dxpart.mul_add(-(Cds + Css), Cds) / qcheq;
                     ddxpart_dVb = -(ddxpart_dVd + ddxpart_dVg + ddxpart_dVs);
                 }
                 sxpart = 1.0 - dxpart;
@@ -1464,13 +1388,13 @@ pub(super) fn companion(
                     sxpart = qdrn / qcheq;
                     Css = here.cddb;
                     Cds = -(here.cgdb + here.cddb + here.cbdb);
-                    dsxpart_dVs = (Css - sxpart * (Css + Cds)) / qcheq;
+                    dsxpart_dVs = sxpart.mul_add(-(Css + Cds), Css) / qcheq;
                     Csg = here.cdgb;
                     Cdg = -(here.cggb + here.cdgb + here.cbgb);
-                    dsxpart_dVg = (Csg - sxpart * (Csg + Cdg)) / qcheq;
+                    dsxpart_dVg = sxpart.mul_add(-(Csg + Cdg), Csg) / qcheq;
                     Csd = here.cdsb;
                     Cdd = -(here.cgsb + here.cdsb + here.cbsb);
-                    dsxpart_dVd = (Csd - sxpart * (Csd + Cdd)) / qcheq;
+                    dsxpart_dVd = sxpart.mul_add(-(Csd + Cdd), Csd) / qcheq;
                     dsxpart_dVb = -(dsxpart_dVd + dsxpart_dVg + dsxpart_dVs);
                 }
                 dxpart = 1.0 - sxpart;

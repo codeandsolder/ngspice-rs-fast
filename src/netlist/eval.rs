@@ -53,10 +53,12 @@
 //! evaluating anything against a deck's top-level parameters and functions.
 
 mod plan;
+pub(crate) mod statistics;
 pub use plan::{
     BoundExpression, CandidateParameters, ParameterInput, ParameterPlan, ParameterScopeId,
     ParameterScopeSpec, ParameterSlot,
 };
+use statistics::{PreparedSite, Realization, Sampler};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -104,13 +106,65 @@ impl Default for EvalLimits {
 pub struct EvalBudget {
     limits: EvalLimits,
     nodes: usize,
+    seed: u64,
+    scope_sequence: u64,
 }
 
 impl EvalBudget {
     /// A fresh budget.
     #[must_use = "the new budget tracks expression evaluation against the supplied limits"]
     pub const fn new(limits: EvalLimits) -> Self {
-        Self { limits, nodes: 0 }
+        Self {
+            limits,
+            nodes: 0,
+            seed: statistics::DEFAULT_SEED,
+            scope_sequence: 0,
+        }
+    }
+
+    /// A fresh deck-loading budget with the explicitly selected realization seed.
+    /// # Errors
+    /// Invalid seed options, which must be resolved before parameters.
+    pub fn for_netlist(netlist: &Netlist) -> SpiceResult<Self> {
+        Ok(Self {
+            seed: statistics::seed(&netlist.options)?,
+            ..Self::default()
+        })
+    }
+
+    fn realization(
+        &mut self,
+        parent: Option<&ParamScope>,
+        instance: Option<&str>,
+    ) -> SpiceResult<Realization> {
+        if let Some(parent) = parent {
+            self.scope_sequence = self
+                .scope_sequence
+                .checked_add(1)
+                .ok_or_else(|| SpiceError::circuit("statistical scope sequence overflow"))?;
+            Ok(parent.realization.child(self.scope_sequence, instance))
+        } else {
+            Ok(Realization::root(self.seed))
+        }
+    }
+
+    /// Charge a prepared scalar expression against the same aggregate
+    /// expansion budget, using source bytes as an upper bound on syntax nodes.
+    pub(crate) fn charge_prepared(
+        &mut self,
+        bytes: usize,
+        location: &SourceLoc,
+    ) -> SpiceResult<()> {
+        self.nodes = self.nodes.checked_add(bytes).ok_or_else(|| {
+            SpiceError::parse(location.clone(), "prepared expression work budget overflow")
+        })?;
+        if self.nodes > self.limits.nodes {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "prepared expression work budget exceeded",
+            ));
+        }
+        Ok(())
     }
 
     /// Expression nodes evaluated so far.
@@ -178,6 +232,7 @@ pub struct ParamScope {
     entries: Vec<ParamEntry>,
     active: HashMap<String, usize>,
     functions: Option<Arc<FunctionScope>>,
+    realization: Realization,
 }
 
 /// Already evaluated values published in sequence over an immutable parameter
@@ -252,6 +307,7 @@ impl<'a> SequentialBindings<'a> {
             expression,
             &|name| self.get(name),
             self.base.functions.as_deref(),
+            self.base.realization,
             budget,
         )
         .map_err(Failure::into_error)
@@ -656,7 +712,7 @@ impl ParamScope {
     /// As [`Self::root`], plus invalid `.func` definitions
     /// ([`FunctionScope::new`]).
     pub fn for_netlist(netlist: &Netlist) -> SpiceResult<Self> {
-        let mut budget = EvalBudget::default();
+        let mut budget = EvalBudget::for_netlist(netlist)?;
         let functions = FunctionScope::for_netlist(netlist, &budget)?;
         Self::resolve_scoped(None, Some(functions), &[], &netlist.params, &mut budget)
     }
@@ -677,7 +733,14 @@ impl ParamScope {
         budget: &mut EvalBudget,
     ) -> SpiceResult<Self> {
         let functions = parent.as_ref().and_then(|p| p.functions.clone());
-        Self::resolve_with(parent, functions, bindings, cards, budget, Bindings::Reject)
+        Self::resolve_with(
+            parent,
+            functions,
+            bindings,
+            cards,
+            budget,
+            (Bindings::Reject, None),
+        )
     }
 
     /// As [`Self::resolve`], with the `.func` definitions visible in this
@@ -693,7 +756,14 @@ impl ParamScope {
         cards: &[ParamCard],
         budget: &mut EvalBudget,
     ) -> SpiceResult<Self> {
-        Self::resolve_with(parent, functions, bindings, cards, budget, Bindings::Reject)
+        Self::resolve_with(
+            parent,
+            functions,
+            bindings,
+            cards,
+            budget,
+            (Bindings::Reject, None),
+        )
     }
 
     /// Resolve one subcircuit body's scope, where `bindings` are that
@@ -716,7 +786,14 @@ impl ParamScope {
         budget: &mut EvalBudget,
     ) -> SpiceResult<Self> {
         let functions = parent.as_ref().and_then(|p| p.functions.clone());
-        Self::resolve_with(parent, functions, bindings, cards, budget, Bindings::Win)
+        Self::resolve_with(
+            parent,
+            functions,
+            bindings,
+            cards,
+            budget,
+            (Bindings::Win, None),
+        )
     }
 
     /// As [`Self::resolve_instance`], with the `.func` definitions visible in
@@ -730,12 +807,20 @@ impl ParamScope {
     /// As [`Self::root`].
     pub fn resolve_instance_scoped(
         parent: Option<Arc<Self>>,
+        instance: &str,
         functions: Option<Arc<FunctionScope>>,
         bindings: &[ParamBinding],
         cards: &[ParamCard],
         budget: &mut EvalBudget,
     ) -> SpiceResult<Self> {
-        Self::resolve_with(parent, functions, bindings, cards, budget, Bindings::Win)
+        Self::resolve_with(
+            parent,
+            functions,
+            bindings,
+            cards,
+            budget,
+            (Bindings::Win, Some(instance)),
+        )
     }
 
     fn resolve_with(
@@ -744,11 +829,12 @@ impl ParamScope {
         bindings: &[ParamBinding],
         cards: &[ParamCard],
         budget: &mut EvalBudget,
-        policy: Bindings,
+        policy: (Bindings, Option<&str>),
     ) -> SpiceResult<Self> {
+        let (policy, instance) = policy;
         let defs = collect_definitions(bindings, cards, budget.limits, policy)?;
         let sequence = defs.schedule(parent.as_deref(), functions.as_deref(), budget, |_, _| {})?;
-        Self::resolve_definitions(parent, functions, defs, sequence, budget)
+        Self::resolve_definitions(parent, functions, defs, sequence, budget, instance)
     }
 
     fn resolve_definitions(
@@ -757,7 +843,9 @@ impl ParamScope {
         defs: ScopeDefinitions<'_>,
         sequence: Vec<usize>,
         budget: &mut EvalBudget,
+        instance: Option<&str>,
     ) -> SpiceResult<Self> {
+        let realization = budget.realization(parent.as_deref(), instance)?;
         let scope_parent = parent.as_deref();
         let scope_functions = functions.as_deref();
         let ScopeDefinitions {
@@ -785,6 +873,7 @@ impl ParamScope {
                 expr,
                 &lookup,
                 scope_functions,
+                realization,
                 budget,
                 name,
                 &entries[i].location,
@@ -800,7 +889,81 @@ impl ParamScope {
             entries,
             active,
             functions,
+            realization,
         })
+    }
+
+    pub(crate) const fn sampler<'a>(
+        &self,
+        location: &'a SourceLoc,
+        site: Option<PreparedSite>,
+    ) -> Sampler<'a> {
+        self.realization.at(site).sampler(location)
+    }
+
+    pub(crate) fn evaluate_sampled(
+        &self,
+        expression: &ParameterExpression,
+        budget: &mut EvalBudget,
+        sampler: &Sampler<'_>,
+        expression_identity: Option<model_statistics::Identity>,
+    ) -> SpiceResult<Real> {
+        evaluate_sampled_root(
+            expression,
+            &|name| self.get(name),
+            self.functions.as_deref(),
+            sampler,
+            expression_identity,
+            budget,
+        )
+        .map_err(Failure::into_error)
+    }
+
+    /// Inspect the lexical call graph, including shadowed macro definitions.
+    pub(crate) fn uses_prepared_statistics(&self, expression: &Expr) -> bool {
+        if matches!(
+            expression.kind,
+            ExprKind::Number { .. } | ExprKind::Identifier(_)
+        ) {
+            return false;
+        }
+        let mut pending = vec![(expression, self.functions.as_deref())];
+        let mut visited = HashSet::new();
+        while let Some((expression, lexical)) = pending.pop() {
+            for (name, _, _) in collect_calls(expression) {
+                if name.starts_with(model_statistics::PREPARED_PREFIX) {
+                    return true;
+                }
+                if let Some((definition, owner)) = lexical
+                    .and_then(|scope| scope.get(name))
+                    .or_else(|| self.functions.as_deref().and_then(|scope| scope.get(name)))
+                    && visited.insert(std::ptr::from_ref(definition))
+                {
+                    pending.push((&definition.body.root, Some(owner)));
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn statistical_site(&self, kind: &[u8], name: &str) -> Option<PreparedSite> {
+        self.realization.site(kind, name)
+    }
+
+    pub(crate) fn evaluate_at(
+        &self,
+        expression: &ParameterExpression,
+        site: Option<PreparedSite>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        evaluate_root(
+            expression,
+            &|name| self.get(name),
+            self.functions.as_deref(),
+            self.realization.at(site),
+            budget,
+        )
+        .map_err(Failure::into_error)
     }
 
     /// The `.func` definitions visible in this scope, if any.
@@ -848,9 +1011,53 @@ impl ParamScope {
             expression,
             &|name| lookup(name).or_else(|| self.get(name)),
             self.functions.as_deref(),
+            self.realization,
             budget,
         )
         .map_err(Failure::into_error)
+    }
+
+    /// Evaluate a source-defined function with arguments already resolved by
+    /// the prepared expression evaluator. Reuse native lexical function
+    /// lookup, recursion checks and call-site bindings without re-parsing or
+    /// rounding the supplied numeric arguments.
+    pub(crate) fn evaluate_prepared_call(
+        &self,
+        name: &str,
+        values: &[Real],
+        location: &SourceLoc,
+        lookup: impl Fn(&str) -> Option<Real>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        let span = crate::netlist::expr::SourceSpan {
+            start: location.clone(),
+            end: location.clone(),
+            logical: 0..0,
+        };
+        let arguments = values
+            .iter()
+            .map(|&value| Expr {
+                kind: ExprKind::Number {
+                    value,
+                    spelling: value.to_string(),
+                },
+                span: span.clone(),
+            })
+            .collect();
+        let expression = ParameterExpression {
+            text: name.to_owned(),
+            braced: false,
+            quoted: false,
+            span: span.clone(),
+            root: Expr {
+                kind: ExprKind::UserCall {
+                    name: name.to_ascii_lowercase(),
+                    arguments,
+                },
+                span,
+            },
+        };
+        self.evaluate_with(&expression, lookup, budget)
     }
 
     /// Evaluate a site expression against this scope, drawing on `budget`.
@@ -862,13 +1069,7 @@ impl ParamScope {
         expression: &ParameterExpression,
         budget: &mut EvalBudget,
     ) -> SpiceResult<Real> {
-        evaluate_root(
-            expression,
-            &|n| self.get(n),
-            self.functions.as_deref(),
-            budget,
-        )
-        .map_err(Failure::into_error)
+        self.evaluate_at(expression, None, budget)
     }
 }
 
@@ -1316,6 +1517,7 @@ struct Frame<'a> {
     scope: &'a FunctionScope,
     args: Vec<Real>,
     call: SourceLoc,
+    call_offset: Option<u64>,
     outer: Option<&'a Self>,
 }
 
@@ -1326,9 +1528,31 @@ struct Env<'a> {
     lookup: Lookup<'a>,
     functions: Option<&'a FunctionScope>,
     frame: Option<&'a Frame<'a>>,
+    sampler: &'a Sampler<'a>,
+    expression_identity: Option<model_statistics::Identity>,
 }
 
 impl<'a> Env<'a> {
+    /// The path of static macro invocations, not evaluation order or values.
+    fn statistical_expression(&self) -> Option<model_statistics::Identity> {
+        let mut identity = self
+            .expression_identity
+            .or_else(|| self.sampler.prepared_site().map(|site| site.expression))?;
+        let mut frames = Vec::new();
+        let mut frame = self.frame;
+        while let Some(active) = frame {
+            frames.push(active);
+            frame = active.outer;
+        }
+        for active in frames.into_iter().rev() {
+            identity = identity
+                .child(b"macro")
+                .child(active.def.name.as_bytes())
+                .child(&active.call_offset?.to_le_bytes());
+        }
+        Some(identity)
+    }
+
     /// A name: the formals of the active calls, innermost first (C's textual
     /// expansion lets an enclosing call's formal capture a callee's free
     /// name), then the site's parameters.
@@ -1359,12 +1583,27 @@ fn evaluate_root(
     root: &ParameterExpression,
     lookup: Lookup<'_>,
     functions: Option<&FunctionScope>,
+    realization: Realization,
+    budget: &mut EvalBudget,
+) -> Result<Real, Failure> {
+    let sampler = realization.sampler(&root.span.start);
+    evaluate_sampled_root(root, lookup, functions, &sampler, None, budget)
+}
+
+fn evaluate_sampled_root(
+    root: &ParameterExpression,
+    lookup: Lookup<'_>,
+    functions: Option<&FunctionScope>,
+    sampler: &Sampler<'_>,
+    expression_identity: Option<model_statistics::Identity>,
     budget: &mut EvalBudget,
 ) -> Result<Real, Failure> {
     let env = Env {
         lookup,
         functions,
         frame: None,
+        sampler,
+        expression_identity,
     };
     eval(&root.root, root, env, budget, 0)
 }
@@ -1373,11 +1612,19 @@ fn evaluate_definition(
     expression: &ParameterExpression,
     lookup: Lookup<'_>,
     functions: Option<&FunctionScope>,
+    realization: Realization,
     budget: &mut EvalBudget,
     name: &str,
     location: &SourceLoc,
 ) -> SpiceResult<Real> {
-    evaluate_root(expression, lookup, functions, budget).map_err(|failure| {
+    evaluate_root(
+        expression,
+        lookup,
+        functions,
+        realization.at(realization.site(b"parameter", name)),
+        budget,
+    )
+    .map_err(|failure| {
         failure
             .context(|| format!("while evaluating parameter '{name}' defined at {location}"))
             .into_error()
@@ -1578,7 +1825,27 @@ fn user_call(
     name: &str,
     arguments: &[Expr],
 ) -> Result<Real, Failure> {
+    if name.starts_with(model_statistics::PREPARED_PREFIX) {
+        let mut args = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            args.push(eval(argument, root, env, budget, depth + 1)?);
+        }
+        return env
+            .sampler
+            .sample_prepared(name, &args, env.statistical_expression(), &node.span.start)
+            .map_err(|error| fail(node, root, error));
+    }
     let Some((def, scope)) = env.function(name) else {
+        if crate::netlist::bexpr::STATISTICAL_FUNCTIONS.contains(&name) {
+            let mut args = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                args.push(eval(argument, root, env, budget, depth + 1)?);
+            }
+            return env
+                .sampler
+                .sample(name, &args, &node.span.start)
+                .map_err(|error| fail(node, root, error));
+        }
         if EXCLUDED_FUNCTIONS.contains(&name) {
             return Err(Failure {
                 location: node.span.start.clone(),
@@ -1669,12 +1936,18 @@ fn call(
         scope,
         args,
         call: node.span.start.clone(),
+        call_offset: node
+            .span
+            .relative_to(&root.span)
+            .map(|span| span.start as u64),
         outer: env.frame,
     };
     let inner = Env {
         lookup: env.lookup,
         functions: env.functions,
         frame: Some(&frame),
+        sampler: env.sampler,
+        expression_identity: env.expression_identity,
     };
     let value =
         eval(&def.body.root, &def.body, inner, budget, depth + CALL_DEPTH).map_err(|f| {

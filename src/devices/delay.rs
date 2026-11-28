@@ -47,6 +47,8 @@ pub enum DelayHistory {
     Waveform(WaveformHistory),
     /// TXL uses integer picosecond ticks and one accepted convolution state.
     Txl(Box<crate::devices::txl::TxlHistory>),
+    /// Modal CPL stores accepted waves and pending slope changes.
+    Cpl(Box<crate::devices::cpl::CplHistory>),
 }
 
 impl DelayHistory {
@@ -63,7 +65,7 @@ impl DelayHistory {
     pub fn as_waveform(&self) -> SpiceResult<&WaveformHistory> {
         match self {
             Self::Waveform(history) => Ok(history),
-            Self::Txl(_) => Err(delay_error("expected continuous waveform history")),
+            _ => Err(delay_error("expected continuous waveform history")),
         }
     }
 
@@ -74,16 +76,27 @@ impl DelayHistory {
     pub fn as_txl(&self) -> SpiceResult<&crate::devices::txl::TxlHistory> {
         match self {
             Self::Txl(history) => Ok(history),
-            Self::Waveform(_) => Err(delay_error("expected TXL tick history")),
+            _ => Err(delay_error("expected TXL tick history")),
         }
     }
 
-    /// Number of accepted samples.
+    /// Access the accepted CPL delay graph.
+    /// # Errors
+    /// This line uses a different history representation.
+    pub fn as_cpl(&self) -> SpiceResult<&crate::devices::cpl::CplHistory> {
+        match self {
+            Self::Cpl(history) => Ok(history),
+            _ => Err(delay_error("expected CPL delay graph")),
+        }
+    }
+
+    /// Number of retained history records.
     #[must_use = "the returned count measures retained history records of the active delay representation"]
     pub fn len(&self) -> usize {
         match self {
             Self::Waveform(history) => history.len(),
             Self::Txl(history) => history.len(),
+            Self::Cpl(history) => history.len(),
         }
     }
 
@@ -101,6 +114,7 @@ impl DelayHistory {
         match (self, update) {
             (Self::Waveform(history), DelayUpdate::Waveform(update)) => history.check(update),
             (Self::Txl(history), DelayUpdate::Txl(update)) => history.check(update),
+            (Self::Cpl(history), DelayUpdate::Cpl(update)) => history.check(update),
             _ => Err(delay_error("incompatible delay update")),
         }
     }
@@ -118,6 +132,7 @@ impl DelayHistory {
                 history.apply_validated(update);
             }
             (Self::Txl(history), DelayUpdate::Txl(update)) => history.apply_validated(update),
+            (Self::Cpl(history), DelayUpdate::Cpl(update)) => history.apply_validated(update),
             _ => unreachable!("delay updates were validated before committing"),
         }
     }
@@ -126,6 +141,7 @@ impl DelayHistory {
         match self {
             Self::Waveform(history) => history.clear(),
             Self::Txl(history) => history.clear(),
+            Self::Cpl(history) => history.clear(),
         }
     }
 }
@@ -137,6 +153,8 @@ pub enum DelayUpdate {
     Waveform(WaveformUpdate),
     /// Integer-tick TXL update and its accepted convolution state.
     Txl(crate::devices::txl::TxlUpdate),
+    /// Replacement accepted modal delay graph and future breakpoints.
+    Cpl(crate::devices::cpl::CplUpdate),
 }
 
 impl DelayUpdate {
@@ -144,6 +162,7 @@ impl DelayUpdate {
         match self {
             Self::Waveform(update) => update.reset.is_some(),
             Self::Txl(update) => update.is_reset(),
+            Self::Cpl(update) => update.is_reset(),
         }
     }
 
@@ -151,6 +170,7 @@ impl DelayUpdate {
         match self {
             Self::Waveform(update) => update.breakpoints,
             Self::Txl(_) => Vec::new(),
+            Self::Cpl(update) => update.into_breakpoints(),
         }
     }
 }

@@ -82,6 +82,10 @@ edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/codeandsolder/ngspice-rs-fast"
 
+[workspace.metadata.rust-skills2]
+allow-test-panics = true
+allow-test-panics-reason = "Existing assertion-based numerical and conformance tests; production and examples remain strict"
+
 [workspace.dependencies]
 # Token-stream combinators replace the manual semantic-parser cursor. No FFI,
 # no regex dependency, and no optional ASCII/binary/SIMD/debug features.
@@ -104,9 +108,19 @@ petgraph = "0.8.3"
 [dependencies]
 winnow.workspace = true
 petgraph.workspace = true
+model-kernel-api = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
+model-normalize-ngspice = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
+model-kernel-diode = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
+model-preprocess-command = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
+model-statistics = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
+sha2 = "0.11"
+anyhow = "1"
 
 [dev-dependencies]
 ngspice-conformance = { path = "conformance/support" }
+model-kernel-vdmos = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
+ngspice-rs-preprocess = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "277d90b5a465456fa220975ef3c1b8bd52655490" }
+tempfile = "3"
 
 [workspace.lints.rust]
 missing_docs = "warn"
@@ -114,14 +128,13 @@ unsafe_code = "forbid"
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
 # Google Rust style guide: no glob imports beyond `use super::*` in tests,
-# `# Panics` docs on public fns, `#[must_use]` on pure results. `unwrap_used`
-# is enabled at the library crate root (`src/lib.rs`) rather than here, so the
-# integration-test helpers under `tests/` may keep unwrapping.
+# `# Panics` docs on public fns and reasoned `#[must_use]` on pure results.
+# The shared gate owns strict production and test-specific lint policy.
 wildcard_imports = "warn"
 enum_glob_use = "warn"
 missing_panics_doc = "warn"

@@ -636,3 +636,46 @@ fn model_creation_rank_is_stable_across_families_and_interleaved_instances() {
         ]
     );
 }
+
+#[test]
+fn behavioural_resistor_noise_uses_its_constitutive_equation_not_a_parallel_bypass() {
+    for setter in ["noisy=1", "noise=1"] {
+        let deck = format!(
+            "noise\ni1 0 a dc 3m ac 1\nrload a 0 1k noisy=0\nr1 a 0 r={{1000*(1+1000*i(r1))}} {setter}\n.options reltol=1e-10\n.noise v(a) i1 lin 4 1k 4k 1\n.end\n"
+        );
+        let plots = run(&deck);
+        // Bias I=1 mA, R=2k, dV/dI=3k. The series source sees
+        // Rload/(Rload+Rdiff)=1/4, not Rload/(Rload+R).
+        let expected = (4. * BOLTZMANN * KELVIN * 2000.).sqrt() / 4.;
+        for value in column(&plots[0], "onoise_spectrum") {
+            close(value, expected, 1e-8);
+        }
+        for value in column(&plots[0], "inoise_spectrum") {
+            close(value, expected / 750., 1e-8);
+        }
+    }
+}
+
+#[test]
+fn behavioural_noise_is_explicit_and_has_physical_temperature_and_resistance_policy() {
+    let deck = |r: &str, setter: &str| {
+        format!(
+            "noise\nv1 in 0 dc 1 ac 1\nr1 in out r={{{r}+0*v(in)}} {setter}\nrload out 0 1k noisy=0\n.noise v(out) v1 lin 2 1k 2k\n.end\n"
+        )
+    };
+    for setter in ["", "noisy=0"] {
+        let plots = run(&deck("1000", setter));
+        assert!(
+            column(&plots[0], "onoise_spectrum")
+                .iter()
+                .all(|value| *value == 0.)
+        );
+    }
+    let plots = run(&deck("1000", "noisy=1 temp=100 m=2"));
+    let expected = (4. * BOLTZMANN * 373.15 * 500.).sqrt() * 2. / 3.;
+    for value in column(&plots[0], "onoise_spectrum") {
+        close(value, expected, 1e-8);
+    }
+    let error = error_of(&deck("-2000", "noisy=1"));
+    assert!(error.contains("thermal resistance"), "{error}");
+}

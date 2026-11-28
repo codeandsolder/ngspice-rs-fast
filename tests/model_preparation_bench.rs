@@ -127,7 +127,7 @@ fn scalar_projection(shared: bool) {
         let selected = r.resolve(&n.devices[0]).unwrap().unwrap();
         black_box(
             selected
-                .passive_parameters(black_box(&n.devices[0]))
+                .passive_parameters(black_box(&n.devices[0]), 1.)
                 .unwrap(),
         );
     }

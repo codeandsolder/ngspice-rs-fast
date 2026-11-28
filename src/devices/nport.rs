@@ -479,7 +479,9 @@ impl Device for MeasuredNPort {
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         match context.mode {
-            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
+            AnalysisMode::OperatingPoint
+            | AnalysisMode::DcSweep
+            | AnalysisMode::Instantaneous { .. } => {
                 let admittance = self.admittance_at(0.)?;
                 if admittance.data().iter().any(|y| y.im != 0.) {
                     return Err(invalid(

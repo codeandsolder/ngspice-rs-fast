@@ -294,17 +294,8 @@ pub(super) fn rdseff_geo(
         rend
     } else if rend <= 0.0 {
         rint
-    } else if rint.is_finite() && rend.is_finite() {
-        // The equivalent of two positive parallel sheet resistances is
-        // representable even when rint*rend overflows or underflows. Scale
-        // by the smaller leg, so the denominator stays in [1, 2].
-        let smaller = rint.min(rend);
-        let larger = rint.max(rend);
-        smaller / (1. + smaller / larger)
     } else {
-        // Preserve the original nonfinite-input diagnostics and IEEE
-        // propagation for invalid derived resistance values.
-        rint * rend / (rint + rend)
+        parallel_resistance(rint, rend)
     };
     if rtot == 0.0 {
         warnings.push("Warning: Zero resistance returned from RdseffGeo".into());
@@ -392,6 +383,19 @@ fn rds_end_sha(
         };
     } else {
         warnings.push(format!("Warning: Specified RGEO = {rgeo} not matched"));
+    }
+}
+
+/// Two positive physical resistance legs in parallel. Scale by the
+/// smaller leg so the denominator stays in [1, 2]; retain ordinary IEEE
+/// propagation for nonpositive/nonfinite inputs of the body network.
+pub(super) fn parallel_resistance(first: f64, second: f64) -> f64 {
+    if first > 0. && second > 0. && first.is_finite() && second.is_finite() {
+        let smaller = first.min(second);
+        let larger = first.max(second);
+        smaller / (1. + smaller / larger)
+    } else {
+        first * second / (first + second)
     }
 }
 

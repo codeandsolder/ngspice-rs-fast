@@ -3,9 +3,10 @@
 **Implemented: B arbitrary sources (`v=`/`i=` expressions) and the nonlinear
 E/G/F/H forms `VALUE=`/`VOL=`/`CUR=`, `TABLE`, `POLY(n)` and the implicit
 spice2g6 `POLY(1)`, for `.op`, `.dc`, `.ac` and the companion `.tran`
-(trapezoidal/Gear-2).** `LAPLACE`, `ddt()` and the statistical functions
-(`agauss`, `gauss`, `aunif`, `unif`, `limit`) are explicit `NotYetPorted`
-errors.
+(trapezoidal/Gear-2).** Native stateful `ddt()`, rational transfer
+models and nonlinear passive laws are described in [BEHAVIOURAL_RLC.md](BEHAVIOURAL_RLC.md).
+Static statistical functions (`agauss`, `gauss`, `aunif`, `unif`, `limit`)
+are realized during elaboration.
 
 C references (read-only behaviour): `src/spicelib/parser/inp2b.c`,
 `inpptree.c`, `inpptree-parser.y`, `ptfuncs.c`, `ifeval.c`;
@@ -82,11 +83,13 @@ literally (C does not substitute formals there; verified).
 The complete `inpptree.c` table: `abs acos acosh asin asinh atan atanh cos
 cosh exp ln log log10 sgn sin sinh sqrt tan tanh u uramp ceil floor nint u2
 pwl eq0 ne0 gt0 lt0 ge0 le0 pow pwr min max ternary_fcn`. Unknown names are a
-parse error ("no such function"); `ddt` is `NotYetPorted`, and so are
-`agauss`, `gauss`, `aunif`, `unif` and `limit`, which C replaces by one drawn
-value before parsing a B line (`src/frontend/inp.c` `eval_agauss()`, the
+parse error ("no such function"). `ddt` becomes a solver-owned dynamic
+equation. `agauss`, `gauss`, `aunif`, `unif` and `limit` become static
+samples before compilation (`src/frontend/inp.c` `eval_agauss()`, the
 `inp_fix_agauss_in_param()` set of `inpcom.c`; a user `.func` of the same name
-is expanded first, as in C);
+takes precedence). See [PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md) for the
+realization policy; static arithmetic in these arguments is supported,
+but circuit-dependent arguments are rejected.
 `pwl_derivative` (internal to `pwl`, C would dereference a missing table) is
 `Unsupported`.
 
@@ -111,20 +114,29 @@ Value rules (`ptfuncs.c`, no compatibility mode, as the reference binary runs):
 Newton and AC need `d f / d x` for every quantity `x` the expression reads.
 ngspice differentiates the tree symbolically once (`PTdifferentiate`) and
 evaluates the derivative trees with the same C functions. The port evaluates
-value and gradient together (forward mode) and applies **C's derivative rule
-at every node**, so the Jacobian is C's Jacobian, including its deliberate and
-accidental quirks (all verified against the C binary's AC analysis):
+value and gradient together using a sparse symbolic instruction DAG.
+Value kernels retain the SPICE branch and domain conventions. The
+Jacobian follows the actual value law where the C symbolic derivative
+is inconsistent with it:
 
 - `u`, `sgn`, `floor`, `ceil`, `nint` and the comparisons have derivative 0;
   `min`/`max` take the derivative of the selected operand (`lt0(a-b) ? a' : b'`);
   the ternary differentiates the selected branch;
-- `a^b` with a constant `b` differentiates as `b pwr(a, b-1) a'`, i.e. as
-  `|a|^b`: for an odd integer `b` and `a < 0` the derivative has the wrong
-  sign (`v(in)**3` at -0.45 V gives -0.6075 in C and in the port);
-- `pwr(a, b)` with a constant `b` uses `b pow(a, b-1) a'`, which is 0 for a
-  negative `a` and a non-integer `b`;
-- `pwl` on a descending table takes the slope C's ascending-only search
-  finds (`PTpwl_derivative`);
+- Ordinary powers `a^b` and `pow(a,b)` use the true base slope
+  `b*a^(b-1)` on positive bases and on the negative quasi-integer branch
+  (with the same rounded exponent as the value). On the negative
+  noninteger branch the value and its local slope are zero. The
+  exponent partial on a negative base is zero within the selected
+  rounded-integer or zero branch; the branch boundaries themselves
+  are discontinuous.
+- Signed `pwr(a,b)` uses the even base slope `b*abs(a)^(b-1)` and
+  exponent partial `pwr(a,b)*ln(abs(a))` away from zero. Ngspice 47
+  swaps the ordinary and signed derivative kernels for constant
+  exponents: for example `(-0.45)^3` has slope -0.6075 in C,
+  whereas its physical slope is +0.6075. The corrected Jacobian
+  deliberately differs from C at these points.
+- `pwl` takes the slope of the same segment as the value. This fixes
+  ngspice's ascending-only derivative search for descending tables;
 - divisions in derivative trees include the `gmin * 1e-20` fudge.
 
 Elsewhere the analytic gradient matches finite differences for every function
@@ -132,10 +144,9 @@ and operator (`tests/devices_behavioural_sources.rs`). Where C would
 continue with a NaN or an infinity (`acos(2)`, `cosh(1000)`), the port stops
 with a numerical error naming the function and the non-finite value or
 derivative. This includes infinite *slopes* at an intermediate Newton iterate:
-`v(in)^0.5` or `v(in)^-1` at the 0 V start has derivative `b pwr(0, b-1) =
-inf`; C loads it, carries a NaN iterate for the unknowns that depend on that
-row and converges on the next iteration, while the port stops ("non-finite
-derivative inf (value 0) in '^'"). See Limits.
+`v(in)^0.5` has an infinite positive-side slope at the 0 V start.
+C may load an infinity and recover on a later iteration; the port
+stops with a diagnostic naming the power base slope and its inputs. See Limits.
 
 ### Singular slopes at the zero start
 
@@ -192,10 +203,19 @@ global 0.2 V voltage-step damping, behavioural devices opt out
 watches only the nodes of the junction devices, so a 1000x B gain on 5 V
 converges in one step instead of thousands.
 
+The nonlinear convergence test compares the scaled physical source output
+at consecutive iterates, using current or voltage absolute tolerance as
+appropriate, and checks the error of the loaded tangent at the new iterate.
+Voltage sources additionally check the actual terminal voltage against
+their law at both iterates. The trial stores the physical output of the
+last load; this algebraic observation is not a charge state.
+C's raw-expression comparison in `ASRCconvTest` does not account for output
+multipliers; that can make inserting a zero-volt series current probe change
+whether the physical current passes convergence. The physical test is
+independent of that extra branch unknown.
+
 Not modelled: C scales B outputs by the source-stepping factor only in the
-transient operating point (`MODETRANOP`), and `ASRCconvTest` adds a
-function-value convergence test; both change the iteration path, not the
-converged solution.
+transient operating point (`MODETRANOP`).
 
 ## Front-end lowering (`inpcom.c`)
 
@@ -211,26 +231,37 @@ names are renamed per instance (`x1.e1_int1`, `b.x1.be1`, `i(v.x1.v_b1)`):
 | `g1 ... table ... m=k` | the same with gain `k`; `[`, `]`, `%` in G names become `_` |
 | `e1 n+ n- nc+ nc- table=(...)` | `e1 n+ n- e1_int1 0 1`, `ae1` reading `v(nc+, nc-)` |
 | one TABLE pair `(x0, y0)` | `v<name> <name>_int1 0 y0` instead of the B/XSPICE pair |
-| `POLY(n)` on E/G/F/H (and the implicit `POLY(1)`) | the `spice2poly` instance `a$poly$<name>` with output `v=` (E/H, branch `i(a$poly$e1)`) or `i=` (G/F) |
+| `POLY(n)` on E/G/F/H (and the implicit `POLY(1)`) | native behavioural polynomial retaining the original instance name, with output `v=` (E/H) or `i=` (G/F) |
 
-The XSPICE instances are internal designator-`a` behavioural devices (user
-`a` cards stay unported): `ae1` evaluates the `pwl` code model's static map
+The TABLE instances are internal designator-`a` behavioural devices:
+`ae1` evaluates the `pwl` code model's static map
 (`input_domain` 0.1, or 0.001 for the LTspice form, `fraction=TRUE`,
 `limit=TRUE`: flat outside the table, parabolic corners over 10 % of the
 shorter adjacent segment); the model's iteration-to-iteration input limiting is
-a Newton aid and is not reproduced. `a$poly$...` is the SPICE2 polynomial
+a Newton aid and is not reproduced. POLY is the SPICE2 polynomial
 `c0 + c1 x1 + ... + cn xn + c(n+1) x1^2 + c(n+2) x1 x2 + ...`, terms in
 `nxtpwr()` order (total degree, then lexicographically descending exponents),
 `m=` multiplying G/F outputs; `m=` on an E/H POLY is rejected (C drops it with
 a warning).
 
-`inp_meas_current()` is reproduced too: an `i(name)` in a behavioural
-expression whose `name` does not start with `v` and is not a simple linear
-E/H senses the current through an inserted zero-volt source `v_name`; `name`'s
-first node becomes `<node>_vmeas_<n>` (`n` counting references in deck order)
-and the reference becomes `i(v_name)`. The device is searched in the same
-scope only. As in C, an `i(` preceded by a comma (`max(0,i(b2))`) is not
-rewritten and must name a findable branch (V, E, H or voltage B).
+Current references are bound after lexical expansion, parameter evaluation,
+controlled-source lowering and hierarchy expansion. Voltage-output sources,
+linear inductors, behavioural passive laws, and native rational transfers
+supply their existing physical branch coordinates. A remaining analog
+device with no readable branch receives one series zero-voltage measurement
+source at its first terminal, shared by all resolved expressions that sense
+it. Generated names cannot collide with any declared or referenced name.
+This replaces the C text heuristic in `inp_meas_current()`: references after
+commas, nested in function bodies, or in passive laws are handled uniformly.
+A lexically shadowed probe or an unused macro argument does not allocate a
+measurement branch. Ordinary F/H/W controls retain their voltage-source
+semantics.
+
+Internal measurement node and source names are not a source-level API.
+The C conformance fixtures compare every physical quantity including
+redundant C measurement columns and renamed polynomial source branches,
+which are explicitly equated to their native branch and terminal coordinates
+in the reference verifier.
 
 ## Errors
 
@@ -238,8 +269,8 @@ rewritten and must name a findable branch (V, E, H or voltage B).
 | --- | --- |
 | malformed expression, trailing text, two `v=`/`i=`, missing `v=`/`i=` | positioned `Parse` error |
 | undefined `.param`, unknown function, wrong argument count, non-literal or non-monotonic `pwl()` points | `Parse` error at the name |
-| `ddt()`, `LAPLACE` | `NotYetPorted` |
-| `agauss()`, `gauss()`, `aunif()`, `unif()`, `limit()` | `NotYetPorted` at the call (`src/frontend/inp.c` `eval_agauss`; `inpcom.c` `inp_fix_agauss_in_param`) |
+| E/G `LAPLACE` | requires rational transfer normalization |
+| statistical function with wrong arity or dynamic argument | positioned error at elaboration, never resampling during load |
 | `v=` with coinciding nodes | `Unsupported` ("shorted ASRC") |
 | `temp=` and `dtemp=` together | `Unsupported` (C ignores `dtemp` with a message) |
 | domain error or non-finite value/derivative during a load | `Numerical`, naming the function and the offending value or derivative |
@@ -272,7 +303,7 @@ rewritten and must name a findable branch (V, E, H or voltage B).
   refinement on the zero-start linearisation; singular systems stay rejected.
 - Opt-in: `NGSPICE_BIN=/abs/ngspice cargo test -p ngspice-rs --test
   c_behavioural_reference -- --ignored` compares 47 expressions' values (OP)
-  and derivatives (one-point AC) with the C binary at four bias points to
+  and valid derivatives (one-point AC) with the C binary at four bias points to
   `1e-12` relative.
 
 ## Limits
@@ -282,14 +313,11 @@ rewritten and must name a findable branch (V, E, H or voltage B).
   constant `b < 1` (`v(in)^0.5`, `v(in)^-1`, `v(in)**-2`) or `pow(0, -1)`
   whose controlling node starts at 0 V. This is a C-parity gap for common
   decks; write `sqrt(v(x))` or `1/v(x)` (finite `1e32` slopes) instead.
-- `ddt()`, the statistical functions (`agauss`, `gauss`, `aunif`, `unif`,
-  `limit`), `LAPLACE` (XSPICE `s_xfer`), the PSPICE/HSPICE/
-  LTspice compatibility variants of `^`, `exp` and `pwr`, and user XSPICE `a`
-  cards are not ported.
-- `.func` bodies are expanded after the lowering passes, so an `i()` that only
-  appears inside a `.func` body is not rewritten by `inp_meas_current()`;
-  numparam-only constructs inside `.func` bodies (`?:`, comparisons) remain
-  unsupported by the numparam grammar.
-- An E/H written with a named `gain=` counts as a simple linear source here;
-  C inserts a measurement source for it (`=` on the card), which changes only
-  vector names.
+- E/G `LAPLACE` source-dialect normalization, general high-index derivative
+  initialization (#230), and PSPICE/HSPICE/LTspice compatibility variants of
+  `^`, `exp` and `pwr` remain separate work. The native XSPICE `s_xfer`
+  rational realization is implemented.
+- Numparam-only constructs inside `.func` bodies (`?:`, comparisons) remain
+  unsupported by the numparam grammar. Adding a later batch to an existing
+  circuit cannot retroactively insert a series probe into a previously
+  instantiated device; native branch probes still bind normally.

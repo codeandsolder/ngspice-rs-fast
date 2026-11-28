@@ -221,6 +221,12 @@ impl SourceExcitation {
         if !dc.value().is_finite() || !ac.phasor.is_finite() {
             return Err(SpiceError::circuit("non-finite source excitation"));
         }
+        let waveform = match waveform {
+            Waveform::Stochastic(process) => {
+                Waveform::Stochastic(process.with_dc(if dc.given() { dc.value() } else { 0. })?)
+            }
+            waveform => waveform,
+        };
         Ok(Self {
             voltage,
             dc,
@@ -231,8 +237,13 @@ impl SourceExcitation {
     }
 
     pub(super) fn bind(self, name: impl Into<String>, terminals: [NodeId; 2]) -> IndependentSource {
+        let name = name.into();
+        let waveform = match self.waveform {
+            Waveform::Stochastic(process) => Waveform::Stochastic(process.with_source_name(&name)),
+            waveform => waveform,
+        };
         IndependentSource {
-            name: Arc::new(name.into()),
+            name: Arc::new(name),
             terminals: [terminals[0], terminals[1], NodeId::GROUND],
             voltage: self.voltage,
             dc: self.dc,
@@ -241,7 +252,7 @@ impl SourceExcitation {
             function_given: self.function_given,
             accumulated_waveform: None,
             power_tone: None,
-            waveform: Arc::new(self.waveform),
+            waveform: Arc::new(waveform),
             port: None,
             distortion: [None, None],
         }
@@ -276,6 +287,24 @@ impl IndependentSource {
         inputs: SourceInputs,
     ) -> SpiceResult<Self> {
         Ok(SourceExcitation::from_inputs(voltage, inputs)?.bind(name, terminals))
+    }
+
+    /// Replace the reference forcing before circuit finalization, preserving
+    /// the source's electrical identity, terminal order and AC excitation.
+    pub(super) fn bind_prepared(
+        &mut self,
+        forcing: super::prepared_waveform::PreparedForcing,
+    ) -> SpiceResult<()> {
+        if self.port.is_some() || self.power_tone.is_some() {
+            return Err(SpiceError::circuit(
+                "prepared forcing cannot replace an RF port",
+            ));
+        }
+        self.dc = DcExcitation::Explicit(forcing.dc());
+        self.function_given = true;
+        self.accumulated_waveform = None;
+        self.waveform = Arc::new(Waveform::Prepared(forcing));
+        Ok(())
     }
 
     /// Selects C's PORT cosine time function, including its zero-amplitude
@@ -397,6 +426,15 @@ impl IndependentSource {
             .clone()
     }
 
+    /// Detect the actual stochastic path before cloning shared waveforms.
+    fn has_stochastic_waveform(waveform: &Waveform) -> bool {
+        match waveform {
+            Waveform::Stochastic(_) => true,
+            Waveform::PortSeries { baseline, .. } => Self::has_stochastic_waveform(baseline),
+            _ => false,
+        }
+    }
+
     /// The terminals of the ideal source: `[positive, negative]`, or
     /// `[#res, negative]` for a port.
     fn ideal(&self) -> [NodeId; 2] {
@@ -475,6 +513,11 @@ impl Device for IndependentSource {
             return Ok(None);
         }
         let value = match time {
+            // The initial transient observation is the prepared startup
+            // state, not its external left-hand limit.
+            Some((0., f)) if matches!(self.effective_waveform(), Waveform::Prepared(_)) => self
+                .effective_waveform()
+                .value_at_timed(0., crate::devices::Limit::Right, &f.timing)?,
             Some((t, f)) => self
                 .effective_waveform()
                 .value_at_timed(t, f.limit, &f.timing)?,
@@ -517,6 +560,9 @@ impl Device for IndependentSource {
             // for each swept point.
             "dc" => {
                 copy.dc = DcExcitation::Explicit(value);
+                if let Waveform::Stochastic(process) = copy.waveform.as_ref() {
+                    copy.waveform = Arc::new(Waveform::Stochastic(process.clone().with_dc(value)?));
+                }
             }
             _ => {
                 return Err(SpiceError::circuit(format!(
@@ -527,8 +573,9 @@ impl Device for IndependentSource {
         Ok(Box::new(copy))
     }
 
-    /// Noiseless: C's VSRC/ISRC have no noise routine (`DEVnoise = NULL`); the
-    /// transient noise sources (`trnoise`/`trrandom`) are not ported.
+    /// C's VSRC/ISRC have no small-signal noise routine.
+    /// Stochastic forcing is owned by the transient waveform, never added
+    /// as an unrelated frequency-domain noise generator.
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
@@ -570,6 +617,34 @@ impl Device for IndependentSource {
 
     fn independent_waveform(&self) -> Option<(crate::devices::SourceKind, &Waveform)> {
         Some((self.source_kind(), self.effective_waveform()))
+    }
+    fn has_stochastic_source(&self) -> bool {
+        Self::has_stochastic_waveform(self.effective_waveform())
+    }
+    fn with_stochastic_candidate(&self, identity: u64) -> Option<Box<dyn Device>> {
+        // Reset derived RTS cache on each candidate transition without
+        // changing the physical source or the original random seed.
+        fn rebind(waveform: &mut Waveform, identity: u64) -> bool {
+            match waveform {
+                Waveform::Stochastic(process) => {
+                    *process = process.clone().with_candidate_identity(identity);
+                    true
+                }
+                Waveform::PortSeries { baseline, .. } => rebind(baseline, identity),
+                _ => false,
+            }
+        }
+        let mut source = self.clone();
+        // The deterministic case never clones the shared immutable waveform.
+        let primary = Self::has_stochastic_waveform(&source.waveform)
+            && rebind(Arc::make_mut(&mut source.waveform), identity);
+        let accumulated = source
+            .accumulated_waveform
+            .as_mut()
+            .is_some_and(|waveform| {
+                Self::has_stochastic_waveform(waveform) && rebind(Arc::make_mut(waveform), identity)
+            });
+        (primary || accumulated).then(|| Box::new(source) as Box<dyn Device>)
     }
 
     fn input_source(&self) -> Option<crate::devices::noise::InputSource> {
@@ -636,14 +711,19 @@ impl Device for IndependentSource {
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let (time, transient_op) = match context.mode {
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => (0., context.forcing.is_some()),
-            AnalysisMode::Transient { time, .. } => (time, false),
+            AnalysisMode::Transient { time, .. } | AnalysisMode::Instantaneous { time } => {
+                (time, false)
+            }
             AnalysisMode::Ac { .. } => {
                 return Err(SpiceError::circuit(
                     "use linear equation assembly for AC sources",
                 ));
             }
         };
-        let dc_mode = !matches!(context.mode, AnalysisMode::Transient { .. });
+        let dc_mode = matches!(
+            context.mode,
+            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep
+        );
         let value = if dc_mode && !transient_op && self.dc.given() {
             self.dc.value() * context.source_factor
         } else {
@@ -653,9 +733,22 @@ impl Device for IndependentSource {
                     *context.voltage_source_value + tone
                 }
                 _ => match context.forcing {
+                    Some(forcing) if matches!(context.mode, AnalysisMode::Instantaneous { .. }) => {
+                        self.effective_waveform().physical_value_at_timed(
+                            time,
+                            forcing.limit,
+                            &forcing.timing,
+                        )?
+                    }
                     Some(forcing) => self.effective_waveform().value_at_timed(
                         time,
-                        forcing.limit,
+                        if transient_op
+                            && matches!(self.effective_waveform(), Waveform::Prepared(_))
+                        {
+                            crate::devices::Limit::Right
+                        } else {
+                            forcing.limit
+                        },
                         &forcing.timing,
                     )?,
                     // DC without a given value: the function at time 0,

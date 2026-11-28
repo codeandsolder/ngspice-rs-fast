@@ -22,6 +22,7 @@ mod exact;
 pub(crate) use exact::{positive_axis_span, rounded_product_ratio};
 pub mod node;
 pub mod numeric;
+pub(crate) mod random;
 pub mod value;
 
 pub use error::{SourceLoc, SpiceError, SpiceResult};
@@ -37,6 +38,7 @@ pub use value::{
 
 /// Bounded, exact accumulator of finite binary64 weighted products.
 /// Arithmetic is implemented in the private exact module.
+#[derive(Clone)]
 pub(crate) struct ExactSum {
     bins: [i128; exact::LIMBS],
     terms: u32,
@@ -87,11 +89,13 @@ pub enum AnalysisKind {
     SParameter,
     /// `.pss` — autonomous periodic steady-state shooting.
     PeriodicSteadyState,
+    /// Native forced frequency-domain harmonic balance.
+    HarmonicBalance,
 }
 
 impl AnalysisKind {
     /// Every analysis kind, in the order ngspice documents them.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::OperatingPoint,
         Self::DcSweep,
         Self::Ac,
@@ -104,6 +108,7 @@ impl AnalysisKind {
         Self::Fourier,
         Self::SParameter,
         Self::PeriodicSteadyState,
+        Self::HarmonicBalance,
     ];
 
     /// The name without the leading dot, e.g. `"tran"`.
@@ -122,6 +127,7 @@ impl AnalysisKind {
             Self::Fourier => "four",
             Self::SParameter => "sp",
             Self::PeriodicSteadyState => "pss",
+            Self::HarmonicBalance => "hb",
         }
     }
 

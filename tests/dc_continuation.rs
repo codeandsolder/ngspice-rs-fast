@@ -1275,13 +1275,10 @@ fn deck_dc_options_are_validated_and_unimplemented_neighbours_still_fail() {
         ContinuationPolicy::from_ngspice_steps(Some(0), Some(0), None, None).unwrap()
     );
     // Junction gmin, itl2, itl4 and noopiter are implemented
-    // (tests/run_config.rs, tests/convergence.rs); diagonal gshunt remains an
-    // explicit gap.
-    assert!(
-        config(".options gshunt=1e-12")
-            .unwrap_err()
-            .is_not_yet_ported()
-    );
+    // (tests/run_config.rs, tests/convergence.rs). Gshunt is a separate
+    // real-valued continuation diagonal, not the junction conductance.
+    let shunt = config(".options gshunt=1e-12").unwrap();
+    assert_eq!(shunt.dc().policy().unwrap().gshunt, 1e-12);
     let skip = config(".options noopiter").unwrap();
     assert!(skip.dc().noopiter);
     assert!(skip.dc().policy().unwrap().skip_direct);

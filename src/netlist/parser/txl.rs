@@ -31,6 +31,7 @@ pub(super) fn txl_card(input: &mut Input<'_>) -> Result<ParsedCard> {
             ));
         }
         Ok(ParsedCard::Device(DeviceInstance {
+            code_ports: Vec::new(),
             name: instance.text.to_ascii_lowercase(),
             designator: 'y',
             nodes,

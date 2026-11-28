@@ -1,13 +1,13 @@
 //! Bounded plot transforms for a native control session.
 //!
 //! Linearization shares the measurement/Fourier ordered-axis geometry.
-//! FFT uses a native radix-2 transform, with the single-sided normalization
-//! and periodic window conventions of `frontend/com_fft.c` and `maths/fft/fftext.c`.
-
-use std::f64::consts::TAU;
+//! Spectra share reusable exact-length Fourier and window plans.
 
 use crate::analysis::fourier_resample::PolynomialPlan;
 use crate::analysis::ordered_samples::OrderedAxis;
+use crate::analysis::spectrum::{
+    SpectrumLayout, SpectrumLength, SpectrumNormalization, SpectrumPlan, SpectrumSettings,
+};
 use crate::analysis::{Plot, PlotFlags, Variable};
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, exact_nonnegative_integer};
 
@@ -115,10 +115,19 @@ fn allocate<T: Default + Clone>(length: usize) -> SpiceResult<Vec<T>> {
 }
 
 fn time_axis(plot: &Plot) -> SpiceResult<OrderedAxis<'static>> {
-    if plot.flags().is_complex() || plot.point_count() < 2 {
+    if plot.point_count() < 2 {
         return Err(failure(
-            "a transform needs a real time plot with at least two points",
+            "a transform needs a time plot with at least two points",
         ));
+    }
+    let time = plot
+        .column_at(
+            plot.variable_index("time")
+                .ok_or_else(|| failure("missing time scale"))?,
+        )
+        .ok_or_else(|| failure("missing time scale"))?;
+    if (&time).into_iter().any(|value| !value.is_real()) {
+        return Err(failure("time scale must be real"));
     }
     OrderedAxis::from_plot(plot, "time")
         .map_err(|error| failure(format!("invalid time scale: {error:?}")))
@@ -151,24 +160,21 @@ fn vector_columns(plot: &Plot, names: &[String]) -> SpiceResult<Vec<usize>> {
     Ok(columns)
 }
 
-fn real_trace(plot: &Plot, index: usize) -> SpiceResult<Vec<Real>> {
+fn trace_components(plot: &Plot, index: usize, imaginary: bool) -> SpiceResult<Vec<Real>> {
     let column = plot
         .column_at(index)
         .ok_or_else(|| failure("missing transform column"))?;
-    let mut trace = Vec::new();
-    trace
-        .try_reserve_exact(column.len())
-        .map_err(|error| failure(format!("allocating transform trace: {error}")))?;
-    for value in &column {
-        if !value.is_real() || !value.is_finite() {
-            return Err(failure("non-real or nonfinite transform input"));
+    let mut trace = allocate::<Real>(column.len())?;
+    for (destination, value) in trace.iter_mut().zip(&column) {
+        if !value.is_finite() || (plot.variables()[index].is_real && !value.is_real()) {
+            return Err(failure("invalid transform input"));
         }
-        trace.push(value.re);
+        *destination = if imaginary { value.im } else { value.re };
     }
     Ok(trace)
 }
 
-/// Resample selected real transient vectors onto a uniform physical grid.
+/// Resample selected real or complex transient vectors onto a uniform physical grid.
 /// An empty vector list selects every signal (not the time scale).
 ///
 /// # Errors
@@ -188,14 +194,20 @@ pub fn linearize(
     let cells = budget.check_cells(length, width)?;
     let axis = time_axis(plot)?;
     let (geometry_work, _) = PolynomialPlan::budget(axis.len(), length, 1);
+    let components = columns
+        .iter()
+        .map(|&index| {
+            if plot.variables()[index].is_real {
+                1usize
+            } else {
+                2
+            }
+        })
+        .sum::<usize>();
     // Geometry and per-vector sampling are both bounded, independently of
     // how many times a script destroys its retained output.
     budget.charge(
-        geometry_work.saturating_add(
-            axis.len()
-                .saturating_add(length)
-                .saturating_mul(columns.len()),
-        ),
+        geometry_work.saturating_add(axis.len().saturating_add(length).saturating_mul(components)),
     )?;
     let interpolation = PolynomialPlan::new(&axis, &coordinates, 1)?;
     let mut result = allocate::<Complex>(cells)?;
@@ -203,10 +215,19 @@ pub fn linearize(
         row[0] = Complex::real(time);
     }
     for (column, source) in columns.iter().copied().enumerate() {
-        let trace = real_trace(plot, source)?;
+        let trace = trace_components(plot, source, false)?;
         let sampled = interpolation.sample(&trace)?;
         for (row, value) in result.chunks_exact_mut(width).zip(sampled) {
             row[column + 1] = Complex::real(value);
+        }
+        if !plot.variables()[source].is_real {
+            let trace = trace_components(plot, source, true)?;
+            for (row, value) in result
+                .chunks_exact_mut(width)
+                .zip(interpolation.sample(&trace)?)
+            {
+                row[column + 1].im = value;
+            }
         }
     }
     let mut variables = vec![Variable::new("time", "time")];
@@ -214,78 +235,14 @@ pub fn linearize(
     Plot::new(
         "tran",
         "Transient Analysis (linearized)",
-        PlotFlags::Real,
+        if columns.len() == components {
+            PlotFlags::Real
+        } else {
+            PlotFlags::Complex
+        },
         variables,
     )
     .with_cells(length, result)
-}
-
-/// Periodic amplitude-normalized FFT window.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SpectrumWindow {
-    /// No taper (unity).
-    Rectangular,
-    /// Hann (ngspice default).
-    #[default]
-    Hann,
-    /// Hamming.
-    Hamming,
-    /// Bartlett/triangle.
-    Triangle,
-    /// Blackman.
-    Blackman,
-    /// Four-term Blackman-Harris.
-    BlackmanHarris,
-    /// Five-term flat top.
-    FlatTop,
-}
-
-impl SpectrumWindow {
-    /// Parse the supported ngspice window names and aliases.
-    #[must_use = "the parsed window determines the spectral transform weighting"]
-    pub fn parse(name: &str) -> Option<Self> {
-        match name.to_ascii_lowercase().as_str() {
-            "none" | "rectangular" => Some(Self::Rectangular),
-            "hann" | "hanning" | "cosine" => Some(Self::Hann),
-            "hamming" => Some(Self::Hamming),
-            "triangle" | "bartlet" | "bartlett" => Some(Self::Triangle),
-            "blackman" => Some(Self::Blackman),
-            "blackmanharris" => Some(Self::BlackmanHarris),
-            "flattop" => Some(Self::FlatTop),
-            _ => None,
-        }
-    }
-
-    fn weight(self, position: Real) -> Real {
-        let angle = TAU * position;
-        let c1 = angle.cos();
-        match self {
-            Self::Rectangular => 1.,
-            Self::Hann => 1. - c1,
-            Self::Hamming => (0.46_f64 / 0.54).mul_add(-c1, 1.),
-            Self::Triangle => 4. * position.abs().min(1. - position.abs()),
-            Self::Blackman => {
-                (0.08 / 0.42_f64).mul_add((2. * angle).cos(), (0.50_f64 / 0.42).mul_add(-c1, 1.))
-            }
-            Self::BlackmanHarris => {
-                let c2 = (2. * angle).cos();
-                let c3 = (3. * angle).cos();
-                (-0.01168 / 0.35875_f64).mul_add(
-                    c3,
-                    (0.14128 / 0.35875_f64).mul_add(c2, (0.48829_f64 / 0.35875).mul_add(-c1, 1.)),
-                )
-            }
-            Self::FlatTop => {
-                let c2 = (2. * angle).cos();
-                let c3 = (3. * angle).cos();
-                let c4 = (4. * angle).cos();
-                0.032_f64.mul_add(
-                    c4,
-                    (-0.388_f64).mul_add(c3, 1.29_f64.mul_add(c2, 1.93_f64.mul_add(-c1, 1.))),
-                )
-            }
-        }
-    }
 }
 
 fn real_count(value: usize) -> SpiceResult<Real> {
@@ -323,154 +280,82 @@ fn uniform_spacing(axis: &OrderedAxis<'_>) -> SpiceResult<Real> {
     Ok(step)
 }
 
-struct Radix2 {
-    size: usize,
-    twiddles: Vec<Complex>,
-}
-
-impl Radix2 {
-    fn new(size: usize) -> SpiceResult<Self> {
-        let mut twiddles = allocate::<Complex>(size / 2)?;
-        let denominator = real_count(size)?;
-        for (index, twiddle) in twiddles.iter_mut().enumerate() {
-            let (sin, cos) = (-TAU * real_count(index)? / denominator).sin_cos();
-            *twiddle = Complex::new(cos, sin);
-        }
-        Ok(Self { size, twiddles })
-    }
-
-    fn transform(&self, values: &mut [Complex]) {
-        let bits = self.size.ilog2();
-        for index in 0..self.size {
-            let reverse = index.reverse_bits() >> (usize::BITS - bits);
-            if index < reverse {
-                values.swap(index, reverse);
-            }
-        }
-        for stage in 1..=bits {
-            let width = 1usize << stage;
-            let half = width / 2;
-            let stride = self.size / width;
-            for chunk in values.chunks_exact_mut(width) {
-                let (left, right) = chunk.split_at_mut(half);
-                for (index, (a, b)) in left.iter_mut().zip(right).enumerate() {
-                    let rotated = *b * self.twiddles[index * stride];
-                    let original = *a;
-                    *a = original + rotated;
-                    *b = original - rotated;
-                }
-            }
-        }
-    }
-}
-
-fn spectrum_trace(
-    trace: &[Real],
-    window: &[Real],
-    plan: &Radix2,
-    buffer: &mut [Complex],
-    mut output: impl FnMut(usize, Complex) -> SpiceResult<()>,
-) -> SpiceResult<()> {
-    let count = real_count(trace.len())?;
-    let maximum = trace
-        .iter()
-        .fold(0_f64, |maximum, value| maximum.max(value.abs()));
-    let max_weight = window
-        .iter()
-        .fold(1_f64, |maximum, value| maximum.max(value.abs()));
-    // In normal ranges keep the original data; range-scale extreme inputs
-    // before a butterfly could overflow or erase an entire tiny signal.
-    let scale = if maximum > Real::MAX / (count * max_weight)
-        || (maximum > 0. && maximum < Real::MIN_POSITIVE * count)
-    {
-        maximum
-    } else {
-        1.
-    };
-    buffer.fill(Complex::ZERO);
-    for ((destination, &sample), &weight) in buffer.iter_mut().zip(trace).zip(window) {
-        *destination = Complex::real((sample / scale) * weight);
-    }
-    plan.transform(buffer);
-    let nyquist = plan.size / 2;
-    for (index, value) in buffer.iter().take(nyquist + 1).enumerate() {
-        let boundary = index == 0 || index == nyquist;
-        let factor = if boundary { 1. / count } else { 2. / count };
-        let result = Complex::new(
-            (value.re * factor) * scale,
-            if boundary {
-                0.
-            } else {
-                (value.im * factor) * scale
-            },
-        );
-        if !result.is_finite() {
-            return Err(failure("FFT spectrum is not finite"));
-        }
-        output(index, result)?;
-    }
-    Ok(())
-}
-
-/// Single-sided complex amplitude spectrum of uniform real samples.
-/// Non-power-of-two lengths are zero padded; amplitude is normalized by
-/// the actual sample count (not the padded length).
-///
+/// Windowed spectrum of uniformly sampled real or complex signals.
 /// # Errors
 /// Invalid scale/vector, nonuniform samples, numerical or resource failure.
 pub fn fft(
     plot: &Plot,
     vectors: &[String],
-    window: SpectrumWindow,
+    settings: SpectrumSettings,
     budget: &mut TransformBudget,
 ) -> SpiceResult<Plot> {
     let columns = vector_columns(plot, vectors)?;
     let axis = time_axis(plot)?;
     let step = uniform_spacing(&axis)?;
     let length = axis.len();
-    let size = length
-        .checked_next_power_of_two()
-        .ok_or_else(|| failure("FFT size overflow"))?;
-    let bins = size / 2 + 1;
+    let size = match settings.length {
+        SpectrumLength::Exact => length,
+        SpectrumLength::Padded => length
+            .checked_next_power_of_two()
+            .ok_or_else(|| failure("FFT size overflow"))?,
+    };
+    let layout = if columns
+        .iter()
+        .any(|&index| !plot.variables()[index].is_real)
+    {
+        SpectrumLayout::Complex
+    } else {
+        SpectrumLayout::Real
+    };
+    let bins = if layout == SpectrumLayout::Real {
+        size / 2 + 1
+    } else {
+        size
+    };
     let width = columns.len() + 1;
     let cells = budget.check_cells(bins, width)?;
-    budget.charge(
-        size.saturating_mul(size.ilog2() as usize + 1)
-            .saturating_mul(columns.len()),
-    )?;
-    let sample_count = real_count(length)?;
-    let span = step * real_count(size)?;
-    let frequency_step = 1. / span;
-    if !frequency_step.is_finite() || frequency_step <= 0. {
-        return Err(failure("invalid FFT frequency spacing"));
-    }
-    let mut weights = allocate::<Real>(length)?;
-    for (index, weight) in weights.iter_mut().enumerate() {
-        *weight = window.weight((real_count(index)? - (sample_count - 1.)) / sample_count);
-    }
-    let plan = Radix2::new(size)?;
-    let mut buffer = allocate::<Complex>(size)?;
+    let work = SpectrumPlan::work_estimate(length, settings.length, columns.len())?;
+    budget.charge(work)?;
+    let plan = SpectrumPlan::new(length, step, layout, settings, work)?;
+    let mut workspace = plan.workspace()?;
+    let mut trace = allocate::<Complex>(length)?;
+    let mut spectrum = allocate::<Complex>(bins)?;
     let mut result = allocate::<Complex>(cells)?;
     for (index, row) in result.chunks_exact_mut(width).enumerate() {
-        let frequency = real_count(index)? * frequency_step;
-        if !frequency.is_finite() {
-            return Err(failure("FFT frequency overflows"));
-        }
-        row[0] = Complex::real(frequency);
+        row[0] = Complex::real(plan.frequency(index)?);
     }
     for (column, source) in columns.iter().copied().enumerate() {
-        let trace = real_trace(plot, source)?;
-        spectrum_trace(&trace, &weights, &plan, &mut buffer, |index, value| {
-            result[index * width + column + 1] = value;
-            Ok(())
-        })?;
+        let values = plot
+            .column_at(source)
+            .ok_or_else(|| failure("missing transform column"))?;
+        for (destination, value) in trace.iter_mut().zip(&values) {
+            *destination = *value;
+        }
+        plan.transform(&trace, &mut workspace, &mut spectrum)?;
+        for (row, &value) in result.chunks_exact_mut(width).zip(&spectrum) {
+            row[column + 1] = value;
+        }
     }
     let mut variables = vec![Variable::new("frequency", "frequency")];
-    variables.extend(columns.iter().map(|&index| {
-        let source = &plot.variables()[index];
-        Variable::complex(source.name.clone(), source.unit.clone())
-    }));
-    Plot::new("spectrum", "Spectrum", PlotFlags::Complex, variables).with_cells(bins, result)
+    let flags = if settings.normalization == SpectrumNormalization::Amplitude {
+        variables.extend(columns.iter().map(|&index| {
+            let source = &plot.variables()[index];
+            Variable::complex(source.name.clone(), source.unit.clone())
+        }));
+        PlotFlags::Complex
+    } else {
+        variables.extend(columns.iter().map(|&index| {
+            let source = &plot.variables()[index];
+            let unit = if settings.normalization == SpectrumNormalization::Power {
+                format!("{}^2", source.unit)
+            } else {
+                format!("{}^2/Hz", source.unit)
+            };
+            Variable::new(source.name.clone(), unit)
+        }));
+        PlotFlags::Real
+    };
+    Plot::new("spectrum", "Spectrum", flags, variables).with_cells(bins, result)
 }
 
 // A vector expression is bound once against the plot's schema and scalar

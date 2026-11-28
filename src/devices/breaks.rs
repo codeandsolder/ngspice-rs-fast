@@ -299,13 +299,14 @@ enum Eligibility {
 
 fn eligibility(waveform: &Waveform) -> Eligibility {
     match waveform {
-        Waveform::Constant(_) | Waveform::Function(_) => Eligibility::Inert,
+        Waveform::Constant(_) | Waveform::Function(_) | Waveform::Prepared(_) => Eligibility::Inert,
         Waveform::PortSeries { baseline, .. } => eligibility(baseline),
         Waveform::Pulse(_) => Eligibility::AtBreakOnly,
         Waveform::Pwl(_)
         | Waveform::Step { .. }
         | Waveform::PulseDefaults(_)
-        | Waveform::FunctionDefaults(_) => Eligibility::EveryAccept,
+        | Waveform::FunctionDefaults(_)
+        | Waveform::Stochastic(_) => Eligibility::EveryAccept,
     }
 }
 
@@ -320,6 +321,7 @@ pub struct SourceBreaks<'a> {
     current: Vec<ActiveSource>,
     /// Positions in the ordered current list checked off-break too.
     current_always: Vec<usize>,
+    exact: Vec<usize>,
 }
 
 impl PartialEq for SourceBreaks<'_> {
@@ -328,6 +330,7 @@ impl PartialEq for SourceBreaks<'_> {
             && self.voltage == other.voltage
             && self.current == other.current
             && self.current_always == other.current_always
+            && self.exact == other.exact
     }
 }
 
@@ -339,7 +342,11 @@ impl<'a> SourceBreaks<'a> {
         let mut voltage = Vec::new();
         let mut current = Vec::new();
         let mut current_always = Vec::new();
+        let mut exact = Vec::new();
         for (index, source) in system.sources.iter().enumerate() {
+            if source.waveform.prepared_base().is_some() {
+                exact.push(index);
+            }
             let eligibility = eligibility(&source.waveform);
             if eligibility == Eligibility::Inert {
                 continue;
@@ -365,7 +372,32 @@ impl<'a> SourceBreaks<'a> {
             voltage,
             current,
             current_always,
+            exact,
         }
+    }
+
+    /// Whether this circuit contains a source with exact event semantics.
+    #[must_use = "the exact-event policy controls the transient stopping condition"]
+    pub const fn has_exact(&self) -> bool {
+        !self.exact.is_empty()
+    }
+
+    /// Next exact prepared-source event after an accepted time. No trial
+    /// consumes the sequence, and native breakpoint coalescing never sees it.
+    /// # Errors
+    /// An unrepresentable periodic event window.
+    pub fn next_exact(&self, now: Real, stop: Real) -> SpiceResult<Option<Real>> {
+        let mut next = None::<Real>;
+        for &index in &self.exact {
+            if let Some(forcing) = self.system.sources[index].waveform.prepared_base()
+                && let Some(event) = forcing
+                    .breakpoints_in(now, stop)?
+                    .find(|event| event.time > now)
+            {
+                next = Some(next.map_or(event.time, |previous| previous.min(event.time)));
+            }
+        }
+        Ok(next)
     }
 
     /// Restart the phases on the same bound system without reallocating.
@@ -447,7 +479,7 @@ impl Request<'_> {
         table: &mut BreakTable,
     ) -> SpiceResult<()> {
         match waveform {
-            Waveform::Constant(_) | Waveform::Function(_) => Ok(()),
+            Waveform::Constant(_) | Waveform::Function(_) | Waveform::Prepared(_) => Ok(()),
             Waveform::PortSeries { baseline, .. } => self.waveform(baseline, break_time, table),
             Waveform::Pulse(pulse) => match self.kind {
                 SourceKind::Voltage => self.vsrc_pulse(pulse, break_time, table),
@@ -457,6 +489,17 @@ impl Request<'_> {
                 self.pwl(pwl.knots(), pwl.delay(), pwl.repeat(), break_time, table)
             }
             Waveform::Step { time, .. } => self.pwl(&[(*time, 0.)], 0., None, break_time, table),
+            Waveform::Stochastic(process) => {
+                let mut events = process.events(self.now, table.final_time)?;
+                while let Some(event) = events.next_event() {
+                    if event.time > self.now {
+                        // One pending event per source; the accept callback
+                        // advances on physical time, never Newton trial count.
+                        return table.set(self.now, event.time);
+                    }
+                }
+                Ok(())
+            }
             Waveform::PulseDefaults(_) | Waveform::FunctionDefaults(_) => Err(SpiceError::circuit(
                 "source defaults are unresolved; bind transient timing before scheduling breakpoints",
             )),

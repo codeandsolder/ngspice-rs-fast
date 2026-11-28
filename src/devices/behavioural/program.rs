@@ -4,9 +4,9 @@
 //! (`PT_mkfnode`, `PTdifferentiate`, `prepare_PTF_PWL`), `ptfuncs.c` (the
 //! function values and domain rules) and `ifeval.c` (`PTeval`). Like ngspice,
 //! the port keeps the parse tree unsimplified, differentiates it symbolically
-//! once per quantity with C's rules and its `mkb`/`mkf` simplifications
-//! (constant folding, the 0/1 identities), and evaluates the value tree and
-//! each derivative with the same operation order as C. Sparse symbolic
+//! once per quantity with analytic rules for the actual value kernels and
+//! constant folding/zero-one identities. The evaluation retains SPICE
+//! value semantics, but does not reproduce inconsistent Jacobians. Sparse symbolic
 //! partials are built directly in an indexed DAG; successful finite results are
 //! reused only within one environment, with lazy branch traversal. That includes the deliberate non-derivatives
 //! (`floor`, comparisons, `u` and `pwl_derivative` are zero or piecewise) and
@@ -23,8 +23,8 @@
 //!   compatibility); `pow()` is the same except `pow(0, b) = 0` (`PTpower`);
 //!   `pwr(a, b) = sign(a) |a|^b`;
 //! - `u(0) = 0.5`; `nint` rounds half to even; `pwl()` extrapolates the end
-//!   segments linearly, and its derivative uses C's ascending-only search
-//!   (`PTpwl_derivative`) even for descending tables.
+//!   segments linearly, and its derivative uses the same selected segment as
+//!   the value, including descending tables.
 //!
 //! Where C silently continues with a NaN (for example `acos(2)`) or an
 //! infinity, the port stops with an explicit numerical error naming the
@@ -40,8 +40,8 @@ use std::sync::Arc;
 use super::xspice::XspicePwl;
 
 mod plan;
-pub(super) use plan::Workspace;
 use plan::{Plan, PlanBuilder, Slot};
+pub(super) use plan::{TaylorEvaluation, Workspace};
 
 /// A circuit quantity an expression reads, in first-use order (C
 /// `mkvnode`/`mkinode` deduplicate them the same way).
@@ -207,10 +207,77 @@ enum Operator {
 /// Two-argument functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Binary {
-    Pow,
-    Pwr,
+    Power(PowerLaw, PowerPart),
     Min,
     Max,
+}
+
+/// Separate numerical laws selected explicitly by the prepared expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PowerLaw {
+    NativePow,
+    NativePwr,
+    SimetrixAbsolute,
+    SimetrixCaret,
+    SimetrixRealPart,
+}
+
+/// Value and the two analytic partials share one typed numerical law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PowerPart {
+    Value,
+    Base,
+    Exponent,
+}
+
+impl PowerPart {
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Value => "",
+            Self::Base => "_base_slope",
+            Self::Exponent => "_exponent_slope",
+        }
+    }
+}
+
+impl PowerLaw {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "pow" => Some(Self::NativePow),
+            "pwr" => Some(Self::NativePwr),
+            "simetrix_abs_pow" => Some(Self::SimetrixAbsolute),
+            "simetrix_caret_pow" => Some(Self::SimetrixCaret),
+            "simetrix_pow" => Some(Self::SimetrixRealPart),
+            _ => None,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NativePow => "pow",
+            Self::NativePwr => "pwr",
+            Self::SimetrixAbsolute => "simetrix_abs_pow",
+            Self::SimetrixCaret => "simetrix_caret_pow",
+            Self::SimetrixRealPart => "simetrix_pow",
+        }
+    }
+
+    fn evaluate(self, part: PowerPart, a: Real, b: Real) -> Real {
+        match self {
+            Self::NativePow | Self::NativePwr => {
+                let signed = self == Self::NativePwr;
+                match part {
+                    PowerPart::Value if signed => pwr(a, b),
+                    PowerPart::Value => power(a, b),
+                    PowerPart::Base => power_base_slope(a, b, signed),
+                    PowerPart::Exponent => power_exponent_slope(a, b, signed),
+                }
+            }
+            Self::SimetrixAbsolute => absolute_power(part, a, b),
+            Self::SimetrixCaret => caret_power(part, a, b),
+            Self::SimetrixRealPart => real_part_power(part, a, b),
+        }
+    }
 }
 
 /// A shared subtree: C shares subtrees between the function and its
@@ -312,7 +379,7 @@ impl Program {
     /// errors), non-literal or non-monotonic `pwl()` points (C:
     /// `prepare_PTF_PWL`), and [`SpiceError::NotYetPorted`] for `ddt()` and
     /// the statistical functions (`agauss`, `gauss`, `aunif`, `unif`,
-    /// `limit`; normally already rejected by the front end). Expressions
+    /// `limit`; must be realized by the front end). Expressions
     /// exceeding the source depth, size or symbolic expansion limits are
     /// explicitly rejected before unbounded work can occur.
     pub fn compile(expr: &BExpr) -> SpiceResult<Self> {
@@ -366,6 +433,22 @@ impl Program {
             value,
             gradient: workspace.into_gradient(),
         })
+    }
+
+    pub(super) fn evaluate_taylor(
+        &self,
+        environment: &Environment<'_>,
+        variables: &[crate::maths::taylor::Jet],
+        time: &crate::maths::taylor::Jet,
+        collect_guards: bool,
+    ) -> SpiceResult<TaylorEvaluation> {
+        if variables.len() != self.quantities.len() {
+            return Err(SpiceError::circuit(
+                "wrong number of behavioural Taylor variables",
+            ));
+        }
+        self.plan
+            .evaluate_taylor(self.root, environment, variables, time, collect_guards)
     }
 
     pub(super) fn evaluate_with_workspace<'w>(
@@ -602,9 +685,17 @@ fn call<'a>(
             boxed(&arguments[1], compiler)?,
         ))
     };
+    if let Some(law) = PowerLaw::from_name(name) {
+        return two(Binary::Power(law, PowerPart::Value), compiler);
+    }
     match name {
-        "pow" => two(Binary::Pow, compiler),
-        "pwr" => two(Binary::Pwr, compiler),
+        "simetrix_abs_pow_product" => {
+            arity(3)?;
+            let factor = boxed(&arguments[0], compiler)?;
+            let base = boxed(&arguments[1], compiler)?;
+            let exponent = boxed(&arguments[2], compiler)?;
+            Ok(absolute_power_product(factor, base, exponent))
+        }
         "min" => two(Binary::Min, compiler),
         "max" => two(Binary::Max, compiler),
         "ternary_fcn" => {
@@ -643,6 +734,29 @@ fn call<'a>(
             format!("no such function '{name}' (src/spicelib/parser/inpptree.c PT_mkfnode)"),
         )),
     }
+}
+
+/// An explicit ordered product of a factor and an absolute-base power.
+/// The source's zero-factor convention only masks a zero-base negative
+/// power; finite products retain the ordinary product-rule Jacobian.
+fn absolute_power_product(factor: Tree, base: Tree, exponent: Tree) -> Node {
+    let zero = Arc::new(Node::Constant(0.));
+    let factor_zero = Arc::new(Node::Unary(Unary::Eq0, Arc::clone(&factor)));
+    let base_zero = Arc::new(Node::Unary(Unary::Eq0, Arc::clone(&base)));
+    let exponent_negative = Arc::new(Node::Unary(Unary::Lt0, Arc::clone(&exponent)));
+    let singular = Arc::new(Node::Ternary(
+        base_zero,
+        exponent_negative,
+        Arc::clone(&zero),
+    ));
+    let masked = Arc::new(Node::Ternary(factor_zero, singular, Arc::clone(&zero)));
+    let power = Arc::new(Node::Binary(
+        Binary::Power(PowerLaw::SimetrixAbsolute, PowerPart::Value),
+        base,
+        exponent,
+    ));
+    let product = Arc::new(Node::Operator(Operator::Times, factor, power));
+    Node::Ternary(masked, zero, product)
 }
 
 fn pwl<'a>(expr: &BExpr, arguments: &'a [BExpr], compiler: &mut Compiler<'a>) -> SpiceResult<Node> {
@@ -705,6 +819,7 @@ impl PwlOrder {
 struct PwlTable {
     points: Vec<(Real, Real)>,
     order: PwlOrder,
+    boundaries: Vec<Real>,
 }
 
 impl PwlTable {
@@ -719,22 +834,46 @@ impl PwlTable {
         } else {
             return None;
         };
-        order.ordered(&points).then_some(Self { points, order })
+        if !order.ordered(&points) {
+            return None;
+        }
+        let mut boundaries: Vec<_> = points[1..points.len() - 1]
+            .iter()
+            .map(|point| point.0)
+            .collect();
+        if matches!(order, PwlOrder::Descending) {
+            boundaries.reverse();
+        }
+        boundaries.dedup_by(|a, b| (*a).partial_cmp(&*b) == Some(std::cmp::Ordering::Equal));
+        Some(Self {
+            points,
+            order,
+            boundaries,
+        })
     }
 
     /// The original C binary search, including extrapolation at both ends.
     /// Preserve its midpoint and strict comparison even for duplicate knots.
     fn segment(&self, arg: Real, order: PwlOrder) -> [(Real, Real); 2] {
+        self.segment_by(|x| order.is_upper(x, arg))
+    }
+
+    fn segment_by(&self, upper_than_arg: impl FnMut(Real) -> bool) -> [(Real, Real); 2] {
+        let lower = self.segment_index_by(upper_than_arg);
+        [self.points[lower], self.points[lower + 1]]
+    }
+
+    fn segment_index_by(&self, mut upper_than_arg: impl FnMut(Real) -> bool) -> usize {
         let (mut lower, mut upper) = (0, self.points.len() - 1);
         while upper - lower > 1 {
             let middle = usize::midpoint(lower, upper);
-            if order.is_upper(self.points[middle].0, arg) {
+            if upper_than_arg(self.points[middle].0) {
                 upper = middle;
             } else {
                 lower = middle;
             }
         }
-        [self.points[lower], self.points[upper]]
+        lower
     }
 
     /// `PTpwl` in the original floating-point operation order.
@@ -743,9 +882,9 @@ impl PwlTable {
         y0 + (y1 - y0) * (arg - x0) / (x1 - x0)
     }
 
-    /// `PTpwl_derivative`: intentionally ignores the table's actual order.
+    /// Derivative of the selected interpolation/extrapolation segment.
     fn slope(&self, arg: Real) -> Real {
-        let [(x0, y0), (x1, y1)] = self.segment(arg, PwlOrder::Ascending);
+        let [(x0, y0), (x1, y1)] = self.segment(arg, self.order);
         (y1 - y0) / (x1 - x0)
     }
 }
@@ -777,6 +916,130 @@ fn power(a: Real, b: Real) -> Real {
 /// `PTpwr` without a compatibility mode.
 fn pwr(a: Real, b: Real) -> Real {
     if a < 0. { -c_pow(-a, b) } else { c_pow(a, b) }
+}
+
+/// Branch-local base derivative of the actual power value kernel.
+/// Ordinary negative bases use the same quasi-integer exponent rule
+/// as the value; signed powers instead differentiate |a|^b with an
+/// even base slope. No absolute-value derivative is substituted for an
+/// ordinary integer power.
+fn power_base_slope(a: Real, b: Real, signed: bool) -> Real {
+    if b == 0. {
+        return 0.;
+    }
+    if a == 0. {
+        return if b > 1. {
+            0.
+        } else if b.to_bits() == 1_f64.to_bits() {
+            1.
+        } else {
+            Real::INFINITY
+        };
+    }
+    if signed {
+        return b * c_pow(a.abs(), b - 1.);
+    }
+    if a > 0. {
+        return b * c_pow(a, b - 1.);
+    }
+    if almost_equal_ulps(b.round_ties_even(), b, 10) {
+        let exponent = b.round();
+        exponent * c_pow(a, exponent - 1.)
+    } else {
+        0.
+    }
+}
+
+/// Partial with respect to the exponent. For ordinary negative bases
+/// the value kernel is locally constant in each exponent branch
+/// (rounded integer or zero); its branch-local partial is zero.
+/// At a branch boundary no unique derivative exists.
+fn power_exponent_slope(a: Real, b: Real, signed: bool) -> Real {
+    if a == 0. || (!signed && a < 0.) {
+        0.
+    } else if signed {
+        pwr(a, b) * a.abs().ln()
+    } else {
+        power(a, b) * a.ln()
+    }
+}
+
+/// Source absolute-base law: both PWR and **, with the measured zero-base
+/// Jacobian. Singular negative powers remain errors outside an explicit
+/// ordered zero-factor product.
+fn absolute_power(part: PowerPart, a: Real, b: Real) -> Real {
+    if a == 0. {
+        if b < 0. {
+            return Real::INFINITY;
+        }
+        return if part == PowerPart::Value && b == 0. {
+            1.
+        } else {
+            0.
+        };
+    }
+    let magnitude = a.abs();
+    match part {
+        PowerPart::Value => c_pow(magnitude, b),
+        PowerPart::Base if b == 0. => 0.,
+        PowerPart::Base => a.signum() * b * c_pow(magnitude, b - 1.),
+        PowerPart::Exponent => c_pow(magnitude, b) * magnitude.ln(),
+    }
+}
+
+/// Source caret law. Negative fractional bases are outside its real domain.
+/// The separately measured primal, base-slope and log floors at zero are
+/// intentionally not shared with the absolute-base or complex-real laws.
+fn caret_power(part: PowerPart, a: Real, b: Real) -> Real {
+    let integral = b.fract() == 0.;
+    if a < 0. && !integral {
+        return Real::NAN;
+    }
+    let value = || {
+        if a == 0. && !integral && b > 0. {
+            c_pow(1e-308, b)
+        } else {
+            c_pow(a, b)
+        }
+    };
+    match part {
+        PowerPart::Value => value(),
+        PowerPart::Base if b == 0. => 0.,
+        PowerPart::Base if a == 0. && b > 1. => 0.,
+        PowerPart::Base if a == 0. => b * c_pow(1e-200, b - 1.),
+        PowerPart::Base => b * c_pow(a, b - 1.),
+        PowerPart::Exponent => value() * a.max(1e-100).ln(),
+    }
+}
+
+/// The real component of a principal complex power. The exact integer
+/// branches preserve signs without trigonometric roundoff.
+fn real_part_power(part: PowerPart, a: Real, b: Real) -> Real {
+    if a == 0. {
+        return match part {
+            PowerPart::Value => c_pow(a, b),
+            PowerPart::Base if b == 0. || b > 1. => 0.,
+            PowerPart::Base => b * c_pow(1e-200, b - 1.),
+            PowerPart::Exponent if b > 0. => 0.,
+            PowerPart::Exponent => c_pow(a, b) * 1e-100_f64.ln(),
+        };
+    }
+    let magnitude = a.abs();
+    let (sin, cos) = if a > 0. {
+        (0., 1.)
+    } else if b.fract() == 0. {
+        (0., if b.rem_euclid(2.) == 0. { 1. } else { -1. })
+    } else {
+        (core::f64::consts::PI * b.rem_euclid(2.)).sin_cos()
+    };
+    match part {
+        PowerPart::Value => c_pow(magnitude, b) * cos,
+        PowerPart::Base if b == 0. => 0.,
+        PowerPart::Base => a.signum() * b * c_pow(magnitude, b - 1.) * cos,
+        PowerPart::Exponent => {
+            c_pow(magnitude, b) * magnitude.ln().mul_add(cos, -core::f64::consts::PI * sin)
+        }
+    }
 }
 
 /// C's `MODULUS(x, limit)`: `x - (int)(x / limit) * limit` (the `int`
@@ -1033,7 +1296,7 @@ mod tests {
         let descending = PwlTable::new(vec![(3., 5.), (1., 1.), (0., 0.)]).unwrap();
         assert_eq!(descending.value(2.), 3.);
         assert_eq!(ascending.slope(2.), 2.);
-        assert_eq!(descending.slope(2.), 1.);
+        assert_eq!(descending.slope(2.), 2.);
 
         let duplicate = PwlTable::new(vec![(0., 0.), (1., 1.), (1., 2.), (2., 5.)]).unwrap();
         assert_eq!(duplicate.value(1.), 2.);

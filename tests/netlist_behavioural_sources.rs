@@ -287,26 +287,30 @@ fn resolution_errors_name_their_cause() {
 }
 
 #[test]
-fn statistical_functions_are_not_yet_ported_at_their_call() {
-    // C's inp.c eval_agauss() replaces these by a drawn value before parsing
-    // a B line (and E/G VALUE lines become B lines first).
-    for (body, column) in [
-        ("b1 o 0 v=agauss(1,0.1,3)*v(1)", 10),
-        ("b1 o 0 v=2*gauss(1,0.1,3)", 12),
-        ("b1 o 0 i=aunif(1,0.1)*1m", 10),
-        ("e1 o 0 value={unif(1,0.1)*v(1)}", 15),
-        ("g1 o 0 value={limit(1,0.1)*v(1)}", 15),
+fn statistical_functions_are_realized_before_compiling_the_behavioural_law() {
+    for body in [
+        "b1 o 0 v=agauss(1,0.1,3)*v(1)",
+        "b1 o 0 v=2*gauss(1,0.1,3)",
+        "b1 o 0 i=aunif(1,0.1)*1m",
+        "e1 o 0 value={unif(1,0.1)*v(1)}",
+        "g1 o 0 value={limit(1,0.1)*v(1)}",
     ] {
-        let netlist = lower_nonlinear_sources(&parse(body)).unwrap();
-        let error = literalize(&netlist).unwrap_err();
-        assert!(error.is_not_yet_ported(), "{body}: {error}");
-        let text = error.to_string();
-        assert!(
-            text.contains(&format!("in.cir:2:{column}:")),
-            "{body}: {text}"
-        );
-        assert!(text.contains("src/frontend/inp.c (eval_agauss)"), "{text}");
+        let source = lower_nonlinear_sources(&parse(body)).unwrap();
+        let netlist = literalize(&source).unwrap().netlist;
+        for instance in &netlist.devices {
+            for parameter in &instance.parameters {
+                if let ParameterKind::Behavioural(expression) = &parameter.kind {
+                    expression.root.visit(&mut |node| {
+                        assert!(!matches!(&node.kind,BExprKind::Call{name,..} if ngspice_rs::netlist::bexpr::STATISTICAL_FUNCTIONS.contains(&name.as_str())));
+                    });
+                }
+            }
+        }
     }
+    let error = literalize(&parse("b1 o 0 v=agauss(v(1),0.1,3)"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("static arguments"), "{error}");
     // A user .func of the same name is expanded first, as in C.
     let netlist = resolved(".func agauss(a,b,c) {a*2}\nb1 o 0 v=agauss(1,0.1,3)*v(x)");
     assert_eq!(
@@ -388,8 +392,8 @@ fn table_forms_lower_onto_the_xspice_pwl_transfer() {
 #[test]
 fn poly_forms_lower_onto_spice2poly_in_spice2_term_order() {
     let netlist = lowered("e1 o 0 poly(2) a 0 b 0 1 2 3 4 5 6\nf1 0 p poly(1) vx 0 2 m=3");
-    assert_eq!(netlist.devices[0].name, "a$poly$e1");
-    assert_eq!(netlist.devices[0].designator, 'a');
+    assert_eq!(netlist.devices[0].name, "e1");
+    assert_eq!(netlist.devices[0].designator, 'e');
     assert_eq!(netlist.devices[0].nodes, ["o", "0"]);
     let v = expression(&netlist.devices[0], "v");
     assert_eq!(
@@ -435,76 +439,24 @@ fn poly_dimensions_use_one_validation_rule_across_frontend() {
 }
 
 #[test]
-fn measurement_rewrite_preserves_global_serials_and_scope_boundaries() {
+fn nonlinear_lowering_preserves_unresolved_probe_names_and_scope_boundaries() {
     let result = lowered(
         "r1 a 0 1k\nb1 out 0 v=i(r1)+i(r1)\n.subckt child a\nr1 a 0 2k\nb1 out 0 v=i(r1)\n.ends\nr2 b 0 2k\nb2 p 0 v=i(r2)+i(r1)+i(r2)",
     );
+    assert_eq!(result.devices.len(), 4);
+    assert_eq!(result.subcircuits[0].devices.len(), 2);
+    assert_eq!(result.devices[0].nodes[0], "a");
     assert_eq!(
-        result
-            .devices
-            .iter()
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>(),
-        ["r1", "v_r1", "b1", "r2", "v_r2", "b2"]
-    );
-    assert_eq!(result.devices[0].nodes[0], "a_vmeas_0");
-    assert_eq!(result.devices[3].nodes[0], "b_vmeas_3");
-    assert_eq!(result.devices[1].nodes, ["a", "a_vmeas_0"]);
-    assert_eq!(result.devices[4].nodes, ["b", "b_vmeas_3"]);
-    assert_eq!(result.subcircuits[0].devices[0].nodes[0], "a_vmeas_2");
-    assert_eq!(result.subcircuits[0].devices[1].name, "v_r1");
-    assert_eq!(
-        expression(&result.devices[5], "v")
+        expression(&result.devices[3], "v")
             .root
             .current_references(),
-        ["v_r2", "v_r1", "v_r2"]
-    );
-}
-
-#[test]
-fn measurement_rewrite_handles_many_independent_references() {
-    use std::fmt::Write as _;
-    let mut body = String::new();
-    for index in 0..512 {
-        writeln!(body, "r{index} n{index} 0 1k").unwrap();
-        writeln!(body, "b{index} out{index} 0 v=i(r{index})+i(r{index})").unwrap();
-    }
-    let result = lowered(&body);
-    assert_eq!(result.devices.len(), 3 * 512);
-    for (index, devices) in result.devices.as_chunks::<3>().0.iter().enumerate() {
-        assert_eq!(devices[0].nodes[0], format!("n{index}_vmeas_{}", 2 * index));
-        assert_eq!(devices[1].name, format!("v_r{index}"));
-        let reference = format!("v_r{index}");
-        assert_eq!(
-            expression(&devices[2], "v").root.current_references(),
-            [reference.as_str(), reference.as_str()]
-        );
-    }
-}
-
-#[test]
-fn current_references_insert_measurement_sources_like_inp_meas_current() {
-    let netlist = lowered(
-        "b1 o 0 v=1\nb2 p 0 v=i(b1)*2 + i(b1)\nb3 q 0 v=max(1,i(b1))\n\
-         e1 r 0 a 0 2\nb4 s 0 v=i(e1) + i(vx)",
-    );
-    let lines = summary(&netlist);
-    // Both i(b1) of b2 become i(v_b1); b1's first node moves to o_vmeas_0
-    // behind one zero-volt source (the serial still counts both).
-    assert_eq!(lines[0], "b1 o_vmeas_0 0 [v=1]");
-    assert_eq!(lines[1], "v_b1 o o_vmeas_0 [dc=0]");
-    assert_eq!(
-        shape(&expression(&netlist.devices[2], "v").root),
-        "((i(v_b1) * 2) + i(v_b1))"
-    );
-    // After a comma C does not rewrite; a simple E and a V keep theirs.
-    assert_eq!(
-        shape(&expression(&netlist.devices[3], "v").root),
-        "max[1,i(b1)]"
+        ["r2", "r1", "r2"]
     );
     assert_eq!(
-        shape(&expression(&netlist.devices[5], "v").root),
-        "(i(e1) + i(vx))"
+        expression(&result.subcircuits[0].devices[1], "v")
+            .root
+            .current_references(),
+        ["r1"]
     );
 }
 
@@ -569,40 +521,13 @@ fn malformed_nonlinear_shapes_are_rejected_by_both_writer_and_lowering() {
 }
 
 #[test]
-fn repeated_duplicate_targets_advance_serial_without_reinsertion() {
-    let deck = lowered(
-        "r1 a 0 1k\nr1 b 0 2k\nb1 out 0 v=i(r1)+i(r1)\n\
-         e1 e 0 value={i(r1)}\nb2 z 0 v=i(e1)\nr2 c 0 3k\nb3 out2 0 v=i(r2)",
+fn duplicate_targets_are_rejected_at_physical_elaboration() {
+    let input = parse("r1 a 0 1k\nr1 b 0 2k\nb1 out 0 v=i(r1)");
+    let error = ngspice_rs::devices::Circuit::from_netlist(&input).unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate instance name"),
+        "{error}"
     );
-    let lines = summary(&deck);
-    assert_eq!(lines[0], "r1 a_vmeas_0 0 [resistance=1k]");
-    assert_eq!(lines[1], "v_r1 a a_vmeas_0 [dc=0]");
-    assert_eq!(lines[2], "r1 b_vmeas_1 0 [resistance=2k]");
-    assert_eq!(
-        expression(&deck.devices[3], "v").root.current_references(),
-        ["v_r1", "v_r1"]
-    );
-    // Lowering a measured nonlinear E must put its own expansion before
-    // the sense source, with the same measured first terminal.
-    assert_eq!(lines[4], "e1 e_vmeas_6 0 e1_int1 0 [gain=1]");
-    assert_eq!(lines[5], "be1 e1_int1 0 [v={i(r1)}]");
-    assert_eq!(lines[6], "v_e1 e e_vmeas_6 [dc=0]");
-    assert_eq!(lines[8], "r2 c_vmeas_7 0 [resistance=3k]");
-    assert_eq!(lines[9], "v_r2 c c_vmeas_7 [dc=0]");
-}
-
-#[test]
-fn generated_instance_names_do_not_silently_overwrite_existing_devices() {
-    let input = parse("r1 a 0 1k\nv_r1 a 0 0\nb1 out 0 v=i(r1)");
-    let lowered = lower_nonlinear_sources(&input).unwrap();
-    assert_eq!(
-        lowered.devices.iter().filter(|d| d.name == "v_r1").count(),
-        2
-    );
-    let Err(err) = ngspice_rs::devices::Circuit::from_netlist(&input) else {
-        panic!("generated device name collision");
-    };
-    assert!(err.to_string().contains("duplicate instance name"), "{err}");
 }
 
 #[test]
@@ -618,17 +543,13 @@ fn behavioural_expression_and_setters_use_separate_physical_and_logical_offsets(
 }
 
 #[test]
-fn folded_current_references_use_logical_offsets_for_the_c_rewrite() {
+fn folded_current_references_survive_controlled_source_lowering() {
     let netlist =
-        lowered("r1 a 0 1k\nr2 b 0 1k\nb1 out 0 v=max(1,\n* comment\n    + i(r1)) +\n + i(r2)");
-    // The first reference follows a comma inside a call and remains unchanged.
-    // The second follows an arithmetic operator and inserts a sense source.
-    assert!(!netlist.devices.iter().any(|d| d.name == "v_r1"));
-    assert!(netlist.devices.iter().any(|d| d.name == "v_r2"));
-    let source = netlist.devices.iter().find(|d| d.name == "b1").unwrap();
+        lowered("r1 a 0 1k\nr2 b 0 1k\ne1 out 0 value={max(1,\n* comment\n + i(r1)) +\n + i(r2)}");
+    let source = netlist.devices.iter().find(|d| d.name == "be1").unwrap();
     assert_eq!(
         expression(source, "v").root.current_references(),
-        ["r1", "v_r2"]
+        ["r1", "r2"]
     );
 }
 

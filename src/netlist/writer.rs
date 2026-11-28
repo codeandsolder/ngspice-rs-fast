@@ -107,10 +107,10 @@ use std::io::{self, Write};
 use crate::primitives::{AnalysisKind, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
 use crate::netlist::ast::{
-    AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
-    Netlist, NodeHintCard, NodeHintValue, OptionCard, ParamCard, ParameterAssignment,
-    ParameterKind, PositionedValue, ScopeEntry, ScopeView, ScopedCardKind, SourceWaveform,
-    Subcircuit,
+    AnalysisCard, CodePortKind, DeviceInstance, FuncCard, FuncSpelling, GlobalCard,
+    IncludeDirective, ModelCard, Netlist, NodeHintCard, NodeHintValue, NumericVectorEntry,
+    OptionCard, ParamCard, ParameterAssignment, ParameterKind, PositionedValue, ScopeEntry,
+    ScopeView, ScopedCardKind, SourceWaveform, Subcircuit,
 };
 use crate::netlist::behavioural::forms::{
     B_SETTERS, NonlinearForm, PolyControls, PolyForm, TableForm, TableInput,
@@ -174,6 +174,12 @@ pub fn write_netlist_to(
     sink: &mut dyn Write,
     limits: WriteLimits,
 ) -> SpiceResult<()> {
+    if netlist.prepared_initialization.is_some() {
+        return Err(refuse(
+            "prepared initial conditions require their typed metadata, not native deck serialization",
+            Some(&netlist.location),
+        ));
+    }
     if netlist.title.contains(['\n', '\r']) || netlist.title != netlist.title.trim_end() {
         return Err(refuse(
             "the title must be one line without trailing whitespace",
@@ -775,29 +781,7 @@ impl Writer<'_> {
     fn model(&mut self, model: &ModelCard, depth: usize) -> SpiceResult<()> {
         let location = &model.location;
         let base = model.base.as_str();
-        if !matches!(
-            base,
-            "d" | "npn"
-                | "pnp"
-                | "nmos"
-                | "pmos"
-                | "r"
-                | "res"
-                | "c"
-                | "l"
-                | "sw"
-                | "csw"
-                | "njf"
-                | "pjf"
-                | "urc"
-                | "ltra"
-                | "txl"
-                | "nmf"
-                | "pmf"
-                // `inpdomod.c`'s HFET spellings of the same families.
-                | "nhfet"
-                | "phfet"
-        ) {
+        if crate::devices::ModelFamily::from_base(base).is_none() {
             return Err(refuse(
                 format!("model type {base:?} is outside the supported syntax"),
                 Some(location),
@@ -815,6 +799,21 @@ impl Writer<'_> {
                 parts.push(' ')?;
             }
             match &parameter.kind {
+                ParameterKind::NumericVector(entries)
+                    if matches!(base, "cpl" | "cpllines")
+                        && ["r", "l", "g", "c"].contains(&parameter.name.as_str()) =>
+                {
+                    append_cpl_material(&mut parts, parameter, entries)?;
+                }
+                ParameterKind::NumericVector(entries)
+                    if crate::devices::code_model::source::SourceModel::from_base(base)
+                        .and_then(|schema| schema.parameter(&parameter.name))
+                        .is_some_and(
+                            crate::devices::code_model::source::ParameterShape::vector,
+                        ) =>
+                {
+                    append_transfer_vector(&mut parts, parameter, entries)?;
+                }
                 ParameterKind::Flag => {
                     let allowed = model_flags(base);
                     if !allowed.contains(&parameter.name.as_str()) || !parameter.value.is_empty() {
@@ -890,6 +889,10 @@ impl Writer<'_> {
             return self.finish_card(depth, location);
         }
         parts.word(node(&parts, &device.name, location)?)?;
+        if designator == 'a' {
+            code_model_ports(device, &mut parts)?;
+            return self.finish_card(depth, location);
+        }
         let setters = device_prefix(device, &mut parts)?;
         match designator {
             'r' | 'c' | 'l' => passive_parameters(device, &mut parts)?,
@@ -900,6 +903,22 @@ impl Writer<'_> {
             't' => tline_parameters(device, &mut parts)?,
             'o' => ltra_parameters(device, &mut parts)?,
             'u' => urc_parameters(device, &mut parts)?,
+            'p' => {
+                for parameter in &device.parameters {
+                    if parameter.name != "length"
+                        || !matches!(
+                            parameter.kind,
+                            ParameterKind::Scalar | ParameterKind::Expression(_)
+                        )
+                    {
+                        return Err(refuse(
+                            "P/CPL instance only accepts length=",
+                            Some(&parameter.location),
+                        ));
+                    }
+                    named_value(&mut parts, parameter, false)?;
+                }
+            }
             'y' => {
                 for p in &device.parameters {
                     if p.name != "len"
@@ -927,6 +946,7 @@ fn model_flags(base: &str) -> &'static [&'static str] {
         "npn" | "pnp" => &["npn", "pnp"],
         "nmos" | "pmos" => &["nmos", "pmos"],
         "sw" => &["sw"],
+        "ltspice_switch" => &["oneway"],
         "csw" => &["csw"],
         "njf" | "pjf" => &["njf", "pjf"],
         "urc" => &["urc"],
@@ -948,6 +968,81 @@ fn model_flags(base: &str) -> &'static [&'static str] {
 }
 
 // Write and validate the common positional device fields before its setters.
+/// Write ordered typed scalar/vector ports, retaining type changes within
+/// vectors. Internal lowered A cards remain unrepresentable.
+fn code_model_ports(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
+    let location = &device.location;
+    if device.code_ports.is_empty() || !device.nodes.is_empty() || !device.parameters.is_empty() {
+        return Err(refuse(
+            "expected ordered typed A-instance ports",
+            Some(location),
+        ));
+    }
+    for port in &device.code_ports {
+        if port.terminals.is_empty() || (!port.vector && port.terminals.len() != 1) {
+            return Err(refuse(
+                "invalid A-instance port cardinality",
+                Some(location),
+            ));
+        }
+        let mut kind = port.terminals[0].kind;
+        if let Some(marker) = kind.marker() {
+            parts.word(marker)?;
+        }
+        if port.vector {
+            parts.word("[")?;
+        } else if kind.marker().is_some() {
+            parts.push('(')?;
+        }
+        for terminal in &port.terminals {
+            if terminal.kind != kind {
+                let marker = terminal.kind.marker().ok_or_else(|| {
+                    refuse(
+                        "unresolved type change inside A-instance vector",
+                        Some(location),
+                    )
+                })?;
+                parts.word(marker)?;
+                kind = terminal.kind;
+            }
+            if terminal.negative.is_some() != kind.differential()
+                || (terminal.inverted
+                    && !matches!(kind, CodePortKind::Digital | CodePortKind::Default))
+            {
+                return Err(refuse("invalid A-instance terminal", Some(location)));
+            }
+            if terminal.inverted {
+                parts.word("~")?;
+            }
+            parts.word(code_port_name(parts, &terminal.positive, location)?)?;
+            if let Some(negative) = &terminal.negative {
+                parts.word(code_port_name(parts, negative, location)?)?;
+            }
+        }
+        if port.vector {
+            parts.word("]")?;
+        } else if kind.marker().is_some() {
+            parts.push(')')?;
+        }
+    }
+    let model = device
+        .model
+        .as_deref()
+        .ok_or_else(|| refuse("A instance needs a declared model", Some(location)))?;
+    parts.word(code_port_name(parts, model, location)?)
+}
+
+fn code_port_name<'a>(
+    parts: &Card<'_>,
+    value: &'a str,
+    location: &SourceLoc,
+) -> SpiceResult<&'a str> {
+    if value.starts_with('%') || value.contains(['[', ']', '~']) {
+        return Err(refuse("invalid A-instance name", Some(location)));
+    }
+    node(parts, value, location)
+}
+
 fn device_prefix<'a>(
     device: &'a DeviceInstance,
     parts: &mut Card<'_>,
@@ -961,6 +1056,7 @@ fn device_prefix<'a>(
         'm' | 'e' | 'g' | 's' | 't' | 'o' | 'y' => count == 4,
         'j' | 'u' | 'z' => count == 3,
         'x' => true,
+        'p' => count >= 4 && count % 2 == 0,
         'k' => count == 0,
         _ => {
             return Err(refuse(
@@ -1000,7 +1096,7 @@ fn device_prefix<'a>(
         ('v' | 'i' | 'e'..='h' | 'k' | 't', Some(_)) => {
             return Err(refuse("source with a model", Some(location)));
         }
-        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y', None) => {
+        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y' | 'p', None) => {
             return Err(refuse("device without a model/target", Some(location)));
         }
         (_, Some(model)) => {
@@ -1202,6 +1298,56 @@ fn value_text<'a>(
     Ok(&parameter.value)
 }
 
+/// Write a transfer coefficient or initial-condition vector without
+/// losing numeric expressions or source spelling.
+fn append_transfer_vector(
+    parts: &mut Card<'_>,
+    parameter: &ParameterAssignment,
+    entries: &[crate::netlist::ast::NumericVectorEntry],
+) -> SpiceResult<()> {
+    parts.push_str(&parameter.name)?;
+    parts.push_str("=[")?;
+    for (index, entry) in entries.iter().enumerate() {
+        if index != 0 {
+            parts.push(' ')?;
+        }
+        append_vector_entry(parts, entry)?;
+    }
+    parts.push(']')?;
+    Ok(())
+}
+
+/// Write the evaluated independent CPL vector coefficients as ordinary
+/// numeric tokens, retaining physical scale suffixes and rejecting injection.
+fn append_cpl_material(
+    parts: &mut Card<'_>,
+    parameter: &ParameterAssignment,
+    entries: &[crate::netlist::ast::NumericVectorEntry],
+) -> SpiceResult<()> {
+    parts.push_str(&parameter.name)?;
+    parts.push('=')?;
+    for (position, entry) in entries.iter().enumerate() {
+        if position != 0 {
+            parts.push(' ')?;
+        }
+        match single_token(&entry.source.text, &entry.source.location) {
+            Some(Lexeme {
+                kind: TokenKind::Number(value),
+                ..
+            }) if value.is_finite() => {
+                parts.push_str(&entry.source.text)?;
+            }
+            _ => {
+                return Err(refuse(
+                    "CPL vector coefficient must be a finite literal",
+                    Some(&entry.source.location),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn append_named_value(
     parts: &mut Card<'_>,
     parameter: &ParameterAssignment,
@@ -1285,6 +1431,7 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceRes
         (_, "temp" | "dtemp" | "m" | "tc1" | "tc2" | "scale")
         | ('r' | 'c', "w" | "l" | "bv_max")
         | ('r', "ac" | "tc" | "tce" | "noisy")
+        | ('c', "charge")
         | ('c' | 'l', "ic")
         | ('l', "nt") => true,
         (_, name) => name == primary,
@@ -1297,7 +1444,12 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceRes
             ));
         }
     }
-    if device.model.is_none() && !device.parameters.iter().any(|p| p.name == primary) {
+    if device.model.is_none()
+        && !device
+            .parameters
+            .iter()
+            .any(|p| p.name == primary || (designator == 'c' && p.name == "charge"))
+    {
         return Err(refuse(
             format!("model-less '{designator}' instance without {primary}"),
             Some(&device.location),
@@ -1309,7 +1461,23 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceRes
             .first()
             .is_some_and(|parameter| parameter.name == primary);
     for (index, parameter) in device.parameters.iter().enumerate() {
-        if positional && index == 0 {
+        if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
+            if parameter.name != primary && !(designator == 'c' && parameter.name == "charge") {
+                return Err(refuse(
+                    "invalid behavioural passive setter",
+                    Some(&parameter.location),
+                ));
+            }
+            let text = behavioural_text(parts, parameter)?;
+            parts.push(' ')?;
+            parts.push_str(if parameter.name == "charge" {
+                "q"
+            } else {
+                primary
+            })?;
+            parts.push('=')?;
+            parts.push_str(text)?;
+        } else if positional && index == 0 {
             parts.word(value_text(parts, parameter, false)?)?;
         } else {
             named_value(parts, parameter, false)?;
@@ -1776,6 +1944,40 @@ fn source_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResu
     Ok(())
 }
 
+fn append_vector_entry(parts: &mut Card<'_>, entry: &NumericVectorEntry) -> SpiceResult<()> {
+    if let Some(expression) = &entry.expression {
+        check_value_expression(
+            parts,
+            &entry.source.text,
+            expression,
+            &entry.source.location,
+        )?;
+        parts.push_str(&entry.source.text)
+    } else {
+        parts.push_str(positioned_number(
+            parts,
+            &entry.source,
+            &entry.source.location,
+        )?)
+    }
+}
+
+fn waveform_vector_text<'a>(
+    parts: &mut Card<'_>,
+    keyword: &str,
+    fields: impl IntoIterator<Item = &'a NumericVectorEntry>,
+) -> SpiceResult<()> {
+    parts.word(keyword)?;
+    parts.push('(')?;
+    for (index, entry) in fields.into_iter().enumerate() {
+        if index != 0 {
+            parts.push(' ')?;
+        }
+        append_vector_entry(parts, entry)?;
+    }
+    parts.push(')')
+}
+
 fn waveform_text(
     parts: &mut Card<'_>,
     waveform: &SourceWaveform,
@@ -1811,26 +2013,22 @@ fn waveform_text(
                     ));
                 }
             }
-            numeric_vector_text(
+            waveform_vector_text(
                 parts,
                 keyword,
                 [&pulse.initial, &pulse.pulsed]
                     .into_iter()
                     .chain(optional.into_iter().filter_map(Option::as_ref)),
-                ' ',
-                location,
             )
         }
         SourceWaveform::Pwl(points) => {
             if points.is_empty() || points.len() > kind.maximum_fields() / 2 {
                 return Err(refuse("PWL needs 1 to 2048 points", Some(location)));
             }
-            numeric_vector_text(
+            waveform_vector_text(
                 parts,
                 keyword,
                 points.iter().flat_map(|p| [&p.time, &p.value]),
-                ' ',
-                location,
             )
         }
         SourceWaveform::Function(function) => {
@@ -1844,7 +2042,17 @@ fn waveform_text(
                     Some(location),
                 ));
             }
-            numeric_vector_text(parts, keyword, &function.values, ' ', location)
+            waveform_vector_text(parts, keyword, &function.values)
+        }
+        SourceWaveform::Stochastic { values, .. } => {
+            let maximum = kind.maximum_fields();
+            if !(2..=maximum).contains(&values.len()) {
+                return Err(refuse(
+                    format!("{keyword} requires 2 to {maximum} fields"),
+                    Some(location),
+                ));
+            }
+            waveform_vector_text(parts, keyword, values)
         }
     }
 }

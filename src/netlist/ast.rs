@@ -83,6 +83,10 @@ pub enum ParameterKind {
     /// syntax tree and spans. Scalar consumers must treat this like any other
     /// non-scalar kind until an evaluation pass resolves it.
     Expression(Box<crate::netlist::expr::ParameterExpression>),
+    /// A numeric vector setter such as a CPL upper-triangle R/L/G/C array.
+    /// Components have separate positions and optional expressions, all
+    /// resolved by elaboration before device material preparation.
+    NumericVector(Vec<NumericVectorEntry>),
     /// A bare `IF_FLAG` keyword: C's `INPgetValue` supplies integer 1 without
     /// consuming a value. Explicit `flag=0`/`flag=1` forms are not accepted.
     Flag,
@@ -106,10 +110,20 @@ pub enum ParameterKind {
     Behavioural(Box<crate::netlist::bexpr::BehaviouralExpression>),
 }
 
-/// One finite textual waveform/IC value and its byte-column position.
+/// A separately positioned numeric vector entry, possibly containing an
+/// unevaluated formal/numparam expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NumericVectorEntry {
+    /// The physical source token and its location.
+    pub source: PositionedValue,
+    /// An optional expression to be evaluated by netlist elaboration.
+    pub expression: Option<Box<crate::netlist::expr::ParameterExpression>>,
+}
+
+/// One numeric or expression source token and its byte-column position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionedValue {
-    /// Original numeric spelling, including scale/unit suffixes.
+    /// Original token spelling, including scale/unit suffixes or expression delimiters.
     pub text: String,
     /// Physical source location, with a 1-based UTF-8 byte column.
     pub location: SourceLoc,
@@ -129,7 +143,7 @@ pub struct InitialCondition {
 ///
 /// PWL `td=`/`r=` are separate ordered scalar setters (`VSRC_TD`/`VSRC_R` in
 /// `vsrc.c`), not part of this value, exactly as C applies them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SourceWaveform {
     /// Two required levels and up to six optional fields.
     Pulse(Box<PulseWaveform>),
@@ -137,6 +151,40 @@ pub enum SourceWaveform {
     Pwl(Vec<PwlPoint>),
     /// SIN/EXP/SFFM/AM: two required fields and a bounded optional prefix.
     Function(Box<FunctionWaveform>),
+    /// TRNOISE/TRRANDOM: immutable typed numeric field vectors.
+    Stochastic {
+        /// Noise law selected by the upstream waveform name.
+        function: StochasticFunction,
+        /// Two required fields and a contiguous optional prefix.
+        values: Vec<NumericVectorEntry>,
+    },
+}
+
+/// Upstream time-domain stochastic-source waveform families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StochasticFunction {
+    /// TRNOISE(NA TS [NALPHA [NAMP [RTSAM [RTSCAPT [RTSEMT]]]]]).
+    Noise,
+    /// TRRANDOM(TYPE TS [TD [PARAM1 [PARAM2]]]).
+    Random,
+}
+impl StochasticFunction {
+    /// Number and name of all fields in upstream order.
+    #[must_use = "the field list defines stochastic coefficient ordering and arity"]
+    pub const fn fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Noise => &["na", "ts", "nalpha", "namp", "rtsam", "rtscapt", "rtsemt"],
+            Self::Random => &["type", "ts", "td", "param1", "param2"],
+        }
+    }
+    /// Original ngspice waveform keyword.
+    #[must_use = "the keyword identifies the original stochastic source syntax"]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Noise => "trnoise",
+            Self::Random => "trrandom",
+        }
+    }
 }
 
 /// Shared lexical classification for parsing and serializing waveform
@@ -146,6 +194,7 @@ pub(crate) enum WaveformKind {
     Pulse,
     Pwl,
     Function(SourceFunction),
+    Stochastic(StochasticFunction),
 }
 
 impl WaveformKind {
@@ -158,6 +207,8 @@ impl WaveformKind {
             ("exp", Self::Function(SourceFunction::Exp)),
             ("sffm", Self::Function(SourceFunction::Sffm)),
             ("am", Self::Function(SourceFunction::Am)),
+            ("trnoise", Self::Stochastic(StochasticFunction::Noise)),
+            ("trrandom", Self::Stochastic(StochasticFunction::Random)),
         ]
         .into_iter()
         .find_map(|(name, kind)| keyword.eq_ignore_ascii_case(name).then_some(kind))
@@ -168,6 +219,7 @@ impl WaveformKind {
             Self::Pulse => 8,
             Self::Pwl => 4096,
             Self::Function(function) => function.fields().len(),
+            Self::Stochastic(function) => function.fields().len(),
         }
     }
 
@@ -178,16 +230,46 @@ impl WaveformKind {
             Self::Pwl => "pwl",
             Self::Function(SourceFunction::Sin) if spelling == "sine" => "sine",
             Self::Function(function) => function.keyword(),
+            Self::Stochastic(function) => function.keyword(),
         }
     }
 }
 
 impl SourceWaveform {
+    /// Visit supplied coefficients in physical setter order, including PWL
+    /// time/value pairs. Omitted trailing fields never become sites.
+    pub(super) fn coefficients_mut(&mut self) -> Vec<&mut NumericVectorEntry> {
+        match self {
+            Self::Pulse(pulse) => [&mut pulse.initial, &mut pulse.pulsed]
+                .into_iter()
+                .chain(
+                    [
+                        &mut pulse.delay,
+                        &mut pulse.rise,
+                        &mut pulse.fall,
+                        &mut pulse.width,
+                        &mut pulse.period,
+                        &mut pulse.count,
+                    ]
+                    .into_iter()
+                    .filter_map(Option::as_mut),
+                )
+                .collect(),
+            Self::Pwl(points) => points
+                .iter_mut()
+                .flat_map(|p| [&mut p.time, &mut p.value])
+                .collect(),
+            Self::Function(function) => function.values.iter_mut().collect(),
+            Self::Stochastic { values, .. } => values.iter_mut().collect(),
+        }
+    }
+
     pub(crate) fn kind(&self) -> WaveformKind {
         match self {
             Self::Pulse(_) => WaveformKind::Pulse,
             Self::Pwl(_) => WaveformKind::Pwl,
             Self::Function(function) => WaveformKind::Function(function.function),
+            Self::Stochastic { function, .. } => WaveformKind::Stochastic(*function),
         }
     }
 }
@@ -237,43 +319,113 @@ impl SourceFunction {
 /// One SIN/EXP/SFFM/AM setter: its function and the supplied fields in C
 /// coefficient order. Omitted trailing fields are simply absent; defaults that
 /// depend on `.tran` (`CKTstep`, `CKTfinalTime`) belong to elaboration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionWaveform {
     /// Which function.
     pub function: SourceFunction,
     /// Two to `function.fields().len()` positioned values.
-    pub values: Vec<PositionedValue>,
+    pub values: Vec<NumericVectorEntry>,
 }
 
 /// `PULSE(V1 V2 [TD [TR [TF [PW [PER [NP]]]]]])`; omissions stay explicit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PulseWaveform {
     /// Initial level (volts for V, amperes for I).
-    pub initial: PositionedValue,
+    pub initial: NumericVectorEntry,
     /// Pulsed level.
-    pub pulsed: PositionedValue,
+    pub pulsed: NumericVectorEntry,
     /// Delay in seconds.
-    pub delay: Option<PositionedValue>,
+    pub delay: Option<NumericVectorEntry>,
     /// Rise time in seconds.
-    pub rise: Option<PositionedValue>,
+    pub rise: Option<NumericVectorEntry>,
     /// Fall time in seconds.
-    pub fall: Option<PositionedValue>,
+    pub fall: Option<NumericVectorEntry>,
     /// Pulse width in seconds.
-    pub width: Option<PositionedValue>,
+    pub width: Option<NumericVectorEntry>,
     /// Period in seconds.
-    pub period: Option<PositionedValue>,
+    pub period: Option<NumericVectorEntry>,
     /// The eighth field (`PHASE` in `vsrcload.c`): in ngspice's default
     /// compatibility mode a positive value is the number of pulses.
-    pub count: Option<PositionedValue>,
+    pub count: Option<NumericVectorEntry>,
 }
 
 /// One PWL knot, retained in supplied order (syntax is not runtime validation).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PwlPoint {
     /// Time in seconds.
-    pub time: PositionedValue,
+    pub time: NumericVectorEntry,
     /// Level in volts for V, amperes for I.
-    pub value: PositionedValue,
+    pub value: NumericVectorEntry,
+}
+
+/// Declared XSPICE port type; an untyped terminal is resolved by the model schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodePortKind {
+    /// Model-declared default domain.
+    Default,
+    /// Single-ended voltage.
+    Voltage,
+    /// Differential voltage.
+    VoltageDifferential,
+    /// Single-ended current.
+    Current,
+    /// Differential current.
+    CurrentDifferential,
+    /// Digital event terminal.
+    Digital,
+    /// Single-ended conductance.
+    Conductance,
+    /// Differential conductance.
+    ConductanceDifferential,
+}
+
+impl CodePortKind {
+    /// Whether one element contains an ordered pair of nodes.
+    #[must_use]
+    pub const fn differential(self) -> bool {
+        matches!(
+            self,
+            Self::VoltageDifferential | Self::CurrentDifferential | Self::ConductanceDifferential
+        )
+    }
+
+    /// Canonical explicit marker; the default is written without a marker.
+    #[must_use]
+    pub const fn marker(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Voltage => Some("%v"),
+            Self::VoltageDifferential => Some("%vd"),
+            Self::Current => Some("%i"),
+            Self::CurrentDifferential => Some("%id"),
+            Self::Digital => Some("%d"),
+            Self::Conductance => Some("%g"),
+            Self::ConductanceDifferential => Some("%gd"),
+        }
+    }
+}
+
+/// One scalar or differential element of an A-instance port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeTerminal {
+    /// Type of this element, including changes within a vector.
+    pub kind: CodePortKind,
+    /// Positive or single-ended node, case folded.
+    pub positive: NodeName,
+    /// Explicit negative node, absent for single-ended terminals.
+    pub negative: Option<NodeName>,
+    /// Digital inversion marker, validated against the selected schema.
+    pub inverted: bool,
+}
+
+/// Ordered scalar or vector port group. Vector grouping is never inferred
+/// from the number of nodes: a one-element vector remains a vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodePort {
+    /// Whether the source used a bracketed vector.
+    pub vector: bool,
+    /// Elements in source order.
+    pub terminals: Vec<CodeTerminal>,
 }
 
 /// A device instance, e.g. `r1 in out 1k tc1=0.01`.
@@ -287,6 +439,8 @@ pub struct DeviceInstance {
     /// three or four ports; an omitted substrate is not injected here. Circuit
     /// elaboration must ground it as INP2Q does.
     pub nodes: Vec<NodeName>,
+    /// Typed A-instance ports, stored separately from ordinary analog nodes.
+    pub code_ports: Vec<CodePort>,
     /// The model this instance refers to, if the device takes one.
     pub model: Option<String>,
     /// Parameter assignments, including positional values, in application order.
@@ -1151,6 +1305,11 @@ pub enum ScopedCardKind {
 /// `docs/port/FRONTEND_STRUCTURE.md` and the central `TODO.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Netlist {
+    /// Typed source-prepared initialization, separate from native .ic cards.
+    pub prepared_initialization:
+        Option<crate::netlist::prepared_initialization::PreparedInitialConditions>,
+    /// Whether analog ground aliases are enabled for this deck.
+    pub auto_gnd: bool,
     /// The deck's title line.
     pub title: String,
     /// The file the deck came from.

@@ -246,8 +246,7 @@ fn singular_slopes_at_the_zero_start_converge_in_every_analysis() {
 
 #[test]
 fn infinite_slopes_at_the_zero_start_name_the_offending_derivative() {
-    // pwr(0, -0.5) is infinite, so v(in)^0.5 has an infinite slope at the
-    // 0 V start (the derivative tree `0.5 * pwr(v, -0.5)`). C loads it and
+    // The positive-side slope of v(in)^0.5 is infinite at zero. C loads it and
     // carries a NaN iterate; the port stops naming the derivative node and
     // its arguments.
     let error = run(
@@ -257,7 +256,9 @@ fn infinite_slopes_at_the_zero_start_name_the_offending_derivative() {
     )
     .unwrap_err();
     assert!(
-        error.to_string().contains("0, -0.5 out of range for pwr()"),
+        error
+            .to_string()
+            .contains("0, 0.5 out of range for pow_base_slope()"),
         "{error}"
     );
 }
@@ -293,5 +294,274 @@ fn table_and_poly_forms_simulate_through_the_lowered_devices() {
     );
     close(value(&plot, "v(e1_int2)", 0), 0.25, 1e-12);
     assert!(plot.variable_index("i(ae1)").is_some());
-    assert!(plot.variable_index("i(a$poly$e2)").is_some());
+    assert!(plot.variable_index("i(e2)").is_some());
+}
+
+#[test]
+fn resolved_current_probes_share_one_physical_measurement_across_laws() -> SpiceResult<()> {
+    let body = ".func sense(x) {i(r1)*x}\nvin in 0 dc 2 ac 1\nr1 in 0 1k\nb1 out 0 v=max(0,sense(1000))\nb2 other 0 v=1000*i(r1)\nr2 in 0 r={1000*(1+sense(1000))}\nb3 mon 0 v=1000*i(r2)";
+    let mut circuit = circuit(body)?;
+    let generated = circuit
+        .devices()
+        .iter()
+        .filter(|d| d.name().starts_with("v__sense_"))
+        .count();
+    assert_eq!(generated, 1);
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&plot, "v(out)", 0), 2., 1e-12);
+    close(value(&plot, "v(other)", 0), 2., 1e-12);
+    close(value(&plot, "v(mon)", 0), 2. / 3., 1e-9);
+    let ac = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "1", "1000", "1000"])
+        .resolve()?
+        .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&ac, "v(out)", 0), 1., 1e-12);
+    close(value(&ac, "v(other)", 0), 1., 1e-12);
+    close(value(&ac, "v(mon)", 0), 1. / 9., 1e-9);
+    Ok(())
+}
+
+#[test]
+fn lexical_shadowing_and_erased_macro_arguments_do_not_create_probes() -> SpiceResult<()> {
+    let body = ".func i(x) {x*2}\n.func ignore(x) {3}\nv1 a 0 1\nr1 a 0 1k\nb1 out 0 v=i(4)\nb2 b 0 v=ignore(i(missing))";
+    let mut circuit = circuit(body)?;
+    assert_eq!(circuit.devices().len(), 4);
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&plot, "v(out)", 0), 8., 1e-12);
+    close(value(&plot, "v(b)", 0), 3., 1e-12);
+    Ok(())
+}
+
+#[test]
+fn native_branch_probes_do_not_split_storage_or_voltage_source_terminals() -> SpiceResult<()> {
+    let body = "v1 in 0 dc 1\nr1 in a 1k\nl1 a 0 1m\nb1 b 0 v=1000*i(l1)\nr2 b 0 1k\nb2 out 0 v=1000*i(b1)\ne1 c 0 value={2*v(b)}\nr3 c 0 1k\nb3 other 0 v=1000*i(e1)";
+    let mut circuit = circuit(body)?;
+    assert!(
+        !circuit
+            .devices()
+            .iter()
+            .any(|d| d.name().starts_with("v__sense_"))
+    );
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&plot, "v(b)", 0), 1., 1e-12);
+    close(value(&plot, "v(out)", 0), -1., 1e-12);
+    close(value(&plot, "v(other)", 0), -2., 1e-12);
+    Ok(())
+}
+
+#[test]
+fn measurement_names_are_collision_safe_and_comma_probes_are_not_special() -> SpiceResult<()> {
+    let body = "v1 a 0 2\nr1 a 0 1k\nv__sense_0 __sense_0 0 5\nv_r1 r1probe 0 4\nb1 out 0 v=max(0,i(r1)*1000)";
+    let plot = run(body, AnalysisKind::OperatingPoint, &[])?;
+    close(value(&plot, "v(out)", 0), 2., 1e-12);
+    close(value(&plot, "v(__sense_0)", 0), 5., 1e-12);
+    close(value(&plot, "v(r1probe)", 0), 4., 1e-12);
+    let plot = run(
+        "b1 b 0 v=max(0,i(b2))\nb2 c 0 i=1m\nr2 b 0 1\nr3 c 0 1",
+        AnalysisKind::OperatingPoint,
+        &[],
+    )?;
+    close(value(&plot, "v(b)", 0), 1e-3, 1e-12);
+    Ok(())
+}
+
+#[test]
+fn local_probe_bindings_follow_expanded_hierarchy() -> SpiceResult<()> {
+    let body = ".subckt cell a b params: r=1k\n.func read(x) {i(r1)*x}\nr1 a 0 {r}\nb1 b 0 v=read(1000)\n.ends\nv1 a 0 2\nx1 a b cell r=1k\nx2 a c cell r=2k";
+    let mut circuit = circuit(body)?;
+    assert_eq!(
+        circuit
+            .devices()
+            .iter()
+            .filter(|d| d.name().starts_with("v__sense_"))
+            .count(),
+        2
+    );
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&plot, "v(b)", 0), 2., 1e-12);
+    close(value(&plot, "v(c)", 0), 1., 1e-12);
+    Ok(())
+}
+
+#[test]
+fn many_independent_current_probes_have_linear_measurement_count() -> SpiceResult<()> {
+    use std::fmt::Write as _;
+    let mut deck = String::from("v1 in 0 1\n");
+    for index in 0..512 {
+        writeln!(deck, "r{index} in 0 1k").unwrap();
+        writeln!(
+            deck,
+            "b{index} out{index} 0 v=1000*(i(r{index})+i(r{index}))"
+        )
+        .unwrap();
+    }
+    let mut circuit = circuit(&deck)?;
+    assert_eq!(
+        circuit
+            .devices()
+            .iter()
+            .filter(|d| d.name().starts_with("v__sense_"))
+            .count(),
+        512
+    );
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    for index in 0..512 {
+        close(value(&plot, &format!("v(out{index})"), 0), 2., 1e-12);
+    }
+    Ok(())
+}
+
+#[test]
+fn polynomial_sources_retain_probe_identity_inside_and_outside_hierarchy() -> SpiceResult<()> {
+    let body = ".subckt cell a b c\ne1 b 0 poly(1) a 0 1 2\nr1 b 0 1k\nb1 c 0 v=1000*i(e1)\n.ends\nv1 a 0 2\nx1 a b c cell\ne2 d 0 poly(1) a 0 1 2\nr2 d 0 1k\nb2 e 0 v=1000*i(e2)\ng1 f 0 poly(1) a 0 0 1m\nr3 f 0 1k\nb3 g 0 v=max(0,1000*i(g1))";
+    let plot = run(body, AnalysisKind::OperatingPoint, &[])?;
+    close(value(&plot, "v(c)", 0), -5., 1e-12);
+    close(value(&plot, "v(e)", 0), -5., 1e-12);
+    close(value(&plot, "v(g)", 0), 2., 1e-12);
+    Ok(())
+}
+
+#[test]
+fn scaled_nonlinear_current_converges_with_or_without_a_series_probe() {
+    // KCL has the unique root 10 uV: I = V/100 + 1e9 V^3.
+    // At that point the current source delivers 1 uA, regardless of
+    // whether a zero-volt series source makes its branch current observable.
+    for expression in [
+        "v(out)^3 m=1e9",
+        "1e9*v(out)^3",
+        "v(out)^3 m=1e-9 reciprocm=1",
+        "v(out)^3 m=5e8 temp=37 tc1=0.1",
+        "-v(out)^3 m=-1e9",
+    ] {
+        for (connection, observation) in [
+            ("b1 out 0 i=", ""),
+            ("vprobe out sense 0\nb1 sense 0 i=", ""),
+            (
+                "b1 out 0 i=",
+                "\nbobserve observed 0 v=1e6*i(b1)\nr2 observed 0 1k",
+            ),
+        ] {
+            let body =
+                format!("i1 0 out 1.1u\nr1 out 0 100\n{connection}{expression}{observation}");
+            let plot = run(&body, AnalysisKind::OperatingPoint, &[]).unwrap();
+            let v = value(&plot, "v(out)", 0);
+            let current = 1e9 * v.powi(3);
+            let residual = v / 100. + current - 1.1e-6;
+            assert!(
+                residual.abs() <= 1.1e-9 + 1e-12,
+                "{body}: V={v:e}, residual={residual:e}"
+            );
+            if connection.starts_with("vprobe") {
+                close(value(&plot, "i(vprobe)", 0), current, 1e-3);
+            }
+            if !observation.is_empty() {
+                close(value(&plot, "v(observed)", 0), current * 1e6, 1e-3);
+            }
+        }
+    }
+}
+
+#[test]
+fn nonlinear_current_probe_preserves_the_manufactured_transient_solution() {
+    // Manufactured solution V(t) = 10 uV + 10 uV (t / 1 ms)^2.
+    // The forcing is G V + 1e9 V^3 + C dV/dt, with G=0.01 S, C=10 uF.
+    // Its initial derivative is zero, so the DC operating point is exact.
+    let forcing = "bdrive 0 out i=(10u+10u*(time/1m)^2)/100+1e9*(10u+10u*(time/1m)^2)^3+200u*time";
+    for (connection, probed) in [
+        ("b1 out 0 i=v(out)^3 m=1e9", false),
+        ("vprobe out sense 0\nb1 sense 0 i=v(out)^3 m=1e9", true),
+    ] {
+        let body = format!("{forcing}\nr1 out 0 100\nc1 out 0 10u\n{connection}");
+        let plot = run(&body, AnalysisKind::Transient, &["10u", "1m", "0", "10u"]).unwrap();
+        assert!(plot.point_count() >= 100);
+        let mut last = None;
+        for point in 0..plot.point_count() {
+            let t = value(&plot, "time", point);
+            let v = value(&plot, "v(out)", point);
+            let exact = 1e-5 * (1. + (t / 1e-3).powi(2));
+            assert!(
+                (v - exact).abs() <= 5e-3 * exact,
+                "t={t:e}, {connection}: {v:e} != {exact:e}"
+            );
+            if let Some(previous) = last {
+                assert!(t > previous && t - previous <= 1e-5 * (1. + 1e-9));
+            }
+            if probed {
+                close(value(&plot, "i(vprobe)", point), 1e9 * v.powi(3), 1e-3);
+            }
+            last = Some(t);
+        }
+        close(last.unwrap(), 1e-3, 1e-12);
+    }
+}
+
+#[test]
+fn nonlinear_current_probe_does_not_regularize_a_singular_circuit() {
+    // The floating nonlinear conductance leaves the common-mode voltage
+    // unconstrained. Inserting a zero-voltage source cannot ground it.
+    for connection in [
+        "b1 a b i=1m*v(a,b)^3",
+        "vprobe a sense 0\nb1 sense b i=1m*v(a,b)^3",
+    ] {
+        let body = format!("r1 a b 1k\n{connection}");
+        assert!(
+            run(&body, AnalysisKind::OperatingPoint, &[]).is_err(),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn discontinuous_current_without_a_root_is_rejected_in_every_probe_topology() {
+    // For V < 0, KCL requires V = +30 nV; for V > 0, it
+    // requires V = -70 nV. At V = 0, u(0) = 0.5 also fails KCL.
+    // Both voltage updates are below VNTOL, and the unscaled expression
+    // changes by only 1 pA, but the actual branch current changes by 1 mA.
+    for connection in [
+        "b1 out 0 i=1p*u(v(out)) m=1e9",
+        "vprobe out sense 0\nb1 sense 0 i=1p*u(v(out)) m=1e9",
+        "b1 out 0 i=1p*u(v(out)) m=1e9\nbobserve observed 0 v=i(b1)\nr2 observed 0 1k",
+    ] {
+        let body = format!("i1 0 out 0.3m\nr1 out 0 100u\n{connection}");
+        let error = run(&body, AnalysisKind::OperatingPoint, &[]).expect_err(&body);
+        assert!(error.to_string().contains("Newton"), "{body}: {error}");
+    }
+}
+
+#[test]
+fn prepared_power_laws_reach_operating_point_and_complex_ac_stamps() {
+    let deck = "vx x 0 dc 0 ac 1\nvp p 0 dc .5 ac 0\nbabs a 0 v=simetrix_abs_pow(v(x),v(p))\nbproduct b 0 v=simetrix_abs_pow_product(sgn(v(x)),v(x),-.5)\nvneg n 0 dc -2 ac 0\nvexp e 0 dc 3 ac 1\nbcaret c 0 v=simetrix_caret_pow(v(n),v(e))\nbpow d 0 v=simetrix_pow(v(n),v(e))";
+    let op = run(deck, AnalysisKind::OperatingPoint, &[]).unwrap();
+    for (node, expected) in [("v(a)", 0.), ("v(b)", 0.), ("v(c)", -8.), ("v(d)", -8.)] {
+        close(value(&op, node, 0), expected, 1e-12);
+    }
+    let ac = run(deck, AnalysisKind::Ac, &["lin", "2", "1k", "2k"]).unwrap();
+    for i in 0..ac.point_count() {
+        for (node, expected) in [
+            ("v(a)", 0.),
+            ("v(b)", 0.),
+            ("v(c)", 1842.068_074_4),
+            ("v(d)", -5.545_177_444_5),
+        ] {
+            let sample = ac.value(node, i).unwrap();
+            close(sample.re, expected, 1e-10);
+            assert_eq!(sample.im, 0.);
+        }
+    }
+    let singular = "vx x 0 0\nb1 out 0 v=simetrix_abs_pow(v(x),-.5)";
+    assert!(run(singular, AnalysisKind::OperatingPoint, &[]).is_err());
 }

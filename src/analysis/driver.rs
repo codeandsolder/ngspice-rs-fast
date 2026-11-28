@@ -146,6 +146,8 @@ impl From<&AnalysisCard> for AnalysisInput {
 /// and TNOM = 27.000000` at the start of a run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnalysisContext {
+    /// Enclosing analysis selected by the analysis plan; None for UIC or native low-level loads.
+    pub bias_analysis: Option<AnalysisKind>,
     /// Circuit temperature in degrees Celsius.
     pub temperature: Real,
     /// Nominal temperature at which model parameters were measured.
@@ -154,6 +156,10 @@ pub struct AnalysisContext {
     /// default [`crate::devices::DEFAULT_GMIN`]. See
     /// [`crate::devices::ModelContext::gmin`].
     pub gmin: Real,
+    /// Physical nodal shunts used during circuit elaboration.
+    pub shunts: crate::devices::models::TopologyShunts,
+    /// Global scale of source geometry setters.
+    pub geometry_scale: Real,
     /// Resolved circuit relative tolerance (C `CKTreltol`). Device preparation
     /// uses this value even when the analysis has a local Newton override.
     pub reltol: Real,
@@ -181,6 +187,9 @@ impl AnalysisContext {
                 .with_gmin(self.gmin)
                 .with_reltol(self.reltol)
                 .with_pivot_tolerances(self.pivot);
+        context.bias_analysis = self.bias_analysis;
+        context.shunts = self.shunts;
+        context.geometry_scale = self.geometry_scale;
         if let Some(overrides) = self.candidate_model_overrides {
             context.resistor_overrides = overrides.resistor_overrides;
             context.instance_overrides = overrides.instance_overrides;
@@ -208,17 +217,20 @@ impl Default for AnalysisContext {
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
+            shunts: crate::devices::models::TopologyShunts::default(),
+            geometry_scale: 1.,
             reltol: crate::devices::DEFAULT_RELTOL,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             rf_limits: crate::analysis::RfLimits::default(),
             candidate_model_overrides: None,
+            bias_analysis: None,
         }
     }
 }
 
 /// Analyses with production drivers, for the devices and options documented
 /// under `docs/port/`.
-pub const DRIVERS: [AnalysisKind; 11] = [
+pub const DRIVERS: [AnalysisKind; 12] = [
     AnalysisKind::OperatingPoint,
     AnalysisKind::DcSweep,
     AnalysisKind::Ac,
@@ -230,6 +242,7 @@ pub const DRIVERS: [AnalysisKind; 11] = [
     AnalysisKind::Distortion,
     AnalysisKind::Sensitivity,
     AnalysisKind::PeriodicSteadyState,
+    AnalysisKind::HarmonicBalance,
 ];
 
 /// Whether an analysis has a driver.

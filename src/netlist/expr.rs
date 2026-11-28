@@ -233,9 +233,8 @@ pub enum ExprKind {
     /// (C: `inpcom.c` `inp_expand_macro_in_str()`), resolved during
     /// evaluation in the scope of the site. Any argument count (including
     /// zero) is syntactically valid; arity is checked against the definition.
-    /// Names of numparam built-ins outside the allowlist (`agauss`, `limit`,
-    /// ...) parse here too, so a `.func` may define them; without one they are
-    /// reported as not yet ported when evaluated.
+    /// Static statistical built-ins and unsupported numparam names also
+    /// parse here, so user functions can shadow them.
     UserCall {
         /// Lowercased function name.
         name: String,
@@ -320,9 +319,8 @@ impl TreeBudget {
 macro_rules! functions {
     ($($variant:ident => $name:literal / $arity:literal,)*) => {
         /// The allowlisted numparam functions (a subset of `fmathS` in
-        /// `xpressn.c`). Randomised functions (`agauss`, `gauss`, `unif`,
-        /// `aunif`, `limit`), `ternary_fcn`, and the string-argument `vec`/`var`
-        /// are deliberately excluded.
+        /// `xpressn.c`). Statistical calls are realized separately from
+        /// ordinary deterministic math functions.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum Function {
             $(
@@ -398,13 +396,4 @@ functions! {
 /// C `fmathS` names outside the allowlist. A call to one parses as
 /// [`ExprKind::UserCall`] and is rejected as not yet ported during evaluation
 /// unless a `.func` of that name is in scope.
-pub const EXCLUDED_FUNCTIONS: &[&str] = &[
-    "ternary_fcn",
-    "agauss",
-    "gauss",
-    "unif",
-    "aunif",
-    "limit",
-    "vec",
-    "var",
-];
+pub const EXCLUDED_FUNCTIONS: &[&str] = &["ternary_fcn", "vec", "var"];

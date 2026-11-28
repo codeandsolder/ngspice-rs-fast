@@ -24,6 +24,10 @@
 )]
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{SmallSignalCkt, state};
+use super::stamp_common::{
+    self, ChannelCurrent, ChannelGain, GateCurrent, GateResistance, GateStamp, MidGateCharge,
+    Pencil, SeriesResistance, SubstrateCurrent,
+};
 
 /// `BSIM4pzLoad` for one instance, from the values the `MODEINITSMSIG`
 /// load left on `h`.
@@ -39,26 +43,38 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
     let cgso = h.cgso;
     let cgdo = h.cgdo;
 
-    let mut T0 = 0.0;
     let mut xcdbdb = 0.0;
+    let mid = MidGateCharge::new::<Pencil>(h, p, 0.);
+    let MidGateCharge {
+        drain: xcdgmb,
+        source: xcsgmb,
+        bulk: xcbgmb,
+        ..
+    } = mid;
     let mut xcsbsb = 0.0;
-    let mut xcgmgmb = 0.0;
-    let mut xcgmdb = 0.0;
-    let mut xcgmsb = 0.0;
-    let mut xcdgmb = 0.0;
-    let mut xcsgmb = 0.0;
-    let mut xcgmbb = 0.0;
-    let mut xcbgmb = 0.0;
     let mut xcqgb = 0.0;
     let mut xcqdb = 0.0;
     let mut xcqsb = 0.0;
     let mut xcqbb = 0.0;
 
-    let (Gm, Gmbs, FwdSum, RevSum);
-    let (gbbdp, gbbsp, gbdpg, gbdpdp, gbdpb, gbdpsp, gbspdp, gbspg, gbspb, gbspsp);
-    let (gIstotg, gIstotd, gIstots, gIstotb, gIdtotg, gIdtotd, gIdtots, gIdtotb);
-    let (gIbtotg, gIbtotd, gIbtots, gIbtotb, gIgtotg, gIgtotd, gIgtots, gIgtotb);
-    let (gcrg, gcrgd, gcrgg, gcrgs, gcrgb);
+    let real_gain = ChannelGain::new(h.mode, h.gm, h.gmbs);
+    let substrate = SubstrateCurrent::new(h);
+    let gate_current = GateCurrent::new(m, h);
+    let GateCurrent {
+        gIgtotg,
+        gIgtotd,
+        gIgtots,
+        gIgtotb,
+        ..
+    } = gate_current;
+    let resistance = GateResistance::new(h, ckt);
+    let GateResistance {
+        gcrgd,
+        gcrgg,
+        gcrgs,
+        gcrgb,
+        ..
+    } = resistance;
     let (xcggb, xcgdb, xcgsb, xcgbb, xcbgb, xcbdb, xcbsb, xcbbb);
     let (xcdgb, xcddb, xcdsb, xcdbb, xcsgb, xcsdb, xcssb, xcsbb);
     let (xgtg, xgtd, xgts, xgtb, sxpart, dxpart);
@@ -66,82 +82,8 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
     let (dsxpart_dVd, dsxpart_dVg, dsxpart_dVb, dsxpart_dVs);
 
     if h.mode >= 0 {
-        Gm = h.gm;
-        Gmbs = h.gmbs;
-        FwdSum = Gm + Gmbs;
-        RevSum = 0.0;
-
-        gbbdp = -(h.gbds);
-        gbbsp = h.gbds + h.gbgs + h.gbbs;
-        gbdpg = h.gbgs;
-        gbdpdp = h.gbds;
-        gbdpb = h.gbbs;
-        gbdpsp = -(gbdpg + gbdpdp + gbdpb);
-
-        gbspdp = 0.0;
-        gbspg = 0.0;
-        gbspb = 0.0;
-        gbspsp = 0.0;
-
-        if m.igcMod != 0 {
-            gIstotg = h.gIgsg + h.gIgcsg;
-            gIstotd = h.gIgcsd;
-            gIstots = h.gIgss + h.gIgcss;
-            gIstotb = h.gIgcsb;
-
-            gIdtotg = h.gIgdg + h.gIgcdg;
-            gIdtotd = h.gIgdd + h.gIgcdd;
-            gIdtots = h.gIgcds;
-            gIdtotb = h.gIgcdb;
-        } else {
-            (gIstotg, gIstotd, gIstots, gIstotb) = (0.0, 0.0, 0.0, 0.0);
-            (gIdtotg, gIdtotd, gIdtots, gIdtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if m.igbMod != 0 {
-            gIbtotg = h.gIgbg;
-            gIbtotd = h.gIgbd;
-            gIbtots = h.gIgbs;
-            gIbtotb = h.gIgbb;
-        } else {
-            (gIbtotg, gIbtotd, gIbtots, gIbtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if (m.igcMod != 0) || (m.igbMod != 0) {
-            gIgtotg = gIstotg + gIdtotg + gIbtotg;
-            gIgtotd = gIstotd + gIdtotd + gIbtotd;
-            gIgtots = gIstots + gIdtots + gIbtots;
-            gIgtotb = gIstotb + gIdtotb + gIbtotb;
-        } else {
-            (gIgtotg, gIgtotd, gIgtots, gIgtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if h.rgateMod == 2 {
-            T0 = ckt.state0(state::VGES) - ckt.state0(state::VGS);
-        } else if h.rgateMod == 3 {
-            T0 = ckt.state0(state::VGMS) - ckt.state0(state::VGS);
-        }
-        if h.rgateMod > 1 {
-            gcrgd = h.gcrgd * T0;
-            gcrgg = h.gcrgg.mul_add(T0, -h.gcrg);
-            gcrgs = h.gcrgs * T0;
-            gcrgb = h.gcrgb * T0;
-            gcrg = h.gcrg;
-        } else {
-            (gcrg, gcrgd, gcrgg, gcrgs, gcrgb) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
         if h.acnqsMod == 0 {
             if h.rgateMod == 3 {
-                xcgmgmb = cgdo + cgso + p.cgbo;
-                xcgmdb = -cgdo;
-                xcgmsb = -cgso;
-                xcgmbb = -p.cgbo;
-
-                xcdgmb = xcgmdb;
-                xcsgmb = xcgmsb;
-                xcbgmb = xcgmbb;
-
                 xcggb = h.cggb;
                 xcgdb = h.cgdb;
                 xcgsb = h.cgsb;
@@ -159,8 +101,6 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
                 xcdgb = h.cdgb - cgdo;
                 xcsgb = -(h.cggb + h.cbgb + h.cdgb + cgso);
                 xcbgb = h.cbgb - p.cgbo;
-
-                (xcdgmb, xcsgmb, xcbgmb) = (0.0, 0.0, 0.0);
             }
             xcddb = h.cddb + h.capbd + cgdo;
             xcdsb = h.cdsb;
@@ -239,84 +179,8 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
             dsxpart_dVb = -(dsxpart_dVd + dsxpart_dVg + dsxpart_dVs);
         }
     } else {
-        Gm = -h.gm;
-        Gmbs = -h.gmbs;
-        FwdSum = 0.0;
-        RevSum = -(Gm + Gmbs);
-
-        gbbsp = -(h.gbds);
-        gbbdp = h.gbds + h.gbgs + h.gbbs;
-
-        gbdpg = 0.0;
-        gbdpsp = 0.0;
-        gbdpb = 0.0;
-        gbdpdp = 0.0;
-
-        gbspg = h.gbgs;
-        gbspsp = h.gbds;
-        gbspb = h.gbbs;
-        gbspdp = -(gbspg + gbspsp + gbspb);
-
-        if m.igcMod != 0 {
-            gIstotg = h.gIgsg + h.gIgcdg;
-            gIstotd = h.gIgcds;
-            gIstots = h.gIgss + h.gIgcdd;
-            gIstotb = h.gIgcdb;
-
-            gIdtotg = h.gIgdg + h.gIgcsg;
-            gIdtotd = h.gIgdd + h.gIgcss;
-            gIdtots = h.gIgcsd;
-            gIdtotb = h.gIgcsb;
-        } else {
-            (gIstotg, gIstotd, gIstots, gIstotb) = (0.0, 0.0, 0.0, 0.0);
-            (gIdtotg, gIdtotd, gIdtots, gIdtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if m.igbMod != 0 {
-            gIbtotg = h.gIgbg;
-            gIbtotd = h.gIgbs;
-            gIbtots = h.gIgbd;
-            gIbtotb = h.gIgbb;
-        } else {
-            (gIbtotg, gIbtotd, gIbtots, gIbtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if (m.igcMod != 0) || (m.igbMod != 0) {
-            gIgtotg = gIstotg + gIdtotg + gIbtotg;
-            gIgtotd = gIstotd + gIdtotd + gIbtotd;
-            gIgtots = gIstots + gIdtots + gIbtots;
-            gIgtotb = gIstotb + gIdtotb + gIbtotb;
-        } else {
-            (gIgtotg, gIgtotd, gIgtots, gIgtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if h.rgateMod == 2 {
-            T0 = ckt.state0(state::VGES) - ckt.state0(state::VGS);
-        } else if h.rgateMod == 3 {
-            T0 = ckt.state0(state::VGMS) - ckt.state0(state::VGS);
-        }
-        if h.rgateMod > 1 {
-            // C swaps the drain and source derivatives in reverse mode.
-            gcrgd = h.gcrgs * T0;
-            gcrgg = h.gcrgg.mul_add(T0, -h.gcrg);
-            gcrgs = h.gcrgd * T0;
-            gcrgb = h.gcrgb * T0;
-            gcrg = h.gcrg;
-        } else {
-            (gcrg, gcrgd, gcrgg, gcrgs, gcrgb) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
         if h.acnqsMod == 0 {
             if h.rgateMod == 3 {
-                xcgmgmb = cgdo + cgso + p.cgbo;
-                xcgmdb = -cgdo;
-                xcgmsb = -cgso;
-                xcgmbb = -p.cgbo;
-
-                xcdgmb = xcgmdb;
-                xcsgmb = xcgmsb;
-                xcbgmb = xcgmbb;
-
                 xcggb = h.cggb;
                 xcgdb = h.cgsb;
                 xcgsb = h.cgdb;
@@ -334,8 +198,6 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
                 xcdgb = -(h.cggb + h.cbgb + h.cdgb + cgdo);
                 xcsgb = h.cdgb - cgso;
                 xcbgb = h.cbgb - p.cgbo;
-
-                (xcdgmb, xcsgmb, xcbgmb) = (0.0, 0.0, 0.0);
             }
             xcddb = h.capbd + cgdo - (h.cgsb + h.cbsb + h.cdsb);
             xcdsb = -(h.cgdb + h.cbdb + h.cddb);
@@ -414,24 +276,16 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         }
     }
 
-    let (gstot, gstotd, gstotg, gstots, gstotb);
-    let (gdtot, gdtotd, gdtotg, gdtots, gdtotb);
-    if m.rdsMod == 1 {
-        gstot = h.gstot;
-        gstotd = h.gstotd;
-        gstotg = h.gstotg;
-        gstots = h.gstots - gstot;
-        gstotb = h.gstotb;
-
-        gdtot = h.gdtot;
-        gdtotd = h.gdtotd - gdtot;
-        gdtotg = h.gdtotg;
-        gdtots = h.gdtots;
-        gdtotb = h.gdtotb;
-    } else {
-        (gstot, gstotd, gstotg, gstots, gstotb) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        (gdtot, gdtotd, gdtotg, gdtots, gdtotb) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    }
+    let series = SeriesResistance::new(m, h);
+    let SeriesResistance {
+        gstot,
+        gstots,
+        gdtot,
+        gdtotd,
+        gdpr,
+        gspr,
+        ..
+    } = series;
 
     let T1 = ckt.state0(state::QDEF) * h.gtau;
     let gds = h.gds;
@@ -441,106 +295,41 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
     let mult_i = h.mult_i * h.m;
     let mult_q = h.mult_q * h.m;
 
-    let (gdpr, gspr) = if m.rdsMod == 0 {
-        (h.drainConductance, h.sourceConductance)
-    } else {
-        (0.0, 0.0)
-    };
-
-    let (gjbd, gjbs) = if h.rbodyMod == 0 {
-        (h.gbd, h.gbs)
-    } else {
-        (0.0, 0.0)
-    };
-
     let geltd = h.grgeltd;
 
-    let (dp, gp, gm, sp, bp) = (
-        h.dNodePrime,
-        h.gNodePrime,
-        h.gNodeMid,
-        h.sNodePrime,
-        h.bNodePrime,
-    );
-    let (d, ge, s, b) = (h.dNode, h.gNodeExt, h.sNode, h.bNode);
-    let (db, sb, q) = (h.dbNode, h.sbNode, h.qNode);
+    let (dp, gp, sp, bp) = (h.dNodePrime, h.gNodePrime, h.sNodePrime, h.bNodePrime);
+    let (d, s, q) = (h.dNode, h.sNode, h.qNode);
 
-    if h.rgateMod == 1 {
-        ckt.real(ge, ge, mult_i * geltd);
-        ckt.real(gp, ge, -(mult_i * geltd));
-        ckt.real(ge, gp, -(mult_i * geltd));
-
-        ckt.cap(gp, gp, mult_q * xcggb);
-        ckt.real(gp, gp, mult_q.mul_add(-xgtg, mult_i * (geltd + gIgtotg)));
-        ckt.cap(gp, dp, mult_q * xcgdb);
-        ckt.real(gp, dp, -mult_i.mul_add(-gIgtotd, mult_q * xgtd));
-        ckt.cap(gp, sp, mult_q * xcgsb);
-        ckt.real(gp, sp, -mult_i.mul_add(-gIgtots, mult_q * xgts));
-        ckt.cap(gp, bp, mult_q * xcgbb);
-        ckt.real(gp, bp, -mult_i.mul_add(-gIgtotb, mult_q * xgtb));
-    } else if h.rgateMod == 2 {
-        ckt.real(ge, ge, mult_i * gcrg);
-        ckt.real(ge, gp, mult_i * gcrgg);
-        ckt.real(ge, dp, mult_i * gcrgd);
-        ckt.real(ge, sp, mult_i * gcrgs);
-        ckt.real(ge, bp, mult_i * gcrgb);
-
-        ckt.real(gp, ge, -(mult_i * gcrg));
-        ckt.cap(gp, gp, mult_q * xcggb);
-        ckt.real(gp, gp, -mult_q.mul_add(xgtg, mult_i * (gcrgg - gIgtotg)));
-        ckt.cap(gp, dp, mult_q * xcgdb);
-        ckt.real(gp, dp, -mult_q.mul_add(xgtd, mult_i * (gcrgd - gIgtotd)));
-        ckt.cap(gp, sp, mult_q * xcgsb);
-        ckt.real(gp, sp, -mult_q.mul_add(xgts, mult_i * (gcrgs - gIgtots)));
-        ckt.cap(gp, bp, mult_q * xcgbb);
-        ckt.real(gp, bp, -mult_q.mul_add(xgtb, mult_i * (gcrgb - gIgtotb)));
-    } else if h.rgateMod == 3 {
-        ckt.real(ge, ge, mult_i * geltd);
-        ckt.real(ge, gm, -(mult_i * geltd));
-        ckt.real(gm, ge, -(mult_i * geltd));
-        ckt.real(gm, gm, mult_i * (geltd + gcrg));
-        ckt.cap(gm, gm, mult_q * xcgmgmb);
-
-        ckt.real(gm, dp, mult_i * gcrgd);
-        ckt.cap(gm, dp, mult_q * xcgmdb);
-        ckt.real(gm, gp, mult_i * gcrgg);
-        ckt.real(gm, sp, mult_i * gcrgs);
-        ckt.cap(gm, sp, mult_q * xcgmsb);
-        ckt.real(gm, bp, mult_i * gcrgb);
-        ckt.cap(gm, bp, mult_q * xcgmbb);
-
-        ckt.cap(dp, gm, mult_q * xcdgmb);
-        ckt.real(gp, gm, -(mult_i * gcrg));
-        ckt.cap(sp, gm, mult_q * xcsgmb);
-        ckt.cap(bp, gm, mult_q * xcbgmb);
-
-        ckt.real(gp, gp, -mult_q.mul_add(xgtg, mult_i * (gcrgg - gIgtotg)));
-        ckt.cap(gp, gp, mult_q * xcggb);
-        ckt.real(gp, dp, -mult_q.mul_add(xgtd, mult_i * (gcrgd - gIgtotd)));
-        ckt.cap(gp, dp, mult_q * xcgdb);
-        ckt.real(gp, sp, -mult_q.mul_add(xgts, mult_i * (gcrgs - gIgtots)));
-        ckt.cap(gp, sp, mult_q * xcgsb);
-        ckt.real(gp, bp, -mult_q.mul_add(xgtb, mult_i * (gcrgb - gIgtotb)));
-        ckt.cap(gp, bp, mult_q * xcgbb);
-    } else {
-        ckt.cap(gp, dp, mult_q * xcgdb);
-        ckt.real(gp, dp, -mult_i.mul_add(-gIgtotd, mult_q * xgtd));
-        ckt.cap(gp, gp, mult_q * xcggb);
-        ckt.real(gp, gp, -mult_i.mul_add(-gIgtotg, mult_q * xgtg));
-        ckt.cap(gp, sp, mult_q * xcgsb);
-        ckt.real(gp, sp, -mult_i.mul_add(-gIgtots, mult_q * xgts));
-        ckt.cap(gp, bp, mult_q * xcgbb);
-        ckt.real(gp, bp, -mult_i.mul_add(-gIgtotb, mult_q * xgtb));
+    let prime_real = match h.rgateMod {
+        1 => [
+            mult_q.mul_add(-xgtg, mult_i * (geltd + gIgtotg)),
+            -mult_i.mul_add(-gIgtotd, mult_q * xgtd),
+            -mult_i.mul_add(-gIgtots, mult_q * xgts),
+            -mult_i.mul_add(-gIgtotb, mult_q * xgtb),
+        ],
+        2 | 3 => [
+            -mult_q.mul_add(xgtg, mult_i * (gcrgg - gIgtotg)),
+            -mult_q.mul_add(xgtd, mult_i * (gcrgd - gIgtotd)),
+            -mult_q.mul_add(xgts, mult_i * (gcrgs - gIgtots)),
+            -mult_q.mul_add(xgtb, mult_i * (gcrgb - gIgtotb)),
+        ],
+        _ => [
+            -mult_i.mul_add(-gIgtotg, mult_q * xgtg),
+            -mult_i.mul_add(-gIgtotd, mult_q * xgtd),
+            -mult_i.mul_add(-gIgtots, mult_q * xgts),
+            -mult_i.mul_add(-gIgtotb, mult_q * xgtb),
+        ],
+    };
+    GateStamp {
+        real: prime_real,
+        charge: [xcggb, xcgdb, xcgsb, xcgbb],
+        mid,
     }
+    .emit::<Pencil>(h, &resistance, ckt);
 
-    if m.rdsMod != 0 {
-        ckt.real(d, gp, mult_i * gdtotg);
-        ckt.real(d, sp, mult_i * gdtots);
-        ckt.real(d, bp, mult_i * gdtotb);
-        ckt.real(s, dp, mult_i * gstotd);
-        ckt.real(s, gp, mult_i * gstotg);
-        ckt.real(s, bp, mult_i * gstotb);
-    }
+    series.emit_external(m, h, ckt);
+    let current =
+        ChannelCurrent::new::<Pencil>(h, real_gain, gds, &substrate, &gate_current, &series);
 
     ckt.cap(dp, dp, mult_q * xcddb);
     ckt.real(
@@ -548,7 +337,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         dp,
         mult_q.mul_add(
             T1.mul_add(ddxpart_dVd, dxpart * xgtd),
-            mult_i * (gdpr + gds + h.gbd - gdtotd + RevSum + gbdpdp - gIdtotd),
+            mult_i * current.drain[0],
         ),
     );
     ckt.real(dp, d, -(mult_i * (gdpr + gdtot)));
@@ -558,7 +347,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         gp,
         mult_q.mul_add(
             f64::mul_add(dxpart, xgtg, T1 * ddxpart_dVg),
-            mult_i * (Gm - gdtotg + gbdpg - gIdtotg),
+            mult_i * current.drain[1],
         ),
     );
     ckt.cap(dp, sp, mult_q * xcdsb);
@@ -567,7 +356,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         sp,
         -mult_q.mul_add(
             -f64::mul_add(dxpart, xgts, T1 * ddxpart_dVs),
-            mult_i * (gds + FwdSum + gdtots - gbdpsp + gIdtots),
+            mult_i * current.drain[2],
         ),
     );
     ckt.cap(dp, bp, mult_q * xcdbb);
@@ -576,7 +365,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         bp,
         -(mult_q * T1).mul_add(
             -f64::mul_add(dxpart, xgtb, ddxpart_dVb),
-            mult_i * (gjbd + gdtotb - Gmbs - gbdpb + gIdtotb),
+            mult_i * current.drain[3],
         ),
     );
 
@@ -589,7 +378,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         dp,
         -mult_q.mul_add(
             -f64::mul_add(sxpart, xgtd, T1 * dsxpart_dVd),
-            mult_i * (gds + gstotd + RevSum - gbspdp + gIstotd),
+            mult_i * current.source[0],
         ),
     );
     ckt.cap(sp, gp, mult_q * xcsgb);
@@ -598,7 +387,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         gp,
         -mult_q.mul_add(
             -f64::mul_add(sxpart, xgtg, T1 * dsxpart_dVg),
-            mult_i * (Gm + gstotg - gbspg + gIstotg),
+            mult_i * current.source[1],
         ),
     );
     ckt.cap(sp, sp, mult_q * xcssb);
@@ -607,7 +396,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         sp,
         mult_q.mul_add(
             T1.mul_add(dsxpart_dVs, sxpart * xgts),
-            mult_i * (gspr + gds + h.gbs - gIstots - gstots + FwdSum + gbspsp),
+            mult_i * current.source[2],
         ),
     );
     ckt.real(sp, s, -(mult_i * (gspr + gstot)));
@@ -617,54 +406,21 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         bp,
         -mult_q.mul_add(
             -f64::mul_add(sxpart, xgtb, T1 * dsxpart_dVb),
-            mult_i * (gjbs + gstotb + Gmbs - gbspb + gIstotb),
+            mult_i * current.source[3],
         ),
     );
 
     ckt.real(s, sp, -(mult_i * (gspr - gstots)));
     ckt.real(s, s, mult_i * (gspr + gstot));
 
-    ckt.cap(bp, dp, mult_q * xcbdb);
-    ckt.real(bp, dp, -(mult_i * (gjbd - gbbdp + gIbtotd)));
-    ckt.cap(bp, gp, mult_q * xcbgb);
-    ckt.real(bp, gp, -(mult_i * (h.gbgs + gIbtotg)));
-    ckt.cap(bp, sp, mult_q * xcbsb);
-    ckt.real(bp, sp, -(mult_i * (gjbs - gbbsp + gIbtots)));
-    ckt.cap(bp, bp, mult_q * xcbbb);
-    ckt.real(bp, bp, mult_i * (gjbd + gjbs - h.gbbs - gIbtotb));
-    super::stamp_common::leakage(h, mult_i, |row, col, value| ckt.real(row, col, value));
-
-    if h.rbodyMod != 0 {
-        ckt.cap(dp, db, mult_q * xcdbdb);
-        ckt.real(dp, db, -(mult_i * h.gbd));
-        ckt.cap(sp, sb, mult_q * xcsbsb);
-        ckt.real(sp, sb, -(mult_i * h.gbs));
-
-        ckt.cap(db, dp, mult_q * xcdbdb);
-        ckt.real(db, dp, -(mult_i * h.gbd));
-        ckt.cap(db, db, -(mult_q * xcdbdb));
-        ckt.real(db, db, mult_i * (h.gbd + h.grbpd + h.grbdb));
-        ckt.real(db, bp, -(mult_i * h.grbpd));
-        ckt.real(db, b, -(mult_i * h.grbdb));
-
-        ckt.real(bp, db, -(mult_i * h.grbpd));
-        ckt.real(bp, b, -(mult_i * h.grbpb));
-        ckt.real(bp, sb, -(mult_i * h.grbps));
-        ckt.real(bp, bp, mult_i * (h.grbpd + h.grbps + h.grbpb));
-        // WDL: (-here->BSIM4gbbs) already added to BPbpPtr
-
-        ckt.cap(sb, sp, mult_q * xcsbsb);
-        ckt.real(sb, sp, -(mult_i * h.gbs));
-        ckt.real(sb, bp, -(mult_i * h.grbps));
-        ckt.real(sb, b, -(mult_i * h.grbsb));
-        ckt.cap(sb, sb, -(mult_q * xcsbsb));
-        ckt.real(sb, sb, mult_i * (h.gbs + h.grbps + h.grbsb));
-
-        ckt.real(b, db, -(mult_i * h.grbdb));
-        ckt.real(b, bp, -(mult_i * h.grbpb));
-        ckt.real(b, sb, -(mult_i * h.grbsb));
-        ckt.real(b, b, mult_i * (h.grbsb + h.grbdb + h.grbpb));
-    }
+    stamp_common::bulk::<Pencil>(
+        h,
+        &substrate,
+        &gate_current,
+        [xcbdb, xcbgb, xcbsb, xcbbb],
+        ckt,
+    );
+    stamp_common::body_network::<Pencil>(h, [xcdbdb, xcsbsb], ckt);
 
     if h.acnqsMod != 0 {
         // C: `*(QqPtr) += m * s->real * ScalingFactor` (see the module note).
