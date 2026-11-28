@@ -234,7 +234,11 @@ fn interpolated_output_never_changes_the_accepted_trajectory() {
             assert_eq!(stats, selected_stats);
             assert_eq!(
                 selected.values,
-                plot.column("v(out)").unwrap().iter().copied().collect::<Vec<_>>()
+                plot.column("v(out)")
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
             );
         }
     }
