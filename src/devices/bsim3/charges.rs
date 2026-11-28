@@ -17,10 +17,6 @@
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
 #![expect(
-    clippy::float_cmp,
-    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
@@ -29,7 +25,9 @@ use super::dc::{Bias, DcEvaluation};
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
-use crate::devices::bsim_physics::{JunctionCapacitance, depletion, overlap};
+use crate::devices::bsim_physics::{
+    JunctionCapacitance, depletion, depletion_charge, overlap, smooth_positive,
+};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 const EXP_THRESHOLD: Real = 34.0;
@@ -244,15 +242,7 @@ impl ChargeModel<'_> {
         // ---- capMod == 3, the charge-thickness model (CTM).
         let vfbzb = p.vfbzb;
         let v3 = vfbzb - cv.vgs_eff + vbseff_cv - DELTA_3;
-        let discriminant_addend = 4.0 * DELTA_3 * vfbzb.abs();
-        let t0 = v3.mul_add(v3, discriminant_addend).sqrt();
-        let (flatband_drop, t1) = if v3 < 0.0 {
-            let conjugate = t0 - v3;
-            let drop = 0.5 * discriminant_addend / conjugate;
-            (drop, drop / t0)
-        } else {
-            (Real::midpoint(v3, t0), Real::midpoint(1.0, v3 / t0))
-        };
+        let (flatband_drop, t1) = smooth_positive(v3, DELTA_3 * vfbzb.abs())?;
         let vfbeff = vfbzb - flatband_drop;
         let dvfbeff_dvg = t1 * cv.d_vgs_eff_dvg;
         let dvfbeff_dvb = -t1 * dvbseff_cv_dvb;
@@ -308,27 +298,10 @@ impl ChargeModel<'_> {
 
         // Poly-gate depletion share of the bulk charge.
         let k1ox = p.derived.k1ox;
-        let t0 = 0.5 * k1ox;
         let t3 = cv.vgs_eff - vfbeff - vbseff_cv - vgsteff;
-        let (t1, t2) = if k1ox == 0.0 {
-            (0.0, 0.0)
-        } else if t3 < 0.0 {
-            (t0 + t3 / k1ox, cox_wl_cen)
-        } else {
-            let t1 = t0.mul_add(t0, t3).sqrt();
-            (t1, cox_wl_cen * t0 / t1)
-        };
-
-        let potential_drop = if k1ox == 0.0 {
-            0.0
-        } else if t3 < 0.0 {
-            t3 / k1ox
-        } else if t0 >= 0.0 {
-            t3 / (t1 + t0)
-        } else {
-            t1 - t0
-        };
-        let qsub0 = cox_wl_cen * k1ox * potential_drop;
+        let (charge, slope) = depletion_charge(k1ox, t3)?;
+        let qsub0 = cox_wl_cen * charge;
+        let t2 = cox_wl_cen * slope;
         let qov_cox = qsub0 / coxeff;
         let dqsub0_dvg = qov_cox.mul_add(
             dcoxeff_dvg,
@@ -610,8 +583,8 @@ impl ChargeModel<'_> {
         // quirk is reproduced.
         let source = junction_parts(t, m, p.source_area, p.source_perimeter, p.weff);
         let drain = junction_parts(t, m, p.drain_area, p.drain_perimeter, p.weff);
-        let (qbs, capbs) = depletion(vbs, source, |_| {})?;
-        let (qbd, capbd) = depletion(vbs - vds, drain, |_| {})?;
+        let (qbs, capbs) = depletion(&vbs, source, |_| {})?;
+        let (qbd, capbd) = depletion(&(vbs - vds), drain, |_| {})?;
 
         let result = ChargeEvaluation {
             qgate,

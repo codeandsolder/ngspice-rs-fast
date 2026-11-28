@@ -21,6 +21,9 @@
 )] // C's if nesting.
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{LoadCkt, mode, state};
+use crate::devices::bsim_physics::{
+    depletion_charge, positive_half_sum, smooth_drain, smooth_positive,
+};
 use crate::maths::taylor::arithmetic::Constitutive;
 use crate::primitives::SpiceResult;
 
@@ -79,50 +82,6 @@ fn DEXP<S: Constitutive>(argument: S) -> (S, S) {
     }
 }
 
-/// Smooth the transition from linear drain voltage to saturation using
-/// the smaller root of y² - (sat + drain + delta)y + sat*drain = 0.
-/// Keep the complementary gaps as independent values: reconstructing them
-/// by subtraction would lose precisely the low-field terms needed by the
-/// channel-length and capacitance derivatives.
-struct DrainSmoothing {
-    effective: f64,
-    drain_excess: f64,
-    saturation_partial: f64,
-    drain_partial: f64,
-}
-
-fn positive_half_sum(x: f64, root: f64, product: f64) -> f64 {
-    if x >= 0. {
-        root.midpoint(x)
-    } else {
-        2. * product / (root - x)
-    }
-}
-
-/// Smooth positive part and its slope, without losing the negative-tail
-/// value or evaluating its derivative as a difference of nearly equal terms.
-fn smooth_positive(x: f64, quarter_width_squared: f64) -> (f64, f64) {
-    let root = x.mul_add(x, 4. * quarter_width_squared).sqrt();
-    let value = positive_half_sum(x, root, quarter_width_squared);
-    // The symmetric limiting slope at the unsmoothed kink.
-    let slope = if root == 0. { 0.5 } else { value / root };
-    (value, slope)
-}
-
-fn smooth_drain(saturation: f64, drain: f64, delta: f64) -> DrainSmoothing {
-    let x = saturation - drain - delta;
-    let root = x.mul_add(x, 4. * delta * saturation).sqrt();
-    let effective = (2. * saturation / (saturation + drain + delta + root)) * drain;
-    let drain_excess = positive_half_sum(drain - saturation - delta, root, delta * drain);
-    let saturation_excess = positive_half_sum(x, root, delta * saturation);
-    DrainSmoothing {
-        effective,
-        drain_excess,
-        saturation_partial: drain_excess / root,
-        drain_partial: saturation_excess / root,
-    }
-}
-
 /// Smaller physical saturation root of a*y²/2 - b*y + c = 0.
 struct SaturationRoot {
     value: f64,
@@ -144,26 +103,6 @@ impl SaturationRoot {
     }
 }
 
-/// Normalized depletion charge and its differential capacitance.
-/// The negative-potential continuation is linear. Rationalization makes
-/// the positive branch continuous down to the representable zero limit.
-fn depletion_charge(k1: f64, increment: f64) -> (f64, f64) {
-    if k1 == 0. {
-        return (0., 0.);
-    }
-    if increment < 0. {
-        return (increment, 1.);
-    }
-    let base = 0.5 * k1;
-    let root = base.mul_add(base, increment).sqrt();
-    let difference = if base > 0. {
-        increment / (root + base)
-    } else {
-        root - base
-    };
-    (k1 * difference, base / root)
-}
-
 /// `BSIM4load` for one instance: evaluates the device at the voltages C's
 /// mode selects, writes `CKTstate0`, integrates charges and adds the
 /// matrix and right-hand-side terms, as C does.
@@ -183,8 +122,8 @@ pub(super) fn load(
     };
     junction::current(model, here, pParam, ckt, junction_bias)?;
     let electrostatics = channel::electrostatics(model, here, pParam, ckt, &bias)?;
-    let transport = channel::transport(model, here, pParam, &bias, &electrostatics);
-    let cdrain = leakage::evaluate(model, here, pParam, &bias, &electrostatics, &transport);
+    let transport = channel::transport(model, here, pParam, &bias, &electrostatics)?;
+    let cdrain = leakage::evaluate(model, here, pParam, &bias, &electrostatics, &transport)?;
     let charges = charge::intrinsic(model, here, pParam, ckt, &bias, &electrostatics, &transport)?;
     if bias.ChargeComputationNeeded != 0 {
         junction::charge(model, here, pParam, ckt, junction_bias)?;

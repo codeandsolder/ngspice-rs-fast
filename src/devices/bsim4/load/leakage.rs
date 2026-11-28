@@ -37,6 +37,7 @@ use super::{
     channel::{Electrostatics, Transport},
     reduction::{mixed, residual},
 };
+use crate::primitives::SpiceResult;
 
 /// Source/drain channel-tunneling partition and derivative with respect
 /// to its exponential argument. These are the C regularized fractions,
@@ -179,7 +180,7 @@ pub(super) fn evaluate(
     bias: &LoadBias,
     electrostatics: &Electrostatics,
     transport: &Transport,
-) -> f64 {
+) -> SpiceResult<f64> {
     let &LoadBias {
         vbd,
         vbs,
@@ -513,7 +514,7 @@ pub(super) fn evaluate(
     if (model.igcMod != 0) || (model.igbMod != 0) {
         Vfb = here.vfbzb;
         V3 = Vfb - Vgs_eff + Vbseff - DELTA_3;
-        (Voxacc, T1) = super::smooth_positive(V3, DELTA_3 * Vfb.abs());
+        (Voxacc, T1) = super::smooth_positive(V3, DELTA_3 * Vfb.abs())?;
         dVfbeff_dVg = T1 * dVgs_eff_dVg;
         dVfbeff_dVb = -T1;
         dVoxacc_dVg = -dVfbeff_dVg;
@@ -535,7 +536,7 @@ pub(super) fn evaluate(
             dVoxdepinv_dVd = dVgsteff_dVd;
             dVoxdepinv_dVb = dVfbeff_dVb + 1.0 + dVgsteff_dVb;
         } else {
-            (Voxdepinv, T2) = super::depletion_charge(pParam.k1ox, T3);
+            (Voxdepinv, T2) = super::depletion_charge(pParam.k1ox, T3)?;
             dVoxdepinv_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg);
             dVoxdepinv_dVd = -T2 * dVgsteff_dVd;
             dVoxdepinv_dVb = -T2 * (dVfbeff_dVb + 1.0 + dVgsteff_dVb);
@@ -832,7 +833,7 @@ pub(super) fn evaluate(
         Vdseff = if Vds == 0. {
             0.
         } else {
-            super::smooth_drain(Vdsat, Vds, DELTA_4).effective
+            super::smooth_drain(Vdsat, Vds, DELTA_4)?.effective
         };
         T0 = Abulk * Vdseff;
         T1 = 12.0 * ((-0.5_f64).mul_add(T0, Vgsteff) + 1.0e-20);
@@ -846,7 +847,7 @@ pub(super) fn evaluate(
     } else if model.tnoiMod == 2 {
         here.noiGd0 = here.nf * beta * Vgsteff / (gche.mul_add(Rds, 1.));
     }
-    cdrain
+    Ok(cdrain)
 }
 
 #[cfg(test)]

@@ -493,7 +493,7 @@ pub(super) fn transport(
     pParam: &SizeParam,
     bias: &LoadBias,
     electrostatics: &Electrostatics,
-) -> Transport {
+) -> SpiceResult<Transport> {
     let &LoadBias {
         vbd,
         vbs,
@@ -740,7 +740,7 @@ pub(super) fn transport(
         T1 = pParam.prwb * T9;
         dT1_dVb = pParam.prwb * dsqrtPhis_dVb;
         T2 = 1.0 / T0 + T1;
-        let (positive, slope) = smooth_positive(T2, 0.0025);
+        let (positive, slope) = smooth_positive(T2, 0.0025)?;
         T3 = 2.0 * positive;
         dT3_dVg = 2.0 * slope;
         dT3_dVb = dT3_dVg * dT1_dVb;
@@ -1028,7 +1028,7 @@ pub(super) fn transport(
         dVdsat_dVb = root.derivative(dT0_dVb, dT1_dVb, dT2_dVb);
     }
     here.vdsat = Vdsat;
-    let smoothing = smooth_drain(Vdsat, Vds, pParam.delta);
+    let smoothing = smooth_drain(Vdsat, Vds, pParam.delta)?;
     Vdseff = smoothing.effective;
     dVdseff_dVg = smoothing.saturation_partial * dVdsat_dVg;
     dVdseff_dVd = smoothing
@@ -1421,13 +1421,13 @@ pub(super) fn transport(
     }
     if model.rdsMod != 0 {
         T0 = vgs - pParam.vfbsd;
-        (vgs_eff, dvgs_eff_dvg) = smooth_positive(T0, 2.5e-5);
+        (vgs_eff, dvgs_eff_dvg) = smooth_positive(T0, 2.5e-5)?;
         T0 = 1.0 + pParam.prwg * vgs_eff;
         dT0_dvg = -pParam.prwg / T0 / T0 * dvgs_eff_dvg;
         T1 = -pParam.prwb * vbs;
         dT1_dvb = -pParam.prwb;
         T2 = 1.0 / T0 + T1;
-        let (positive, slope) = smooth_positive(T2, 0.0025);
+        let (positive, slope) = smooth_positive(T2, 0.0025)?;
         T3 = 2.0 * positive;
         dT3_dvg = 2.0 * slope;
         dT3_dvb = dT3_dvg * dT1_dvb;
@@ -1444,13 +1444,13 @@ pub(super) fn transport(
         dgstot_dvb = T0 * dRs_dvb;
         dgstot_dvs = -(dgstot_dvg + dgstot_dvb + dgstot_dvd);
         T0 = vgd - pParam.vfbsd;
-        (vgd_eff, dvgd_eff_dvg) = smooth_positive(T0, 2.5e-5);
+        (vgd_eff, dvgd_eff_dvg) = smooth_positive(T0, 2.5e-5)?;
         T0 = 1.0 + pParam.prwg * vgd_eff;
         dT0_dvg = -pParam.prwg / T0 / T0 * dvgd_eff_dvg;
         T1 = -pParam.prwb * vbd;
         dT1_dvb = -pParam.prwb;
         T2 = 1.0 / T0 + T1;
-        let (positive, slope) = smooth_positive(T2, 0.0025);
+        let (positive, slope) = smooth_positive(T2, 0.0025)?;
         T3 = 2.0 * positive;
         dT3_dvg = 2.0 * slope;
         dT3_dvb = dT3_dvg * dT1_dvb;
@@ -1487,7 +1487,7 @@ pub(super) fn transport(
         here.gdtotb = 0.0;
         here.gdtots = here.gdtotb;
     }
-    Transport {
+    Ok(Transport {
         Abulk0_Q,
         Coxeff,
         Rds,
@@ -1499,5 +1499,5 @@ pub(super) fn transport(
         dVdseff_dVd,
         dVdseff_dVg,
         gche,
-    }
+    })
 }

@@ -71,7 +71,7 @@ impl JunctionDiode {
     fn evaluate<S: Constitutive>(
         self,
         selector: i32,
-        voltage: S,
+        voltage: &S,
         gmin: f64,
     ) -> SpiceResult<Option<(S, S)>> {
         if self.saturation <= 0. {
@@ -79,13 +79,13 @@ impl JunctionDiode {
         }
         let argument = voltage.clone().divide(&voltage.constant(self.thermal))?;
         let (current, slope) = match selector {
-            0 => self.unclipped(&voltage, &argument)?,
-            1 => self.forward_limited(&voltage, &argument),
-            2 => self.both_limited(&voltage, &argument)?,
+            0 => self.unclipped(voltage, &argument)?,
+            1 => self.forward_limited(voltage, &argument),
+            2 => self.both_limited(voltage, &argument)?,
             _ => return Ok(None),
         };
         Ok(Some((
-            voltage.constant(gmin).mul_add(&voltage, &current),
+            voltage.constant(gmin).mul_add(voltage, &current),
             slope.offset(gmin),
         )))
     }
@@ -317,11 +317,11 @@ pub(super) fn current(
         reverse_current: here.IVjdmRev,
         reverse_slope: here.DslpRev,
     };
-    if let Some((current, slope)) = source.evaluate(model.dioMod, bias.source, ckt.gmin())? {
+    if let Some((current, slope)) = source.evaluate(model.dioMod, &bias.source, ckt.gmin())? {
         here.cbs = current;
         here.gbs = slope;
     }
-    if let Some((current, slope)) = drain.evaluate(model.dioMod, bias.drain, ckt.gmin())? {
+    if let Some((current, slope)) = drain.evaluate(model.dioMod, &bias.drain, ckt.gmin())? {
         here.cbd = current;
         here.gbd = slope;
     }
@@ -363,7 +363,7 @@ pub(super) fn charge(
     bias: JunctionBias,
 ) -> SpiceResult<()> {
     let (_, source_capacitance) = depletion(
-        bias.source,
+        &bias.source,
         [
             JunctionCapacitance {
                 zero: model.SunitAreaTempJctCap * here.Aseff,
@@ -385,7 +385,7 @@ pub(super) fn charge(
     )?;
     here.capbs = source_capacitance;
     let (_, drain_capacitance) = depletion(
-        bias.drain,
+        &bias.drain,
         [
             JunctionCapacitance {
                 zero: model.DunitAreaTempJctCap * here.Adeff,
@@ -437,7 +437,7 @@ mod tests {
             let gain = if selector == 1 { 1. } else { 1.5 };
             let expected = gain * diode.saturation / diode.thermal;
             for voltage in [-1e-22, -1e-18, 1e-18, 1e-22] {
-                let (current, slope) = diode.evaluate(selector, voltage, 0.).unwrap().unwrap();
+                let (current, slope) = diode.evaluate(selector, &voltage, 0.).unwrap().unwrap();
                 assert!((current / (expected * voltage) - 1.).abs() < 8. * f64::EPSILON);
                 assert!((slope / expected - 1.).abs() < 8. * f64::EPSILON);
             }
@@ -449,22 +449,22 @@ mod tests {
         let mut diode = diode();
         diode.breakdown_voltage = 40. * diode.thermal;
         diode.breakdown_at_zero = MIN_EXP;
-        let (current, slope) = diode.evaluate(2, 0., 0.).unwrap().unwrap();
+        let (current, slope) = diode.evaluate(2, &0., 0.).unwrap().unwrap();
         assert_eq!(current.to_bits(), 0_f64.to_bits());
         assert!((slope / (diode.saturation / diode.thermal) - 1.).abs() < f64::EPSILON);
-        let (current, _) = diode.evaluate(0, 0., 0.).unwrap().unwrap();
+        let (current, _) = diode.evaluate(0, &0., 0.).unwrap().unwrap();
         // Mode zero retains the C zero-bias floor but uses the unclipped
         // reverse exponential, unlike mode two.
         assert!(current > 0.);
         let (current, slope) = diode
-            .evaluate(1, -36. * diode.thermal, 0.)
+            .evaluate(1, &(-36. * diode.thermal), 0.)
             .unwrap()
             .unwrap();
         assert_eq!(current, diode.saturation * (MIN_EXP - 1.));
         assert_eq!(slope, 0.);
         diode.forward_voltage = 1e-18;
         diode.forward_current = diode.saturation;
-        let (current, _) = diode.evaluate(1, 2e-18, 0.).unwrap().unwrap();
+        let (current, _) = diode.evaluate(1, &2e-18, 0.).unwrap().unwrap();
         assert!(
             (current / (2e-18 * diode.saturation / diode.thermal) - 1.).abs() < 4. * f64::EPSILON
         );
@@ -494,8 +494,9 @@ mod tests {
             for bias in [-1.25, -0.95, -0.7, -0.1, -1e-18, 0., 0.05, 0.15, 1.] {
                 let rate = 0.01;
                 let voltage = Differential::<1>::variable(0, Jet::affine(order, bias, rate))?;
-                let (current, slope) = diode.evaluate(selector, voltage, gmin)?.unwrap();
-                let (scalar_current, scalar_slope) = diode.evaluate(selector, bias, gmin)?.unwrap();
+                let (current, slope) = diode.evaluate(selector, &voltage, gmin)?.unwrap();
+                let (scalar_current, scalar_slope) =
+                    diode.evaluate(selector, &bias, gmin)?.unwrap();
                 close(current.value.value(), scalar_current, 1e-28);
                 close(slope.value.value(), scalar_slope, 1e-28);
                 let partial = current.gradient[0].as_ref().unwrap();
@@ -508,7 +509,7 @@ mod tests {
                 }
                 for time in [-0.03, 0.03] {
                     let (expected, expected_slope) = diode
-                        .evaluate(selector, rate.mul_add(time, bias), gmin)?
+                        .evaluate(selector, &rate.mul_add(time, bias), gmin)?
                         .unwrap();
                     close(sample(&current.value, time), expected, 1e-25);
                     close(sample(&slope.value, time), expected_slope, 1e-25);
@@ -530,10 +531,10 @@ mod tests {
         ] {
             for rate in [-0.01, 0.01] {
                 let voltage = Differential::<1>::variable(0, Jet::affine(8, bias, rate))?;
-                let (current, slope) = diode.evaluate(selector, voltage, gmin)?.unwrap();
+                let (current, slope) = diode.evaluate(selector, &voltage, gmin)?.unwrap();
                 let time = 0.03;
                 let (expected, expected_slope) = diode
-                    .evaluate(selector, rate.mul_add(time, bias), gmin)?
+                    .evaluate(selector, &rate.mul_add(time, bias), gmin)?
                     .unwrap();
                 close(sample(&current.value, time), expected, 1e-25);
                 close(sample(&slope.value, time), expected_slope, 1e-25);
