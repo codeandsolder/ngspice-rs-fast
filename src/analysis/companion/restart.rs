@@ -30,8 +30,10 @@ pub(super) enum RestartProbe {
 /// derivative is needed, and no provisional midpoint is published.
 fn restart_error(initial: Real, middle: Real, final_value: Real, dt: Real, half: Real) -> Real {
     let fraction = half / dt;
-    let residual = (-(1. / fraction)).mul_add(middle - initial, final_value - initial);
-    residual.abs() / (2. * (1. - fraction))
+    // Cross-multiply before subtraction rather than round the reciprocal
+    // of the fractional interval before cancellation.
+    let residual = fraction.mul_add(final_value - initial, -(middle - initial));
+    residual.abs() / (2. * fraction * (1. - fraction))
 }
 
 fn charge_ratio(
