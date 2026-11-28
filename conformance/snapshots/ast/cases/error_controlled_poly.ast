@@ -1,4 +1,0 @@
-# ngspice-rs ast-dump v1
-file: cases/error_controlled_poly.cir
-error parse @cases/error_controlled_poly.cir:4:22
-  message: "a POLY source needs at least one coefficient (C: number of connections differs from poly dimension)"

@@ -1,3 +1,0 @@
-# `cargo xtask <command>` runs the workspace automation crate (see xtask/).
-[alias]
-xtask = "run --package xtask --"
