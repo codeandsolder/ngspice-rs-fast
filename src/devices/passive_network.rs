@@ -317,7 +317,7 @@ impl PreparedPassiveNetwork {
     }
 
     /// Select the physical branch used by controlling-current references.
-    #[must_use]
+    #[must_use = "the returned network carries the selected physical control branch"]
     pub fn with_current_control(mut self, reference: CurrentReference) -> Self {
         self.control = Some(reference);
         self.update_primary_probe();
@@ -556,7 +556,7 @@ impl PreparedVoltageNetwork {
     }
 
     /// Select the physical branch used by controlling-current references.
-    #[must_use]
+    #[must_use = "the returned network carries the selected physical control branch"]
     pub const fn with_current_control(mut self, reference: CurrentReference) -> Self {
         self.control = Some(reference);
         self
