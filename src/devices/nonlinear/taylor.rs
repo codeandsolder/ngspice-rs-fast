@@ -101,15 +101,15 @@ fn characteristic(
     if sat == 0. {
         return Ok(Law::zero(v));
     }
-    if !forward {
+    if forward {
+        exponential(v, vt, sat).checked()
+    } else {
         let (value, derivative) = cubic_reverse_junction(v.value(), vt, sat);
         // The slope varies as v^-4. Normalize around the expansion point,
         // avoiding powers of a small dimensional voltage or of saturation current.
         let relative = v.clone().scale(v.value().recip()).with_value(1.);
         let slope = relative.integer_power(-4)?.scale(derivative);
         Law::lift(v, value, slope).checked()
-    } else {
-        exponential(v, vt, sat).checked()
     }
 }
 

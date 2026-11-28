@@ -369,10 +369,16 @@ impl StateHistory {
             .accepted
             .first()
             .ok_or_else(|| state_error("missing accepted physical germ"))?;
-        let mut trial = self.trial();
-        trial.values = Arc::clone(values);
-        trial.physical_currents = self.physical_currents.as_ref().map(Arc::clone);
-        Ok(trial)
+        Ok(TrialState {
+            topology: self.binding.as_ref().map(|binding| binding.topology),
+            revision: Arc::clone(&self.revision),
+            values: Arc::clone(values),
+            mode: LoadMode::EXACT,
+            previous: None,
+            nonconvergent: false,
+            physical_currents: self.physical_currents.as_ref().map(Arc::clone),
+            patches: State1Patches::default(),
+        })
     }
 
     /// A fresh trial for a Newton load in `phase`, seeing `previous` (the

@@ -1644,10 +1644,14 @@ fn diode_breakdown_crossing_retains_selected_current_at_interior_and_stop() -> S
     // IBV is deliberately smaller than IS*BV/Vt: the matching law
     // retains BV exactly, so the cubic and breakdown currents differ
     // at the knot. This distinguishes the selected germ from a scalar ask.
-    let body = "vdrive in 0 PWL(0 -0.875 2u -1.125 4u -0.875)\nd1 in 0 dm\n.model dm d(is=1u n=10 bv=1 ibv=1p nbv=1)\nb1 out 0 v=1u*ddt(v(in))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
-    let thermal = (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    // The dyadic times and slope give an exactly representable voltage
+    // crossing, not a threshold rounded to an earlier adjacent time.
+    let body = "vdrive in 0 PWL(0 0 1.9073486328125e-6 -2 3.814697265625e-6 0)\nd1 in 0 dm\n.model dm d(is=1u n=10 bv=1 ibv=1p nbv=10)\nb1 out 0 v=1u*ddt(v(in))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    let down = 9.536_743_164_062_5e-7_f64;
+    let up = 3. * down;
     for method in ["method=trap", "method=gear"] {
-        for stop in ["1u", "4u"] {
+        for (stop, interior) in [("9.5367431640625e-7", false), ("3.814697265625e-6", true)] {
             let plot = run_observed(
                 body,
                 AnalysisKind::Transient,
@@ -1658,29 +1662,54 @@ fn diode_breakdown_crossing_retains_selected_current_at_interior_and_stop() -> S
             for index in 0..plot.point_count() {
                 let at = |name: &str| plot.value(name, index).unwrap().re;
                 let time = at("time");
-                let at_down = (time - 1e-6).abs() <= 1e-18;
-                let at_up = (time - 3e-6).abs() <= 1e-18;
+                let at_down = time.to_bits() == down.to_bits();
+                let at_up = time.to_bits() == up.to_bits();
                 seen[0] |= at_down;
                 seen[1] |= at_up;
                 let voltage = at("v(in)");
                 let breakdown = if at_down {
-                    stop != "1u"
+                    interior
                 } else if at_up {
                     false
                 } else {
-                    (1e-6..3e-6).contains(&time)
+                    (down..up).contains(&time)
                 };
                 let current = if breakdown {
                     -1e-6 * (-(1. + voltage) / thermal).exp()
+                } else if voltage < -3. * thermal {
+                    -1e-6 * (1. + (3. * thermal / (voltage * std::f64::consts::E)).powi(3))
                 } else {
-                    -1e-6 * (1. + (30. * thermal / (voltage * std::f64::consts::E)).powi(3))
+                    1e-6 * (voltage / thermal).exp_m1()
                 } + 1e-12 * voltage;
                 close(at("@d1[i]"), current, 1e-12);
                 close(at("i(vdrive)"), -current, 1e-12);
                 close(at("@d1[p]"), voltage * current, 1e-12);
             }
-            assert_eq!(seen, [true, stop == "4u"], "{method}, stop={stop}");
+            assert_eq!(seen, [true, interior], "{method}, stop={stop}");
         }
     }
     Ok(())
+}
+
+#[test]
+fn diode_breakdown_charge_discontinuity_requires_an_impulse() {
+    // With nonzero transit time the same deliberately unmatched static
+    // breakdown law has discontinuous diffusion charge. A prescribed
+    // continuous voltage cannot satisfy both one-sided charge values.
+    let body = "vdrive in 0 PWL(0 0 1.9073486328125e-6 -2 3.814697265625e-6 0)\nd1 in 0 dm\n.model dm d(is=1u n=10 bv=1 ibv=1p nbv=10 tt=1m)\nb1 out 0 v=1u*ddt(v(in))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n chgtol=1e-18";
+    for method in ["method=trap", "method=gear"] {
+        let error = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.4u", "3.814697265625e-6", "0", "0.4u", "uic", method],
+        )
+        .expect_err("a diffusion charge jump requires an impulse")
+        .to_string();
+        assert!(
+            error.contains("source event")
+                && error.contains("d1: initial charge constraint")
+                && error.contains("impulse"),
+            "{method}: {error}"
+        );
+    }
 }

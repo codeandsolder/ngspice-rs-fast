@@ -533,7 +533,7 @@ impl TaylorContext<'_> {
         Ok(())
     }
 
-    pub(crate) fn constitutive_guards(&mut self) -> ConstitutiveGuards<'_> {
+    pub(crate) const fn constitutive_guards(&mut self) -> ConstitutiveGuards<'_> {
         ConstitutiveGuards {
             trace: self.output.guards.as_mut(),
             device: self.device,
