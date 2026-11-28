@@ -35,17 +35,36 @@ use std::{
 };
 
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
-use crate::netlist::bexpr::{BExpr, BExprKind, BehaviouralExpression, DynamicOperator};
+use crate::netlist::bexpr::{
+    BExpr, BExprKind, BehaviouralExpression, CurrentPolicy, DynamicOperator,
+};
 use crate::primitives::NodeTable;
 
-const DERIVATIVE: &str = "__dynamic_derivative";
+pub(super) const DERIVATIVE: &str = "__dynamic_derivative";
+const SAMPLED_CURRENT: &str = "__dynamic_sampled_current";
 
-/// The marker is emitted by the resolved-expression expansion, never by
-/// the netlist parser. Ordinary behavioural sources cannot acquire it.
-pub(in crate::devices) fn is_generated(instance: &DeviceInstance) -> bool {
-    instance.designator == 'b'
-        && matches!(instance.parameters.as_slice(), [parameter] if parameter.name == DERIVATIVE
-            && matches!(parameter.kind, ParameterKind::Behavioural(_)))
+/// The private operator kind is the single source of truth for factory
+/// dispatch and exclusion from source-declared node identities.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::devices) enum GeneratedOperator {
+    Derivative,
+    SampledCurrent,
+}
+
+pub(in crate::devices) fn generated_operator(
+    instance: &DeviceInstance,
+) -> Option<GeneratedOperator> {
+    if instance.designator != 'b' {
+        return None;
+    }
+    let [parameter] = instance.parameters.as_slice() else {
+        return None;
+    };
+    match (parameter.name.as_str(), &parameter.kind) {
+        (DERIVATIVE, ParameterKind::Behavioural(_)) => Some(GeneratedOperator::Derivative),
+        (SAMPLED_CURRENT, ParameterKind::Instance) => Some(GeneratedOperator::SampledCurrent),
+        _ => None,
+    }
 }
 
 fn expressions(instance: &DeviceInstance) -> impl Iterator<Item = &BehaviouralExpression> {
@@ -163,15 +182,15 @@ fn measured_targets(
         let Some(location) = referenced.get(&name) else {
             continue;
         };
-        if removed_network(instance)? {
-            targets.zero.insert(name);
-            continue;
-        }
         if is_instantaneous_branch(
             instance.designator,
             instance.parameters.iter().any(|p| p.name == "v"),
         ) {
-            targets.instantaneous.insert(name);
+            targets.instantaneous.insert(name.clone());
+        }
+        if removed_network(instance)? {
+            targets.zero.insert(name);
+            continue;
         }
         if !resistors.contains_key(&instance.name) && !has_native_current(instance, models)? {
             // A series probe reads the first physical terminal. A terminal-less
@@ -398,9 +417,8 @@ impl Expansion {
             }
             match dynamic_operator(expr) {
                 Some(DynamicOperator::Derivative) => result = self.extract_derivative(expr),
-                Some(DynamicOperator::SampledCurrent) => result = self.extract_sample(expr, false),
-                Some(DynamicOperator::BranchOrSampledCurrent) => {
-                    result = self.extract_sample(expr, true)
+                Some(DynamicOperator::Current(policy)) => {
+                    result = self.extract_sample(expr, policy)
                 }
                 None => {
                     if let BExprKind::Current(name) = &mut expr.kind {
@@ -417,7 +435,7 @@ impl Expansion {
         result
     }
 
-    fn extract_sample(&mut self, expr: &mut BExpr, preserve_branch: bool) -> SpiceResult<()> {
+    fn extract_sample(&mut self, expr: &mut BExpr, policy: CurrentPolicy) -> SpiceResult<()> {
         let invalid = || {
             SpiceError::parse(
                 expr.span.start.clone(),
@@ -438,11 +456,19 @@ impl Expansion {
             return Err(invalid());
         };
         let key = name.to_ascii_lowercase();
+        let requires_branch =
+            policy == CurrentPolicy::BranchOrSampled && self.instantaneous.contains(&key);
         if self.zero_currents.contains(&key) {
+            if requires_branch {
+                return Err(SpiceError::parse(
+                    expr.span.start.clone(),
+                    format!("{name}: required physical branch is absent (zero multiplicity)"),
+                ));
+            }
             expr.kind = zero_current();
             return Ok(());
         }
-        if preserve_branch && self.instantaneous.contains(&key) {
+        if requires_branch {
             // Classification preceded sensing aliases: an observation-only
             // source cannot acquire a voltage-imposing branch policy.
             expr.kind = BExprKind::Current(self.renames.get(&key).cloned().unwrap_or(key));
@@ -461,7 +487,7 @@ impl Expansion {
                 nodes: vec![node.clone()],
                 model: None,
                 parameters: vec![ParameterAssignment {
-                    name: super::sampled::MARKER.to_owned(),
+                    name: SAMPLED_CURRENT.to_owned(),
                     value: name.clone(),
                     kind: ParameterKind::Instance,
                     location: location.clone(),

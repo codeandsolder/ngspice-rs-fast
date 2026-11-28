@@ -275,19 +275,24 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
 ];
 
 /// Operators lowered to solver-owned state after lexical resolution.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentPolicy {
+    Sampled,
+    BranchOrSampled,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum DynamicOperator {
     Derivative,
-    SampledCurrent,
-    BranchOrSampledCurrent,
+    Current(CurrentPolicy),
 }
 
 impl DynamicOperator {
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             "ddt" => Some(Self::Derivative),
-            "sampled_current" => Some(Self::SampledCurrent),
-            "branch_or_sampled_current" => Some(Self::BranchOrSampledCurrent),
+            "sampled_current" => Some(Self::Current(CurrentPolicy::Sampled)),
+            "branch_or_sampled_current" => Some(Self::Current(CurrentPolicy::BranchOrSampled)),
             _ => None,
         }
     }

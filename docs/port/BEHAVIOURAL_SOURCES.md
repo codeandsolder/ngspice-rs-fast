@@ -301,7 +301,9 @@ Both forms share existing physical branch coordinates or a single ideal
 sensing branch after lexical and hierarchy expansion. `pn_control=1` selects
 the physical port of a prepared passive network independently of
 `pn_report_*` and the intrinsic storage branch. A resolved zero-multiplicity
-removed network contributes constant zero. The sampled signal itself is a
+removed network contributes constant zero to sampled observations. A selected
+required winding branch is diagnosed if the inductor has zero copies; it
+is not silently converted to an observation. The sampled signal itself is a
 private algebraic coordinate without electrical incidence. Physical DAE and
 Taylor evaluations use the exact converged algebraic residual (not the
 iteration-dependent linearization or AC tangent).

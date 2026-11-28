@@ -990,10 +990,7 @@ fn from_numparam(
             } else if builtin
                 && matches!(
                     crate::netlist::bexpr::DynamicOperator::from_name(name),
-                    Some(
-                        crate::netlist::bexpr::DynamicOperator::SampledCurrent
-                            | crate::netlist::bexpr::DynamicOperator::BranchOrSampledCurrent
-                    )
+                    Some(crate::netlist::bexpr::DynamicOperator::Current(_))
                 )
                 && let [operand] = operands.as_slice()
                 && let Some(current) =

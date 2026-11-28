@@ -176,11 +176,12 @@ pub(super) fn instantiate(
     {
         return crate::devices::behavioural::rlc::instantiate(instance, nodes);
     }
-    if crate::devices::behavioural::sampled::is_generated(instance) {
-        return crate::devices::behavioural::sampled::instantiate(instance, nodes);
-    }
-    if crate::devices::behavioural::dynamic::is_generated(instance) {
-        return crate::devices::behavioural::rlc::instantiate(instance, nodes);
+    if let Some(operator) = crate::devices::behavioural::dynamic::generated_operator(instance) {
+        use crate::devices::behavioural::{dynamic::GeneratedOperator, rlc, sampled};
+        return match operator {
+            GeneratedOperator::Derivative => rlc::instantiate(instance, nodes),
+            GeneratedOperator::SampledCurrent => sampled::instantiate(instance, nodes),
+        };
     }
     if matches!(instance.designator, 'b' | 'a') {
         return crate::devices::behavioural::instantiate(instance, nodes);

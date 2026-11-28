@@ -932,7 +932,7 @@ pub(in crate::devices) fn instantiate(
                     ('c', "capacitance") => Law::Capacitance,
                     ('c', "charge") => Law::Charge,
                     ('l', "inductance") => Law::Inductance,
-                    ('b', "__dynamic_derivative") => Law::Derivative,
+                    ('b', super::dynamic::DERIVATIVE) => Law::Derivative,
                     _ => {
                         return Err(unsupported(
                             &parameter.location,

@@ -392,3 +392,27 @@ fn sampled_current_does_not_add_noise_or_change_small_signal_gain() -> SpiceResu
     }
     Ok(())
 }
+
+#[test]
+fn absent_winding_control_is_distinct_from_sampled_zero_projection() -> SpiceResult<()> {
+    let deck = "zero copies\nv1 a 0 2 ac 1\nr1 a 0 10\nl1 a 0 3m m=0 pn_control=0\nc1 a 0 2u m=0 pn_control=1\nb1 b 0 v=sampled_current(i(l1))+branch_or_sampled_current(i(c1))\n.end\n";
+    let mut c = circuit(deck)?;
+    for (kind, args) in [
+        (AnalysisKind::OperatingPoint, [].as_slice()),
+        (AnalysisKind::Ac, ["lin", "1", "1000", "1000"].as_slice()),
+    ] {
+        let plot = run(&mut c, kind, args)?;
+        close(plot.value("v(b)", 0).unwrap(), Complex::real(0.));
+    }
+    let error =
+        circuit(&deck.replace("sampled_current(i(l1))", "branch_or_sampled_current(i(l1))"))
+            .and_then(|mut c| c.finalize())
+            .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("required physical branch is absent"),
+        "{error}"
+    );
+    Ok(())
+}

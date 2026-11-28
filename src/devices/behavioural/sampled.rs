@@ -9,16 +9,8 @@ use crate::devices::{
     traits::{AnalysisMode, ControlReference, ConvergenceContext, MnaUnknowns, StampContext},
 };
 use crate::maths::Vector;
-use crate::netlist::ast::{DeviceInstance, ParameterKind};
+use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
-
-pub(super) const MARKER: &str = "__dynamic_sampled_current";
-
-pub(in crate::devices) fn is_generated(instance: &DeviceInstance) -> bool {
-    instance.designator == 'b'
-        && matches!(instance.parameters.as_slice(), [parameter]
-            if parameter.name == MARKER && parameter.kind == ParameterKind::Instance)
-}
 
 #[derive(Debug)]
 struct SampledCurrent {
@@ -172,7 +164,7 @@ pub(in crate::devices) fn instantiate(
     let [parameter] = instance.parameters.as_slice() else {
         return Err(SpiceError::circuit("invalid sampled-current operator"));
     };
-    if !is_generated(instance) || instance.model.is_some() {
+    if instance.model.is_some() {
         return Err(SpiceError::circuit("invalid sampled-current operator"));
     }
     let signal = nodes.intern_array::<1>(&instance.nodes)?;
