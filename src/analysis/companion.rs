@@ -1220,7 +1220,6 @@ fn run_transient_inner(
         if let Some(device) = circuit.devices().iter().find(|device| {
             device.delay_line().is_some()
                 || device.depends_on_time()
-                || !device.accepted_control_samples().is_empty()
                 || matches!(device.designator(), 's' | 'w')
         }) {
             return Err(unsupported(format!(

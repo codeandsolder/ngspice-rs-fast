@@ -1,7 +1,7 @@
-//! Accepted-point sampling of a physical branch coordinate.
+//! Phase-selected iteration sampling of a physical branch coordinate.
 //!
-//! The private signal equation has no electrical incidence. Its stored value
-//! is published from the solved control coordinate, never from a Newton guess.
+//! The private signal has no electrical incidence or independent history.
+//! Transient loads sample the current iterate with a frozen control tangent.
 
 use crate::devices::{
     Device, LinearContext,
@@ -46,12 +46,6 @@ impl SampledCurrent {
             .get(Self::control_row(controls)?)
             .ok_or_else(|| SpiceError::circuit("missing sampled-current control value"))
     }
-
-    fn held(sample: Option<Real>) -> SpiceResult<Real> {
-        sample.ok_or_else(|| {
-            SpiceError::circuit("sampled current requires an accepted initial point")
-        })
-    }
 }
 
 impl Device for SampledCurrent {
@@ -82,13 +76,6 @@ impl Device for SampledCurrent {
     fn limits_voltage_steps(&self) -> bool {
         false
     }
-    fn state_count(&self) -> usize {
-        1
-    }
-    fn accepted_control_samples(&self) -> &[(usize, usize)] {
-        &[(0, 0)]
-    }
-
     fn setup_matrix(&self, setup: &mut MatrixSetup<'_>) -> SpiceResult<bool> {
         let row = setup.node(self.signal[0]);
         setup.element(row, row);
@@ -99,22 +86,43 @@ impl Device for SampledCurrent {
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let row = self.row(context.unknowns)?;
         let control = Self::control_row(context.controls)?;
-        let current = Self::current(context.solution, context.controls)?;
-        // Satisfy the trial-state contract. Acceptance overwrites this slot
-        // with the final solved current, which may differ from this load.
-        context.states.set(0, current)?;
         context.matrix.add(row, row, 1.)?;
         match context.mode {
-            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
+            AnalysisMode::OperatingPoint
+            | AnalysisMode::DcSweep
+            | AnalysisMode::Instantaneous { .. } => {
+                // The converged static/physical law is exact equality. Its
+                // Jacobian is not the source-selected small-signal tangent.
                 context.matrix.add(row, control, -1.)
             }
-            AnalysisMode::Transient { .. } => context
-                .rhs
-                .add_to(row, Self::held(context.states.accepted(1, 0))?),
-            _ => Err(SpiceError::circuit(
-                "sampled current requires bias, companion transient, or small-signal assembly",
+            AnalysisMode::Transient { .. } => {
+                // Picard sampling: re-evaluate from each Newton load's
+                // input iterate, never persist a rejected trial observation.
+                context
+                    .rhs
+                    .add_to(row, Self::current(context.solution, context.controls)?)
+            }
+            AnalysisMode::Ac { .. } => Err(SpiceError::circuit(
+                "sampled current uses small-signal assembly for AC",
             )),
         }
+    }
+
+    fn assemble_nonlinear_charge(
+        &self,
+        _context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        let row = Some(self.row(context.unknowns)?);
+        let control = Some(Self::control_row(context.controls)?);
+        context.linear_static(row, row, 1.)?;
+        context.linear_static(row, control, -1.)
     }
 
     fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
@@ -122,11 +130,7 @@ impl Device for SampledCurrent {
             .solution
             .get(self.row(context.unknowns)?)
             .ok_or_else(|| SpiceError::circuit("missing sampled-current signal value"))?;
-        let expected = if context.integration.is_some() {
-            Self::held(context.accepted(1, 0))?
-        } else {
-            Self::current(context.solution, context.controls)?
-        };
+        let expected = Self::current(context.solution, context.controls)?;
         Ok((actual - expected).abs()
             > context
                 .reltol
@@ -140,7 +144,7 @@ impl Device for SampledCurrent {
     ) -> SpiceResult<()> {
         let row = self.row(context.unknowns)?;
         // The DC value remains in the expression's bias point, but there is
-        // no infinitesimal signal through an accepted-point observation.
+        // no infinitesimal signal through this sampled observation.
         context.system.a.add(row, row, 1.)
     }
 

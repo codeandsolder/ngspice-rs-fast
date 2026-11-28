@@ -1,4 +1,4 @@
-//! Accepted-point behavioural sampling, independently of physical current reporting.
+//! Phase-selected behavioural sampling, independently of physical current reporting.
 use std::path::Path;
 
 use ngspice_rs::{
@@ -72,7 +72,7 @@ fn dc_ac_and_instantaneous_probe_are_independent() -> SpiceResult<()> {
 }
 
 #[test]
-fn feedback_reads_preceding_accepted_point_for_both_companion_methods() -> SpiceResult<()> {
+fn feedback_converges_to_present_physical_current_for_both_companion_methods() -> SpiceResult<()> {
     let mut rejected = 0;
     for method in ["method=trap", "method=gear"] {
         let mut c = circuit(&format!(
@@ -92,15 +92,21 @@ fn feedback_reads_preceding_accepted_point_for_both_companion_methods() -> Spice
             let live = plot.value("v(live)", point).unwrap();
             let port = plot.value("i(vc1#port)", point).unwrap();
             let previous = plot.value("i(vc1#port)", point - 1).unwrap();
-            close(held, previous);
+            assert!(
+                (held - port).magnitude() <= 2e-6 * port.magnitude() + 2e-12,
+                "{method} point {point}: {held:?} != {port:?}"
+            );
             close(live, port);
             close(
                 plot.value("v(s)", point).unwrap(),
                 plot.value("v(drive)", point).unwrap() - Complex::real(0.5) * held,
             );
-            changed |= (held - live).magnitude() > 1e-5;
+            changed |= (held - previous).magnitude() > 1e-5;
         }
-        assert!(changed, "{method}: sampled and live current never differed");
+        assert!(
+            changed,
+            "{method}: sampled and preceding-point currents never differed"
+        );
     }
     assert!(
         rejected > 0,
@@ -110,63 +116,57 @@ fn feedback_reads_preceding_accepted_point_for_both_companion_methods() -> Spice
 }
 
 #[test]
-fn acceptance_publishes_solved_current_not_trial_guess() -> SpiceResult<()> {
+fn transient_load_samples_only_its_input_iterate_and_has_no_control_tangent() -> SpiceResult<()> {
     let mut c =
         circuit("transaction\nv1 a 0 1\nr1 a 0 1\nb1 b 0 v=sampled_current(i(v1))\n.end\n")?;
     c.finalize()?;
     let sample = c
         .devices()
         .iter()
-        .position(|d| !d.accepted_control_samples().is_empty())
+        .position(|d| d.name().starts_with("b__sampled_current_"))
         .unwrap();
     let control = c.devices().iter().position(|d| d.name() == "v1").unwrap();
-    let slot = c.state_rows(sample).unwrap().start;
     let row = c
         .unknowns()
         .node_row(c.devices()[sample].constitutive_nodes()[0])
         .unwrap();
     let control_row = c.branch_rows(control).unwrap().start;
     let n = c.unknown_count();
-    let solution = |current| {
+    let history = c.state_history()?;
+    let accepted = history.clone();
+    assert!(c.state_rows(sample).unwrap().is_empty());
+    let load = |mode, current| -> SpiceResult<(SparseMatrix, Vector)> {
         let mut x = vec![0.; n];
         x[control_row] = current;
-        Vector::from_slice(&x)
-    };
-    let mut history = c.state_history()?;
-    let load = |history: &ngspice_rs::devices::StateHistory, mode, current| -> SpiceResult<_> {
         let mut trial = history.trial();
         let mut a = SparseMatrix::new(n, n);
         let mut rhs = Vector::zeros(n);
         c.load(
             &LoadRequest {
                 mode,
-                solution: &solution(current),
+                solution: &Vector::from_slice(&x),
                 model_context: &ModelContext::default(),
                 integration: None,
-                history,
+                history: &history,
                 forcing: None,
             },
             &mut a,
             &mut rhs,
             &mut trial,
         )?;
-        Ok((trial, rhs))
+        Ok((a, rhs))
     };
-    let (trial, _) = load(&history, AnalysisMode::OperatingPoint, 3.)?;
-    c.accept_point(&solution(4.), Some(0.), &mut history, trial)?;
-    assert_eq!(history.accepted(1).unwrap()[slot], 4.);
+    let (a, rhs) = load(AnalysisMode::OperatingPoint, 3.)?;
+    assert_eq!(a.get(row, control_row), -1.);
+    assert_eq!(rhs.get(row), Some(0.));
     let mode = AnalysisMode::Transient { time: 1., dt: 1. };
-    let accepted = history.clone();
-    for guess in [9., -11., 2.] {
-        let (_, rhs) = load(&history, mode, guess)?;
-        assert_eq!(rhs.get(row), Some(4.));
+    for guess in [9., -11., 2., 9.] {
+        let (a, rhs) = load(mode, guess)?;
+        assert_eq!(a.get(row, row), 1.);
+        assert_eq!(a.get(row, control_row), 0.);
+        assert_eq!(rhs.get(row), Some(guess));
         assert_eq!(history, accepted);
     }
-    let (trial, _) = load(&history, mode, 9.)?;
-    c.accept_point(&solution(7.), Some(1.), &mut history, trial)?;
-    assert_eq!(history.accepted(1).unwrap()[slot], 7.);
-    let (_, rhs) = load(&history, AnalysisMode::Transient { time: 2., dt: 1. }, 10.)?;
-    assert_eq!(rhs.get(row), Some(7.));
     Ok(())
 }
 

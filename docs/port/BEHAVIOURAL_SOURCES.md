@@ -267,31 +267,35 @@ A lexically shadowed probe or an unused macro argument does not allocate a
 measurement branch. Ordinary F/H/W controls retain their voltage-source
 semantics.
 
-### Accepted-point current sampling
+### Phase-selected current sampling
 
-The source-neutral operator `sampled_current(i(instance))` selects a history
-policy for a resolved current expression occurrence, independently of the
-physical current coordinate and the output reporting law. In DC operating
-points and sweeps it reads the selected physical current. In AC and noise the
-DC bias value is retained in the surrounding expression, but the sampled
-quantity has zero small-signal tangent. During companion transient analysis
-it holds the current from the preceding accepted point, including the initial
-point. Newton iterations and rejected timesteps cannot change the held value.
-Ordinary `i(instance)` retains instantaneous control semantics.
+The source-neutral operator `sampled_current(i(instance))` selects a control
+policy for a resolved current expression occurrence, independently of physical
+current and output reporting. In DC operating points and sweeps it reads the
+exact selected physical current. In AC and noise the DC bias value remains in
+the surrounding expression, but the sampled quantity has zero small-signal
+tangent. Companion transient loads sample the current Newton iterate, with a
+frozen control tangent (Picard iteration). Convergence checks the sampled
+signal against the solved physical current. No separate history is advanced
+on load, acceptance, or rejection. Ordinary `i(instance)` retains its full
+instantaneous Jacobian.
 
-The lowering runs after lexical function and hierarchy expansion. Both forms
-share existing physical branch coordinates or a single ideal sensing branch.
-A prepared passive network can select the port coordinate with `pn_control=1`;
-this is independent of `pn_report_*` and the intrinsic storage branch. A
-resolved zero-multiplicity removed network contributes constant zero to its
-current expressions. The sampled signal itself is a private algebraic
-coordinate without electrical incidence. Its device-local state is updated
-transactionally from the final solved control row at point acceptance, not
-from the preceding load's Newton guess.
+This interpretation is supported by independent LTspice 24.0.12 experiments:
+with feedback the sampled quantity is close to the present current, not the
+previous output point. Tightening reltol from 1e-3 to 1e-6 reduces present
+current errors by approximately three orders of magnitude, also for an
+isolated sine-driven network. The first tiny transient steps alone cannot
+establish a previous-accepted-point policy. The experiments qualify the
+converged residual and zero AC tangent, not LTspice's exact iteration count.
 
-This policy is not a continuous-time constitutive relation. Memoryless
-physical DAE/Taylor analysis and periodic orbit restarts reject sampled
-currents rather than silently replacing them with an instantaneous law.
+Both forms share existing physical branch coordinates or a single ideal
+sensing branch after lexical and hierarchy expansion. `pn_control=1` selects
+the physical port of a prepared passive network independently of
+`pn_report_*` and the intrinsic storage branch. A resolved zero-multiplicity
+removed network contributes constant zero. The sampled signal itself is a
+private algebraic coordinate without electrical incidence. Physical DAE and
+Taylor evaluations use the exact converged algebraic residual (not the
+iteration-dependent linearization or AC tangent).
 
 Internal measurement node and source names are not a source-level API.
 The C conformance fixtures compare every physical quantity including
