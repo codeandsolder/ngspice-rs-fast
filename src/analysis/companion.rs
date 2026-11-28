@@ -2058,7 +2058,7 @@ impl Driver<'_> {
             }
             let device_breaks = self.commit_point(Acceptance::Initial, &x, trial)?;
             if let Some(mixed) = self.mixed.as_deref_mut() {
-                mixed.accept_initial();
+                mixed.accept_initial()?;
             }
             return Ok(AcceptedPoint {
                 cursor: AcceptedCursor::initial(&self.settings),

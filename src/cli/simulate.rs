@@ -267,6 +267,9 @@ pub fn run_with_admission(
         };
         request.run_into(&mut circuit, &config.context(), &mut sink)?;
         sink.finish()?;
+        for warning in circuit.last_digital_diagnostics() {
+            eprintln!("warning: {warning}");
+        }
         circuit.note_completed(entry.kind);
         previous_circuit = Some(circuit);
     }

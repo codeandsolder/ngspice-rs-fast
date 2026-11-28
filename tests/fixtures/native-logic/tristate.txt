@@ -1,0 +1,8 @@
+0 0s 0s
+2u 1s 0s
+5u 1s 1s
+10u 0s 1s
+15u 0s 0s
+18u 1s 0s
+22u 1s 1s
+26u 1s 0s

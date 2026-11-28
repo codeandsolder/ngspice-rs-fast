@@ -1,0 +1,14 @@
+Independent clock, latch and asynchronous causal propagation
+Asource [data clk preset clear] stimulus
+Aedge data clk preset clear qedge null edge
+Alatch data clk preset clear qlatch null latch
+.model stimulus d_source(input_file="causal.txt" input_load=0)
+.model edge d_dff(clk_delay=1.907348632812500000000000e-06 set_delay=8.583068847656250000000000e-06 reset_delay=7.629394531250000000000000e-06 rise_delay=9.536743164062500000000000e-07 fall_delay=1.907348632812500000000000e-06 ic=0 data_load=0 clk_load=0 set_load=0 reset_load=0)
+.model latch d_dlatch(data_delay=5.722045898437500000000000e-06 enable_delay=3.814697265625000000000000e-06 set_delay=8.583068847656250000000000e-06 reset_delay=7.629394531250000000000000e-06 rise_delay=9.536743164062500000000000e-07 fall_delay=1.907348632812500000000000e-06 ic=0 data_load=0 enable_load=0 set_load=0 reset_load=0)
+.control
+set numdgt=17
+tran 1.192092895507812500000000e-07 1.525878906250000000000000e-04 0 1.192092895507812500000000e-07
+eprint data clk preset clear qedge qlatch
+quit
+.endc
+.end

@@ -3,17 +3,25 @@
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
+mod causal_history;
 mod continuous_switch;
 mod continuous_switch_device;
 mod frequency;
+mod pulse;
+mod range_receiver;
 pub mod rational;
+pub use range_receiver::{GapPolicy, RangeReceiver, RangeSample, RangeState, VoltageRange};
+mod sequential_timing;
 pub mod source;
 mod source_logic;
 mod timed_switch;
 mod timed_switch_device;
+mod window_clocked;
+mod window_gate;
+pub use window_gate::{WindowDelays, WindowGate, WindowGateState};
 
-/// Three-valued digital logic.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Stable digital logic and directional timing ambiguity.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Logic {
     /// Logical zero.
     Zero,
@@ -22,30 +30,99 @@ pub enum Logic {
     /// Unknown or conflicting state.
     #[default]
     Unknown,
+    /// Possible rising transition or positive glitch.
+    Rising,
+    /// Possible falling transition or negative glitch.
+    Falling,
 }
 
 impl Logic {
-    /// Three-valued inversion.
+    /// Inversion preserves transition direction.
     #[must_use = "the returned logic value is inverted without changing the original"]
     pub const fn invert(self) -> Self {
         match self {
             Self::Zero => Self::One,
             Self::One => Self::Zero,
             Self::Unknown => Self::Unknown,
+            Self::Rising => Self::Falling,
+            Self::Falling => Self::Rising,
+        }
+    }
+
+    /// Whether a value is a definite binary level.
+    #[must_use = "binary certainty is required for a definite capture"]
+    pub const fn is_binary(self) -> bool {
+        matches!(self, Self::Zero | Self::One)
+    }
+
+    /// Project a timing-ambiguous phase to the three-valued logical
+    /// information available at an arbitrary instant in the phase.
+    #[must_use = "the projection retains all definite logic information"]
+    pub const fn instantaneous(self) -> Self {
+        match self {
+            Self::Rising | Self::Falling => Self::Unknown,
+            _ => self,
+        }
+    }
+
+    const fn phase_start(self) -> Self {
+        match self {
+            Self::Rising => Self::Zero,
+            Self::Falling => Self::One,
+            _ => self,
+        }
+    }
+
+    const fn phase_end(self) -> Self {
+        match self {
+            Self::Rising => Self::One,
+            Self::Falling => Self::Zero,
+            _ => self,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::Unknown => 2,
+            Self::Rising => 3,
+            Self::Falling => 4,
         }
     }
 }
 
-/// Drive strength, in increasing resolution priority.
+/// Ordinal drive strength, from disconnected (0) to forcing (63).
+/// Resistance quantization is a producer policy, not an engine assumption.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
-pub enum Strength {
+pub struct Strength(u8);
+
+impl Strength {
     /// Disconnected output.
-    #[default]
-    HighImpedance,
-    /// Resistive output.
-    Resistive,
-    /// Strong output.
-    Strong,
+    pub const HIGH_IMPEDANCE: Self = Self(0);
+    /// Lowest connected rank.
+    pub const RESISTIVE: Self = Self(1);
+    /// Maximum forcing rank.
+    pub const STRONG: Self = Self(63);
+
+    /// Explicit ordinal strength, in the inclusive range 0..=63.
+    ///
+    /// # Errors
+    /// Invalid rank.
+    pub fn from_rank(rank: u8) -> SpiceResult<Self> {
+        if rank > 63 {
+            return Err(SpiceError::circuit(
+                "digital strength rank must be in 0..=63",
+            ));
+        }
+        Ok(Self(rank))
+    }
+
+    /// The ordinal used by net resolution.
+    #[must_use = "the returned rank is the resolution priority"]
+    pub const fn rank(self) -> u8 {
+        self.0
+    }
 }
 
 /// State and strength of a digital output.
@@ -63,25 +140,44 @@ impl Drive {
     pub const fn strong(logic: Logic) -> Self {
         Self {
             logic,
-            strength: Strength::Strong,
+            strength: Strength::STRONG,
         }
     }
 
-    /// Resolve concurrent drives, ignoring disconnected outputs.
-    #[must_use = "the returned drive is the resolved result of all concurrent outputs"]
+    /// Resolve concurrent drives using exact ordinal strength comparison.
+    #[must_use = "the resolved drive is the result of all concurrent outputs"]
     pub fn resolve(drives: impl IntoIterator<Item = Self>) -> Self {
-        drives
-            .into_iter()
-            .filter(|d| d.strength != Strength::HighImpedance)
-            .fold(Self::default(), |a, b| match a.strength.cmp(&b.strength) {
-                std::cmp::Ordering::Less => b,
-                std::cmp::Ordering::Greater => a,
-                std::cmp::Ordering::Equal if a.logic == b.logic => a,
-                std::cmp::Ordering::Equal => Self {
-                    logic: Logic::Unknown,
-                    strength: a.strength,
-                },
-            })
+        Self::resolve_with_margin(drives, std::num::NonZeroU8::MIN)
+    }
+
+    /// Resolve all competing states together. A differing state within the
+    /// declared rank margin of the strongest driver makes the net unknown.
+    /// No pairwise fold: the result is independent of driver iteration order.
+    #[must_use = "the resolved drive is the result of all concurrent outputs"]
+    pub fn resolve_with_margin(
+        drives: impl IntoIterator<Item = Self>,
+        margin: std::num::NonZeroU8,
+    ) -> Self {
+        let mut ranks = [Strength::HIGH_IMPEDANCE; 5];
+        for drive in drives {
+            let index = drive.logic.index();
+            ranks[index] = ranks[index].max(drive.strength);
+        }
+        let strength = ranks.into_iter().max().unwrap_or_default();
+        if strength == Strength::HIGH_IMPEDANCE {
+            return Self::default();
+        }
+        let competes = |rank: Strength| {
+            rank != Strength::HIGH_IMPEDANCE && strength.rank() - rank.rank() < margin.get()
+        };
+        let logic = match ranks.map(competes) {
+            [true, false, false, false, false] => Logic::Zero,
+            [false, true, false, false, false] => Logic::One,
+            [false, false, false, true, false] => Logic::Rising,
+            [false, false, false, false, true] => Logic::Falling,
+            _ => Logic::Unknown,
+        };
+        Self { logic, strength }
     }
 }
 
@@ -95,14 +191,30 @@ pub enum DelayMode {
     Inertial,
 }
 
-/// Validated rise/fall propagation delays.
+/// Validated propagation delays. Two-state models use rise/fall; a
+/// disconnectable driver can specify four additional high-impedance paths.
 #[derive(Clone, Copy, Debug)]
 pub struct Delays {
     rise: Real,
     fall: Real,
+    impedance: Option<ImpedanceDelays>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ImpedanceDelays {
+    low_to_z: Real,
+    high_to_z: Real,
+    z_to_low: Real,
+    z_to_high: Real,
 }
 
 impl Delays {
+    pub(super) const ZERO: Self = Self {
+        rise: 0.,
+        fall: 0.,
+        impedance: None,
+    };
+
     /// Construct finite, nonnegative delays.
     ///
     /// # Errors
@@ -111,17 +223,93 @@ impl Delays {
         if !rise.is_finite() || !fall.is_finite() || rise < 0. || fall < 0. {
             return Err(SpiceError::circuit("invalid digital propagation delay"));
         }
-        Ok(Self { rise, fall })
+        Ok(Self {
+            rise,
+            fall,
+            impedance: None,
+        })
     }
 
-    /// Select delay by target state, with unknown transitions using the
-    /// previous state (upstream `d_and/cfunc.mod`).
+    /// Construct six independent physical transition paths in the order
+    /// low→high, high→low, low→Z, high→Z, Z→low, Z→high.
+    ///
+    /// # Errors
+    /// Any delay is negative or nonfinite.
+    pub fn paths(values: [Real; 6]) -> SpiceResult<Self> {
+        let [rise, fall, low_to_z, high_to_z, z_to_low, z_to_high] = values;
+        let mut delays = Self::new(rise, fall)?;
+        if [low_to_z, high_to_z, z_to_low, z_to_high]
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.)
+        {
+            return Err(SpiceError::circuit(
+                "invalid high-impedance propagation delay",
+            ));
+        }
+        delays.impedance = Some(ImpedanceDelays {
+            low_to_z,
+            high_to_z,
+            z_to_low,
+            z_to_high,
+        });
+        Ok(delays)
+    }
+
+    /// Add precomputed loading delays for target L, H and Z. A declared
+    /// zero propagation path remains zero; it is not replaced by an RC
+    /// estimate. The ordinary two-state law retains its unknown-state rule.
+    pub(super) fn with_load(self, load: [Real; 3]) -> SpiceResult<Self> {
+        let add = |path: Real, extra: Real| if path == 0. { 0. } else { path + extra };
+        if let Some(paths) = self.impedance {
+            Self::paths([
+                add(self.rise, load[1]),
+                add(self.fall, load[0]),
+                add(paths.low_to_z, load[2]),
+                add(paths.high_to_z, load[2]),
+                add(paths.z_to_low, load[0]),
+                add(paths.z_to_high, load[1]),
+            ])
+        } else {
+            Self::new(add(self.rise, load[1]), add(self.fall, load[0]))
+        }
+    }
+
+    /// Select the physical transition using both logic and drive strength.
+    /// An unknown endpoint of an explicitly specified Z path uses the later
+    /// of its two possible known transitions. Ordinary XSPICE rise/fall
+    /// timing retains the previous-state rule for unknown transitions.
     #[must_use = "the returned delay determines the scheduled transition time"]
-    pub const fn transition(self, previous: Logic, next: Logic) -> Real {
-        match next {
-            Logic::One => self.rise,
-            Logic::Unknown if matches!(previous, Logic::Zero) => self.rise,
-            Logic::Zero | Logic::Unknown => self.fall,
+    pub fn transition(self, previous: Drive, next: Drive) -> Real {
+        if let Some(paths) = self.impedance {
+            let old_z = previous.strength == Strength::HIGH_IMPEDANCE;
+            let new_z = next.strength == Strength::HIGH_IMPEDANCE;
+            match (old_z, new_z) {
+                (true, true) => return 0.,
+                (false, true) => {
+                    return match previous.logic {
+                        Logic::Zero => paths.low_to_z,
+                        Logic::One => paths.high_to_z,
+                        Logic::Unknown | Logic::Rising | Logic::Falling => {
+                            paths.low_to_z.max(paths.high_to_z)
+                        }
+                    };
+                }
+                (true, false) => {
+                    return match next.logic {
+                        Logic::Zero => paths.z_to_low,
+                        Logic::One => paths.z_to_high,
+                        Logic::Unknown | Logic::Rising | Logic::Falling => {
+                            paths.z_to_low.max(paths.z_to_high)
+                        }
+                    };
+                }
+                (false, false) => {}
+            }
+        }
+        match next.logic {
+            Logic::One | Logic::Rising => self.rise,
+            Logic::Unknown if previous.logic == Logic::Zero => self.rise,
+            Logic::Zero | Logic::Falling | Logic::Unknown => self.fall,
         }
     }
 }
@@ -147,6 +335,26 @@ pub struct EventContext {
     pub delta: usize,
     /// True during initial operating-point settlement.
     pub initial: bool,
+}
+
+/// A diagnostic emitted by a successfully evaluated digital model. The
+/// event engine assigns its model identity and physical timestamp at acceptance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelDiagnostic {
+    /// Whether this diagnostic prevents accepting the trial.
+    pub fatal: bool,
+    /// Type of timing constraint (setup, hold, pulse width, recovery).
+    pub kind: &'static str,
+    /// Zero-based input port involved in the constraint.
+    pub input: usize,
+    /// Earliest possible observed interval in seconds.
+    pub elapsed: Real,
+    /// Latest possible observed interval in seconds.
+    pub maximum_elapsed: Real,
+    /// Whether violation of the constraint is possible or definite.
+    pub certainty: crate::analysis::digital::timing::Certainty,
+    /// Required minimum interval in seconds.
+    pub minimum: Real,
 }
 
 /// Number of ordered input and output ports in one signal domain.
@@ -237,6 +445,48 @@ pub trait CodeModel: std::fmt::Debug + Send + Sync + 'static {
         ))
     }
 
+    /// Drain diagnostics produced by the most recent input evaluation. The
+    /// engine records these in the same disposable transaction as outputs.
+    fn take_diagnostics(&self, _state: &mut Self::State) -> Vec<ModelDiagnostic> {
+        Vec::new()
+    }
+
+    /// Request causal arrival tracking, including exact input events.
+    fn tracks_arrivals(&self) -> bool {
+        false
+    }
+
+    /// Evaluate resolved inputs with causal provenance. A scalar model
+    /// must explicitly handle nonexact arrivals rather than flattening
+    /// them to a guessed physical instant.
+    ///
+    /// # Errors
+    /// Unsupported arrival uncertainty, invalid inputs or state.
+    fn evaluate_timed(
+        &self,
+        context: EventContext,
+        inputs: &[crate::analysis::digital::timing::TimedInput],
+        state: &mut Self::State,
+    ) -> SpiceResult<Vec<crate::analysis::digital::timing::TimedOutput>> {
+        use crate::analysis::digital::timing::TimedOutput;
+        if inputs.iter().any(|input| {
+            input
+                .arrival
+                .as_ref()
+                .is_some_and(|arrival| !arrival.window().bounds().is_exact())
+        }) {
+            return Err(SpiceError::circuit(
+                "code model has no causal interval semantics",
+            ));
+        }
+        let drives: Vec<_> = inputs.iter().map(|input| input.drive).collect();
+        Ok(self
+            .evaluate(context, &drives, state)?
+            .into_iter()
+            .map(TimedOutput::Scalar)
+            .collect())
+    }
+
     /// Evaluate the model against resolved inputs.
     ///
     /// # Errors
@@ -272,7 +522,28 @@ pub enum GateKind {
 
 impl GateKind {
     fn evaluate(self, inputs: &[Drive]) -> Logic {
-        let has = |value| inputs.iter().any(|drive| drive.logic == value);
+        let value = self.evaluate_levels(inputs, Logic::instantaneous);
+        if value.is_binary() {
+            return value;
+        }
+        let start = self.evaluate_levels(inputs, Logic::phase_start);
+        let end = self.evaluate_levels(inputs, Logic::phase_end);
+        // Direction describes departure from the known pre-ambiguity
+        // level. A pure convergence hazard can return to that same
+        // level. Genuine X influence must not be relabelled as R/F.
+        if start.is_binary() && end.is_binary() {
+            if start == Logic::Zero {
+                Logic::Rising
+            } else {
+                Logic::Falling
+            }
+        } else {
+            Logic::Unknown
+        }
+    }
+
+    fn evaluate_levels(self, inputs: &[Drive], level: impl Fn(Logic) -> Logic) -> Logic {
+        let has = |value| inputs.iter().any(|drive| level(drive.logic) == value);
         let and = || {
             if has(Logic::Zero) {
                 Logic::Zero
@@ -294,7 +565,13 @@ impl GateKind {
         let xor = || {
             if has(Logic::Unknown) {
                 Logic::Unknown
-            } else if inputs.iter().filter(|d| d.logic == Logic::One).count() % 2 == 1 {
+            } else if inputs
+                .iter()
+                .filter(|d| level(d.logic) == Logic::One)
+                .count()
+                % 2
+                == 1
+            {
                 Logic::One
             } else {
                 Logic::Zero
@@ -307,8 +584,8 @@ impl GateKind {
             Self::Nand => and().invert(),
             Self::Nor => or().invert(),
             Self::Xnor => xor().invert(),
-            Self::Buffer => inputs[0].logic,
-            Self::Inverter => inputs[0].logic.invert(),
+            Self::Buffer => level(inputs[0].logic),
+            Self::Inverter => level(inputs[0].logic).invert(),
         }
     }
 }
@@ -381,13 +658,25 @@ pub struct DFlipFlop {
     pub mode: DelayMode,
 }
 
+/// Transactional storage and possible clock excursion for a D flip-flop.
+#[derive(Clone, Debug)]
+pub struct DFlipFlopState {
+    clock: Logic,
+    q: Logic,
+    ambiguity: Option<source_logic::ClockAmbiguity>,
+}
+
 impl CodeModel for DFlipFlop {
-    type State = [Logic; 2];
+    type State = DFlipFlopState;
     fn schema(&self) -> ModelSchema {
         ModelSchema::digital(2, 2)
     }
     fn initial_state(&self) -> Self::State {
-        [Logic::Unknown, self.initial]
+        DFlipFlopState {
+            clock: Logic::Unknown,
+            q: self.initial.instantaneous(),
+            ambiguity: None,
+        }
     }
     fn evaluate(
         &self,
@@ -398,14 +687,23 @@ impl CodeModel for DFlipFlop {
         let [data, clock] = inputs else {
             return Err(SpiceError::circuit("flip-flop input dimension mismatch"));
         };
-        let [previous_clock, q] = state;
         if context.initial {
-            *q = self.initial;
-        } else if *previous_clock != Logic::One && clock.logic == Logic::One {
-            *q = data.logic;
+            state.q = self.initial.instantaneous();
+            state.ambiguity = None;
+        } else if state.ambiguity.is_some() || matches!(clock.logic, Logic::Rising | Logic::Falling)
+        {
+            state.q = source_logic::Edge::Rising.timed_capture(
+                state.clock,
+                clock.logic,
+                state.q,
+                &mut state.ambiguity,
+                |_| Ok(data.logic.instantaneous()),
+            )?;
+        } else if state.clock != Logic::One && clock.logic == Logic::One {
+            state.q = data.logic.instantaneous();
         }
-        *previous_clock = clock.logic;
-        Ok([*q, q.invert()]
+        state.clock = clock.logic;
+        Ok([state.q, state.q.invert()]
             .map(|logic| Output {
                 drive: Drive::strong(logic),
                 delays: self.delays,
@@ -468,7 +766,7 @@ impl Adc {
     /// # Errors
     /// Invalid threshold order or nonbinary initial state.
     pub fn qualified(low: Real, high: Real, initial: Logic, inverted: bool) -> SpiceResult<Self> {
-        if !low.is_finite() || !high.is_finite() || low > high || initial == Logic::Unknown {
+        if !low.is_finite() || !high.is_finite() || low > high || !initial.is_binary() {
             return Err(SpiceError::circuit("invalid qualified receiver"));
         }
         Ok(Self {
@@ -501,7 +799,7 @@ impl Adc {
             };
             return Ok(decisive.map_or_else(
                 || {
-                    if initial || previous == Logic::Unknown {
+                    if initial || !previous.is_binary() {
                         qualification.initial
                     } else {
                         previous
@@ -683,7 +981,7 @@ impl Dac {
         let value = match logic {
             Logic::Zero => self.low,
             Logic::One => self.high,
-            Logic::Unknown => self.unknown,
+            Logic::Unknown | Logic::Rising | Logic::Falling => self.unknown,
         };
         if !value.is_finite() {
             return Err(SpiceError::circuit("nonfinite DAC output"));
@@ -705,8 +1003,14 @@ impl DacConfig {
     /// Validate levels and full-scale transition times.
     ///
     /// # Errors
-    /// Invalid voltage range or unknown-state level.
+    /// Invalid voltage range, unknown-state level, or impedance timing on
+    /// a voltage-only bridge.
     pub fn new(levels: Dac, slew: Delays) -> SpiceResult<Self> {
+        if slew.impedance.is_some() {
+            return Err(SpiceError::circuit(
+                "voltage DAC requires rise/fall slew times, not impedance delays",
+            ));
+        }
         let span = levels.high - levels.low;
         if !span.is_finite()
             || span <= 0.
@@ -745,13 +1049,18 @@ impl DacConfig {
         self.levels.target(logic)
     }
 
-    pub(crate) fn retarget(self, ramp: DacRamp, time: Real, logic: Logic) -> SpiceResult<DacRamp> {
+    pub(crate) fn retarget(
+        self,
+        ramp: OutputRamp,
+        time: Real,
+        logic: Logic,
+    ) -> SpiceResult<OutputRamp> {
         let target = self.target(logic)?;
         if ramp.target.to_bits() == target.to_bits() {
             return Ok(ramp);
         }
         let Some((slew, span)) = self.slew else {
-            return Ok(DacRamp {
+            return Ok(OutputRamp {
                 start: time,
                 end: time,
                 from: target,
@@ -767,7 +1076,7 @@ impl DacConfig {
                 "DAC transition outside representable time range",
             ));
         }
-        Ok(DacRamp {
+        Ok(OutputRamp {
             start: time,
             end,
             from,
@@ -776,15 +1085,111 @@ impl DacConfig {
     }
 }
 
+/// A passive output branch selected by the full resolved digital drive.
+/// The binary table contains strong L/H/X, resistive L/H/X, and Z;
+/// directional ambiguity requires explicit strong/resistive R/F entries.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DacRamp {
+pub(crate) struct ConductanceConfig {
+    values: [Real; 7],
+    phases: Option<[Real; 4]>,
+    inverted: bool,
+}
+
+impl ConductanceConfig {
+    pub(crate) fn new(values: &[Real], inverted: bool) -> SpiceResult<Self> {
+        if values.iter().any(|value| !value.is_finite() || *value < 0.) {
+            return Err(SpiceError::circuit("invalid digital output conductance"));
+        }
+        let (values, phases) = match values {
+            [a, b, c, d, e, f, z] => ([*a, *b, *c, *d, *e, *f, *z], None),
+            [a, b, c, d, e, f, z, sr, sf, rr, rf] => {
+                ([*a, *b, *c, *d, *e, *f, *z], Some([*sr, *sf, *rr, *rf]))
+            }
+            _ => {
+                return Err(SpiceError::circuit(
+                    "logic conductance table requires seven or eleven entries",
+                ));
+            }
+        };
+        Ok(Self {
+            values,
+            phases,
+            inverted,
+        })
+    }
+
+    fn target(self, drive: Drive) -> SpiceResult<Real> {
+        let logic = if self.inverted {
+            drive.logic.invert()
+        } else {
+            drive.logic
+        };
+        if drive.strength == Strength::HIGH_IMPEDANCE {
+            return Ok(self.values[6]);
+        }
+        let strong = drive.strength == Strength::STRONG;
+        if matches!(logic, Logic::Rising | Logic::Falling) {
+            let phases = self.phases.ok_or_else(|| {
+                SpiceError::circuit(
+                    "directional timing ambiguity requires explicit R/F conductance entries",
+                )
+            })?;
+            return Ok(phases[usize::from(!strong) * 2 + usize::from(logic == Logic::Falling)]);
+        }
+        Ok(self.values[usize::from(!strong) * 3 + logic.index()])
+    }
+}
+
+/// Shared scalar forcing port; voltage and conductance have different
+/// electrical stamps, but identical accepted event publication semantics.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AnalogOutputConfig {
+    Voltage(DacConfig),
+    Conductance(ConductanceConfig),
+}
+
+impl AnalogOutputConfig {
+    pub(crate) const fn is_voltage(self) -> bool {
+        matches!(self, Self::Voltage(_))
+    }
+
+    pub(crate) fn target(self, drive: Drive) -> SpiceResult<Real> {
+        match self {
+            Self::Voltage(config) => config.target(drive.logic),
+            Self::Conductance(config) => config.target(drive),
+        }
+    }
+
+    pub(crate) fn retarget(
+        self,
+        ramp: OutputRamp,
+        time: Real,
+        drive: Drive,
+    ) -> SpiceResult<OutputRamp> {
+        match self {
+            Self::Voltage(config) => config.retarget(ramp, time, drive.logic),
+            Self::Conductance(config) => {
+                let target = config.target(drive)?;
+                Ok(OutputRamp {
+                    start: time,
+                    end: time,
+                    from: target,
+                    target,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutputRamp {
     start: Real,
     end: Real,
     from: Real,
     target: Real,
 }
 
-impl DacRamp {
+impl OutputRamp {
     pub(crate) const fn initial(target: Real) -> Self {
         Self {
             start: 0.,
@@ -821,17 +1226,17 @@ impl DacRamp {
 /// The mixed-signal analysis owns this accepted forcing signal; stamps only
 /// read it. An unbound port cannot accidentally run as an ordinary source.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct DacPort(std::rc::Rc<std::cell::Cell<Option<DacRamp>>>);
+pub(crate) struct OutputPort(std::rc::Rc<std::cell::Cell<Option<OutputRamp>>>);
 
-impl DacPort {
-    pub(crate) fn set(&self, ramp: Option<DacRamp>) {
+impl OutputPort {
+    pub(crate) fn set(&self, ramp: Option<OutputRamp>) {
         self.0.set(ramp);
     }
 
-    pub(crate) fn ramp(&self) -> SpiceResult<DacRamp> {
-        self.0
-            .get()
-            .ok_or_else(|| SpiceError::circuit("DAC requires an active mixed-signal transient"))
+    pub(crate) fn ramp(&self) -> SpiceResult<OutputRamp> {
+        self.0.get().ok_or_else(|| {
+            SpiceError::circuit("analog output requires an active mixed-signal analysis")
+        })
     }
 
     pub(crate) fn same(&self, other: &Self) -> bool {
@@ -839,17 +1244,18 @@ impl DacPort {
     }
 }
 
-/// Ideal differential voltage output driven by the accepted DAC ramp.
-/// Constructed and bound by the analysis layer, not by the netlist parser.
+/// Differential analog voltage or passive conductance output, driven by
+/// the accepted mixed-signal forcing port.
 #[derive(Debug)]
-pub(crate) struct DacSource {
+pub(crate) struct AnalogOutputDevice {
     pub(crate) name: String,
     pub(crate) terminals: [crate::primitives::NodeId; 2],
-    pub(crate) port: DacPort,
-    pub(crate) native: Option<source::NativeVoltageBinding>,
+    pub(crate) port: OutputPort,
+    pub(crate) config: AnalogOutputConfig,
+    pub(crate) native: Option<source::NativeOutputBinding>,
 }
 
-impl crate::devices::Device for DacSource {
+impl crate::devices::Device for AnalogOutputDevice {
     fn model_name(&self) -> Option<&str> {
         self.native.as_ref().map(|binding| binding.model.as_str())
     }
@@ -863,10 +1269,16 @@ impl crate::devices::Device for DacSource {
         &self.terminals
     }
     fn branch_currents(&self) -> usize {
-        1
+        usize::from(self.config.is_voltage())
     }
     fn findable_branch(&self) -> Option<usize> {
-        Some(0)
+        self.config.is_voltage().then_some(0)
+    }
+    fn is_nonlinear(&self) -> bool {
+        !self.config.is_voltage()
+    }
+    fn limits_voltage_steps(&self) -> bool {
+        false
     }
     fn depends_on_time(&self) -> bool {
         true
@@ -876,18 +1288,26 @@ impl crate::devices::Device for DacSource {
         &self,
         _inductors_short: bool,
     ) -> Vec<crate::devices::InitialVoltageRelation> {
-        vec![crate::devices::InitialVoltageRelation {
-            terminals: self.terminals,
-            law: crate::devices::InitialVoltageLaw::Source(0),
-        }]
+        if self.config.is_voltage() {
+            vec![crate::devices::InitialVoltageRelation {
+                terminals: self.terminals,
+                law: crate::devices::InitialVoltageLaw::Source(0),
+            }]
+        } else {
+            Vec::new()
+        }
     }
 
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        let branch = setup.branch(0)?;
-        setup.voltage_branch(self.terminals[0], self.terminals[1], branch);
+        if self.config.is_voltage() {
+            let branch = setup.branch(0)?;
+            setup.voltage_branch(self.terminals[0], self.terminals[1], branch);
+        } else {
+            setup.conductance(self.terminals[0], self.terminals[1]);
+        }
         Ok(true)
     }
 
@@ -895,14 +1315,29 @@ impl crate::devices::Device for DacSource {
         use crate::devices::traits::AnalysisMode;
         let ramp = self.port.ramp()?;
         let value = match context.mode {
-            AnalysisMode::OperatingPoint => ramp.value(0.) * context.source_factor,
-            AnalysisMode::Transient { time, .. } => ramp.value(time),
+            AnalysisMode::OperatingPoint => ramp.value(0.),
+            AnalysisMode::Transient { time, .. } | AnalysisMode::Instantaneous { time } => {
+                ramp.value(time)
+            }
             _ => {
                 return Err(SpiceError::not_yet_ported(
                     "DAC outside mixed-signal transient",
                     "src/xspice/icm/digital/dac_bridge/cfunc.mod",
                 ));
             }
+        };
+        if !self.config.is_voltage() {
+            return crate::devices::linear::nodal_stamp(
+                context.matrix,
+                context.unknowns,
+                self.terminals,
+                value,
+            );
+        }
+        let value = if matches!(context.mode, AnalysisMode::OperatingPoint) {
+            value * context.source_factor
+        } else {
+            value
         };
         let branch = context.branch(0)?;
         crate::devices::linear::branch_stamp(
@@ -914,12 +1349,26 @@ impl crate::devices::Device for DacSource {
         context.rhs.add_to(branch, value)
     }
 
+    fn assemble_nonlinear_charge(
+        &self,
+        _context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        // The output branch is memoryless. Any electrical storage is an
+        // explicit circuit element attached to its physical terminals.
+        Ok(())
+    }
+
     fn assemble_linear(
         &self,
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
         use crate::devices::linear::{LinearSource, SourceRows, Waveform};
         use crate::primitives::Complex;
+        if !self.config.is_voltage() {
+            return Err(SpiceError::circuit(
+                "event-controlled conductance requires dynamic assembly",
+            ));
+        }
         let value = self.port.ramp()?.value(0.);
         let mut rows = SourceRows::new();
         rows.push(context.branch(self.terminals)?, 1.)?;

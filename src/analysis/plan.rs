@@ -918,7 +918,7 @@ impl AnalysisPlan {
                     "native mixed-signal analysis requires OP or transient",
                 )),
             };
-            circuit.record_digital_stats(result.as_ref().ok().map(|()| mixed.engine().stats()));
+            circuit.record_digital_results(result.as_ref().ok().map(|()| mixed.engine()));
             return result;
         }
         // Large sweeps emit rows directly. Drivers whose numerical method

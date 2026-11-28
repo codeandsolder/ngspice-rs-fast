@@ -14,8 +14,12 @@ pub enum SourceModel {
     FrequencyTransfer,
     /// Qualified analog receivers with event logic output.
     LogicEvent,
+    /// Ordered differential-voltage ranges with independent occurrence history.
+    LogicRange,
     /// Ideal digital-to-voltage bridge.
     LogicVoltage,
+    /// Digital drive-selected passive conductance.
+    LogicConductance,
     /// Timed conductance switch.
     TimedSwitch,
     /// Cubic logarithmic or linear PSpice-style switch.
@@ -78,6 +82,7 @@ use CodePortKind::{
 const ANALOG: &[CodePortKind] = &[Voltage, VoltageDifferential];
 const TRANSFER: &[CodePortKind] = &[Voltage, VoltageDifferential, Current, CurrentDifferential];
 const EVENT: &[CodePortKind] = &[Digital];
+const LOGIC_INPUT: &[CodePortKind] = &[Voltage, VoltageDifferential, Digital];
 const BRANCH: &[CodePortKind] = &[ConductanceDifferential];
 
 impl PortSpec {
@@ -106,8 +111,12 @@ impl SourceModel {
             Some(Self::FrequencyTransfer)
         } else if base.eq_ignore_ascii_case("preprocess_logic_event") {
             Some(Self::LogicEvent)
+        } else if base.eq_ignore_ascii_case("preprocess_logic_range") {
+            Some(Self::LogicRange)
         } else if base.eq_ignore_ascii_case("preprocess_logic_voltage") {
             Some(Self::LogicVoltage)
+        } else if base.eq_ignore_ascii_case("preprocess_logic_conductance") {
+            Some(Self::LogicConductance)
         } else if base.eq_ignore_ascii_case("preprocess_timed_switch") {
             Some(Self::TimedSwitch)
         } else if base.eq_ignore_ascii_case("pswitch") {
@@ -127,12 +136,20 @@ impl SourceModel {
             PortSpec::new(Voltage, TRANSFER, false, false),
         ];
         const LOGIC_PORTS: &[PortSpec] = &[
-            PortSpec::new(Voltage, ANALOG, true, false),
+            PortSpec::new(Voltage, LOGIC_INPUT, true, true),
+            PortSpec::new(Digital, EVENT, false, false),
+        ];
+        const RANGE_PORTS: &[PortSpec] = &[
+            PortSpec::new(Voltage, ANALOG, false, false),
             PortSpec::new(Digital, EVENT, false, false),
         ];
         const VOLTAGE_PORTS: &[PortSpec] = &[
             PortSpec::new(Digital, EVENT, false, true),
             PortSpec::new(Voltage, ANALOG, false, false),
+        ];
+        const CONDUCTANCE_PORTS: &[PortSpec] = &[
+            PortSpec::new(Digital, EVENT, false, true),
+            PortSpec::new(ConductanceDifferential, BRANCH, false, false),
         ];
         const SWITCH_PORTS: &[PortSpec] = &[
             PortSpec::new(VoltageDifferential, ANALOG, false, false),
@@ -167,7 +184,9 @@ impl SourceModel {
             Self::ASwitch => ASWITCH_PORTS,
             Self::RationalTransfer | Self::FrequencyTransfer => TRANSFER_PORTS,
             Self::LogicEvent => LOGIC_PORTS,
+            Self::LogicRange => RANGE_PORTS,
             Self::LogicVoltage => VOLTAGE_PORTS,
+            Self::LogicConductance => CONDUCTANCE_PORTS,
             Self::TimedSwitch => SWITCH_PORTS,
         }
     }
@@ -190,11 +209,24 @@ impl SourceModel {
                 _ => None,
             },
             Self::LogicEvent => match name {
-                "operation" | "ic" => Some(Integer),
-                "delay" | "low" | "high" => Some(Real),
+                "operation" | "ic" | "strength" | "override_margin" | "timing_violation" => {
+                    Some(Integer)
+                }
+                "delay" | "low" | "high" | "output_capacitance" | "pulse_reject" => Some(Real),
+                "input_capacitance" | "load_resistance" | "delay_paths" | "delay_windows"
+                | "delay_gate" | "delay_preset" | "delay_clear" | "timing_setup"
+                | "timing_hold" | "timing_clock_min" | "timing_async_min" | "timing_recovery" => {
+                    Some(RealVector)
+                }
                 "inertial" => Some(Boolean),
                 "inverted" => Some(BooleanVector),
-                "rx_ic" => Some(IntegerVector),
+                "rx_ic" | "async_policy" | "strength_paths" => Some(IntegerVector),
+                _ => None,
+            },
+            Self::LogicRange => match name {
+                "ranges" => Some(RealVector),
+                "initial_range" | "gap_policy" => Some(Integer),
+                "gap_drive" => Some(IntegerVector),
                 _ => None,
             },
             Self::LogicVoltage => match name {
@@ -206,6 +238,10 @@ impl SourceModel {
                 "log" => Some(Boolean),
                 "r_cntl_in" if self == Self::PSwitch => Some(Real),
                 "limit" if self == Self::ASwitch => Some(Boolean),
+                _ => None,
+            },
+            Self::LogicConductance => match name {
+                "conductance" => Some(RealVector),
                 _ => None,
             },
             Self::TimedSwitch => match name {
@@ -244,7 +280,7 @@ impl SourceModel {
                 let kind = terminal.kind;
                 if !spec.allowed.contains(&kind)
                     || terminal.negative.is_some() != kind.differential()
-                    || (terminal.inverted && !spec.inversion)
+                    || (terminal.inverted && (!spec.inversion || kind != Digital))
                     || terminal.positive.eq_ignore_ascii_case("null")
                     || terminal
                         .negative
@@ -335,9 +371,16 @@ fn validate_value(
     Ok(())
 }
 
-use super::source_logic::{LogicKernel, Operation};
-use super::{Adc, DacConfig, DacPort, DacSource, DelayMode, Delays, Logic};
-use crate::analysis::digital::{AdcBinding, DacBinding, NativeTopology, NetId, Network};
+use super::pulse::PulseFilter;
+use super::sequential_timing::TimingSpec;
+use super::source_logic::{AsyncPolicy, CausalPaths, DriveStrengths, LogicKernel, Operation};
+use super::{
+    Adc, AnalogOutputConfig, AnalogOutputDevice, ConductanceConfig, DacConfig, DelayMode, Delays,
+    Drive, GapPolicy, Logic, OutputPort, RangeReceiver, Strength, VoltageRange,
+};
+use crate::analysis::digital::{
+    AdcBinding, AnalogOutputBinding, NativeTopology, NetId, Network, RangeBinding, ReceiverBinding,
+};
 use crate::devices::circuit::ElaboratedDevice;
 use crate::devices::models::{PreparationKey, ResolvedModel};
 use crate::devices::{Device, ElaborationLimits};
@@ -348,9 +391,19 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug)]
 struct LogicMaterial {
     operation: Real,
-    delay: Real,
+    delays: Delays,
+    windows: Option<super::WindowDelays>,
+    causal: CausalPaths,
     inertial: bool,
+    pulse: Option<PulseFilter>,
     initial: Logic,
+    strength: DriveStrengths,
+    margin: Option<std::num::NonZeroU8>,
+    input_capacitance: Option<Vec<Real>>,
+    output_capacitance: Real,
+    load_resistance: Option<[Real; 3]>,
+    asynchronous: Option<AsyncPolicy>,
+    timing: TimingSpec,
     low: Real,
     high: Real,
     inverted: Option<Vec<bool>>,
@@ -361,9 +414,19 @@ impl Default for LogicMaterial {
     fn default() -> Self {
         Self {
             operation: 0.,
-            delay: 0.,
+            delays: Delays::ZERO,
+            windows: None,
+            causal: CausalPaths::default(),
             inertial: true,
+            pulse: None,
             initial: Logic::Zero,
+            strength: DriveStrengths::uniform(Strength::STRONG),
+            margin: None,
+            input_capacitance: None,
+            output_capacitance: 0.,
+            load_resistance: None,
+            asynchronous: None,
+            timing: TimingSpec::default(),
             low: 2.,
             high: 3.,
             inverted: None,
@@ -388,16 +451,193 @@ fn logic(value: Real) -> SpiceResult<Logic> {
     })
 }
 
+fn three_logic(value: Real) -> SpiceResult<Logic> {
+    if matches!(value, 2.) {
+        Ok(Logic::Unknown)
+    } else {
+        logic(value)
+    }
+}
+
+fn rank(value: Real) -> SpiceResult<Strength> {
+    Strength::from_rank(
+        crate::primitives::exact_nonnegative_integer(value)
+            .ok_or_else(|| SpiceError::circuit("invalid digital strength rank"))?,
+    )
+}
+
+fn nonnegative(value: Real) -> SpiceResult<Real> {
+    if value.is_finite() && value >= 0. {
+        Ok(value)
+    } else {
+        Err(SpiceError::circuit(
+            "invalid digital electrical loading parameter",
+        ))
+    }
+}
+
 impl LogicMaterial {
     fn compile(card: &ModelCard) -> SpiceResult<Self> {
         SourceModel::LogicEvent.validate_parameters(card)?;
         let mut material = Self::default();
+        let mut timing_given = false;
+        let mut strength_given = false;
+        let mut mode_given = false;
         for parameter in &card.parameters {
             match parameter.name.as_str() {
                 "operation" => material.operation = numeric_scalar(parameter)?,
-                "delay" => material.delay = numeric_scalar(parameter)?,
-                "inertial" => material.inertial = binary(numeric_scalar(parameter)?)?,
-                "ic" => material.initial = logic(numeric_scalar(parameter)?)?,
+                "delay" | "delay_paths" => {
+                    if timing_given {
+                        return Err(SpiceError::circuit(
+                            "specify exactly one logic timing declaration",
+                        ));
+                    }
+                    timing_given = true;
+                    material.delays = if parameter.name == "delay" {
+                        let delay = numeric_scalar(parameter)?;
+                        Delays::new(delay, delay)?
+                    } else {
+                        match numeric_vector(parameter)?.as_slice() {
+                            [rise, fall] => Delays::new(*rise, *fall)?,
+                            [rise, fall, lz, hz, zl, zh] => {
+                                Delays::paths([*rise, *fall, *lz, *hz, *zl, *zh])?
+                            }
+                            _ => {
+                                return Err(SpiceError::circuit(
+                                    "delay_paths requires two or six directional values",
+                                ));
+                            }
+                        }
+                    };
+                }
+                "delay_windows" => {
+                    if timing_given {
+                        return Err(SpiceError::circuit(
+                            "specify exactly one logic timing declaration",
+                        ));
+                    }
+                    timing_given = true;
+                    use crate::analysis::digital::timing::DelayWindow;
+                    let values = numeric_vector(parameter)?;
+                    material.windows = Some(match values.as_slice() {
+                        [rmin, rmax, fmin, fmax] => super::WindowDelays::binary(
+                            DelayWindow::new(*rmin, *rmax)?,
+                            DelayWindow::new(*fmin, *fmax)?,
+                        ),
+                        [a, b, c, d, e, f, g, h, i, j, k, l] => super::WindowDelays::paths([
+                            DelayWindow::new(*a, *b)?,
+                            DelayWindow::new(*c, *d)?,
+                            DelayWindow::new(*e, *f)?,
+                            DelayWindow::new(*g, *h)?,
+                            DelayWindow::new(*i, *j)?,
+                            DelayWindow::new(*k, *l)?,
+                        ]),
+                        _ => {
+                            return Err(SpiceError::circuit(
+                                "delay_windows requires four or twelve directional bounds",
+                            ));
+                        }
+                    });
+                }
+                "delay_gate" | "delay_preset" | "delay_clear" => {
+                    let [rise, fall]: [Real; 2] =
+                        numeric_vector(parameter)?.try_into().map_err(|_| {
+                            SpiceError::circuit(
+                                "causal propagation path requires two directional values",
+                            )
+                        })?;
+                    let target = match parameter.name.as_str() {
+                        "delay_gate" => &mut material.causal.gate,
+                        "delay_preset" => &mut material.causal.preset,
+                        _ => &mut material.causal.clear,
+                    };
+                    *target = Some(Delays::new(rise, fall)?);
+                }
+                "inertial" | "pulse_reject" => {
+                    if mode_given {
+                        return Err(SpiceError::circuit(
+                            "specify exactly one logic pulse policy",
+                        ));
+                    }
+                    mode_given = true;
+                    if parameter.name == "inertial" {
+                        material.inertial = binary(numeric_scalar(parameter)?)?;
+                    } else {
+                        material.pulse = Some(PulseFilter::new(numeric_scalar(parameter)?)?);
+                    }
+                }
+                "ic" => material.initial = three_logic(numeric_scalar(parameter)?)?,
+                "strength" | "strength_paths" => {
+                    if strength_given {
+                        return Err(SpiceError::circuit(
+                            "specify exactly one logic strength declaration",
+                        ));
+                    }
+                    strength_given = true;
+                    material.strength = if parameter.name == "strength" {
+                        DriveStrengths::uniform(match numeric_scalar(parameter)? {
+                            1. => Strength::RESISTIVE,
+                            2. => Strength::STRONG,
+                            _ => {
+                                return Err(SpiceError::circuit(
+                                    "logic strength must be resistive (1) or strong (2)",
+                                ));
+                            }
+                        })
+                    } else {
+                        let [low, high, unknown]: [Real; 3] =
+                            numeric_vector(parameter)?.try_into().map_err(|_| {
+                                SpiceError::circuit("strength_paths requires L/H/X ranks")
+                            })?;
+                        DriveStrengths([rank(low)?, rank(high)?, rank(unknown)?])
+                    };
+                }
+                "override_margin" => {
+                    material.margin = Some(
+                        std::num::NonZeroU8::new(rank(numeric_scalar(parameter)?)?.rank())
+                            .ok_or_else(|| {
+                                SpiceError::circuit("digital net strength margin must be nonzero")
+                            })?,
+                    );
+                }
+                "input_capacitance" => {
+                    material.input_capacitance = Some(
+                        numeric_vector(parameter)?
+                            .into_iter()
+                            .map(nonnegative)
+                            .collect::<SpiceResult<_>>()?,
+                    );
+                }
+                "output_capacitance" => {
+                    material.output_capacitance = nonnegative(numeric_scalar(parameter)?)?
+                }
+                "load_resistance" => {
+                    let values: [Real; 3] = numeric_vector(parameter)?
+                        .into_iter()
+                        .map(nonnegative)
+                        .collect::<SpiceResult<Vec<_>>>()?
+                        .try_into()
+                        .map_err(|_| {
+                            SpiceError::circuit("load_resistance requires L/H/Z resistances")
+                        })?;
+                    material.load_resistance = Some(values);
+                }
+                "async_policy" => {
+                    let [preset, clear, both]: [Real; 3] = numeric_vector(parameter)?.try_into()
+                        .map_err(|_| SpiceError::circuit("async_policy requires preset level, clear level and simultaneous result"))?;
+                    material.asynchronous = Some(AsyncPolicy {
+                        preset: logic(preset)?,
+                        clear: logic(clear)?,
+                        both: three_logic(both)?,
+                    });
+                }
+                "timing_setup" | "timing_hold" | "timing_clock_min" | "timing_async_min"
+                | "timing_recovery" => {
+                    material
+                        .timing
+                        .set_vector(&parameter.name, numeric_vector(parameter)?)?;
+                }
+                "timing_violation" => material.timing.set_policy(numeric_scalar(parameter)?)?,
                 "low" => material.low = numeric_scalar(parameter)?,
                 "high" => material.high = numeric_scalar(parameter)?,
                 "inverted" => {
@@ -419,12 +659,24 @@ impl LogicMaterial {
                 _ => return Err(SpiceError::circuit("unregistered logic parameter")),
             }
         }
-        Delays::new(material.delay, material.delay)?;
-        Adc::qualified(material.low, material.high, material.initial, false)?;
+        if material.windows.is_some() {
+            if material.pulse.is_some() || (mode_given && material.inertial) {
+                return Err(SpiceError::circuit(
+                    "causal arrival windows require transport mode",
+                ));
+            }
+            material.inertial = false;
+        }
+        Adc::qualified(material.low, material.high, Logic::Zero, false)?;
         Ok(material)
     }
 
-    fn bind(&self, inputs: usize) -> SpiceResult<(LogicKernel, Vec<Adc>)> {
+    fn bind(
+        &self,
+        terminals: &[CodeTerminal],
+        nodes: &mut NodeAppend<'_>,
+    ) -> SpiceResult<(LogicKernel, Vec<LogicInput>, Vec<NodeId>)> {
+        let inputs = terminals.len();
         if self
             .inverted
             .as_ref()
@@ -433,36 +685,92 @@ impl LogicMaterial {
                 .receiver_initial
                 .as_ref()
                 .is_some_and(|values| values.len() != inputs)
+            || self
+                .input_capacitance
+                .as_ref()
+                .is_some_and(|values| values.len() != inputs)
         {
             return Err(SpiceError::circuit(
                 "logic parameter vector length must match input port",
             ));
         }
+        let mut invert = Vec::with_capacity(inputs);
+        let mut bindings = Vec::with_capacity(inputs);
+        let mut analog = Vec::with_capacity(inputs.saturating_mul(2));
+        for (index, terminal) in terminals.iter().enumerate() {
+            let inverted = self.inverted.as_ref().is_some_and(|values| values[index]);
+            let capacitance = self
+                .input_capacitance
+                .as_ref()
+                .map_or(0., |values| values[index]);
+            if terminal.kind == Digital {
+                invert.push(terminal.inverted ^ inverted);
+                bindings.push(LogicInput::Digital {
+                    name: terminal.positive.clone(),
+                    capacitance,
+                });
+            } else {
+                if capacitance != 0. {
+                    return Err(SpiceError::circuit(
+                        "analog receiver capacitance must be a physical circuit element",
+                    ));
+                }
+                invert.push(false);
+                let terminals = analog_pair(terminal, nodes)?;
+                analog.extend(terminals);
+                bindings.push(LogicInput::Analog {
+                    terminals,
+                    thresholds: Adc::qualified(
+                        self.low,
+                        self.high,
+                        self.receiver_initial
+                            .as_ref()
+                            .map_or(Logic::Zero, |values| values[index]),
+                        inverted,
+                    )?,
+                });
+            }
+        }
+        let operation = Operation::from_value(self.operation, inputs, self.asynchronous)?;
+        self.causal.validate(operation)?;
+        let timing = self.timing.bind(operation, inputs)?;
+        if self.windows.is_some()
+            && !matches!(operation, Operation::Gate(_) | Operation::Clocked { .. })
+        {
+            return Err(SpiceError::circuit(
+                "causal arrival windows require a combinational gate or clocked storage",
+            ));
+        }
         let kernel = LogicKernel {
-            operation: Operation::from_value(self.operation, inputs)?,
+            operation,
+            timing,
             inputs,
             initial: self.initial,
-            delay: self.delay,
+            delays: self.delays,
+            causal: self.causal,
+            pulse: self.pulse,
             mode: if self.inertial {
                 DelayMode::Inertial
             } else {
                 DelayMode::Transport
             },
+            strength: self.strength,
+            invert,
         };
-        let receivers = (0..inputs)
-            .map(|index| {
-                Adc::qualified(
-                    self.low,
-                    self.high,
-                    self.receiver_initial
-                        .as_ref()
-                        .map_or(Logic::Zero, |values| values[index]),
-                    self.inverted.as_ref().is_some_and(|values| values[index]),
-                )
-            })
-            .collect::<SpiceResult<_>>()?;
-        Ok((kernel, receivers))
+        Ok((kernel, bindings, analog))
     }
+}
+
+#[derive(Debug)]
+enum LogicInput {
+    Analog {
+        terminals: [NodeId; 2],
+        thresholds: Adc,
+    },
+    Digital {
+        name: String,
+        capacitance: Real,
+    },
 }
 
 #[derive(Debug)]
@@ -472,7 +780,11 @@ struct LogicReceiverDevice {
     terminals: Vec<NodeId>,
     output: String,
     kernel: LogicKernel,
-    receivers: Vec<Adc>,
+    windows: Option<super::WindowDelays>,
+    margin: Option<std::num::NonZeroU8>,
+    output_capacitance: Real,
+    load_resistance: Option<[Real; 3]>,
+    inputs: Vec<LogicInput>,
 }
 
 impl Device for LogicReceiverDevice {
@@ -505,11 +817,117 @@ impl Device for LogicReceiverDevice {
     }
 }
 
+#[derive(Debug)]
+struct RangeReceiverDevice {
+    name: String,
+    model: String,
+    terminals: [NodeId; 2],
+    output: String,
+    receiver: RangeReceiver,
+}
+
+impl Device for RangeReceiverDevice {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn designator(&self) -> char {
+        'a'
+    }
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+    fn terminals(&self) -> &[NodeId] {
+        &self.terminals
+    }
+    fn setup_matrix(&self, _: &mut crate::devices::setup::MatrixSetup<'_>) -> SpiceResult<bool> {
+        Ok(true)
+    }
+    fn stamp(&self, _: &mut crate::devices::StampContext<'_>) -> SpiceResult<()> {
+        Ok(())
+    }
+    fn assemble_linear(
+        &self,
+        _: &mut crate::devices::linear::LinearContext<'_>,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+}
+
+fn range_drive(value: Real, strength: Real) -> SpiceResult<Drive> {
+    let logic = match value {
+        0. => Logic::Zero,
+        1. => Logic::One,
+        2. => Logic::Unknown,
+        3. => Logic::Rising,
+        4. => Logic::Falling,
+        _ => return Err(SpiceError::circuit("invalid receiver range logic code")),
+    };
+    Ok(Drive {
+        logic,
+        strength: rank(strength)?,
+    })
+}
+
+fn range_material(card: &ModelCard) -> SpiceResult<RangeReceiver> {
+    SourceModel::LogicRange.validate_parameters(card)?;
+    let mut ranges = Vec::new();
+    let mut initial = 0;
+    let mut gap = None;
+    for parameter in &card.parameters {
+        match parameter.name.as_str() {
+            "ranges" => {
+                let values = numeric_vector(parameter)?;
+                let (entries, remainder) = values.as_chunks::<4>();
+                if entries.is_empty() || !remainder.is_empty() {
+                    return Err(SpiceError::circuit(
+                        "ranges requires voltage-low, voltage-high, logic, strength tuples",
+                    ));
+                }
+                ranges = entries
+                    .iter()
+                    .map(|&[lo, hi, logic, strength]| {
+                        VoltageRange::new(lo, hi, range_drive(logic, strength)?)
+                    })
+                    .collect::<SpiceResult<_>>()?;
+            }
+            "initial_range" => {
+                initial = crate::primitives::exact_nonnegative_integer(numeric_scalar(parameter)?)
+                    .ok_or_else(|| {
+                    SpiceError::circuit("invalid receiver initial range index")
+                })?
+            }
+            "gap_policy" | "gap_drive" => {
+                if gap.is_some() {
+                    return Err(SpiceError::circuit("specify one receiver gap policy"));
+                }
+                gap = Some(if parameter.name == "gap_policy" {
+                    match numeric_scalar(parameter)? {
+                        0. => GapPolicy::Error,
+                        1. => GapPolicy::Nearest,
+                        _ => return Err(SpiceError::circuit("invalid receiver gap policy")),
+                    }
+                } else {
+                    let [logic, strength]: [Real; 2] =
+                        numeric_vector(parameter)?.try_into().map_err(|_| {
+                            SpiceError::circuit("gap_drive requires logic and strength")
+                        })?;
+                    GapPolicy::Drive(range_drive(logic, strength)?)
+                });
+            }
+            _ => {
+                return Err(SpiceError::circuit(
+                    "unregistered ordered receiver parameter",
+                ));
+            }
+        }
+    }
+    RangeReceiver::new(ranges, initial, gap.unwrap_or(GapPolicy::Error))
+}
+
 #[derive(Clone, Debug)]
-pub(crate) struct NativeVoltageBinding {
+pub(crate) struct NativeOutputBinding {
     pub(crate) model: String,
     net: String,
-    config: DacConfig,
 }
 
 fn analog_pair(terminal: &CodeTerminal, nodes: &mut NodeAppend<'_>) -> SpiceResult<[NodeId; 2]> {
@@ -532,6 +950,18 @@ fn voltage_material(card: &ModelCard) -> SpiceResult<[Real; 2]> {
     Ok(rails)
 }
 
+fn conductance_material(card: &ModelCard) -> SpiceResult<Vec<Real>> {
+    SourceModel::LogicConductance.validate_parameters(card)?;
+    let [parameter] = card.parameters.as_slice() else {
+        return Err(SpiceError::circuit(
+            "logic conductance requires one conductance table",
+        ));
+    };
+    let values = numeric_vector(parameter)?;
+    ConductanceConfig::new(&values, false)?;
+    Ok(values)
+}
+
 pub(in crate::devices) fn instantiate(
     schema: SourceModel,
     instance: &DeviceInstance,
@@ -547,44 +977,69 @@ pub(in crate::devices) fn instantiate(
             let [input, output] = instance.code_ports.as_slice() else {
                 return Err(SpiceError::circuit("logic port count mismatch"));
             };
-            let (kernel, receivers) = material.bind(input.terminals.len())?;
-            let mut terminals = Vec::with_capacity(input.terminals.len().saturating_mul(2));
-            for terminal in &input.terminals {
-                terminals.extend(analog_pair(terminal, nodes)?);
-            }
+            let (kernel, inputs, terminals) = material.bind(&input.terminals, nodes)?;
             Ok(Box::new(LogicReceiverDevice {
                 name: instance.name.clone(),
                 model: model.card().name.clone(),
                 terminals,
                 output: output.terminals[0].positive.clone(),
                 kernel,
-                receivers,
+                windows: material.windows,
+                margin: material.margin,
+                output_capacitance: material.output_capacitance,
+                load_resistance: material.load_resistance,
+                inputs,
             }))
         }
-        SourceModel::LogicVoltage => {
-            let rails = model.prepare(PreparationKey::Inputs, || voltage_material(model.card()))?;
+        SourceModel::LogicRange => {
+            let receiver =
+                model.prepare(PreparationKey::Inputs, || range_material(model.card()))?;
             let [input, output] = instance.code_ports.as_slice() else {
-                return Err(SpiceError::circuit("logic voltage port count mismatch"));
+                return Err(SpiceError::circuit("ordered receiver port count mismatch"));
+            };
+            let terminals = analog_pair(&input.terminals[0], nodes)?;
+            Ok(Box::new(RangeReceiverDevice {
+                name: instance.name.clone(),
+                model: model.card().name.clone(),
+                terminals,
+                output: output.terminals[0].positive.clone(),
+                receiver: (*receiver).clone(),
+            }))
+        }
+        SourceModel::LogicVoltage | SourceModel::LogicConductance => {
+            let [input, output] = instance.code_ports.as_slice() else {
+                return Err(SpiceError::circuit(
+                    "logic analog-output port count mismatch",
+                ));
             };
             let input = &input.terminals[0];
             let terminals = analog_pair(&output.terminals[0], nodes)?;
             if terminals[0] == terminals[1] {
-                return Err(SpiceError::circuit("shorted logic voltage output"));
+                return Err(SpiceError::circuit("shorted logic analog output"));
             }
-            let [low, high] = *rails;
-            let config = if input.inverted {
-                DacConfig::ideal(high, low)?
+            let config = if schema == SourceModel::LogicVoltage {
+                let rails =
+                    model.prepare(PreparationKey::Inputs, || voltage_material(model.card()))?;
+                let [low, high] = *rails;
+                AnalogOutputConfig::Voltage(if input.inverted {
+                    DacConfig::ideal(high, low)?
+                } else {
+                    DacConfig::ideal(low, high)?
+                })
             } else {
-                DacConfig::ideal(low, high)?
+                let values = model.prepare(PreparationKey::Inputs, || {
+                    conductance_material(model.card())
+                })?;
+                AnalogOutputConfig::Conductance(ConductanceConfig::new(&values, input.inverted)?)
             };
-            Ok(Box::new(DacSource {
+            Ok(Box::new(AnalogOutputDevice {
                 name: instance.name.clone(),
                 terminals,
-                port: DacPort::default(),
-                native: Some(NativeVoltageBinding {
+                port: OutputPort::default(),
+                config,
+                native: Some(NativeOutputBinding {
                     model: model.card().name.clone(),
                     net: input.positive.clone(),
-                    config,
                 }),
             }))
         }
@@ -633,38 +1088,111 @@ fn bind_receiver(
     device: &LogicReceiverDevice,
     network: &mut Network,
     names: &mut BTreeMap<String, NetId>,
-    adcs: &mut Vec<AdcBinding>,
+    adcs: &mut Vec<ReceiverBinding>,
+    capacitances: &BTreeMap<&str, Real>,
     limits: ElaborationLimits,
 ) -> SpiceResult<()> {
     let output = digital_net(network, names, &device.output, limits.nodes)?;
-    let mut inputs = Vec::with_capacity(device.receivers.len());
-    let zero = Delays::new(0., 0.)?;
-    for (terminals, &thresholds) in device
-        .terminals
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(&device.receivers)
-    {
-        if network.net_count() >= limits.nodes || adcs.len() >= limits.state_slots {
-            return Err(SpiceError::circuit(
-                "qualified receiver resource limit exceeded",
-            ));
-        }
-        // Every receiver has its own private event net. This is intentionally
-        // not interned by its analog terminal spelling or threshold value.
-        let net = network.add_net();
-        let source = network.add_source(net)?;
-        adcs.push(AdcBinding {
-            terminals: *terminals,
-            source,
-            thresholds,
-            delays: zero,
-            mode: DelayMode::Transport,
-        });
+    if let Some(margin) = device.margin {
+        network.set_override_margin(output, margin)?;
+    }
+    let mut inputs = Vec::with_capacity(device.inputs.len());
+    let zero = Delays::ZERO;
+    for input in &device.inputs {
+        let net = match input {
+            LogicInput::Digital { name, .. } => digital_net(network, names, name, limits.nodes)?,
+            LogicInput::Analog {
+                terminals,
+                thresholds,
+            } => {
+                if network.net_count() >= limits.nodes || adcs.len() >= limits.state_slots {
+                    return Err(SpiceError::circuit(
+                        "qualified receiver resource limit exceeded",
+                    ));
+                }
+                // Independent receiver history even when two terminals
+                // have identical analog node spelling.
+                let net = network.add_net();
+                let source = network.add_source(net)?;
+                adcs.push(
+                    AdcBinding {
+                        terminals: *terminals,
+                        source,
+                        thresholds: *thresholds,
+                        delays: zero,
+                        mode: DelayMode::Transport,
+                    }
+                    .into(),
+                );
+                net
+            }
+        };
         inputs.push(net);
     }
-    network.add_model(device.kernel.clone(), &inputs, &[output])
+    let mut kernel = device.kernel.clone();
+    let mut windows = device.windows;
+    if let Some(resistances) = device.load_resistance {
+        let total = capacitances
+            .get(device.output.as_str())
+            .copied()
+            .unwrap_or(0.);
+        let load = resistances.map(|resistance| resistance * (total * std::f64::consts::LN_2));
+        if load.iter().any(|value| !value.is_finite()) {
+            return Err(SpiceError::circuit("digital loading delay overflow"));
+        }
+        kernel.delays = kernel.delays.with_load(load)?;
+        kernel.causal = kernel.causal.with_load(load)?;
+        windows = windows.map(|w| w.with_load(load)).transpose()?;
+    }
+    if let Some(windows) = windows {
+        match kernel.operation {
+            Operation::Gate(kind) => {
+                let model = super::WindowGate::new(kind, inputs.len(), windows)?
+                    .with_binding(kernel.strength, kernel.invert);
+                network.add_named_model(&device.name, model, &inputs, &[output])
+            }
+            Operation::Clocked { .. } => network.add_named_model(
+                &device.name,
+                super::window_clocked::WindowClocked::new(kernel, windows)?,
+                &inputs,
+                &[output],
+            ),
+            _ => Err(SpiceError::circuit("causal window logic binding mismatch")),
+        }
+    } else {
+        network.add_named_model(&device.name, kernel, &inputs, &[output])
+    }
+}
+
+/// Sum terminal capacitance once after flattening, including every
+/// occurrence even when the same net is attached to multiple input ports.
+fn digital_capacitances(devices: &[ElaboratedDevice]) -> SpiceResult<BTreeMap<&str, Real>> {
+    let mut totals = BTreeMap::<&str, Real>::new();
+    for device in devices {
+        if device.designator() != 'a' {
+            continue;
+        }
+        let Some(receiver) =
+            (device.as_ref() as &dyn std::any::Any).downcast_ref::<LogicReceiverDevice>()
+        else {
+            continue;
+        };
+        let mut add = |name, value| -> SpiceResult<()> {
+            let total = totals.entry(name).or_default();
+            *total += value;
+            if !total.is_finite() {
+                return Err(SpiceError::circuit("digital net capacitance overflow"));
+            }
+            Ok(())
+        };
+        add(receiver.output.as_str(), receiver.output_capacitance)?;
+        for input in &receiver.inputs {
+            if let LogicInput::Digital { name, capacitance } = input {
+                add(name.as_str(), *capacitance)?;
+            }
+        }
+    }
+    Ok(totals)
 }
 
 /// Build the fixed mixed-domain topology once after native device binding.
@@ -673,6 +1201,7 @@ pub(in crate::devices) fn mixed_topology(
     devices: &[ElaboratedDevice],
     limits: ElaborationLimits,
 ) -> SpiceResult<Option<NativeTopology>> {
+    let capacitances = digital_capacitances(devices)?;
     let mut topology = None;
     for device in devices {
         if device.designator() != 'a' {
@@ -680,30 +1209,53 @@ pub(in crate::devices) fn mixed_topology(
         }
         let any = device.as_ref() as &dyn std::any::Any;
         let receiver = any.downcast_ref::<LogicReceiverDevice>();
+        let range = any.downcast_ref::<RangeReceiverDevice>();
         let voltage = any
-            .downcast_ref::<DacSource>()
+            .downcast_ref::<AnalogOutputDevice>()
             .and_then(|device| device.native.as_ref().map(|binding| (device, binding)));
-        if receiver.is_none() && voltage.is_none() {
+        if receiver.is_none() && range.is_none() && voltage.is_none() {
             continue;
         }
-        let (network, names, adcs, dacs): &mut (
+        let (network, names, adcs, analog_outputs): &mut (
             Network,
             BTreeMap<String, NetId>,
-            Vec<AdcBinding>,
-            Vec<DacBinding>,
+            Vec<ReceiverBinding>,
+            Vec<AnalogOutputBinding>,
         ) = topology.get_or_insert_with(Default::default);
         if let Some(receiver) = receiver {
-            bind_receiver(receiver, network, names, adcs, limits)?;
+            bind_receiver(receiver, network, names, adcs, &capacitances, limits)?;
+        }
+        if let Some(device) = range {
+            if adcs.len() >= limits.state_slots {
+                return Err(SpiceError::circuit(
+                    "ordered receiver resource limit exceeded",
+                ));
+            }
+            let net = digital_net(network, names, &device.output, limits.nodes)?;
+            let source = network.add_source(net)?;
+            adcs.push(
+                RangeBinding {
+                    name: device.name.as_str().into(),
+                    terminals: device.terminals,
+                    source,
+                    receiver: device.receiver.clone(),
+                    delays: Delays::ZERO,
+                    mode: DelayMode::Transport,
+                }
+                .into(),
+            );
         }
         if let Some((device, binding)) = voltage {
             let net = digital_net(network, names, &binding.net, limits.nodes)?;
-            dacs.push(DacBinding {
+            analog_outputs.push(AnalogOutputBinding {
                 name: device.name.clone(),
                 net,
-                config: binding.config,
+                config: device.config,
                 port: device.port.clone(),
             });
         }
     }
-    Ok(topology.map(|(network, _, adcs, dacs)| NativeTopology::new(network, adcs, dacs)))
+    Ok(topology.map(|(network, _, adcs, analog_outputs)| {
+        NativeTopology::new(network, adcs, analog_outputs)
+    }))
 }
