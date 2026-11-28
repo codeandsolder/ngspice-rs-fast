@@ -356,6 +356,165 @@ pub(super) fn smooth_drain<S: Constitutive>(
     })
 }
 
+/// Saturation-shape coefficient, with the exact overdrive partial.
+/// The sign of a1 selects a parameterization, not a trajectory event.
+pub(super) fn saturation_shape<S: Constitutive>(
+    overdrive: &S,
+    a1: Real,
+    a2: Real,
+) -> SpiceResult<(S, S)> {
+    if a1 == 0. {
+        return Ok((overdrive.constant(a2), overdrive.constant(0.)));
+    }
+    let (argument, width) = if a1 > 0. {
+        (
+            overdrive
+                .constant(-a1)
+                .mul_add(overdrive, &overdrive.constant(1. - a2 - 0.0001)),
+            0.0001 * (1. - a2),
+        )
+    } else {
+        (
+            overdrive
+                .constant(a1)
+                .mul_add(overdrive, &overdrive.constant(a2 - 0.0001)),
+            0.0001 * a2,
+        )
+    };
+    let (root, partial) = smooth_positive(argument, width)?;
+    let value = if a1 > 0. {
+        root.scale(-1.).offset(1.)
+    } else {
+        root
+    };
+    Ok((value, partial.scale(a1)))
+}
+
+/// Substrate-current multiplier before the channel-current product.
+/// The exponential is clipped exactly where the compact model clips it.
+pub(super) fn impact_ionization<S: Constitutive>(
+    excess: &S,
+    alpha: Real,
+    beta: Real,
+) -> SpiceResult<(S, S)> {
+    if alpha <= 0. || beta <= 0. {
+        return Ok((excess.constant(0.), excess.constant(0.)));
+    }
+    if excess.compare(beta / EXP_LIMIT) == Some(Ordering::Greater) {
+        let argument = excess.constant(-beta).divide(excess)?;
+        let coefficient = argument.clone().exp().scale(alpha);
+        let slope = coefficient
+            .clone()
+            .multiply(&argument.scale(-1.).offset(1.));
+        Ok((coefficient.multiply(excess), slope))
+    } else {
+        let slope = alpha * MIN_EXP;
+        Ok((excess.clone().scale(slope), excess.constant(slope)))
+    }
+}
+
+/// Early voltage due to substrate-current-induced body effect. The
+/// caller supplies the version-specific enable predicate.
+pub(super) fn substrate_early_voltage<S: Constitutive>(
+    excess: &S,
+    length: Real,
+    threshold: Real,
+    scale: Real,
+    enabled: bool,
+) -> SpiceResult<(S, S)> {
+    if !enabled {
+        return Ok((excess.constant(MAX_EXP), excess.constant(0.)));
+    }
+    if excess.compare(threshold / EXP_LIMIT) == Some(Ordering::Greater) {
+        let argument = excess.constant(threshold).divide(excess)?;
+        let value = argument.clone().exp().scale(length / scale);
+        let slope = argument.scale(-1.).divide(excess)?.multiply(&value);
+        Ok((value, slope))
+    } else {
+        Ok((
+            excess.constant(MAX_EXP * length / scale),
+            excess.constant(0.),
+        ))
+    }
+}
+
+/// Channel conductance before the series-resistance correction. Independent
+/// coordinates are overdrive, bulk factor, effective drain, saturation field
+/// times length, and mobility/oxide/geometry coefficient.
+pub(super) fn channel_conductance<S: Constitutive>(
+    overdrive: &S,
+    bulk: &S,
+    drain: &S,
+    field: &S,
+    beta: &S,
+    thermal: Real,
+) -> SpiceResult<LocalPart<S, 5>> {
+    let thermal_overdrive = overdrive.clone().offset(2. * thermal);
+    let half_drain = drain.clone().scale(0.5).divide(&thermal_overdrive)?;
+    let edge = bulk
+        .clone()
+        .scale(-1.)
+        .mul_add(&half_drain, &overdrive.constant(1.));
+    let field_ratio = drain.clone().divide(field)?;
+    let denominator = field_ratio.clone().offset(1.);
+    let normalized = overdrive.clone().divide(&denominator)?;
+    let gain = beta.clone().multiply(&normalized);
+    let value = gain.clone().multiply(&edge);
+    let gate_partial = beta.clone().divide(&denominator)?.multiply(
+        &bulk
+            .clone()
+            .multiply(&half_drain)
+            .multiply(&overdrive.clone().divide(&thermal_overdrive)?)
+            .add(&edge),
+    );
+    let bulk_partial = gain.clone().scale(-1.).multiply(&half_drain);
+    let drain_partial = gain
+        .scale(-0.5)
+        .multiply(bulk)
+        .divide(&thermal_overdrive)?
+        .add(
+            &value
+                .clone()
+                .scale(-1.)
+                .divide(field)?
+                .divide(&denominator)?,
+        );
+    let field_partial = value
+        .clone()
+        .multiply(&field_ratio)
+        .divide(field)?
+        .divide(&denominator)?;
+    let beta_partial = normalized.multiply(&edge);
+    Ok(LocalPart {
+        value,
+        partials: [
+            gate_partial,
+            bulk_partial,
+            drain_partial,
+            field_partial,
+            beta_partial,
+        ],
+    })
+}
+
+/// Conductance loaded by the intrinsic source/drain series resistance.
+pub(super) fn series_conductance<S: Constitutive>(
+    conductance: &S,
+    resistance: &S,
+) -> SpiceResult<LocalPart<S, 2>> {
+    let denominator = conductance
+        .clone()
+        .mul_add(resistance, &conductance.constant(1.));
+    let inverse = conductance.constant(1.).divide(&denominator)?;
+    let value = conductance.clone().multiply(&inverse);
+    let conductance_partial = inverse.clone().multiply(&inverse);
+    let resistance_partial = value.clone().scale(-1.).multiply(&value);
+    Ok(LocalPart {
+        value,
+        partials: [conductance_partial, resistance_partial],
+    })
+}
+
 /// Smaller root of a*y²/2 - b*y + c = 0, regular in the linear limit.
 pub(super) struct SaturationRoot<S> {
     pub(super) value: S,
@@ -455,9 +614,8 @@ pub(super) fn depletion_charge<S: Constitutive>(k1: Real, increment: S) -> Spice
     Ok((difference.scale(k1), slope))
 }
 
-/// A charge value and its local partials in the (overdrive, effective
-/// drain voltage, bulk factor) coordinates. All include oxide area.
-pub(super) struct ChargePart<S, const N: usize = 3> {
+/// Constitutive value and analytic partials in the local input coordinates.
+pub(super) struct LocalPart<S, const N: usize = 3> {
     pub(super) value: S,
     partials: [S; N],
 }
@@ -472,7 +630,7 @@ pub(super) struct ChargeChain {
 }
 
 impl ChargeChain {
-    pub(super) fn apply(&self, part: &ChargePart<Real>) -> [Real; 3] {
+    pub(super) fn apply(&self, part: &LocalPart<Real>) -> [Real; 3] {
         std::array::from_fn(|i| {
             part.partials[0].mul_add(
                 self.overdrive[i],
@@ -497,7 +655,7 @@ pub(super) fn channel_inversion<S: Constitutive>(
     oxide_area: &S,
     partition: Real,
     regularization: Real,
-) -> SpiceResult<[ChargePart<S>; 3]> {
+) -> SpiceResult<[LocalPart<S>; 3]> {
     let one = overdrive.constant(1.);
     let weighted_drain = bulk.clone().multiply(drain);
     let width = weighted_drain
@@ -516,7 +674,7 @@ pub(super) fn channel_inversion<S: Constitutive>(
         .clone()
         .add(&edge.clone().scale(-1.));
     let inversion_value = weighted_drain.clone().scale(-1.).mul_add(&edge, overdrive);
-    let part = |value: S, du: S, dd: S, da: S| ChargePart {
+    let part = |value: S, du: S, dd: S, da: S| LocalPart {
         value: value.multiply(oxide_area),
         partials: [du, dd, da].map(|derivative| derivative.multiply(oxide_area)),
     };
@@ -602,7 +760,7 @@ pub(super) struct CapZeroParameters {
     pub(super) partition: Real,
 }
 
-impl<S: Constitutive, const N: usize> ChargePart<S, N> {
+impl<S: Constitutive, const N: usize> LocalPart<S, N> {
     fn scaled(&self, factor: Real) -> Self {
         Self {
             value: self.value.clone().scale(factor),
@@ -618,7 +776,7 @@ impl<S: Constitutive, const N: usize> ChargePart<S, N> {
     }
 }
 
-impl<const N: usize> ChargePart<Real, N> {
+impl<const N: usize> LocalPart<Real, N> {
     /// Project the independent constitutive partials onto terminal biases.
     pub(super) fn project(&self, coordinates: &[[Real; 3]; N]) -> [Real; 3] {
         std::array::from_fn(|column| {
@@ -639,7 +797,7 @@ impl<const N: usize> ChargePart<Real, N> {
 pub(super) fn cap_zero<S: Constitutive>(
     bias: &CapZeroBias<S>,
     parameters: CapZeroParameters,
-) -> SpiceResult<[ChargePart<S, 5>; 3]> {
+) -> SpiceResult<[LocalPart<S, 5>; 3]> {
     let CapZeroParameters {
         flatband,
         phi,
@@ -670,7 +828,7 @@ pub(super) fn cap_zero<S: Constitutive>(
         } else {
             depletion_charge(body_effect, accumulation)?
         };
-        let gate = ChargePart {
+        let gate = LocalPart {
             value: charge.scale(oxide_area),
             partials: [
                 slope.clone().scale(oxide_area),
@@ -681,7 +839,7 @@ pub(super) fn cap_zero<S: Constitutive>(
             ],
         };
         let bulk = gate.scaled(-1.);
-        let drain = ChargePart {
+        let drain = LocalPart {
             value: zero.clone(),
             partials: std::array::from_fn(|_| zero.clone()),
         };
@@ -707,10 +865,10 @@ pub(super) fn cap_zero<S: Constitutive>(
         partition,
         0.,
     )?;
-    let project = |part: ChargePart<S>| {
+    let project = |part: LocalPart<S>| {
         let [gate, drain, factor] = part.partials;
         let surface = gate.clone().scale(-1.);
-        ChargePart {
+        LocalPart {
             value: part.value,
             partials: [gate, zero.clone(), surface, drain, factor],
         }
@@ -718,7 +876,7 @@ pub(super) fn cap_zero<S: Constitutive>(
     let inversion = project(inversion);
     let bulk = project(bulk);
     let source = project(source);
-    let surface = ChargePart {
+    let surface = LocalPart {
         value: bias.surface.clone().scale(oxide_area),
         partials: [
             zero.clone(),
@@ -742,7 +900,7 @@ fn cap_zero_saturation<S: Constitutive>(
     parameters: CapZeroParameters,
     overdrive: &S,
     saturation: &S,
-) -> SpiceResult<[ChargePart<S, 5>; 3]> {
+) -> SpiceResult<[LocalPart<S, 5>; 3]> {
     let CapZeroParameters {
         flatband,
         phi,
@@ -754,7 +912,7 @@ fn cap_zero_saturation<S: Constitutive>(
     let third = oxide_area / 3.;
     let two_thirds = 2. * third;
     let saturation_slope = bias.gate.constant(third).divide(&bias.bulk_factor)?;
-    let gate = ChargePart {
+    let gate = LocalPart {
         value: saturation.clone().scale(-third).add(
             &bias
                 .gate
@@ -771,7 +929,7 @@ fn cap_zero_saturation<S: Constitutive>(
             saturation_slope.multiply(saturation),
         ],
     };
-    let inversion = ChargePart {
+    let inversion = LocalPart {
         value: overdrive.clone().scale(two_thirds),
         partials: [
             bias.gate.constant(two_thirds),
@@ -964,6 +1122,117 @@ mod tests {
         for (&actual, &expected) in gradient.coefficients().iter().zip(cap.value.coefficients()) {
             close(actual, expected, 2e-26);
         }
+    }
+
+    #[test]
+    fn channel_and_series_conductance_match_reference_and_partial_germs() -> SpiceResult<()> {
+        type Local = Differential<6>;
+        for point in [
+            [0.8, 1.2, 0.2, 0.5, 0.003, 150.],
+            [0.1, 0.8, 0., 0.1, 0.002, 0.],
+            [1e-12, 1., 1e-13, 0.8, 0.001, 50.],
+        ] {
+            let rates = [point[0] * 0.02, 0.003, point[0] * 0.01, 0.004, 1e-5, 0.5];
+            let local = |i: usize| Local::variable(i, Jet::affine(ORDER, point[i], rates[i]));
+            let thermal = 0.026;
+            let channel = channel_conductance(
+                &local(0)?,
+                &local(1)?,
+                &local(2)?,
+                &local(3)?,
+                &local(4)?,
+                thermal,
+            )?;
+            let series = series_conductance(&channel.value, &local(5)?)?;
+            for (coordinate, partial) in channel.partials.iter().enumerate() {
+                for (degree, &expected) in partial.value.coefficients().iter().enumerate() {
+                    let actual = channel.value.gradient[coordinate]
+                        .as_ref()
+                        .map_or(0., |g| g.coefficients()[degree]);
+                    close(actual, expected, 1e-22);
+                }
+            }
+            for coordinate in 0..6 {
+                let upstream = channel.value.gradient[coordinate]
+                    .as_ref()
+                    .map_or_else(|| Jet::constant(ORDER, 0.), Clone::clone);
+                let mut expected = series.partials[0].value.multiply(&upstream);
+                if coordinate == 5 {
+                    expected = expected.add(&series.partials[1].value);
+                }
+                for (degree, &coefficient) in expected.coefficients().iter().enumerate() {
+                    let actual = series.value.gradient[coordinate]
+                        .as_ref()
+                        .map_or(0., |g| g.coefficients()[degree]);
+                    close(actual, coefficient, 1e-22);
+                }
+            }
+            for time in [0., 0.001, 0.02] {
+                let [u, a, d, e, b, r]: [Real; 6] =
+                    std::array::from_fn(|i| rates[i].mul_add(time, point[i]));
+                let reference =
+                    b * u * (-0.5_f64).mul_add(a * d / (u + 2. * thermal), 1.) / (1. + d / e);
+                close(value_at(&channel.value.value, time), reference, 1e-24);
+                close(
+                    value_at(&series.value.value, time),
+                    reference / reference.mul_add(r, 1.),
+                    1e-24,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transport_continuations_match_reference_and_one_sided_partials() -> SpiceResult<()> {
+        for a1 in [-0.4, 0., 0.4] {
+            for bias in [0., 0.1, 1., 3., 20.] {
+                let a2 = 0.8;
+                let (value, slope) = saturation_shape(&variable(bias, 0.01)?, a1, a2)?;
+                if a1 != 0. {
+                    check_charge_gradient(&value, &slope);
+                }
+                for time in [0., 0.02] {
+                    let u = 0.01_f64.mul_add(time, bias);
+                    let reference = if a1 > 0. {
+                        let x = (-a1).mul_add(u, 1. - a2 - 0.0001);
+                        1. - x.midpoint(x.mul_add(x, 0.0004 * (1. - a2)).sqrt())
+                    } else if a1 < 0. {
+                        let x = a1.mul_add(u, a2 - 0.0001);
+                        x.midpoint(x.mul_add(x, 0.0004 * a2).sqrt())
+                    } else {
+                        a2
+                    };
+                    close(value_at(&value.value, time), reference, 1e-15);
+                }
+            }
+        }
+        let threshold = 0.34;
+        for bias in [0., 1e-18, threshold / 34., 0.04, 0.4] {
+            for rate in [-0.0001, 0.0001] {
+                let input = variable(bias, rate)?;
+                let (impact, slope) = impact_ionization(&input, 2., threshold)?;
+                check_charge_gradient(&impact, &slope);
+                let (early, slope) = substrate_early_voltage(&input, 1., threshold, 2., true)?;
+                for (degree, &expected) in slope.value.coefficients().iter().enumerate() {
+                    let actual = early.gradient[0]
+                        .as_ref()
+                        .map_or(0., |g| g.coefficients()[degree]);
+                    close(actual, expected, 1e-25);
+                }
+                for time in [0.001, 0.02] {
+                    let x = rate.mul_add(time, bias);
+                    let (i, v) = if x > threshold / 34. {
+                        (2. * x * (-threshold / x).exp(), 0.5 * (threshold / x).exp())
+                    } else {
+                        (2. * MIN_EXP * x, 0.5 * MAX_EXP)
+                    };
+                    close(value_at(&impact.value, time), i, 1e-25);
+                    close(value_at(&early.value, time), v, 1e-25);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
