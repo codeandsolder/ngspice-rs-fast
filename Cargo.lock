@@ -179,12 +179,12 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "model-kernel-api"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 
 [[package]]
 name = "model-kernel-diode"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 dependencies = [
  "model-kernel-api",
 ]
@@ -192,7 +192,7 @@ dependencies = [
 [[package]]
 name = "model-kernel-vdmos"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 dependencies = [
  "model-kernel-api",
 ]
@@ -200,7 +200,7 @@ dependencies = [
 [[package]]
 name = "model-normalize-ngspice"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 dependencies = [
  "anyhow",
  "model-preprocess-command",
@@ -212,7 +212,7 @@ dependencies = [
 [[package]]
 name = "model-preprocess-command"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 dependencies = [
  "anyhow",
  "libc",
@@ -224,7 +224,7 @@ dependencies = [
 [[package]]
 name = "model-preprocess-simplis"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 dependencies = [
  "anyhow",
  "model-kernel-diode",
@@ -238,7 +238,7 @@ dependencies = [
 [[package]]
 name = "model-statistics"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 dependencies = [
  "anyhow",
  "serde",
@@ -248,7 +248,7 @@ dependencies = [
 [[package]]
 name = "model-translate-simplis"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 dependencies = [
  "anyhow",
  "model-normalize-ngspice",
@@ -288,7 +288,7 @@ dependencies = [
 [[package]]
 name = "ngspice-rs-preprocess"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=277d90b5a465456fa220975ef3c1b8bd52655490#277d90b5a465456fa220975ef3c1b8bd52655490"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=0134546412c6f5f67e83d7407df88f7dc68a448a#0134546412c6f5f67e83d7407df88f7dc68a448a"
 dependencies = [
  "anyhow",
  "model-normalize-ngspice",

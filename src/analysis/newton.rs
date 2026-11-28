@@ -360,6 +360,7 @@ pub(super) enum CircuitLoad<'a, 'p> {
         context: &'a ModelContext,
         history: &'a StateHistory,
         forcing: Option<Forcing>,
+        explicit_bias: bool,
     },
     Transient {
         attempt: &'a mut PreparedTransient<'p>,
@@ -392,27 +393,46 @@ impl CircuitNewton<'_, '_> {
     ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
         // Both stamping and convergence read the same attempt-bound model
         // and accepted history, with no second caller-supplied identity.
-        let (prepared, context, history, forcing, time, integration, uic, mut attempt) =
-            match &mut self.load {
-                CircuitLoad::Bias {
-                    prepared,
-                    context,
-                    history,
-                    forcing,
-                } => (
-                    *prepared, *context, *history, *forcing, 0., None, None, None,
-                ),
-                CircuitLoad::Transient { attempt, uic } => (
-                    attempt.run(),
-                    attempt.context(),
-                    attempt.history(),
-                    None,
-                    attempt.time(),
-                    Some(attempt.coefficients()),
-                    Some(*uic),
-                    Some(&mut **attempt),
-                ),
-            };
+        let (
+            prepared,
+            context,
+            history,
+            forcing,
+            time,
+            integration,
+            uic,
+            explicit_bias,
+            mut attempt,
+        ) = match &mut self.load {
+            CircuitLoad::Bias {
+                prepared,
+                context,
+                history,
+                forcing,
+                explicit_bias,
+            } => (
+                *prepared,
+                *context,
+                *history,
+                *forcing,
+                0.,
+                None,
+                None,
+                *explicit_bias,
+                None,
+            ),
+            CircuitLoad::Transient { attempt, uic } => (
+                attempt.run(),
+                attempt.context(),
+                attempt.history(),
+                None,
+                attempt.time(),
+                Some(attempt.coefficients()),
+                Some(*uic),
+                false,
+                Some(&mut **attempt),
+            ),
+        };
         let circuit = prepared.circuit();
         let nodal_regularization = circuit.regularization_nodes();
         let gmin = self.options.diag_gmin;
@@ -443,7 +463,12 @@ impl CircuitNewton<'_, '_> {
                 let mut trial = history
                     .trial_in_reusing(phase, previous, spare)?
                     .with_device_limiting(options.limiting.is_device())
-                    .with_convergence_tolerances(options.reltol, options.abstol);
+                    .with_convergence_tolerances(options.reltol, options.abstol)
+                    .with_prepared_exact(
+                        explicit_bias
+                            || (options.had_nodeset
+                                && matches!(phase, IterationPhase::Junction | IterationPhase::Fix)),
+                    );
                 if let Some(uic) = uic {
                     trial = trial
                         .with_initial_transient(
