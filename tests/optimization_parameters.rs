@@ -627,7 +627,7 @@ fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() 
         (1e3, 2., 27.),
     ] {
         let (mut circuit, config) = candidate
-            .prepare(&[r, analysis], Some(temp), &mut budget)
+            .prepare(&[r, analysis], Some(temp), &[], &mut budget)
             .unwrap();
         close(
             config
@@ -647,14 +647,84 @@ fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() 
     }
     assert!(
         candidate
-            .prepare(&[3e3, 5.], Some(-273.15), &mut budget)
+            .prepare(&[3e3, 5.], Some(-273.15), &[], &mut budget)
             .is_err()
     );
-    let (mut circuit, config) = candidate.prepare(&[1e3, 2.], None, &mut budget).unwrap();
+    let (mut circuit, config) = candidate
+        .prepare(&[1e3, 2.], None, &[], &mut budget)
+        .unwrap();
     close(config.context().temperature, 27.);
     let request = config
         .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
         .unwrap();
     let plot = request.run(&mut circuit, &config.context()).unwrap();
     close(plot.value("i(v1)", 0).unwrap().re, -2e-3);
+}
+
+#[test]
+fn independent_edits_rebuild_models_geometry_and_source_values_together() {
+    use ngspice_rs::devices::circuit::CandidateEdit;
+    let plan = CircuitParameterPlan::new(
+        deck("v1 a 0 1\nr1 a 0 rm l=2u w=1u\nr2 a 0 rm l=4u w=1u\n.model rm r(rsh=100)"),
+        &[],
+    )
+    .unwrap();
+    let mut session = plan.independent_session();
+    let mut budget = EvalBudget::default();
+    for (voltage, width, sheet) in [(2., 2e-6, 200.), (-3., 1e-6, 50.), (2., 2e-6, 200.)] {
+        let (mut circuit, config) = session
+            .prepare(
+                &[],
+                None,
+                &[
+                    CandidateEdit::Source {
+                        name: "v1",
+                        value: voltage,
+                    },
+                    CandidateEdit::Instance {
+                        name: "r1",
+                        parameter: "w",
+                        value: width,
+                    },
+                    CandidateEdit::Model {
+                        scope: &[],
+                        name: "rm",
+                        parameter: "rsh",
+                        value: sheet,
+                    },
+                ],
+                &mut budget,
+            )
+            .unwrap();
+        let plot = config
+            .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+            .unwrap()
+            .run(&mut circuit, &config.context())
+            .unwrap();
+        close(plot.value("v(a)", 0).unwrap().re, voltage);
+        close(
+            plot.value("i(v1)", 0).unwrap().re,
+            -voltage * (width / (2e-6 * sheet) + 1. / (4. * sheet)),
+        );
+    }
+    assert!(
+        session
+            .prepare(
+                &[],
+                None,
+                &[CandidateEdit::Source {
+                    name: "r1",
+                    value: 1.
+                }],
+                &mut budget
+            )
+            .is_err()
+    );
+    let (mut circuit, config) = session.prepare(&[], None, &[], &mut budget).unwrap();
+    let plot = config
+        .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    close(plot.value("i(v1)", 0).unwrap().re, -0.0075);
 }

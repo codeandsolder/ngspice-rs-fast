@@ -222,14 +222,16 @@ impl CircuitParameterPlan {
         &self,
         context: &ModelContext,
         scope: Arc<crate::netlist::eval::ParamScope>,
+        edits: &[crate::devices::circuit::CandidateEdit<'_>],
     ) -> SpiceResult<Circuit> {
-        Circuit::from_prepared_netlist_with_limits(
+        Circuit::from_prepared_netlist_with_edits(
             &self.source,
             context,
             crate::devices::MutualLimits::default(),
             crate::devices::ElaborationLimits::default(),
             Some(scope),
             self.declarations(),
+            edits,
         )
     }
 
@@ -274,7 +276,7 @@ impl CircuitParameterPlan {
                 .clone(),
         );
         let context = self.config.context().model_context();
-        let baseline = self.elaborate(&context, scope)?;
+        let baseline = self.elaborate(&context, scope, &[])?;
         let routes = self
             .sites
             .iter()
@@ -411,6 +413,7 @@ impl IndependentCandidate<'_> {
         &mut self,
         coordinates: &[Real],
         temperature: Option<Real>,
+        edits: &[crate::devices::circuit::CandidateEdit<'_>],
         budget: &mut EvalBudget,
     ) -> SpiceResult<(Circuit, RunConfig)> {
         let mut parameters = self.parameters.clone();
@@ -422,7 +425,7 @@ impl IndependentCandidate<'_> {
         }
         let circuit = self
             .plan
-            .elaborate(&config.context().model_context(), scope)?;
+            .elaborate(&config.context().model_context(), scope, edits)?;
         self.parameters = parameters;
         Ok((circuit, config))
     }
@@ -565,7 +568,7 @@ impl CircuitCandidate<'_> {
     pub(super) fn physical_sensitivity_circuit(&self) -> SpiceResult<Circuit> {
         let scope = self.parameters.resolved_scope(self.plan.root)?;
         let context = self.config().context().model_context();
-        self.plan.elaborate(&context, scope)
+        self.plan.elaborate(&context, scope, &[])
     }
 
     /// Stable name of one independent root coordinate in plan order.
@@ -873,7 +876,7 @@ impl CircuitCandidate<'_> {
         let scope = parameters.resolved_scope(self.plan.root)?;
         let config = RunConfig::from_netlist_with_scope(&self.plan.source, Arc::clone(&scope))?;
         let context = config.context().model_context();
-        let circuit = self.plan.elaborate(&context, scope)?;
+        let circuit = self.plan.elaborate(&context, scope, &[])?;
         Ok(PreparedCandidate {
             context,
             config,
