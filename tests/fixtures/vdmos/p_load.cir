@@ -1,0 +1,12 @@
+VDMOS P channel circuit-coupled load reference
+Vdd supply 0 -12
+Rload supply drain 10
+Vgate gate 0 -4
+M1 drain gate 0 dut
+.model dut VDMOS(PCHAN vto=-3 kp=10 is=1e-14 cgs=1.4n cgdmax=2n cgdmin=20p)
+.control
+op
+print v(drain) i(vdd) @m1[id] @m1[gm] @m1[gds]
+quit
+.endc
+.end
