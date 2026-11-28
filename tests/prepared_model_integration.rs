@@ -154,6 +154,7 @@ fn descriptor(charge: Capability) -> Descriptor {
             .collect(),
         charge,
         noise: Capability::Computed,
+        trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
     }
 }
 
@@ -946,6 +947,7 @@ fn electrothermal_descriptor() -> Descriptor {
         .collect(),
         charge: Capability::Computed,
         noise: Capability::Zero,
+        trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
     }
 }
 
@@ -1645,4 +1647,243 @@ fn prepared_run_reuses_unaffected_tiles_across_context_changes() {
     assert_eq!(count(), after);
     assert_eq!(load(&context).to_bits(), original.to_bits());
     assert_eq!(count(), after + 64);
+}
+
+#[derive(Debug, Default)]
+struct TrialPolynomial;
+
+impl Kernel for TrialPolynomial {
+    type Prepared = Polynomial;
+
+    fn prepare(
+        &self,
+        parameters: &[Real],
+        temperature: Real,
+    ) -> model_kernel_api::Result<Polynomial> {
+        PolynomialKernel.prepare(parameters, temperature)
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &Polynomial,
+        coordinates: &[Real],
+        point: &mut Point<'_>,
+    ) -> model_kernel_api::Result<()> {
+        PolynomialKernel.evaluate(prepared, coordinates, point)
+    }
+
+    fn initialize_trial(
+        &self,
+        _: &Polynomial,
+        coordinates: &mut [Real],
+    ) -> model_kernel_api::Result<()> {
+        coordinates[0] = coordinates[1] + 0.1;
+        Ok(())
+    }
+
+    fn limit_trial(
+        &self,
+        _: &Polynomial,
+        reference: model_kernel_api::trial::TrialReference<'_>,
+        coordinates: &mut [Real],
+    ) -> model_kernel_api::Result<()> {
+        use model_kernel_api::trial::TrialReference;
+        let limit = match reference {
+            TrialReference::PreviousNewton(_) => 0.25,
+            TrialReference::AcceptedStep(_) => 0.125,
+        };
+        let reference = reference.coordinates();
+        let last = reference[0] - reference[1];
+        let raw = coordinates[0] - coordinates[1];
+        coordinates[0] = coordinates[1] + raw.clamp(last - limit, last + limit);
+        Ok(())
+    }
+
+    fn trial_convergence(
+        &self,
+        _: &Polynomial,
+        input: model_kernel_api::trial::ConvergenceInput<'_>,
+    ) -> model_kernel_api::Result<model_kernel_api::trial::Convergence> {
+        let old = input.previous;
+        let next = input.candidate;
+        let delta =
+            (next.coordinates[0] - next.coordinates[1]) - (old.coordinates[0] - old.coordinates[1]);
+        input.compare_residual(
+            0,
+            old.jacobian[0].mul_add(delta, old.residual[0]),
+            next.residual[0],
+        )
+    }
+}
+
+fn trial_artifact() -> Arc<Artifact<TrialPolynomial>> {
+    use model_kernel_api::trial::{TrialCapabilities, TrialPolicy};
+    let mut desc = descriptor(Capability::Computed);
+    desc.trial = TrialCapabilities {
+        initialization: TrialPolicy::Kernel,
+        limiting: TrialPolicy::Kernel,
+        convergence: TrialPolicy::Kernel,
+    };
+    desc.noise = Capability::Zero;
+    Artifact::new(desc, TrialPolynomial).unwrap()
+}
+
+fn trial_circuit(count: usize) -> Circuit {
+    let artifact = trial_artifact();
+    let mut circuit = Circuit::new();
+    for index in 0..count {
+        let node = circuit.add_node(&format!("p{index}")).unwrap();
+        PreparedDevice::bind(
+            &mut circuit,
+            &artifact,
+            &format!("x{index}"),
+            &[node, NodeId::GROUND],
+            &[1e-3, 2e-4, 1e-6, 2e-7],
+            InstanceTemperature::circuit(27.),
+        )
+        .unwrap();
+    }
+    circuit.finalize().unwrap();
+    circuit
+}
+
+fn trial_load(
+    circuit: &Circuit,
+    history: &ngspice_rs::devices::StateHistory,
+    proposed: &[Real],
+    mut trial: ngspice_rs::devices::TrialState,
+    integration: Option<&Coefficients>,
+) -> (SparseMatrix, Vector, ngspice_rs::devices::TrialState) {
+    let n = circuit.unknown_count();
+    let mut matrix = SparseMatrix::new(n, n);
+    let mut rhs = Vector::zeros(n);
+    let mode = integration.map_or(AnalysisMode::OperatingPoint, |coeff| {
+        AnalysisMode::Transient {
+            time: coeff.dt(),
+            dt: coeff.dt(),
+        }
+    });
+    circuit
+        .load(
+            &LoadRequest {
+                mode,
+                solution: &Vector::from_slice(proposed),
+                model_context: &ModelContext::default(),
+                integration,
+                history,
+                forcing: None,
+            },
+            &mut matrix,
+            &mut rhs,
+            &mut trial,
+        )
+        .unwrap();
+    matrix.fold_duplicates();
+    (matrix, rhs, trial)
+}
+
+#[test]
+fn kernel_trial_policy_preserves_reference_provenance_and_exact_acceptance() {
+    use ngspice_rs::devices::{ConvergenceRequest, IterationPhase};
+    // One instance uses the scalar path; three share the same homogeneous tile.
+    for count in [1, 3] {
+        let circuit = trial_circuit(count);
+        let mut history = circuit.state_history().unwrap();
+        let proposed = vec![2.; count];
+        let (matrix, rhs, cold) = trial_load(
+            &circuit,
+            &history,
+            &proposed,
+            history.trial_in(IterationPhase::Junction, None).unwrap(),
+            None,
+        );
+        assert!(cold.is_nonconvergent());
+        let x: Real = 0.1;
+        let g = 1e-3 + 6e-4 * x * x;
+        let i = 1e-3 * x + 2e-4 * x.powi(3);
+        for lane in 0..count {
+            close(cold.values()[7 * lane + 4], x);
+            close(matrix.get(lane, lane), g);
+            close(rhs.as_slice()[lane], g * x - i);
+        }
+        let (_, _, limited) = trial_load(
+            &circuit,
+            &history,
+            &proposed,
+            history.trial_in(IterationPhase::Fix, Some(&cold)).unwrap(),
+            None,
+        );
+        assert!(limited.is_nonconvergent());
+        for lane in 0..count {
+            close(limited.values()[7 * lane + 4], 0.35);
+        }
+        let (_, _, exact) = trial_load(&circuit, &history, &proposed, history.trial(), None);
+        assert!(!exact.is_nonconvergent());
+        for lane in 0..count {
+            close(exact.values()[7 * lane + 4], 2.);
+        }
+        circuit
+            .accept_point(&Vector::from_slice(&proposed), None, &mut history, exact)
+            .unwrap();
+        let accepted = history.accepted(1).unwrap().to_vec();
+        let coeff = StepHistory::new()
+            .trial(IntegrationMethod::Trapezoidal, 1, 1e-6, DEFAULT_XMU)
+            .unwrap();
+        let predictor = history.trial_in(IterationPhase::Predict, None).unwrap();
+        let (matrix, rhs, rejected) = trial_load(
+            &circuit,
+            &history,
+            &vec![3.; count],
+            predictor,
+            Some(&coeff),
+        );
+        assert!(rejected.is_nonconvergent());
+        for lane in 0..count {
+            let x: Real = 2.125;
+            let stored = 1e-6 * x + 2e-7 * x.powi(3);
+            let accepted_charge = 1e-6 * 2. + 2e-7 * 8.;
+            let current = 1e-3 * x + 2e-4 * x.powi(3) + (stored - accepted_charge) / 1e-6;
+            let jac = 1e-3 + 6e-4 * x * x + (1e-6 + 6e-7 * x * x) / 1e-6;
+            close(rejected.values()[7 * lane + 4], x);
+            close(rejected.values()[7 * lane], stored);
+            close(matrix.get(lane, lane), jac);
+            close(rhs.as_slice()[lane], jac * x - current);
+        }
+        assert_eq!(history.accepted(1).unwrap(), accepted);
+        let explicit = history
+            .trial_in(IterationPhase::Predict, None)
+            .unwrap()
+            .with_initial_conditions(true);
+        let (_, _, explicit) =
+            trial_load(&circuit, &history, &vec![3.; count], explicit, Some(&coeff));
+        assert!(!explicit.is_nonconvergent());
+        for lane in 0..count {
+            close(explicit.values()[7 * lane + 4], 3.);
+        }
+        let (_, _, last_exact) = trial_load(&circuit, &history, &proposed, history.trial(), None);
+        let previous = Vector::from_slice(&proposed);
+        let changed = Vector::from_slice(&vec![2.2; count]);
+        let context = ModelContext::default();
+        let request = ConvergenceRequest {
+            solution: &changed,
+            previous: &previous,
+            trial: &last_exact,
+            history: &history,
+            model_context: &context,
+            time: 0.,
+            integration: None,
+            reltol: 1e-8,
+            abstol: 1e-12,
+            vntol: 1e-6,
+        };
+        assert!(circuit.convergence_test(&request).unwrap());
+        assert!(
+            !circuit
+                .convergence_test(&ConvergenceRequest {
+                    solution: &previous,
+                    ..request
+                })
+                .unwrap()
+        );
+    }
 }

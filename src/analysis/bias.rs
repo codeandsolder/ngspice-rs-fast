@@ -1473,6 +1473,9 @@ impl Engine<'_> {
                 context: &context,
                 history: self.history,
                 forcing: self.forcing,
+                explicit_bias: !nodes.initial.is_empty()
+                    || (context.bias_analysis.is_some()
+                        && self.prepared.circuit().has_prepared_bias()),
             },
             workspace: &mut self.workspace,
         }
