@@ -383,7 +383,7 @@ struct BoundCircuitLoad<'a, 'p> {
 }
 
 impl<'p> CircuitLoad<'_, 'p> {
-    fn bind(&mut self) -> BoundCircuitLoad<'_, 'p> {
+    const fn bind(&mut self) -> BoundCircuitLoad<'_, 'p> {
         match self {
             Self::Bias {
                 prepared,
