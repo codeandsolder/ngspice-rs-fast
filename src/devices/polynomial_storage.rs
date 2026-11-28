@@ -38,14 +38,14 @@ const fn parameter(
 const TC1: ScalarParameter = parameter("tc1", U::InverseKelvin, D::Finite, None);
 const TC2: ScalarParameter = parameter("tc2", U::InverseKelvinSquared, D::Finite, None);
 const TEMP: ScalarParameter = parameter("temp", U::Celsius, D::Temperature, None);
-const DTEMP: ScalarParameter = parameter("dtemp", U::Celsius, D::Finite, None);
+const DTEMP: ScalarParameter = parameter("dtemp", U::Kelvin, D::Finite, None);
 const TNOM: ScalarParameter = parameter("tnom", U::Celsius, D::Temperature, None);
 const M: ScalarParameter = parameter("m", U::Dimensionless, D::Positive, Some(1.));
 const SCALE: ScalarParameter = parameter("scale", U::Dimensionless, D::Positive, Some(1.));
 static CAP_MODEL: ScalarSchema<'static> = ScalarSchema::new(&[
     parameter("c", U::Dimensionless, D::Finite, Some(1.)),
     parameter("vc1", U::InverseVolt, D::Finite, Some(0.)),
-    parameter("vc2", U::Dimensionless, D::Finite, Some(0.)),
+    parameter("vc2", U::InverseVoltSquared, D::Finite, Some(0.)),
     TC1,
     TC2,
     TEMP,
@@ -54,8 +54,8 @@ static CAP_MODEL: ScalarSchema<'static> = ScalarSchema::new(&[
 ]);
 static IND_MODEL: ScalarSchema<'static> = ScalarSchema::new(&[
     parameter("l", U::Dimensionless, D::Finite, Some(1.)),
-    parameter("il1", U::Dimensionless, D::Finite, Some(0.)),
-    parameter("il2", U::Dimensionless, D::Finite, Some(0.)),
+    parameter("il1", U::InverseAmpere, D::Finite, Some(0.)),
+    parameter("il2", U::InverseAmpereSquared, D::Finite, Some(0.)),
     TC1,
     TC2,
     TEMP,
@@ -181,7 +181,7 @@ impl Recipe {
         })?;
         let temp = self
             .setting("temp")
-            .unwrap_or(context.temperature + self.setting("dtemp").unwrap_or(0.));
+            .unwrap_or_else(|| context.temperature + self.setting("dtemp").unwrap_or(0.));
         let nominal = scalar(&self.model, "tnom").unwrap_or(context.nominal_temperature);
         let delta = temperature_kelvin(temp, &self.location)?
             - temperature_kelvin(nominal, &self.location)?;
@@ -256,7 +256,7 @@ struct Rows {
 }
 
 impl Rows {
-    fn controls(self) -> [Option<usize>; 2] {
+    const fn controls(self) -> [Option<usize>; 2] {
         match self.kind {
             Kind::Capacitor => self.terminals,
             Kind::Inductor => [Some(self.branch), None],
@@ -407,15 +407,7 @@ impl Device for PolynomialDevice {
             .iter()
             .find(|p| p.name == keyword)
             .ok_or_else(|| SpiceError::circuit("unsupported polynomial storage setter"))?;
-        let valid = value.is_finite()
-            && match definition.domain {
-                D::NonZero => value != 0.,
-                D::Positive => value > 0.,
-                D::Temperature => value > -273.15,
-                D::Finite => true,
-                D::NonNegative => value >= 0.,
-            };
-        if !valid {
+        if !definition.domain.accepts(value) {
             return Err(SpiceError::circuit("invalid polynomial storage setter"));
         }
         let mut recipe = self.recipe.clone();

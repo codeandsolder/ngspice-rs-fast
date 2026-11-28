@@ -268,33 +268,7 @@ impl ModelBackend {
     /// Families differing only in polarity share the same selector catalog.
     pub(crate) const fn catalog(designator: char) -> &'static [BackendSpec] {
         match designator.to_ascii_lowercase() {
-            'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
-            'c' => {
-                const {
-                    &[
-                        BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1]),
-                        BackendSpec::new(
-                            Self::PolynomialCapacitor,
-                            "Prepared polynomial charge",
-                            &[1],
-                        )
-                        .for_family(ModelFamily::PolynomialCapacitor),
-                    ]
-                }
-            }
-            'l' => {
-                const {
-                    &[
-                        BackendSpec::new(Self::Inductor, "Scalar inductor", &[1]),
-                        BackendSpec::new(
-                            Self::PolynomialInductor,
-                            "Prepared polynomial flux",
-                            &[1],
-                        )
-                        .for_family(ModelFamily::PolynomialInductor),
-                    ]
-                }
-            }
+            'r' | 'c' | 'l' => Self::passive_catalog(designator),
             'd' => {
                 const {
                     &[
@@ -372,6 +346,39 @@ impl ModelBackend {
                             .for_family(ModelFamily::LogicVoltage),
                         BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
                             .for_family(ModelFamily::TimedSwitch),
+                    ]
+                }
+            }
+            _ => &[],
+        }
+    }
+
+    const fn passive_catalog(designator: char) -> &'static [BackendSpec] {
+        match designator.to_ascii_lowercase() {
+            'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
+            'c' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1]),
+                        BackendSpec::new(
+                            Self::PolynomialCapacitor,
+                            "Prepared polynomial charge",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PolynomialCapacitor),
+                    ]
+                }
+            }
+            'l' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Inductor, "Scalar inductor", &[1]),
+                        BackendSpec::new(
+                            Self::PolynomialInductor,
+                            "Prepared polynomial flux",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PolynomialInductor),
                     ]
                 }
             }
