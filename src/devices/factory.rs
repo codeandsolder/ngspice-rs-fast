@@ -295,6 +295,12 @@ fn instantiate_passive(
             _ => return Err(unsupported_parameter(instance, p)),
         }
     }
+    if kind != PassiveKind::Resistor && value < 0. {
+        return Err(SpiceError::parse(
+            instance.location.clone(),
+            "literal passive storage must be nonnegative",
+        ));
+    }
     nodes.transaction(|nodes| {
         let terminals = [
             nodes.intern(&instance.nodes[0])?,
