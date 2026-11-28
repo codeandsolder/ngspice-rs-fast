@@ -325,7 +325,7 @@ pub(super) fn instantiate_semiconductor(
             hash.update([shape, u8::from(absolute)]);
             let mut fingerprint = [0; 16];
             fingerprint.copy_from_slice(&hash.finalize()[..16]);
-            ltspice::artifact(compiled.model, input, absolute, fingerprint)
+            ltspice::artifact(&compiled.model, input, absolute, fingerprint)
                 .map_err(|error| source_error(instance, error))
         },
     )?;
