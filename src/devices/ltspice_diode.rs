@@ -214,7 +214,7 @@ pub(super) fn instantiate_fn(
     bind(
         instance,
         nodes,
-        &artifact,
+        artifact.as_ref(),
         &values,
         InstanceTemperature::circuit(context.temperature),
         SourceBinding {
@@ -296,6 +296,15 @@ pub(super) fn instantiate_semiconductor(
         .model
         .bind(input)
         .map_err(|error| source_error(instance, error))?;
+    for branch in [prepared.bulk, prepared.sidewall].into_iter().flatten() {
+        let resistance = branch.resistance();
+        if resistance != 0. && !resistance.recip().is_finite() {
+            return Err(source_error(
+                instance,
+                "nonrepresentable diode series conductance",
+            ));
+        }
+    }
     let shape = u8::from(prepared.bulk.is_some())
         | (u8::from(prepared.sidewall.is_some()) << 1)
         | (u8::from(
@@ -333,7 +342,7 @@ pub(super) fn instantiate_semiconductor(
     bind(
         instance,
         nodes,
-        &artifact,
+        artifact.as_ref(),
         &values,
         InstanceTemperature::circuit(context.temperature),
         SourceBinding {

@@ -35,7 +35,6 @@ fn projected(source: &str) -> Result<(Netlist, RunConfig, Circuit)> {
         PreparedDeclarations {
             waveforms: &bundle.waveforms,
             pwl_resistors: &bundle.pwl_resistors,
-            ..Default::default()
         },
     )?;
     Ok((deck, config, circuit))
