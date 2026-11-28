@@ -141,7 +141,34 @@ not determine higher derivatives. The ABI work is tracked in
 
 Conservative BSIM charge modes and their exact multivariate kernels are
 tracked in [#256](https://github.com/codeandsolder/ngspice-rs-fast/issues/256).
-Continuous switch and prepared PWL-resistor branch laws are tracked in
-[#257](https://github.com/codeandsolder/ngspice-rs-fast/issues/257).
 These are separate implementation and qualification obligations, not
 claims that their current scalar models support high-index derivatives.
+
+## Continuous switch and prepared PWL laws
+
+Memoryless XSPICE P-switch and A-switch, continuous source-selected
+LTspice level 1, and LTspice level 2 evaluate a common constitutive
+program in two arithmetic domains. Ordinary scalar Newton loads carry
+stack-local first partials; physical Taylor loads carry time coefficients
+and their local state partials. Threshold, resistance floor, directional
+voltage, hard current limit, and epsilon-join decisions use the
+one-sided germ, not a numerically perturbed operating point. Each active
+piecewise branch supplies guard observations to the derivative-array
+event localizer. Smooth arctangent and tanh laws have no artificial
+branch event at their rounding or numerical evaluation shortcuts.
+
+The same current law differentiates the ten measured epsilon-join Newton
+iterations. Its physical partials are independent of the reference AC
+chord, cubic control scaling, and implicit-root slope conventions.
+Optional series inductance contributes the physical branch flux rather
+than the LTspice AC short. Floating ports, current-sensor branches,
+named controlling currents and control-port loading retain their original
+MNA incidence.
+
+Prepared voltage- and current-defined PWL resistors use the same
+piecewise affine segment coefficients for scalar and Taylor loads.
+Only internal knots are guards: the first and final segments extrapolate
+without introducing spurious end-point events. The candidate coordinate
+retains its native branch identity; segment hints remain advisory Newton
+initializers and never replace the physical law. Discrete and timed switch
+state machines are not memoryless and remain outside this contract.
