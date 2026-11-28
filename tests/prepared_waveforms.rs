@@ -1053,7 +1053,20 @@ fn actual_ltspice_prepared_waveforms_drive_transient_with_exact_cutoffs() {
         .unwrap()
         .run(&mut circuit, &config.context())
         .unwrap();
-    let cutoff = 1.5_f64.mul_add(10e-6, 1e-6);
+    let timelines = circuit
+        .source_timelines(TransientTiming::new(50e-9, 20e-6).unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let pulse = timelines.iter().find(|source| source.name == "i1").unwrap();
+    let cutoff = pulse
+        .waveform
+        .breakpoints_in(0., 20e-6)
+        .unwrap()
+        .last()
+        .unwrap();
+    // The parser's engineering-suffix multiplication can round differently
+    // from a Rust decimal literal. Require the exact *bound* event in the plot.
+    close(cutoff, 16e-6, 1e-19);
     for point in 0..plot.point_count() {
         let time = plot.value("time", point).unwrap().re;
         let elapsed = (time - 1e-6).clamp(0., 1.5e-6);
@@ -1086,4 +1099,70 @@ fn actual_ltspice_prepared_waveforms_drive_transient_with_exact_cutoffs() {
         (0..plot.point_count())
             .any(|point| plot.value("time", point).unwrap().re.to_bits() == cutoff.to_bits())
     );
+}
+
+#[test]
+fn vendor_prepared_waveform_values_match_at_independent_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = prepare_deck(
+        dir.path(),
+        include_str!("fixtures/ltspice_waveforms/waveforms-gear.cir"),
+        InputFormat::LtspiceDeck,
+    );
+    let netlist = Parser::new()
+        .parse_file(dir.path().join(&bundle.primary.filename))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let circuit = config
+        .prepared_circuit(
+            &netlist,
+            ngspice_rs::devices::subckt::PreparedDeclarations {
+                waveforms: &bundle.waveforms,
+                pwl_resistors: &bundle.pwl_resistors,
+            },
+        )
+        .unwrap();
+    let timelines = circuit
+        .source_timelines(TransientTiming::new(20e-9, 20e-6).unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let waves = ["v1", "v2", "i1", "v3", "v4", "v5", "v6", "v7", "v8"].map(|name| {
+        let source = timelines.iter().find(|source| source.name == name).unwrap();
+        let Waveform::Prepared(wave) = &source.waveform else {
+            panic!("expected prepared source {name}")
+        };
+        wave
+    });
+    assert_eq!(bundle.waveforms.len(), waves.len());
+    close(waves[0].dc(), 7., 0.);
+    let mut count = 0;
+    for row in include_str!("fixtures/ltspice_waveforms/waveforms-gear.tsv").lines() {
+        let numbers = row
+            .split_ascii_whitespace()
+            .map(|value| value.parse::<f64>().unwrap())
+            .collect::<Vec<_>>();
+        let [time, expected @ ..] = numbers.as_slice() else {
+            panic!("missing witness time")
+        };
+        assert_eq!(expected.len(), waves.len());
+        // LTspice records a left landing value at zero for the negative
+        // frequency train, and at its positive-delay counterpart's release.
+        // The separate sided tests qualify both physical external limits.
+        for (index, (wave, expected)) in waves.iter().zip(expected).enumerate() {
+            let side = if (index == 5 && time.to_bits() == 0)
+                || (index == 4 && time.to_bits() == 1e-6_f64.to_bits())
+            {
+                Limit::Left
+            } else {
+                Limit::Right
+            };
+            let actual = wave.value_at(*time, side).unwrap();
+            assert!(
+                (actual - expected).abs() <= 2e-10,
+                "witness source {index} at {time:.17e}: {actual:.17e} != {expected:.17e}"
+            );
+        }
+        count += 1;
+    }
+    assert_eq!(count, 139);
 }

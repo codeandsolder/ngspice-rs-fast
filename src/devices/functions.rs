@@ -628,7 +628,6 @@ impl Exponential {
             .scale(self.pulsed)
             .add(&weight.scale(-self.initial))
             .offset(self.initial)
-            .with_value(self.independent_value_at(t))
     }
 }
 

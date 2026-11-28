@@ -18,10 +18,15 @@ AC phasor remain unchanged.
 The resolved law stores unique knots with distinct external left and right
 ordinates. It interpolates the right value of one knot to the left value of the
 next, including across repeating-cycle boundaries. Signed cycle origins and
-optional startup holds are preserved. Analytic sine forcing uses its signed
-delay and damping without transient-plan defaults. The initial operating point
-uses the prepared right-hand startup value; native sources retain their existing
-left-limit transient startup convention.
+optional startup holds are preserved. A finite repeating train has an exact
+absolute cutoff, with independently specified held value after termination.
+Analytic sine forcing uses signed frequency, amplitude, delay, damping and phase
+without transient-plan defaults. A finite sine train holds its capped endpoint;
+a negative elapsed cap becomes effective when the startup hold releases.
+Exponential forcing evaluates both signed transition delays independently, even
+when the fall precedes the rise. The DC bias is independent of the transient
+startup. Prepared transient initialization uses the physical right-hand limit;
+native sources retain their existing left-limit startup convention.
 
 Exact prepared-source events are enumerated lazily. The companion driver
 previews them from the last accepted time, outside the native breakpoint
@@ -42,8 +47,8 @@ interior event it establishes the right-limit state while retaining physical
 storage and rejects derivative-input jumps that require impulses. The
 requested final endpoint retains the left limit.
 
-Native PULSE/PWL and native source parsing remain unchanged. The currently
-pinned producer contract defines DC as the right-hand startup value. Periodic
+Native PULSE/PWL and native source parsing retain their own dialect semantics.
+The producer binds DC and transient startup independently. Periodic
 operating-point metadata is retained in the resolved forcing; dispatch of the
 source-specific periodic analysis policy is separate from ordinary transient
 execution.
