@@ -140,6 +140,55 @@ fn has_native_current(
     })
 }
 
+/// Electrical consumers before dynamic lowering or numerical simplification.
+fn network_references(
+    instances: &[DeviceInstance],
+    existing: &[crate::devices::ElaboratedDevice],
+    behavioural: impl Iterator<Item = String>,
+) -> NetworkReferences {
+    NetworkReferences {
+        current: behavioural
+            .chain(
+                instances
+                    .iter()
+                    .flat_map(|instance| instance.parameters.iter())
+                    .filter(|parameter| {
+                        parameter.name == "control" && parameter.kind == ParameterKind::Instance
+                    })
+                    .map(|parameter| parameter.value.to_ascii_lowercase()),
+            )
+            .chain(
+                instances
+                    .iter()
+                    .flat_map(|instance| &instance.code_ports)
+                    .flat_map(|port| &port.terminals)
+                    .filter(|terminal| terminal.kind == CodePortKind::BranchCurrent)
+                    .map(|terminal| terminal.positive.to_ascii_lowercase()),
+            )
+            .chain(
+                existing
+                    .iter()
+                    .flat_map(|device| device.controlling_sources())
+                    .map(|control| control.name.to_ascii_lowercase()),
+            )
+            .collect(),
+        coupled: instances
+            .iter()
+            .filter(|instance| instance.designator == 'k')
+            .flat_map(|instance| &instance.parameters)
+            .filter(|parameter| parameter.kind == ParameterKind::Instance)
+            .map(|parameter| parameter.value.to_ascii_lowercase())
+            .chain(
+                existing
+                    .iter()
+                    .filter_map(|device| device.mutual_coupling())
+                    .flat_map(|coupling| coupling.inductors)
+                    .map(|inductor| inductor.name.to_ascii_lowercase()),
+            )
+            .collect(),
+    }
+}
+
 fn measured_targets(
     instances: &[DeviceInstance],
     models: &crate::devices::models::ModelResolver<'_>,
@@ -157,53 +206,8 @@ fn measured_targets(
             }
         });
     }
-    // Resolve physical topology from actual circuit consumers, not output
-    // selections or unused function declarations. Behavioural expressions
-    // here have already undergone lexical and occurrence expansion.
     let mut targets = CurrentTargets {
-        network_references: NetworkReferences {
-            current: referenced
-                .keys()
-                .cloned()
-                .chain(
-                    instances
-                        .iter()
-                        .flat_map(|instance| instance.parameters.iter())
-                        .filter(|parameter| {
-                            parameter.name == "control" && parameter.kind == ParameterKind::Instance
-                        })
-                        .map(|parameter| parameter.value.to_ascii_lowercase()),
-                )
-                .chain(
-                    instances
-                        .iter()
-                        .flat_map(|instance| &instance.code_ports)
-                        .flat_map(|port| &port.terminals)
-                        .filter(|terminal| terminal.kind == CodePortKind::BranchCurrent)
-                        .map(|terminal| terminal.positive.to_ascii_lowercase()),
-                )
-                .chain(
-                    existing
-                        .iter()
-                        .flat_map(|device| device.controlling_sources())
-                        .map(|control| control.name.to_ascii_lowercase()),
-                )
-                .collect(),
-            coupled: instances
-                .iter()
-                .filter(|instance| instance.designator == 'k')
-                .flat_map(|instance| &instance.parameters)
-                .filter(|parameter| parameter.kind == ParameterKind::Instance)
-                .map(|parameter| parameter.value.to_ascii_lowercase())
-                .chain(
-                    existing
-                        .iter()
-                        .filter_map(|device| device.mutual_coupling())
-                        .flat_map(|coupling| coupling.inductors)
-                        .map(|inductor| inductor.name.to_ascii_lowercase()),
-                )
-                .collect(),
-        },
+        network_references: network_references(instances, existing, referenced.keys().cloned()),
         ..CurrentTargets::default()
     };
     if referenced.is_empty() {

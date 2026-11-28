@@ -426,22 +426,41 @@ fn number(input: &mut In<'_>) -> Res<Built<BExpr>> {
     })
 }
 
+/// Recognize a relative descendant path in a macro actual argument. A dot
+/// is legal in a device name, but remains outside ordinary scalar identifiers;
+/// a single colon still belongs to the ternary grammar.
+fn descendant_name<'a>(input: &mut In<'a>) -> Res<Option<&'a str>> {
+    if !input.input.starts_with(['x', 'X']) {
+        return Ok(None);
+    }
+    let checkpoint = input.checkpoint();
+    let original = input.input;
+    let component =
+        |c: char| is_name_continue(c) || c == '.' || (!c.is_ascii() && !c.is_whitespace());
+    take_while(1.., component).void().parse_next(input)?;
+    if !input.input.starts_with("::") {
+        input.reset(&checkpoint);
+        return Ok(None);
+    }
+    while input.input.starts_with("::") {
+        literal("::").void().parse_next(input)?;
+        take_while(1.., component).void().parse_next(input)?;
+    }
+    Ok(Some(&original[..original.len() - input.input.len()]))
+}
+
 fn name_or_call(input: &mut In<'_>, options: Options) -> Res<Built<BExpr>> {
     let start = input.eof_offset();
-    let original = input.input;
-    let identifier = || {
+    let name = if let Some(path) = descendant_name(input)? {
+        path
+    } else {
         (
             any.verify(|c: &char| is_name_start(*c)),
             take_while(0.., is_name_continue),
         )
+            .take()
+            .parse_next(input)?
     };
-    identifier().void().parse_next(input)?;
-    // Double colons are an explicit descendant path, not ternary separators.
-    while input.input.starts_with("::") {
-        literal("::").void().parse_next(input)?;
-        identifier().void().parse_next(input)?;
-    }
-    let name = &original[..original.len() - input.input.len()];
     let lowered = name.to_ascii_lowercase();
     let adjacent = next_char(input) == Some('(');
     let checkpoint = input.checkpoint();

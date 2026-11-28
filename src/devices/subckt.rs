@@ -39,6 +39,7 @@
 //! and analysis cards inside a body are rejected explicitly rather than ignored.
 //! Resolved includes already contribute their materialized cards in source order.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -47,6 +48,7 @@ use crate::netlist::ast::{
     CodePortKind, DeviceInstance, FourierCard, MeasureCard, ModelCard, Netlist, NodeHintCard,
     OptionCard, OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind,
     PrintCard, RequestedVector, SaveCard, ScopeEntry, ScopeView, ScopedCardKind, Subcircuit,
+    VectorRequest,
 };
 use crate::netlist::bexpr::BExprKind;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamBinding, ParamScope};
@@ -265,6 +267,7 @@ fn expand_with_prepared_output(
         binned_bases: BTreeSet::new(),
         root_functions: root.functions().cloned(),
         plans: BTreeMap::new(),
+        descendant_indices: RefCell::default(),
     };
     let mut locals = vec![expander.root_models(root)];
     let directives = Directives {
@@ -532,6 +535,8 @@ struct DefinitionPlan<'a> {
     functions: Option<Arc<FunctionScope>>,
 }
 
+type DescendantIndex<'a> = BTreeMap<&'a str, Option<&'a DeviceInstance>>;
+
 struct Expander<'a> {
     binder: Option<crate::netlist::prepared_initialization::Binder<'a>>,
     netlist: &'a Netlist,
@@ -556,6 +561,8 @@ struct Expander<'a> {
     root_functions: Option<Arc<FunctionScope>>,
     /// Lexical declarations are independent of an instance's bound values.
     plans: BTreeMap<String, Arc<DefinitionPlan<'a>>>,
+    /// Lazy lexical occurrence indices, used only for explicit descendant paths.
+    descendant_indices: RefCell<BTreeMap<&'a str, DescendantIndex<'a>>>,
 }
 
 /// Definition lookup: first declaration wins, like `ModelResolver` and C's
@@ -750,6 +757,75 @@ fn shortest_cycle(
 }
 
 impl<'a> Expander<'a> {
+    /// Index a lexical device scope lazily. Ambiguous source instance names
+    /// cannot resolve an explicit path, even if they would flatten to a valid
+    /// unrelated branch name.
+    fn descendant_instance(&self, definition: &str, name: &str) -> Option<&'a DeviceInstance> {
+        let (key, devices) = if definition.is_empty() {
+            ("", self.netlist.devices.as_slice())
+        } else {
+            let body = self.definitions.get(definition).copied()?;
+            (body.name.as_str(), body.devices.as_slice())
+        };
+        let mut indices = self.descendant_indices.borrow_mut();
+        indices
+            .entry(key)
+            .or_insert_with(|| {
+                let mut index = DescendantIndex::new();
+                for device in devices {
+                    index
+                        .entry(device.name.as_str())
+                        .and_modify(|entry| *entry = None)
+                        .or_insert(Some(device));
+                }
+                index
+            })
+            .get(name)
+            .copied()
+            .flatten()
+    }
+
+    /// Bind an explicit descendant path through actual X declarations before
+    /// translating to the native flattened identity. Ordinary native names
+    /// preserve their existing translation rules.
+    fn device_reference(
+        &self,
+        name: &str,
+        path: &str,
+        definition: &str,
+        at: &SourceLoc,
+    ) -> SpiceResult<String> {
+        let designator = |name: &str| name.chars().next().unwrap_or_default().to_ascii_lowercase();
+        if !name.contains("::") {
+            return Ok(device_name(name, designator(name), path));
+        }
+        let invalid = || {
+            SpiceError::parse(
+                at.clone(),
+                format!("unresolved or ambiguous descendant device reference '{name}'"),
+            )
+        };
+        let (ancestors, leaf) = name.rsplit_once("::").ok_or_else(invalid)?;
+        let mut occurrence = path.to_owned();
+        let mut definition = definition;
+        for component in ancestors.split("::") {
+            let instance = self
+                .descendant_instance(definition, component)
+                .filter(|device| device.designator == 'x')
+                .ok_or_else(invalid)?;
+            definition = instance.model.as_deref().ok_or_else(invalid)?;
+            if !occurrence.is_empty() {
+                occurrence.push('.');
+            }
+            occurrence.push_str(&instance.name);
+        }
+        let device = self
+            .descendant_instance(definition, leaf)
+            .filter(|device| device.designator != 'x')
+            .ok_or_else(invalid)?;
+        Ok(device_name(&device.name, device.designator, &occurrence))
+    }
+
     fn directive(
         &mut self,
         location: &SourceLoc,
@@ -800,8 +876,16 @@ impl<'a> Expander<'a> {
                     self.frontend.nodesets.push(hint);
                 }
             }
-            FrontendAction::Save(save) => self.output_directive(save, terminals, path)?,
-            FrontendAction::Print(print) => self.frontend.output.prints.push(print.clone()),
+            FrontendAction::Save(save) => {
+                self.output_directive(save, terminals, path, directives.definition)?
+            }
+            FrontendAction::Print(print) => {
+                let mut print = print.clone();
+                for request in &mut print.requests {
+                    self.rewrite_output_device(request, path, directives.definition, false)?;
+                }
+                self.frontend.output.prints.push(print);
+            }
             FrontendAction::Measure(measure) => self.frontend.measurements.push(measure.clone()),
             FrontendAction::NoOutput => {}
         }
@@ -815,6 +899,7 @@ impl<'a> Expander<'a> {
         save: &SaveCard,
         terminals: &BTreeMap<String, String>,
         path: &str,
+        definition: &str,
     ) -> SpiceResult<()> {
         let mut save = save.clone();
         for request in &mut save.requests {
@@ -828,21 +913,36 @@ impl<'a> Expander<'a> {
                         *negative = self.rewrite_node(negative, terminals, path);
                     }
                 }
-                RequestedVector::Current { device } => {
-                    *device = device_reference(device, path, &request.location)?;
-                }
-                RequestedVector::Named { name, .. } if name.starts_with('@') => {
-                    if let Some((device, parameter)) = name[1..].split_once('[') {
-                        *name = format!(
-                            "@{}[{parameter}",
-                            device_reference(device, path, &request.location)?
-                        );
-                    }
-                }
-                RequestedVector::All | RequestedVector::Named { .. } => {}
+                _ => self.rewrite_output_device(request, path, definition, true)?,
             }
         }
         self.frontend.output.saves.push(save);
+        Ok(())
+    }
+
+    fn rewrite_output_device(
+        &self,
+        request: &mut VectorRequest,
+        path: &str,
+        definition: &str,
+        rewrite_local: bool,
+    ) -> SpiceResult<()> {
+        match &mut request.vector {
+            RequestedVector::Current { device } if rewrite_local || device.contains("::") => {
+                *device = self.device_reference(device, path, definition, &request.location)?;
+            }
+            RequestedVector::Named { name, .. } if name.starts_with('@') => {
+                if let Some((device, parameter)) = name[1..].split_once('[')
+                    && (rewrite_local || device.contains("::"))
+                {
+                    *name = format!(
+                        "@{}[{parameter}",
+                        self.device_reference(device, path, definition, &request.location)?
+                    );
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -959,7 +1059,7 @@ impl<'a> Expander<'a> {
             for node in &mut instance.nodes {
                 *node = self.rewrite_node(node, &terminals.analog, path);
             }
-            self.rewrite_code_ports(&mut instance, terminals, path)?;
+            self.rewrite_code_ports(&mut instance, terminals, path, directives.definition)?;
             if self.devices.len() >= self.limits.max_devices {
                 return Err(SpiceError::parse(
                     instance.location.clone(),
@@ -970,7 +1070,12 @@ impl<'a> Expander<'a> {
                 ));
             }
             self.rewrite_model(&mut instance, scope, locals)?;
-            self.rewrite_parameter_references(&mut instance, &terminals.analog, path)?;
+            self.rewrite_parameter_references(
+                &mut instance,
+                &terminals.analog,
+                path,
+                directives.definition,
+            )?;
             instance.name = device_name(&instance.name, instance.designator, path);
             self.bind_prepared_waveform(original, directives.definition, &instance, scope)?;
             if let Some(resistor) = self.resistors.get(original, directives.definition)
@@ -1001,6 +1106,7 @@ impl<'a> Expander<'a> {
         instance: &mut DeviceInstance,
         terminals: &BTreeMap<String, String>,
         path: &str,
+        definition: &str,
     ) -> SpiceResult<()> {
         // F/H controlling sources are translated like instance names
         // (`translate()` calls `translate_inst_name` for them), so they
@@ -1023,7 +1129,8 @@ impl<'a> Expander<'a> {
                             }
                         }
                         BExprKind::Current(source) => {
-                            match device_reference(source, path, &node.span.start) {
+                            match self.device_reference(source, path, definition, &node.span.start)
+                            {
                                 Ok(name) => *source = name,
                                 Err(error) => result = Err(error),
                             }
@@ -1035,7 +1142,8 @@ impl<'a> Expander<'a> {
                 continue;
             }
             if parameter.kind == ParameterKind::Instance {
-                parameter.value = device_reference(&parameter.value, path, &parameter.location)?;
+                parameter.value =
+                    self.device_reference(&parameter.value, path, definition, &parameter.location)?;
             }
         }
         Ok(())
@@ -1282,6 +1390,7 @@ impl<'a> Expander<'a> {
         instance: &mut DeviceInstance,
         terminals: &HierarchyBindings,
         path: &str,
+        definition: &str,
     ) -> SpiceResult<()> {
         for terminal in instance
             .code_ports
@@ -1292,7 +1401,7 @@ impl<'a> Expander<'a> {
                 if terminal.kind == CodePortKind::Digital {
                     Ok(Self::rewrite_digital_node(name, &terminals.digital, path))
                 } else if terminal.kind == CodePortKind::BranchCurrent {
-                    device_reference(name, path, &instance.location)
+                    self.device_reference(name, path, definition, &instance.location)
                 } else {
                     Ok(self.rewrite_node(name, &terminals.analog, path))
                 }
@@ -1490,36 +1599,6 @@ fn device_name(name: &str, designator: char, path: &str) -> String {
     } else {
         format!("{designator}.{path}.{name}")
     }
-}
-
-/// Bind a source-neutral descendant reference relative to the containing
-/// occurrence. Ordinary native names retain the native translation rules.
-fn device_reference(name: &str, path: &str, at: &SourceLoc) -> SpiceResult<String> {
-    let designator = |name: &str| name.chars().next().unwrap_or_default().to_ascii_lowercase();
-    if !name.contains("::") {
-        return Ok(device_name(name, designator(name), path));
-    }
-    let invalid = || {
-        SpiceError::parse(
-            at.clone(),
-            format!("invalid descendant device reference '{name}'"),
-        )
-    };
-    let (ancestors, leaf) = name.rsplit_once("::").ok_or_else(invalid)?;
-    if !designator(leaf).is_ascii_alphabetic() || leaf.len() < 2 || leaf.contains(':') {
-        return Err(invalid());
-    }
-    let mut occurrence = path.to_owned();
-    for component in ancestors.split("::") {
-        if designator(component) != 'x' || component.len() < 2 || component.contains(':') {
-            return Err(invalid());
-        }
-        if !occurrence.is_empty() {
-            occurrence.push('.');
-        }
-        occurrence.push_str(component);
-    }
-    Ok(device_name(leaf, designator(leaf), &occurrence))
 }
 
 /// One formal default as a `.param` assignment, so that evaluation orders it
