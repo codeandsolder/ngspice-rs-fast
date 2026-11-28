@@ -22,6 +22,21 @@ pub(crate) trait Constitutive: Clone {
     fn exp(self) -> Self;
     fn exp_m1(self) -> Self;
     fn ln_1p(self) -> SpiceResult<Self>;
+
+    fn subtract(self, rhs: &Self) -> Self {
+        self.add(&rhs.clone().scale(-1.))
+    }
+
+    fn midpoint(self, rhs: &Self) -> Self;
+
+    fn scale_add(self, factor: Real, add: &Self) -> Self {
+        self.constant(factor).mul_add(&self, add)
+    }
+
+    fn affine(self, factor: Real, offset: Real) -> Self {
+        let add = self.constant(offset);
+        self.scale_add(factor, &add)
+    }
 }
 
 impl Constitutive for Real {
@@ -43,6 +58,16 @@ impl Constitutive for Real {
     #[inline]
     fn add(self, rhs: &Self) -> Self {
         self + rhs
+    }
+
+    #[inline]
+    fn subtract(self, rhs: &Self) -> Self {
+        self - rhs
+    }
+
+    #[inline]
+    fn midpoint(self, rhs: &Self) -> Self {
+        Real::midpoint(self, *rhs)
     }
 
     #[inline]
@@ -106,6 +131,13 @@ impl<const N: usize> Constitutive for Differential<N> {
 
     fn add(self, rhs: &Self) -> Self {
         Self::add(self, rhs)
+    }
+
+    fn midpoint(self, rhs: &Self) -> Self {
+        let constant = self.primal().midpoint(rhs.primal());
+        let mut result = self.scale(0.5).add(&rhs.clone().scale(0.5));
+        result.value = result.value.with_value(constant);
+        result
     }
 
     fn multiply(self, rhs: &Self) -> Self {

@@ -27,8 +27,6 @@ use crate::primitives::{Real, SpiceResult};
 const EXP_THRESHOLD: Real = 34.0;
 const MIN_EXP: Real = 1.713_908_431e-15;
 const MAX_EXP: Real = 5.834_617_425e14;
-const EPS_SI: Real = 1.035_94e-10;
-const CHARGE_Q: Real = 1.602_19e-19;
 
 /// Terminal bias applied to the intrinsic device (the `dNodePrime`/
 /// `sNodePrime` reference C uses), already multiplied by the model polarity.
@@ -187,13 +185,9 @@ impl DcModel<'_> {
         let p = self.setup;
         let m = self.model;
         let t = self.temperature;
-        let type_ = Real::from(p.polarity);
         let cox = m.oxide_capacitance;
         let tox = m.values.tox.value;
         let vtm = t.vtm;
-        let temp = t.temp;
-        let tnom = t.tnom;
-        let factor1 = t.factor1;
 
         // Source/drain junction diode DC model begins.
         let nvtm = vtm * m.values.nj.value;
@@ -215,237 +209,44 @@ impl DcModel<'_> {
             (-1, -bias.vds, bias.vgs - bias.vds, bias.vbs - bias.vds)
         };
 
-        // Body-effect and depletion charge.
-        let vbsc = p.derived.vbsc;
-        let phi = p.derived.phi;
-        let t0 = vbs - vbsc - 0.001;
-        let t1 = 0.004f64.mul_add(-vbsc, t0 * t0).sqrt();
-        let vbseff_raw = vbsc + f64::midpoint(t0, t1);
-        let dvbseff_dvb = f64::midpoint(1.0, t0 / t1);
-        let vbseff = if vbseff_raw < vbs { vbs } else { vbseff_raw };
-        let (sqrt_phis, dsqrt_phis_dvb, phis, dphis_dvb);
-        if vbseff > 0.0 {
-            let t0 = phi / (phi + vbseff);
-            phis = phi * t0;
-            dphis_dvb = -t0 * t0;
-            sqrt_phis = p.derived.phis3 / 0.5f64.mul_add(vbseff, phi);
-            dsqrt_phis_dvb = -0.5 * sqrt_phis * sqrt_phis / p.derived.phis3;
-        } else {
-            phis = phi - vbseff;
-            dphis_dvb = -1.0;
-            sqrt_phis = phis.sqrt();
-            dsqrt_phis_dvb = -0.5 / sqrt_phis;
-        }
-        let xdep = p.derived.xdep0 * sqrt_phis / p.derived.sqrtphi;
-        let dxdep_dvb = (p.derived.xdep0 / p.derived.sqrtphi) * dsqrt_phis_dvb;
-
-        let leff = p.leff;
-        let v0 = p.derived.vbi - phi;
-        let t3 = xdep.sqrt();
-
-        // dvt2 body-bias dependence of the threshold.
-        let (t1, t2) = {
-            let t0 = p.binned.dvt2 * vbseff;
-            if t0 >= -0.5 {
-                (1.0 + t0, p.binned.dvt2)
-            } else {
-                let t4 = 1.0 / 8.0f64.mul_add(t0, 3.0);
-                (3.0f64.mul_add(t0, 1.0) * t4, p.binned.dvt2 * t4 * t4)
-            }
-        };
-        let lt1 = factor1 * t3 * t1;
-        let dlt1_dvb = factor1 * t3.mul_add(t2, 0.5 / t3 * t1 * dxdep_dvb);
-        let (t1, t2) = {
-            let t0 = p.binned.dvt2w * vbseff;
-            if t0 >= -0.5 {
-                (1.0 + t0, p.binned.dvt2w)
-            } else {
-                let t4 = 1.0 / 8.0f64.mul_add(t0, 3.0);
-                (3.0f64.mul_add(t0, 1.0) * t4, p.binned.dvt2w * t4 * t4)
-            }
-        };
-        let ltw = factor1 * t3 * t1;
-        let dltw_dvb = factor1 * t3.mul_add(t2, 0.5 / t3 * t1 * dxdep_dvb);
-
-        // Narrow/short-channel threshold shifts.
-        let (theta0, dtheta0_dvb) = {
-            let t0 = -0.5 * p.binned.dvt1 * leff / lt1;
-            if t0 > -EXP_THRESHOLD {
-                let t1 = t0.exp();
-                let dt1_dvb = -t0 / lt1 * t1 * dlt1_dvb;
-                (
-                    t1 * 2.0f64.mul_add(t1, 1.0),
-                    4.0f64.mul_add(t1, 1.0) * dt1_dvb,
-                )
-            } else {
-                let t1 = MIN_EXP;
-                (t1 * 2.0f64.mul_add(t1, 1.0), 0.0)
-            }
-        };
-        let thetavth = p.binned.dvt0 * theta0;
-        let delt_vth = thetavth * v0;
-        let ddelt_vth_dvb = p.binned.dvt0 * dtheta0_dvb * v0;
-
-        let (t2w, dt2w_dvb) = {
-            let t0 = -0.5 * p.binned.dvt1w * p.weff * leff / ltw;
-            if t0 > -EXP_THRESHOLD {
-                let t1 = t0.exp();
-                let dt1_dvb = -t0 / ltw * t1 * dltw_dvb;
-                (
-                    t1 * 2.0f64.mul_add(t1, 1.0),
-                    4.0f64.mul_add(t1, 1.0) * dt1_dvb,
-                )
-            } else {
-                let t1 = MIN_EXP;
-                (t1 * 2.0f64.mul_add(t1, 1.0), 0.0)
-            }
-        };
-        let t0 = p.binned.dvt0w * t2w;
-        let t2 = t0 * v0;
-        let dt2_dvb = p.binned.dvt0w * dt2w_dvb * v0;
-
-        let temp_ratio = (temp - tnom) / tnom;
-        let length_ratio = p.binned.nlx / leff;
-        let root_offset = length_ratio / ((1.0 + length_ratio).sqrt() + 1.0);
-        let t1 = p
-            .binned
-            .kt2
-            .mul_add(vbseff, p.binned.kt1 + p.binned.kt1l / leff)
-            .mul_add(temp_ratio, p.derived.k1ox * root_offset * p.derived.sqrtphi);
-        let effective_width_offset = p.weff + p.binned.w0;
-        let tmp2 = tox * phi / effective_width_offset;
-
-        let t3eta = p.binned.etab.mul_add(vbseff, p.binned.eta0);
-        let (t3eta, t4) = if t3eta < 1.0e-4 {
-            let t9 = 1.0 / 2.0e4f64.mul_add(-t3eta, 3.0);
-            ((2.0e-4 - t3eta) * t9, t9 * t9)
-        } else {
-            (t3eta, 1.0)
-        };
-        let ddibl_sft_dvd = t3eta * p.derived.theta0vb0;
-        let dibl_sft = ddibl_sft_dvd * vds;
-
-        // `here->BSIM3vth0` is the instance value after DELVTO.
-        let vth = p.binned.k3b.mul_add(vbseff, p.binned.k3).mul_add(
-            tmp2,
-            p.derived.k2ox.mul_add(
-                -vbseff,
-                p.derived.k1ox.mul_add(
+        // Shared electrostatics: preserve the reference Newton tangents,
+        // while the physical path differentiates the exact value law.
+        let super::electrostatics::Electrostatics {
+            body:
+                super::electrostatics::Body {
+                    effective: vbseff,
+                    d_effective: dvbseff_dvb,
+                    phis,
+                    d_phis: dphis_dvb,
                     sqrt_phis,
-                    p.binned.k1.mul_add(-p.derived.sqrtphi, type_ * p.vth0),
-                ),
-            ) - delt_vth
-                - t2,
-        ) + t1
-            - dibl_sft;
+                    d_sqrt_phis: dsqrt_phis_dvb,
+                    depletion: xdep,
+                    d_depletion: dxdep_dvb,
+                },
+            threshold:
+                super::electrostatics::Threshold {
+                    voltage: vth,
+                    d_body: dvth_dvb,
+                    d_drain: dvth_dvd,
+                    rolloff: thetavth,
+                    slope: n,
+                    d_slope_body: dn_dvb,
+                    d_slope_drain: dn_dvd,
+                },
+            overdrive:
+                super::electrostatics::Overdrive {
+                    gate: vgs_eff,
+                    d_gate: dvgseff_dvg,
+                    raw: vgst,
+                    effective: vgsteff,
+                    d_effective_gate: dvgsteff_dvg,
+                    d_effective_drain: dvgsteff_dvd,
+                    d_effective_body: dvgsteff_dvb,
+                },
+        } = super::electrostatics::evaluate(self, vbs, vgs, &vds)?;
         let von = vth;
-        let dvth_dvb = p.binned.kt2.mul_add(
-            temp_ratio,
-            (p.binned.etab * vds * p.derived.theta0vb0).mul_add(
-                -t4,
-                p.binned.k3b.mul_add(
-                    tmp2,
-                    p.derived.k1ox.mul_add(dsqrt_phis_dvb, -p.derived.k2ox)
-                        - ddelt_vth_dvb
-                        - dt2_dvb,
-                ),
-            ),
-        );
-        let dvth_dvd = -ddibl_sft_dvd;
-
-        // Subthreshold slope factor n.
-        let tmp2n = p.binned.nfactor * EPS_SI / xdep;
-        let tmp3n = p
-            .binned
-            .cdscd
-            .mul_add(vds, p.binned.cdscb.mul_add(vbseff, p.binned.cdsc));
-        let tmp4 = (tmp3n.mul_add(theta0, tmp2n) + p.binned.cit) / cox;
-        let (n, dn_dvb, dn_dvd) = if tmp4 >= -0.5 {
-            (
-                1.0 + tmp4,
-                p.binned.cdscb.mul_add(
-                    theta0,
-                    tmp3n.mul_add(dtheta0_dvb, -tmp2n / xdep * dxdep_dvb),
-                ) / cox,
-                p.binned.cdscd * theta0 / cox,
-            )
-        } else {
-            let t0 = 1.0 / 8.0f64.mul_add(tmp4, 3.0);
-            let factor = t0 * t0;
-            (
-                3.0f64.mul_add(tmp4, 1.0) * t0,
-                p.binned.cdscb.mul_add(
-                    theta0,
-                    tmp3n.mul_add(dtheta0_dvb, -tmp2n / xdep * dxdep_dvb),
-                ) / cox
-                    * factor,
-                p.binned.cdscd * theta0 / cox * factor,
-            )
-        };
-
-        // Poly-gate depletion.
-        let t0 = p.vfb + phi;
-        let (vgs_eff, dvgseff_dvg) =
-            if p.binned.ngate > 1.0e18 && p.binned.ngate < 1.0e25 && vgs > t0 {
-                let t1 = 1.0e6 * CHARGE_Q * EPS_SI * p.binned.ngate / (cox * cox);
-                let t4 = (1.0 + 2.0 * (vgs - t0) / t1).sqrt();
-                // Rationalize both subtractive square-root differences.
-                let t2 = 2.0 * (vgs - t0) / (t4 + 1.0);
-                let t3 = 0.5 * t2 * t2 / t1;
-                let t7 = 1.07 - t3;
-                let t6 = t7.mul_add(t7, 0.224).sqrt();
-                let t5 = 2.24 * t3 / (2.24 - t7 + t6);
-                (
-                    vgs - t5,
-                    (0.5 * t2 / (t1 * t4)).mul_add(-(1.0 + t7 / t6), 1.0),
-                )
-            } else {
-                (vgs, 1.0)
-            };
-        let vgst = vgs_eff - vth;
-
-        // Effective gate overdrive (Vgsteff), with C's three regimes.
-        let t10 = 2.0 * n * vtm;
-        let vgst_nvt = vgst / t10;
-        let exp_arg = 2.0f64.mul_add(p.binned.voff, -vgst) / t10;
-        let (vgsteff, mut dvgsteff_dvg, dvgsteff_dvd, dvgsteff_dvb);
-        if vgst_nvt > EXP_THRESHOLD {
-            vgsteff = vgst;
-            dvgsteff_dvg = dvgseff_dvg;
-            dvgsteff_dvd = -dvth_dvd;
-            dvgsteff_dvb = -dvth_dvb;
-        } else if exp_arg > EXP_THRESHOLD {
-            let t0 = (vgst - p.binned.voff) / (n * vtm);
-            let exp_vgst = t0.exp();
-            vgsteff = vtm * p.derived.cdep0 / cox * exp_vgst;
-            dvgsteff_dvg = vgsteff / (n * vtm);
-            dvgsteff_dvd = -dvgsteff_dvg * (t0 * vtm).mul_add(dn_dvd, dvth_dvd);
-            dvgsteff_dvb = -dvgsteff_dvg * (t0 * vtm).mul_add(dn_dvb, dvth_dvb);
-            dvgsteff_dvg *= dvgseff_dvg;
-        } else {
-            let exp_vgst = vgst_nvt.exp();
-            let t1 = t10 * exp_vgst.ln_1p();
-            let dt1_dvg = exp_vgst / (1.0 + exp_vgst);
-            let dt1_dvb = (t1 / n).mul_add(dn_dvb, -dt1_dvg * (vgst / n).mul_add(dn_dvb, dvth_dvb));
-            let dt1_dvd = (t1 / n).mul_add(dn_dvd, -dt1_dvg * (vgst / n).mul_add(dn_dvd, dvth_dvd));
-
-            let dt2_dvg = -cox / (vtm * p.derived.cdep0) * exp_arg.exp();
-            let t2v = t10.mul_add(-dt2_dvg, 1.0);
-            let dt2_dvd = ((t2v - 1.0) / n).mul_add(
-                dn_dvd,
-                -dt2_dvg * (2.0 * vtm * exp_arg).mul_add(-dn_dvd, dvth_dvd),
-            );
-            let dt2_dvb = ((t2v - 1.0) / n).mul_add(
-                dn_dvb,
-                -dt2_dvg * (2.0 * vtm * exp_arg).mul_add(-dn_dvb, dvth_dvb),
-            );
-
-            vgsteff = t1 / t2v;
-            let t3 = t2v * t2v;
-            dvgsteff_dvg = t1.mul_add(-dt2_dvg, t2v * dt1_dvg) / t3 * dvgseff_dvg;
-            dvgsteff_dvd = t1.mul_add(-dt2_dvd, t2v * dt1_dvd) / t3;
-            dvgsteff_dvb = t1.mul_add(-dt2_dvb, t2v * dt1_dvb) / t3;
-        }
+        let phi = p.derived.phi;
+        let leff = p.leff;
 
         // Effective channel width.
         let t9 = sqrt_phis - p.derived.sqrtphi;
